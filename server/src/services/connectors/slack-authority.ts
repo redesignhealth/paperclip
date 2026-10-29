@@ -13,6 +13,13 @@ import { forbidden } from "../../errors.js";
 import { boundRunIssueId } from "../run-task-binding.js";
 import { chatRunSourceMessageId } from "../chat-channels/run-origin.js";
 
+/** Ordinary multi-connection tasks need an explicit endpoint at dispatch. */
+export const SLACK_ENDPOINT_SELECTION_REQUIRED = "slack_endpoint_selection_required";
+/** Expected task eligibility denials may hide tools quietly; other failures must be logged. */
+export const SLACK_TASK_AUTHORIZATION_DENIED = "slack_task_authorization_denied";
+const slackTaskDenied = (message: string, details = { code: SLACK_TASK_AUTHORIZATION_DENIED }) =>
+  forbidden(message, details);
+
 export interface SlackTaskBinding {
   companyId: string;
   agentId: string;
@@ -108,7 +115,7 @@ export async function slackRunOrigin(db: Db, binding: SlackTaskBinding) {
         ),
       );
     if (!approved || !binding.identityContextId)
-      throw forbidden("Slack approval is not executing for this task");
+      throw slackTaskDenied("Slack approval is not executing for this task");
     const [run] = await db
       .select()
       .from(heartbeatRuns)
@@ -136,7 +143,7 @@ export async function slackRunOrigin(db: Db, binding: SlackTaskBinding) {
       context.responsibleUserId !== run.responsibleUserId ||
       run.activeIdentityContextId !== context.id
     )
-      throw forbidden(
+      throw slackTaskDenied(
         "The accepted requester changed after Slack approval was requested",
       );
     captured = { run, context };
@@ -146,7 +153,7 @@ export async function slackRunOrigin(db: Db, binding: SlackTaskBinding) {
       binding.identityContextId &&
       binding.identityContextId !== captured.context?.id
     )
-      throw forbidden(
+      throw slackTaskDenied(
         "The accepted requester changed before the Slack operation executed",
       );
   }
@@ -154,7 +161,7 @@ export async function slackRunOrigin(db: Db, binding: SlackTaskBinding) {
     boundRunIssueId(captured.run) !== binding.issueId ||
     !captured.run.responsibleUserId
   )
-    throw forbidden(
+    throw slackTaskDenied(
       "Slack tools require the bound task and an accepted linked user",
     );
   return { ...captured, sourceMessageId: await chatRunSourceMessageId(db, captured.run, { context: captured.context }) };

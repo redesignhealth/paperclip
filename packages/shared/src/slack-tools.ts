@@ -474,6 +474,20 @@ export interface SlackSearchStatus {
 export interface SlackToolCapabilities {
   grantedScopes: string[] | null;
   missingScopes: string[];
+  /**
+   * A permission group not yet enabled, with the tools it would add. The action
+   * distinguishes a group not requested yet from one awaiting reauthorization,
+   * so settings can explain the next step instead of only listing raw scopes.
+   */
+  missingGroups?: Array<{
+    group: string;
+    label: string;
+    description: string;
+    scopes: string[];
+    toolNames: string[];
+    /** Reconnect if already requested; otherwise enable the group first. */
+    action?: "enable" | "reconnect";
+  }>;
   tools: Array<{
     name: string;
     description: string;

@@ -110,7 +110,7 @@ const support = await getEmbeddedPostgresTestSupport();
       if (fault === "pending-parent") await db.update(runIdentityContexts).set({ status: "pending" }).where(eq(runIdentityContexts.id, f.origin.id));
       if (fault === "pending-current") await db.update(runIdentityContexts).set({ status: "pending" }).where(eq(runIdentityContexts.id, f.context.id));
       if (fault === "cycle") await db.update(runIdentityContexts).set({ messageId: null, parentContextId: f.context.id }).where(eq(runIdentityContexts.id, f.origin.id));
-      await expect(chatRunSourceMessageId(db, f.run)).rejects.toMatchObject({ status: 403 });
+      await expect(chatRunSourceMessageId(db, f.run)).rejects.toMatchObject({ status: 403, details: { code: "chat_requester_authorization_changed" } });
     },
   );
 

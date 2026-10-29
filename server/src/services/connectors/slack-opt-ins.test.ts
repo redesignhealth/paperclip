@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   SLACK_DEFAULT_BOT_SCOPES,
+  SLACK_OPT_IN_SCOPE_GROUPS,
   SLACK_TOOLS,
   slackBotScopes,
   slackOptInGroupsFromScopes,
@@ -8,6 +9,7 @@ import {
 } from "@paperclipai/shared";
 import {
   assertSlackToolEnabledForSetup,
+  slackEnabledOptInGroups,
   isSlackLegacyInstall,
   isSlackToolEnabledForSetup,
   sameSlackOptInGroups,
@@ -57,12 +59,17 @@ describe("Slack tool opt-in gating", () => {
     }
   });
 
-  it("keeps a live install's tools while a pending opt-in change is not installed", () => {
-    // Requested: nothing. Installed: channel management. The grant is live.
+  it("disables a group the operator removed even when Slack kept its grant", () => {
+    // Requested: nothing. Installed: channel management. Slack may keep the
+    // scope on the existing installation, but the operator asked for it off.
     expect(isSlackToolEnabledForSetup({
       slackOptInScopeGroups: [],
       slackInstalledOptInScopeGroups: ["channel_management"],
-    }, { name: "slack_create_channel", scopes: ["channels:manage|groups:write"] })).toBe(true);
+    }, { name: "slack_create_channel", scopes: ["channels:manage|groups:write"] })).toBe(false);
+    expect(slackEnabledOptInGroups({
+      slackOptInScopeGroups: [],
+      slackInstalledOptInScopeGroups: ["channel_management"],
+    })).toEqual([]);
   });
 
   it("does not offer a tool Slack has not granted yet", () => {
@@ -84,11 +91,12 @@ describe("Slack tool opt-in gating", () => {
     expect(() => assertSlackToolEnabledForSetup({ slackInstalledOptInScopeGroups: ["file_upload"] }, "slack_upload_file")).not.toThrow();
   });
 
-  it("rejects an unknown tool name cleanly instead of asserting later", () => {
+  it("rejects an unknown tool name as a client error, not an authorization one", () => {
     expect(() => assertSlackToolEnabledForSetup(undefined, "not_a_slack_tool"))
       .toThrow("Unknown Slack tool: not_a_slack_tool");
+    // A 403 would tell the caller to seek access it can never be granted.
     expect(() => assertSlackToolEnabledForSetup(undefined, "not_a_slack_tool"))
-      .toThrow(expect.objectContaining({ details: { code: "slack_tool_unknown" } }));
+      .toThrow(expect.objectContaining({ status: 400, details: { code: "unknown_slack_tool" } }));
   });
 
   it("defaults a new endpoint with no fields to no opt-in groups", () => {
@@ -202,5 +210,89 @@ describe("Slack legacy install definition", () => {
   it("excludes a row with either opt-in field recorded", () => {
     expect(isSlackLegacyInstall({ botExternalId: "UBOT", setup: { slackOptInScopeGroups: [] } })).toBe(false);
     expect(isSlackLegacyInstall({ botExternalId: "UBOT", setup: { slackInstalledOptInScopeGroups: [] } })).toBe(false);
+  });
+});
+
+/**
+ * TECH-7988: gating is requested AND installed. Listing and dispatch both read
+ * `slackEnabledOptInGroups`, so a tool can never be listed but rejected, nor
+ * dispatchable while hidden.
+ */
+describe("Slack tool gating: requested and installed", () => {
+  const channel = { name: "slack_create_channel", scopes: ["channels:manage|groups:write"] };
+  const upload = { name: "slack_upload_file", scopes: ["files:write"] };
+  const readTool = { name: "slack_history", scopes: ["channels:history"] };
+
+  it("enables a group that is both requested and installed", () => {
+    const setup = { slackOptInScopeGroups: ["channel_management" as const], slackInstalledOptInScopeGroups: ["channel_management" as const] };
+    expect(slackEnabledOptInGroups(setup)).toEqual(["channel_management"]);
+    expect(isSlackToolEnabledForSetup(setup, channel)).toBe(true);
+    expect(() => assertSlackToolEnabledForSetup(setup, "slack_create_channel")).not.toThrow();
+  });
+
+  it("disables an ungated-by-default tool group that was never requested", () => {
+    const setup = { slackOptInScopeGroups: [] as const, slackInstalledOptInScopeGroups: [] as const };
+    expect(isSlackToolEnabledForSetup(setup, upload)).toBe(false);
+    expect(() => assertSlackToolEnabledForSetup(setup, "slack_upload_file")).toThrow("not enabled for this agent");
+  });
+
+  it("disables requested-but-not-granted: Slack has no scope yet", () => {
+    const setup = { slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: [] as const };
+    expect(slackEnabledOptInGroups(setup)).toEqual([]);
+    expect(isSlackToolEnabledForSetup(setup, upload)).toBe(false);
+  });
+
+  it("disables granted-but-not-requested: the operator removed the group", () => {
+    const setup = { slackOptInScopeGroups: [] as const, slackInstalledOptInScopeGroups: ["file_upload" as const] };
+    expect(slackEnabledOptInGroups(setup)).toEqual([]);
+    expect(isSlackToolEnabledForSetup(setup, upload)).toBe(false);
+    expect(() => assertSlackToolEnabledForSetup(setup, "slack_upload_file")).toThrow("not enabled for this agent");
+  });
+
+  it("keeps ungated tools available regardless of opt-ins", () => {
+    for (const setup of [
+      { slackOptInScopeGroups: [] as const, slackInstalledOptInScopeGroups: [] as const },
+      { slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: [] as const },
+    ]) {
+      expect(isSlackToolEnabledForSetup(setup, readTool)).toBe(true);
+    }
+  });
+
+  it("uses the implied full grant as the request only for a legacy install", () => {
+    // Legacy: no request recorded, so the implied grant is also the request.
+    const legacy = slackEnabledOptInGroups({},);
+    expect(legacy).toEqual([]);
+    expect(slackEnabledOptInGroups({}, { legacyInstall: true })).toEqual(SLACK_OPT_IN_SCOPE_GROUPS);
+    // Once a request exists, it is authoritative and caps the legacy grant.
+    expect(slackEnabledOptInGroups({ slackOptInScopeGroups: [] }, { legacyInstall: true })).toEqual([]);
+    expect(slackEnabledOptInGroups({ slackOptInScopeGroups: ["file_upload"] }, { legacyInstall: true })).toEqual([]);
+  });
+
+  it("gates a manual app by its requested and granted groups the same way", () => {
+    // A manual app has no registration row; only setup fields decide.
+    const manualWithUpload = { slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: ["file_upload" as const] };
+    const manualMissingGrant = { slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: [] as const };
+    expect(isSlackToolEnabledForSetup(manualWithUpload, upload)).toBe(true);
+    expect(isSlackToolEnabledForSetup(manualMissingGrant, upload)).toBe(false);
+  });
+
+  it("keeps listing and dispatch in agreement for every group combination", () => {
+    const groups = ["channel_management", "proactive_dms", "file_upload"] as const;
+    const subsets = (items: readonly (typeof groups)[number][]) =>
+      items.reduce<(typeof groups)[number][][]>((acc, group) => [...acc, ...acc.map(set => [...set, group])], [[]]);
+    for (const requested of subsets(groups)) {
+      for (const installed of subsets(groups)) {
+        const setup = { slackOptInScopeGroups: requested, slackInstalledOptInScopeGroups: installed };
+        const listed = new Set(slackEnabledToolsForSetup(setup).map(tool => String(tool.name)));
+        for (const tool of SLACK_TOOLS) {
+          // The guard every dispatch path calls must match the listing exactly.
+          const dispatchable = (() => {
+            try { assertSlackToolEnabledForSetup(setup, tool.name); return true; } catch { return false; }
+          })();
+          expect(dispatchable).toBe(listed.has(tool.name));
+          expect(dispatchable).toBe(isSlackToolEnabledForSetup(setup, tool));
+        }
+      }
+    }
   });
 });

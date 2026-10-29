@@ -29,6 +29,14 @@ const support = await getEmbeddedPostgresTestSupport();
     }
     return { companyId, agentId, issueId, runId, messageIds };
   }
+  it.each(["inactive", "missing", "invalid-task"])("tags %s capture eligibility denials", async fault => {
+    const input = await seed();
+    if (fault === "inactive") await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, input.runId));
+    if (fault === "invalid-task") await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: "invalid" } }).where(eq(heartbeatRuns.id, input.runId));
+    await expect(captureRunIdentity(db, { ...input, runId: fault === "missing" ? randomUUID() : input.runId }))
+      .rejects.toMatchObject({ status: 403, details: { code: fault === "invalid-task" ? "run_task_identity_invalid" : "run_identity_not_active" } });
+  });
+
   it("retains mixed-author delivery order without rewriting task ownership", async () => {
     const input = await seed();
     await initializeRunIdentity(db, { ...input, responsibleUserId: "owner", cause: "queued" });

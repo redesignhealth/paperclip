@@ -6,7 +6,7 @@ import { slackSearchActionToken } from "../../connectors/slack-search-context.js
 import { slackAuthorizationRevision } from "../../connectors/slack-revision.js";
 
 import { instanceSettingsService } from "../../instance-settings.js";
-import { registerSlackTaskAuthority, slackRunOrigin, type SlackTaskBinding } from "../../connectors/slack-authority.js";
+import { registerSlackTaskAuthority, SLACK_ENDPOINT_SELECTION_REQUIRED, SLACK_TASK_AUTHORIZATION_DENIED, slackRunOrigin, type SlackTaskBinding } from "../../connectors/slack-authority.js";
 import { measureRunPhase } from "../../execution-preparation-timing.js";
 import { measureRunTransaction } from "../../execution-transaction-timing.js";
 
@@ -40,6 +40,10 @@ import {
   forbidden,
 } from "../../../errors.js";
 
+// Mark known eligibility denials explicitly. Unknown downstream 403s remain faults.
+const taskDenied = (message: string, details = { code: SLACK_TASK_AUTHORIZATION_DENIED }) =>
+  forbidden(message, details);
+
 type SlackTaskAuthorityRegistrationOptions = {
   authorizeInboundWakeup: (tx: DbOrTransaction, action: typeof chatActions.$inferSelect) => Promise<{
     issue: typeof issues.$inferSelect;
@@ -56,11 +60,11 @@ export function createSlackTaskAuthorityRegistration(db: Db, options: SlackTaskA
 
   const authorize = async (binding: SlackTaskBinding) => {
     if (!(await measureRunPhase("connectors.slack.settings", () => instanceSettingsService(db).getExperimental())).enableChatConnectors)
-      throw forbidden("Chat connectors are disabled");
+      throw taskDenied("Chat connectors are disabled");
     const identity = await measureRunPhase("connectors.slack.identity", () => slackRunOrigin(db, binding));
     const run = identity.run;
     if (boundRunIssueId(run) !== binding.issueId || !run.responsibleUserId)
-      throw forbidden("Slack tools require the bound task and an accepted linked user");
+      throw taskDenied("Slack tools require the bound task and an accepted linked user");
     const resolved = await measureRunTransaction(db, "connectors.slack.authority", async (tx) => {
       const [action] = await tx.select().from(chatActions).where(and(
         eq(chatActions.companyId, binding.companyId),
@@ -78,46 +82,47 @@ export function createSlackTaskAuthorityRegistration(db: Db, options: SlackTaskA
           .where(and(eq(issueComments.companyId, binding.companyId), eq(issueComments.issueId, binding.issueId),
             eq(issueComments.id, identity.sourceMessageId), isNull(issueComments.deletedAt))) : [];
         if (identity.sourceMessageId && (!message || message.authorType !== "user" || message.authorUserId !== run.responsibleUserId))
-          throw forbidden("Slack tools require the current task requester's identity");
+          throw taskDenied("Slack tools require the current task requester's identity");
         // An external participant may not acquire unrelated bot connections by
         // falling back to ordinary-task access after source admission fails.
         if (identity.sourceMessageId) {
           const [external] = await tx.select({ id: chatMessageLinks.id }).from(chatMessageLinks)
             .where(and(eq(chatMessageLinks.companyId, binding.companyId), eq(chatMessageLinks.commentId, identity.sourceMessageId), eq(chatMessageLinks.direction, "inbound"))).limit(1);
-          if (external) throw forbidden("External messages require their originating Slack connection");
+          if (external) throw taskDenied("External messages require their originating Slack connection");
         }
         const endpoints = await tx.select().from(chatEndpoints).where(and(
           eq(chatEndpoints.companyId, binding.companyId), eq(chatEndpoints.provider, "slack"),
           eq(chatEndpoints.assignedAgentId, binding.agentId), eq(chatEndpoints.status, "active"),
           ...(binding.endpointId ? [eq(chatEndpoints.id, binding.endpointId)] : []),
         )).for("no key update");
-        if (endpoints.length !== 1) throw forbidden("Select an active Slack connection assigned to this agent");
+        if (endpoints.length !== 1) throw taskDenied("Select an active Slack connection assigned to this agent",
+          endpoints.length > 1 ? { code: SLACK_ENDPOINT_SELECTION_REQUIRED } : undefined);
         const endpoint = endpoints[0]!;
         const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, binding.companyId), eq(issues.id, binding.issueId), eq(issues.assigneeAgentId, binding.agentId)));
-        if (!issue) throw forbidden("Slack tools require a task assigned to this agent");
+        if (!issue) throw taskDenied("Slack tools require a task assigned to this agent");
         const [member] = await tx.select().from(companyMemberships).where(and(
           eq(companyMemberships.companyId, binding.companyId), eq(companyMemberships.principalType, "user"),
           eq(companyMemberships.principalId, run.responsibleUserId!), eq(companyMemberships.status, "active"), ne(companyMemberships.membershipRole, "viewer"),
         ));
-        if (!member) throw forbidden("The responsible user must be an active company operator");
+        if (!member) throw taskDenied("The responsible user must be an active company operator");
         const links = await tx.select({ principal: chatExternalPrincipals }).from(chatIdentityLinks)
           .innerJoin(chatExternalPrincipals, and(eq(chatExternalPrincipals.id, chatIdentityLinks.principalId), eq(chatExternalPrincipals.companyId, binding.companyId)))
           .where(and(eq(chatIdentityLinks.companyId, binding.companyId), eq(chatIdentityLinks.endpointId, endpoint.id),
             eq(chatIdentityLinks.paperclipUserId, run.responsibleUserId!), eq(chatIdentityLinks.status, "linked"),
             eq(chatExternalPrincipals.provider, "slack"), eq(chatExternalPrincipals.providerAccountId, endpoint.providerAccountId!), eq(chatExternalPrincipals.isBot, false)));
-        if (links.length !== 1) throw forbidden("Link your Slack account to this connection before using it from tasks or routines");
+        if (links.length !== 1) throw taskDenied("Link your Slack account to this connection before using it from tasks or routines");
         // A Board message changes who is directing the work, not the privacy
         // of context already present in its linked Slack conversation.
         const conversations = await tx.select().from(chatConversations).where(and(
           eq(chatConversations.companyId, binding.companyId), eq(chatConversations.endpointId, endpoint.id),
           eq(chatConversations.issueId, binding.issueId),
         )).limit(2);
-        if (conversations.length > 1) throw forbidden("The task's Slack conversation boundary is ambiguous");
+        if (conversations.length > 1) throw taskDenied("The task's Slack conversation boundary is ambiguous");
         return { endpoint, issue, conversation: conversations[0] ?? null, delivery: null, principalId: links[0]!.principal.id, slackUserId: links[0]!.principal.externalId };
       }
       if (action.payload.requestedByActorType !== "user" || action.payload.requestedByActorId !== run.responsibleUserId ||
           (binding.endpointId && action.endpointId !== binding.endpointId))
-        throw forbidden("Slack tools require a verified linked Slack request");
+        throw taskDenied("Slack tools require a verified linked Slack request");
       // This standalone resolver does not own the scheduler's issue lock. Use
       // the ingress lock order (endpoint, then issue) so a normal webhook or
       // endpoint update cannot turn tool setup into a NOWAIT failure. The
@@ -127,7 +132,7 @@ export function createSlackTaskAuthorityRegistration(db: Db, options: SlackTaskA
         eq(chatEndpoints.id, action.endpointId),
       )).for("no key update");
       const source = await authorizeInboundWakeup(tx, action);
-      if (source.endpoint.provider !== "slack") throw forbidden("This is not a Slack task");
+      if (source.endpoint.provider !== "slack") throw taskDenied("This is not a Slack task");
       const [principal] = await tx.select().from(chatExternalPrincipals).where(and(
         eq(chatExternalPrincipals.companyId, binding.companyId),
         eq(chatExternalPrincipals.id, action.principalId!),
@@ -135,7 +140,7 @@ export function createSlackTaskAuthorityRegistration(db: Db, options: SlackTaskA
         eq(chatExternalPrincipals.providerAccountId, source.endpoint.providerAccountId!),
         eq(chatExternalPrincipals.isBot, false),
       ));
-      if (!principal) throw forbidden("Slack sender is no longer available");
+      if (!principal) throw taskDenied("Slack sender is no longer available");
       return { ...source, principalId: principal.id, slackUserId: principal.externalId };
     });
     const credentials = await measureRunPhase("connectors.slack.credentials", () => resolveCredentials(resolved.endpoint, db, ["botToken"]));
