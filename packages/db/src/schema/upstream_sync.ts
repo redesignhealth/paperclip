@@ -23,6 +23,7 @@
  */
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   bigserial,
   boolean,
   check,
@@ -128,6 +129,47 @@ export const upstreamSyncAlerts = pgTable("upstream_sync_alerts", {
   // PostgreSQL column-level UNIQUE constraint name.
   unique("upstream_sync_alerts_dedup_key_key").on(table.dedupKey),
 ]);
+
+/**
+ * Append-only audit trail for `upstream_sync_log` (TECH-7978 follow-up).
+ *
+ * Rows are written ONLY by the `upstream_sync_log_audit()` trigger, which is
+ * SECURITY DEFINER, so the restricted `upstream_sync_runner` login needs (and
+ * gets) SELECT only: it cannot forge, edit or delete events. `old_values` /
+ * `new_values` hold only the changed columns for an UPDATE and the full row for
+ * an INSERT / DELETE. `actor` is `session_user` (the login that connected),
+ * because `current_user` inside a SECURITY DEFINER function is the owner.
+ * `run_ref` comes from the `upstream_sync.run_ref` setting the worker sets per
+ * run (for example the Paperclip run issue identifier). The trigger functions
+ * and triggers are hand-written in the migration; Drizzle does not model them.
+ */
+export const upstreamSyncEvents = pgTable(
+  "upstream_sync_events",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    logId: bigint("log_id", { mode: "number" }).notNull(),
+    upstreamSha: text("upstream_sha").notNull(),
+    operation: text("operation").$type<"insert" | "update" | "delete">().notNull(),
+    changedColumns: text("changed_columns").array().notNull(),
+    oldValues: jsonb("old_values").$type<Record<string, unknown>>(),
+    newValues: jsonb("new_values").$type<Record<string, unknown>>(),
+    oldStatus: text("old_status"),
+    newStatus: text("new_status"),
+    actor: text("actor").notNull(),
+    runRef: text("run_ref"),
+    applicationName: text("application_name"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("upstream_sync_events_sha_idx").on(table.upstreamSha, table.id),
+    index("upstream_sync_events_status_idx").on(table.newStatus, table.id),
+    index("upstream_sync_events_created_idx").on(table.createdAt),
+    check(
+      "upstream_sync_events_operation_check",
+      sql`${table.operation} in ('insert', 'update', 'delete')`,
+    ),
+  ],
+);
 
 export type UpstreamSyncCategory = "feature" | "fix" | "perf" | "security" | "infra" | "breaking";
 
