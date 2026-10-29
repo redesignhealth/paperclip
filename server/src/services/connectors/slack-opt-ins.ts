@@ -10,7 +10,7 @@ import {
   slackRequestedOptInGroups,
   type SlackOptInScopeGroup,
 } from "@paperclipai/shared";
-import { forbidden } from "../../errors.js";
+import { badRequest, forbidden } from "../../errors.js";
 
 /**
  * TECH-7988: the opt-in groups that decide which Slack tools an endpoint may
@@ -41,19 +41,49 @@ export function slackEndpointRequestedOptInGroups(
   return slackRequestedOptInGroups(setup);
 }
 
+/**
+ * The opt-in groups an agent may actually use, and the one definition every
+ * listing and dispatch path gates on.
+ *
+ * This is the intersection of requested and installed, never installed alone.
+ * A group counts only when the operator still asks for it AND Slack granted it:
+ * - requested but not granted yet: no access, because Slack would refuse the
+ *   call with `missing_scope`.
+ * - granted but since removed: no access, even if Slack kept the scope on the
+ *   existing installation, because the operator asked for it to be disabled.
+ *
+ * A requested field that is present is authoritative as the operator's request.
+ * Only a legacy install (no request recorded at all) uses its implied full
+ * grant as the request, so pre-opt-in installations keep working until their
+ * opt-ins are first edited.
+ */
+export function slackEnabledOptInGroups(
+  setup: SlackSetupOptIns | null | undefined,
+  options?: SlackGatingOptions,
+): SlackOptInScopeGroup[] {
+  const requested =
+    setup?.slackOptInScopeGroups !== undefined
+      ? new Set(slackRequestedOptInGroups(setup))
+      : new Set(slackOptInGroupsForSetup(setup, options));
+  return slackEndpointOptInGroups(setup, options).filter((group) => requested.has(group));
+}
+
 export function isSlackToolEnabledForSetup(
   setup: SlackSetupOptIns | null | undefined,
   tool: { name: string; scopes: readonly string[] },
   options?: SlackGatingOptions,
 ): boolean {
-  return isSlackToolEnabledForOptIns(tool, slackEndpointOptInGroups(setup, options));
+  return isSlackToolEnabledForOptIns(tool, slackEnabledOptInGroups(setup, options));
 }
 
 /**
  * Fail closed before any Slack API call: a tool whose scopes this agent does
- * not have installed is rejected here rather than surfacing as a Slack
- * `missing_scope` at call time. An unknown tool name is rejected too, so a
- * caller cannot fall through to a `SLACK_TOOLS.find(...)` assertion.
+ * not have enabled is rejected here rather than surfacing as a Slack
+ * `missing_scope` at call time.
+ *
+ * An unknown tool name is a caller mistake, not a permission problem, so it is
+ * a 400 rather than a 403: an authorization error would mislead a client into
+ * asking for access it will never be granted.
  */
 export function assertSlackToolEnabledForSetup(
   setup: SlackSetupOptIns | null | undefined,
@@ -62,8 +92,8 @@ export function assertSlackToolEnabledForSetup(
 ): void {
   const tool = SLACK_TOOLS.find((entry) => entry.name === toolName);
   if (!tool)
-    throw forbidden(`Unknown Slack tool: ${toolName}`, {
-      code: "slack_tool_unknown",
+    throw badRequest(`Unknown Slack tool: ${toolName}`, {
+      code: "unknown_slack_tool",
     });
   if (isSlackToolEnabledForSetup(setup, tool, options)) return;
   const groups = slackOptInGroupsForTool(tool);
@@ -81,12 +111,12 @@ export function assertSlackToolEnabledForSetup(
 /** Scope-based check for a catalog entry, independent of endpoint plumbing. */
 export { isSlackToolEnabledForOptIns };
 
-/** The tools an endpoint with these installed groups may use. */
+/** The tools an endpoint with these enabled groups may use. */
 export function slackEnabledToolsForSetup(
   setup: SlackSetupOptIns | null | undefined,
   options?: SlackGatingOptions,
 ) {
-  const groups = slackEndpointOptInGroups(setup, options);
+  const groups = slackEnabledOptInGroups(setup, options);
   return SLACK_TOOLS.filter((tool) => isSlackToolEnabledForOptIns(tool, groups));
 }
 

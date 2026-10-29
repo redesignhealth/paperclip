@@ -13,7 +13,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { SLACK_TOOLS } from "@paperclipai/shared";
-import { conflict, forbidden, HttpError, unprocessable } from "../../errors.js";
+import { badRequest, conflict, forbidden, HttpError, unprocessable } from "../../errors.js";
 import { getStorageService } from "../../storage/index.js";
 import {
   resolveSlackTaskAuthority,
@@ -31,6 +31,10 @@ import {
   type SlackObject,
 } from "./slack-client.js";
 import { logActivity } from "../activity-log.js";
+import {
+  assertSlackToolEnabledForSetup,
+  slackEndpointOptInsForGating,
+} from "./slack-opt-ins.js";
 
 const richText = (text: unknown) => [
   {
@@ -48,8 +52,18 @@ export async function executeSlackWrite(
   invocationId: string | undefined,
   fetchImpl = fetch,
 ) {
-  const tool = SLACK_TOOLS.find((t) => t.name === name)!;
+  const tool = SLACK_TOOLS.find((t) => t.name === name);
+  if (!tool) throw badRequest(`Unknown Slack tool: ${name}`, { code: "unknown_slack_tool" });
   let authority = await resolveSlackTaskAuthority(db, binding);
+  // Fail closed before any Slack call, including a retried approved invocation:
+  // a group this agent has not enabled (or has since removed) is never written.
+  // This runs before argument-specific work so a disabled tool always reports
+  // the permission error rather than a downstream validation failure.
+  assertSlackToolEnabledForSetup(
+    authority.endpoint.setup,
+    name,
+    await slackEndpointOptInsForGating(db, authority.endpoint),
+  );
   if (authority.workMode !== "standard")
     throw forbidden("Slack writes require standard work mode");
   const [invocation] = invocationId

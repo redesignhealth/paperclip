@@ -474,6 +474,19 @@ export interface SlackSearchStatus {
 export interface SlackToolCapabilities {
   grantedScopes: string[] | null;
   missingScopes: string[];
+  /**
+   * A permission group the operator can enable to unlock more tools, with the
+   * tools it would add. Present only for groups the agent does not have
+   * enabled, so the settings UI can name the switch instead of only listing
+   * raw scopes.
+   */
+  missingGroups?: Array<{
+    group: string;
+    label: string;
+    description: string;
+    scopes: string[];
+    toolNames: string[];
+  }>;
   tools: Array<{
     name: string;
     description: string;

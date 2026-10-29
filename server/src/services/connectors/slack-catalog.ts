@@ -3,7 +3,7 @@ import { ChatTaskBoundaryError } from "../chat-channels/run-origin.js";
 import { createHash } from "node:crypto";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { and, eq, isNull, sql } from "drizzle-orm";
-import { SLACK_TOOLS } from "@paperclipai/shared";
+import { SLACK_TOOLS, slackOptInGroupsForTool } from "@paperclipai/shared";
 import {
   chatEndpoints,
   toolConnections,
@@ -23,6 +23,13 @@ import {
   slackEndpointCandidates,
   type SlackTaskAuthorization,
 } from "./slack-authority.js";
+import {
+  isSlackToolEnabledForOptIns,
+  isSlackToolEnabledForSetup,
+  slackEnabledOptInGroups,
+  slackEndpointOptInsForGating,
+  slackLegacyInstall,
+} from "./slack-opt-ins.js";
 const catalogDefinitions = SLACK_TOOLS.map(tool => ({
   tool,
   hash: createHash("sha256").update(JSON.stringify({
@@ -79,7 +86,19 @@ export async function syncSlackBotTools(
   const entriesByName = new Map(
     existingEntries.map((entry) => [entry.name, entry]),
   );
+  // TECH-7988: a gated tool this agent has not enabled is never activated, so
+  // the connection's catalog never advertises an ability Slack would refuse.
+  // Gating is requested-and-installed; a removed group stays off even if Slack
+  // kept its scope. A legacy install keeps its implied grant until first edit.
+  const optIns = slackEnabledOptInGroups(
+    endpoint.setup,
+    endpoint.setup.slackInstalledOptInScopeGroups === undefined &&
+      endpoint.setup.slackOptInScopeGroups === undefined
+      ? { legacyInstall: await slackLegacyInstall(tx, { companyId: endpoint.companyId, endpointId: endpoint.id }) }
+      : {},
+  );
   for (const { tool, hash } of catalogDefinitions) {
+    const activated = enabled && isSlackToolEnabledForOptIns(tool, optIns);
     const values = {
       companyId: endpoint.companyId,
       applicationId: connection.applicationId,
@@ -95,13 +114,18 @@ export async function syncSlackBotTools(
       isWrite: tool.risk !== "read",
       versionHash: hash,
       schemaHash: hash,
-      status: enabled ? ("active" as const) : ("removed" as const),
+      status: activated ? ("active" as const) : ("removed" as const),
       reviewedByUserId: userId,
       reviewedAt: new Date(),
       updatedAt: new Date(),
     };
     const existing = entriesByName.get(values.name);
-    if (existing?.versionHash === hash) continue;
+    // A gated tool's status follows the enabled opt-in set on every sync, so
+    // enabling or dropping a group flips it even when the definition hash is
+    // unchanged. An ungated tool keeps the operator's own activation decision.
+    const gated = slackOptInGroupsForTool(tool).length > 0;
+    if (existing?.versionHash === hash && (!gated || existing.status === values.status))
+      continue;
     await measureRunPhase("connectors.slack.catalog.write", () => tx
       .insert(toolCatalogEntries)
       .values(values)
@@ -111,7 +135,7 @@ export async function syncSlackBotTools(
           ...values,
           ...(existing
             ? {
-                status: existing.status,
+                status: gated ? values.status : existing.status,
                 reviewedByUserId: existing.reviewedByUserId,
                 reviewedAt: existing.reviewedAt,
               }
@@ -249,8 +273,15 @@ async function slackToolsForEndpoint(
         isNull(toolCatalogEntries.quarantinedAt),
       ),
     );
+  const gating = await slackEndpointOptInsForGating(db, authority.endpoint);
   return entries
-    .filter(({ entry }) => SLACK_TOOLS.some((t) => t.name === entry.toolName))
+    .filter(({ entry }) => {
+      const tool = SLACK_TOOLS.find((t) => t.name === entry.toolName);
+      if (!tool) return false;
+      // Never offer a tool whose opt-in group this agent has not enabled:
+      // Slack would reject the call. Uses the same helper as dispatch.
+      return isSlackToolEnabledForSetup(authority.endpoint.setup, tool, gating);
+    })
     .map(({ entry, applicationId }) => ({
       name: `slack-bot.${authority.endpoint.id}:${entry.toolName}`,
       displayName: entry.title ?? entry.toolName,

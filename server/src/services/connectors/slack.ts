@@ -31,6 +31,10 @@ import {
   authorizeSlackChannel,
   recordSlackReadBoundary,
 } from "./slack-access.js";
+import {
+  assertSlackToolEnabledForSetup,
+  slackEndpointOptInsForGating,
+} from "./slack-opt-ins.js";
 
 async function slackAssignedEndpoint(
   db: Db,
@@ -131,6 +135,17 @@ const messageView = (message: SlackObject, team: string, channel: string) => ({
       : undefined,
 });
 
+/**
+ * The endpoint selector, read without validating the rest of the arguments.
+ * Gating must be decided before argument validation so a tool this agent cannot
+ * use always answers with the permission error, never an argument error.
+ */
+function peekEndpointId(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const endpointId = (value as { endpointId?: unknown }).endpointId;
+  return typeof endpointId === "string" ? endpointId : undefined;
+}
+
 export async function executeSlackTool(
   db: Db,
   binding: SlackTaskBinding,
@@ -140,14 +155,31 @@ export async function executeSlackTool(
   invocationId?: string,
 ) {
   const tool = SLACK_TOOLS.find((entry) => entry.name === name);
-  if (!tool) throw forbidden("Unknown Slack tool");
-  const { endpointId, ...args } = tool.schema.parse(value) as SlackObject;
-  if (endpointId !== undefined) {
-    if (binding.endpointId && binding.endpointId !== endpointId)
-      throw forbidden("Slack connection selector does not match this tool");
-    binding = { ...binding, endpointId: String(endpointId) };
-  }
+  if (!tool) throw badRequest(`Unknown Slack tool: ${name}`, { code: "unknown_slack_tool" });
+  // A gated-off tool is answered as such before its arguments are even parsed:
+  // the caller has no access, so an argument error would only mislead. The
+  // endpoint selector is a safe pre-read, so a mismatch still fails closed.
+  const requestedEndpoint = peekEndpointId(value);
+  if (
+    requestedEndpoint !== undefined &&
+    binding.endpointId &&
+    binding.endpointId !== requestedEndpoint
+  )
+    throw forbidden("Slack connection selector does not match this tool");
+  // The selector is a safe pre-read: resolve the endpoint the call will use,
+  // gate THAT endpoint, and only then parse the rest. A gated-off tool is
+  // answered as such before an argument error can mask it.
+  if (requestedEndpoint !== undefined) binding = { ...binding, endpointId: String(requestedEndpoint) };
   const authority = await resolveSlackTaskAuthority(db, binding);
+  // Fail closed before any Slack call. A tool whose opt-in group this agent has
+  // not enabled (or has since removed) must never reach Slack and surface as a
+  // generic missing_scope. Dispatch uses the same helper as every listing.
+  assertSlackToolEnabledForSetup(
+    authority.endpoint.setup,
+    name,
+    await slackEndpointOptInsForGating(db, authority.endpoint),
+  );
+  const { endpointId: _selector, ...args } = tool.schema.parse(value) as SlackObject;
   binding = { ...binding, endpointId: authority.endpoint.id };
   const upstream = slackClient(authority.botToken, fetchImpl);
   const users = new Map<string, Promise<SlackObject>>();
@@ -487,14 +519,25 @@ export async function executeGovernedSlackTool(
   value: unknown,
 ) {
   const tool = SLACK_TOOLS.find((t) => t.name === name);
-  if (!tool) throw forbidden("Unknown Slack tool");
-  const { endpointId, ...args } = tool.schema.parse(value) as SlackObject;
-  if (endpointId !== undefined) {
-    if (binding.endpointId && binding.endpointId !== endpointId)
-      throw forbidden("Slack connection selector does not match this task");
-    binding = { ...binding, endpointId: String(endpointId) };
-  }
+  if (!tool) throw badRequest(`Unknown Slack tool: ${name}`, { code: "unknown_slack_tool" });
+  const requestedEndpoint = peekEndpointId(value);
+  if (
+    requestedEndpoint !== undefined &&
+    binding.endpointId &&
+    binding.endpointId !== requestedEndpoint
+  )
+    throw forbidden("Slack connection selector does not match this task");
+  if (requestedEndpoint !== undefined) binding = { ...binding, endpointId: String(requestedEndpoint) };
   const authority = await resolveSlackTaskAuthority(db, binding);
+  // Name the missing opt-in here, before the gateway turns a tool this agent
+  // never enabled into a generic tool_not_found. No Slack call has happened.
+  // Gating precedes argument parsing so a disabled tool always reports 403.
+  assertSlackToolEnabledForSetup(
+    authority.endpoint.setup,
+    name,
+    await slackEndpointOptInsForGating(db, authority.endpoint),
+  );
+  const { endpointId: _selector, ...args } = tool.schema.parse(value) as SlackObject;
   binding = { ...binding, endpointId: authority.endpoint.id };
   if (
     binding.workMode &&
