@@ -4,6 +4,10 @@ import { slackCapabilities } from "./slack-capabilities.js";
 
 const auth = vi.hoisted(() => vi.fn());
 vi.mock("./slack-client.js", () => ({ slackClient: () => auth }));
+vi.mock("./slack-catalog.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./slack-catalog.js")>(),
+  ensureSlackBotCatalogCurrent: vi.fn(async () => undefined),
+}));
 vi.mock("../secrets.js", () => ({ secretService: () => ({ resolveSecretValue: async () => "test-token" }) }));
 afterEach(() => vi.resetAllMocks());
 
@@ -11,7 +15,9 @@ describe("Slack capabilities runtime agreement", () => {
   function fixture(setup: Record<string, unknown> | null, status = "active") {
     const endpoint = { id: "endpoint", companyId: "company", connectionId: "connection", status: "active", setup };
     const db = { select: () => ({ from: (table: unknown) => ({
-      innerJoin: () => ({ where: async () => [{ endpoint, connection: { id: "connection", enabled: true,
+      innerJoin: () => ({ where: async () => table === toolCatalogEntries
+        ? status === "active" ? [{ toolName: "slack_upload_file" }] : []
+        : [{ endpoint, connection: { id: "connection", enabled: true,
         credentialSecretRefs: [{ configPath: "credentials.botToken", secretId: "secret" }] } }] }),
       where: async () => {
         if (table === chatEndpoints) return [{ ...endpoint, botExternalId: null }];

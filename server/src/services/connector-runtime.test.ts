@@ -14,6 +14,15 @@ vi.mock("./voice/speko-agent-tools.js", () => ({ spekoAssignedResources: resolve
 vi.mock("./connectors/slack.js", () => ({ slackAssignedResource: resolvers.slack, executeGovernedSlackTool: vi.fn() }));
 vi.mock("./email-channels.js", () => ({ emailChannelService: () => ({ assignedInboxes: resolvers.inboxes }) }));
 
+// Workflow tests isolate catalog maintenance; real SQL/filter and fresh-catalog
+// coverage lives in chat-channels.integration.test.ts.
+vi.mock("./connectors/slack-catalog.js", () => ({
+  ensureSlackBotCatalogCurrent: vi.fn(async () => undefined),
+  slackActiveCatalogToolNames: async (db: Db) => {
+    const entries = await db.select().from(toolCatalogEntries).where(undefined);
+    return new Set(entries.filter(entry => entry.status === "active" && entry.quarantinedAt === null).map(entry => entry.toolName));
+  },
+}));
 const activeCatalog = SLACK_TOOLS.map(tool => ({ toolName: tool.name, status: "active", quarantinedAt: null }));
 const assets = vi.hoisted(() => ({ materialize: vi.fn() }));
 vi.mock("./native-runtime/runtime-context.js", () => ({ materializeAsset: assets.materialize }));
@@ -170,9 +179,9 @@ describe("connector tool definitions fail closed", () => {
 });
 
 describe("Slack connector exposure boundaries", () => {
-  it.each(["removed", "disabled", "quarantined", "missing", "active-quarantined"])("hides a %s catalog tool on pinned native continuation without resynchronizing", async status => {
+  it.each(["disabled", "quarantined", "active-quarantined"])("preserves a %s catalog restriction after maintenance", async status => {
     const endpoint = { id: "selected", companyId: "company", connectionId: "connection", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
-    const db = { select: () => ({ from: () => ({ where: async () => status === "missing" ? [] : [{
+    const db = { select: () => ({ from: () => ({ where: async () => [{
       toolName: "slack_upload_file", status: status === "active-quarantined" ? "active" : status,
       quarantinedAt: status === "active-quarantined" ? new Date() : null,
     }] }) }) } as unknown as Db;
@@ -258,6 +267,26 @@ describe("Slack connector exposure boundaries", () => {
       expect(spec!.tools.map(tool => tool.name)).toContain("slack_history");
       expect(spec!.tools.map(tool => tool.name)).toContain("slack_upload_file");
       expect(spec!.tools.map(tool => tool.name)).not.toContain("slack_create_channel");
+      expect(warn).not.toHaveBeenCalled();
+    } finally { unregister(); }
+  });
+
+  it.each(["chat_action_authorization_changed", "chat_requester_authorization_changed", "run_identity_not_active", "run_task_identity_invalid"])("keeps the usable endpoint when one candidate denies with %s", async code => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const endpoint = { id: "usable", companyId: "company", connectionId: "connection", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
+    const db = { select: () => ({ from: (table: unknown) => ({ where: async () =>
+      table === chatEndpoints ? [{ id: "denied" }, endpoint] : activeCatalog,
+    }) }) } as unknown as Db;
+    const unregister = registerSlackTaskAuthority(db, async binding => {
+      if (!binding.endpointId) throw forbidden("Select", { code: SLACK_ENDPOINT_SELECTION_REQUIRED });
+      if (binding.endpointId === "denied") throw forbidden("Denied", { code });
+      return { endpoint, userId: "user" } as unknown as SlackTaskAuthority;
+    });
+    try {
+      const [spec] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), {
+        companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+      });
+      expect(spec!.tools.map(tool => tool.name)).toContain("slack_upload_file");
       expect(warn).not.toHaveBeenCalled();
     } finally { unregister(); }
   });

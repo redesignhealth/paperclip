@@ -120,7 +120,8 @@ import {
 import { defaultGitHubReviewPolicy, type ChatProvider } from "@paperclipai/shared";
 // Namespaced so these names never collide with the named imports above.
 import * as slackShared from "@paperclipai/shared";
-import { slackLegacyInstall, slackToolNamesForAgent } from "../services/connectors/slack-opt-ins.js";
+import { slackLegacyInstall } from "../services/connectors/slack-opt-ins.js";
+import { slackToolNamesForAgent } from "../services/connectors/slack-tool-discovery.js";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
 import type { Attachment, Author, Message, Thread } from "chat";
 import { errorHandler } from "../middleware/index.js";
@@ -9657,6 +9658,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     onTestFinished(() => vi.unstubAllEnvs());
     await expect(executeConnectorTool(db, binding, "slack_create_channel", { ...args, endpointId: second.endpoint.id }))
       .rejects.toMatchObject({ reasonCode: expect.stringMatching(/approval/) });
+    // A disabled connection contributes no tools, but must not erase the active
+    // endpoint's contribution to the union.
+    const { toolConnections } = await import("@paperclipai/db");
+    await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, second.endpoint.connectionId));
+    expect(await names()).not.toContain("slack_create_channel");
+    expect(await names()).toContain("slack_history");
+    await db.update(toolConnections).set({ enabled: true }).where(eq(toolConnections.id, second.endpoint.connectionId));
     // An unlinked connection is not usable and must contribute no tools.
     await second.service.revokeLink(second.endpoint.id, principal.id, "owner-user");
     expect(await names()).not.toContain("slack_create_channel");
@@ -9846,7 +9854,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it("drops a removed Slack opt-in group from the tool listing and rejects it at dispatch", async () => {
     const { resolveConnectorAssignments, resolvedConnectorToolDefinitionsForSkills, executeConnectorTool } = await import("../services/connector-runtime.js");
-    const { toolCatalogEntries } = await import("@paperclipai/db");
+    const { toolCatalogEntries, toolConnections } = await import("@paperclipai/db");
+    const { slackActiveCatalogToolNames } = await import("../services/connectors/slack-catalog.js");
     const { executeSlackTool } = await import("../services/connectors/slack.js");
     const { slackCapabilities } = await import("../services/connectors/slack-capabilities.js");
     await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
@@ -9862,9 +9871,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await initializeRunIdentity(db, { companyId: fixture.companyId, runId, issueId: issue.id, responsibleUserId: "owner-user", cause: "routine" });
     const binding = { companyId: fixture.companyId, agentId: fixture.assignedAgentId, runId, issueId: issue.id, endpointId: endpoint.id };
     const listed = async () => (await resolveConnectorAssignments(db, binding))[0]?.tools.map(tool => tool.name) ?? [];
+    // Neither a fresh endpoint nor a pinned continuation can rely on a prior
+    // assignment listing to populate the catalog.
+    await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, endpoint.connectionId));
+    expect(await slackActiveCatalogToolNames(db, endpoint)).toEqual(new Set());
+    const [freshNative] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
+    expect(freshNative!.tools.map(tool => tool.name)).toContain("slack_create_channel");
     expect(await listed()).toContain("slack_create_channel");
 
-    // A pinned native continuation does not run assignment/catalog sync. Even
+    // A pinned native continuation must refresh stale consent-driven removal. Even
     // with consent and installed scopes, only dispatchable catalog entries may
     // be exposed. Exercise the real SQL predicate, not just a stubbed catalog.
     const catalogWhere = and(eq(toolCatalogEntries.companyId, fixture.companyId),
@@ -9872,7 +9887,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     for (const status of ["removed", "disabled", "quarantined"] as const) {
       await db.update(toolCatalogEntries).set({ status }).where(catalogWhere);
       const [native] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
-      expect(native!.tools.map(tool => tool.name)).not.toContain("slack_create_channel");
+      expect(native!.tools.some(tool => tool.name === "slack_create_channel")).toBe(status === "removed");
     }
     await db.update(toolCatalogEntries).set({ status: "active", quarantinedAt: new Date() }).where(catalogWhere);
     const [quarantinedNative] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
@@ -9880,6 +9895,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await db.update(toolCatalogEntries).set({ quarantinedAt: null }).where(catalogWhere);
     const [activeNative] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
     expect(activeNative!.tools.map(tool => tool.name)).toContain("slack_create_channel");
+    await db.update(toolCatalogEntries).set({ entryKind: "resource" }).where(catalogWhere);
+    expect(await slackActiveCatalogToolNames(db, endpoint)).not.toContain("slack_create_channel");
+    await db.update(toolCatalogEntries).set({ entryKind: "tool" }).where(catalogWhere);
+    for (const connectionState of [{ enabled: false, status: "active" as const }, { enabled: true, status: "disabled" as const }]) {
+      await db.update(toolConnections).set(connectionState).where(eq(toolConnections.id, endpoint.connectionId));
+      expect(await slackActiveCatalogToolNames(db, endpoint)).toEqual(new Set());
+    }
+    await db.update(toolConnections).set({ enabled: true, status: "active" }).where(eq(toolConnections.id, endpoint.connectionId));
 
     // The operator removes the group. Slack may keep the scope on the existing
     // installation; the request is what decides.
@@ -9901,7 +9924,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     onTestFinished(() => vi.unstubAllGlobals());
     let capabilities: Awaited<ReturnType<typeof slackCapabilities>>;
     try {
+      await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, endpoint.connectionId));
       capabilities = await slackCapabilities(db, fixture.companyId, endpoint.id);
+      expect(capabilities.tools.find(tool => tool.name === "slack_history")?.available).toBe(true);
       expect(capabilities.missingGroups?.find(group => group.group === "channel_management")?.action).toBe("enable");
       // A requested-but-uninstalled group needs reconnect, not another enable.
       await db.update(chatEndpoints).set({ setup: sql`${chatEndpoints.setup} || ${JSON.stringify({

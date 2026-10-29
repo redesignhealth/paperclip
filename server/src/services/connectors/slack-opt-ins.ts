@@ -1,6 +1,5 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { chatEndpoints, toolCatalogEntries, type Db } from "@paperclipai/db";
-import { resolveSlackTaskAuthorization, slackEndpointCandidates, SLACK_ENDPOINT_SELECTION_REQUIRED, SLACK_TASK_AUTHORIZATION_DENIED, type SlackTaskBinding } from "./slack-authority.js";
+import { chatEndpoints, type Db } from "@paperclipai/db";
 import {
   SLACK_TOOLS,
   SLACK_OPT_IN_BOT_SCOPE_GROUPS,
@@ -12,7 +11,6 @@ import {
   type SlackOptInScopeGroup,
 } from "@paperclipai/shared";
 import { badRequest, forbidden } from "../../errors.js";
-import { ChatTaskBoundaryError } from "../chat-channels/run-origin.js";
 
 /**
  * TECH-7988: the opt-in groups that decide which Slack tools an endpoint may
@@ -241,73 +239,6 @@ export async function slackLegacyInstall(
     companyId: input.companyId,
     endpointIds: [input.endpointId],
   })).has(input.endpointId);
-}
-
-function isSlackAuthorizationDenial(error: unknown): error is { status: 403; details?: unknown } {
-  if (error instanceof ChatTaskBoundaryError) return true;
-  if (error === null || typeof error !== "object" || !("status" in error) || error.status !== 403) return false;
-  const code = ("details" in error ? error.details : undefined) as { code?: unknown } | undefined;
-  return code?.code === SLACK_ENDPOINT_SELECTION_REQUIRED || code?.code === SLACK_TASK_AUTHORIZATION_DENIED;
-}
-
-/**
- * Tool exposure follows dispatch authority. A resolvable default (including an
- * external run's source endpoint) contributes only that endpoint's tools. When
- * an ordinary task has multiple connections and needs an explicit selector,
- * expose the union across individually authorized endpoints so it can choose
- * one. A listed group is not a grant on another endpoint: dispatch still gates
- * the selected endpoint, and an unselected ambiguous call still fails.
- *
- * Expected authorization denials contribute no tools and are silent. Database
- * and other real faults propagate to the runtime's logged fail-closed boundary.
- */
-export async function slackToolNamesForAgent(
-  db: Db,
-  binding: Pick<SlackTaskBinding, "companyId" | "agentId" | "endpointId" | "identityContextId"> &
-    Partial<Pick<SlackTaskBinding, "runId" | "issueId">>,
-): Promise<Set<string>> {
-  if (!binding.runId || !binding.issueId) return new Set();
-  const task = { ...binding, runId: binding.runId, issueId: binding.issueId };
-  const namesFor = async (endpoint: typeof chatEndpoints.$inferSelect) => {
-    const enabled = await slackEnabledToolsForEndpoint(db, endpoint);
-    const activeNames = await slackActiveCatalogToolNames(db, endpoint);
-    return enabled.filter(tool => activeNames.has(tool.name)).map(tool => tool.name);
-  };
-  try {
-    return new Set(await namesFor((await resolveSlackTaskAuthorization(db, task)).endpoint));
-  } catch (error) {
-    if (!isSlackAuthorizationDenial(error)) throw error;
-    if (binding.endpointId || (error.details as { code?: string } | undefined)?.code !== SLACK_ENDPOINT_SELECTION_REQUIRED)
-      return new Set();
-  }
-  const names = new Set<string>();
-  for (const candidate of await slackEndpointCandidates(db, task)) {
-    try {
-      const authority = await resolveSlackTaskAuthorization(db, { ...task, endpointId: candidate.id });
-      for (const name of await namesFor(authority.endpoint)) names.add(name);
-    } catch (error) {
-      if (!isSlackAuthorizationDenial(error)) throw error;
-    }
-  }
-  return names;
-}
-
-/** Match gateway dispatch: consent alone cannot reactivate a removed or quarantined tool. */
-export async function slackActiveCatalogToolNames(
-  db: SlackReadExecutor,
-  endpoint: { companyId: string; connectionId: string },
-): Promise<Set<string>> {
-  const entries = await db.select({
-    toolName: toolCatalogEntries.toolName,
-    status: toolCatalogEntries.status,
-    quarantinedAt: toolCatalogEntries.quarantinedAt,
-  }).from(toolCatalogEntries).where(and(
-    eq(toolCatalogEntries.companyId, endpoint.companyId),
-    eq(toolCatalogEntries.connectionId, endpoint.connectionId),
-  ));
-  return new Set(entries
-    .filter(entry => entry.status === "active" && entry.quarantinedAt === null)
-    .map(entry => entry.toolName));
 }
 
 /** Gating for one already-loaded endpoint, resolving its legacy install. */

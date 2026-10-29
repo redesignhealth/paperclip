@@ -11,9 +11,9 @@ import {
 import { notFound } from "../../errors.js";
 import { secretService } from "../secrets.js";
 import { slackClient } from "./slack-client.js";
+import { ensureSlackBotCatalogCurrent, slackActiveCatalogToolNames } from "./slack-catalog.js";
 import {
   isSlackToolEnabledForOptIns,
-  slackActiveCatalogToolNames,
   slackEnabledOptInGroups,
   slackEndpointOptInsForGating,
 } from "./slack-opt-ins.js";
@@ -72,6 +72,8 @@ export async function slackCapabilities(
   const gating = await slackEndpointOptInsForGating(db, row.endpoint);
   const enabled = slackEnabledOptInGroups(row.endpoint.setup, gating);
   const tools = SLACK_TOOLS.filter((tool) => isSlackToolEnabledForOptIns(tool, enabled));
+  // Settings refresh is system maintenance, not a user review of tool grants.
+  await ensureSlackBotCatalogCurrent(db, row.endpoint, null);
   const activeNames = await slackActiveCatalogToolNames(db, row.endpoint);
   // Guidance names the permission group to enable, not just raw scopes: a
   // scope can be enabled through a switch the operator recognises.

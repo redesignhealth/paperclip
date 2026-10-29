@@ -51,7 +51,7 @@ describeDatabase("Slack tool preparation", () => {
       const [application] = await db.insert(toolApplications).values({ companyId, name: `Slack ${i}`, type: "mcp_http" }).returning();
       const credentialSecretRefs = ["botToken", "signingSecret", "appToken"].map(key => ({ secretId: randomUUID(), configPath: `credentials.${key}`, versionSelector: "latest" as const, required: true }));
       refs.push(...credentialSecretRefs);
-      const [connection] = await db.insert(toolConnections).values({ companyId, applicationId: application.id, name: `Slack ${i}`, uid: randomUUID(), transport: "mcp_remote", credentialSecretRefs }).returning();
+      const [connection] = await db.insert(toolConnections).values({ companyId, applicationId: application.id, name: `Slack ${i}`, uid: randomUUID(), transport: "mcp_remote", status: "active", enabled: true, credentialSecretRefs }).returning();
       const [endpoint] = await db.insert(chatEndpoints).values({ companyId, connectionId: connection.id, assignedAgentId: agentId, provider: "slack", publicId: randomUUID(), providerAccountId: `T${i}`, status: "active" }).returning();
       endpoints.push(endpoint);
       const [principal] = await db.insert(chatExternalPrincipals).values({ companyId, provider: "slack", providerAccountId: `T${i}`, externalId: `U${i}`, isBot: false }).returning();

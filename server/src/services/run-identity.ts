@@ -84,7 +84,7 @@ async function lockIdentityTask(
   const legacyIssueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
   if ([issueId, legacyIssueId].some(id => id !== undefined && id !== null &&
       (typeof id !== "string" || !isUuidLike(id)))) {
-    throw forbidden("Run task identity is invalid");
+    throw forbidden("Run task identity is invalid", { code: "run_task_identity_invalid" });
   }
   if (typeof issueId === "string")
     await executor
@@ -448,6 +448,7 @@ export async function captureRunIdentity(
     if (!run || run.status !== "running")
       throw forbidden(
         "Credential acquisition requires this agent's active run",
+        { code: "run_identity_not_active" },
       );
     const [pending] = await tx
       .select()

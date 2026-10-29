@@ -2,7 +2,7 @@ import { SPEKO_SKILL } from "./voice/speko-skill.js";
 import { spekoAssignedResources } from "./voice/speko-agent-tools.js";
 import { SLACK_TOOLS, slackOptInGroupsForTool } from "@paperclipai/shared";
 import { slackAssignedResource, executeGovernedSlackTool } from "./connectors/slack.js";
-import { slackToolNamesForAgent } from "./connectors/slack-opt-ins.js";
+import { slackToolNamesForAgent } from "./connectors/slack-tool-discovery.js";
 import { logger } from "../middleware/logger.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";

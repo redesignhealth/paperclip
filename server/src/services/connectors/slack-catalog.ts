@@ -2,6 +2,7 @@ import { prepareSlackEndpoints } from "./slack-endpoint-preparation.js";
 import { ChatTaskBoundaryError } from "../chat-channels/run-origin.js";
 import { createHash } from "node:crypto";
 import { measureRunPhase } from "../execution-preparation-timing.js";
+import { measureRunTransaction } from "../execution-transaction-timing.js";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { SLACK_TOOLS, slackOptInGroupsForTool } from "@paperclipai/shared";
 import {
@@ -40,6 +41,38 @@ const catalogDefinitions = SLACK_TOOLS.map(tool => ({
     scopes: tool.scopes,
   })).digest("hex"),
 }));
+
+/** Shared by gateway dispatch, native discovery and the settings projection. */
+function slackCallableCatalogPredicate(endpoint: { companyId: string; connectionId: string }) {
+  return and(
+    eq(toolCatalogEntries.companyId, endpoint.companyId),
+    eq(toolCatalogEntries.connectionId, endpoint.connectionId),
+    eq(toolCatalogEntries.entryKind, "tool"),
+    eq(toolCatalogEntries.status, "active"),
+    isNull(toolCatalogEntries.quarantinedAt),
+    eq(toolConnections.companyId, endpoint.companyId),
+    eq(toolConnections.enabled, true),
+    eq(toolConnections.status, "active"),
+  );
+}
+
+export async function slackActiveCatalogToolNames(
+  db: Pick<Db, "select">,
+  endpoint: { companyId: string; connectionId: string },
+): Promise<Set<string>> {
+  const entries = await db.select({ toolName: toolCatalogEntries.toolName })
+    .from(toolCatalogEntries)
+    .innerJoin(toolConnections, eq(toolConnections.id, toolCatalogEntries.connectionId))
+    .where(slackCallableCatalogPredicate(endpoint));
+  return new Set(entries.map(entry => entry.toolName).filter((name): name is string => name !== null));
+}
+
+/** Refresh consent-driven catalog state without restoring operator restrictions. */
+export async function ensureSlackBotCatalogCurrent(db: Db, endpoint: typeof chatEndpoints.$inferSelect, userId: string | null) {
+  if (!await slackBotCatalogIsCurrent(db, endpoint)) {
+    await measureRunTransaction(db, "connectors.slack.catalog", tx => syncSlackBotTools(tx, endpoint, userId, true));
+  }
+}
 
 export async function slackBotCatalogIsCurrent(
   db: Db,
@@ -103,7 +136,7 @@ async function slackCatalogStatusMatches(
 export async function syncSlackBotTools(
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
   endpoint: typeof chatEndpoints.$inferSelect,
-  userId: string,
+  userId: string | null,
   enabled: boolean,
 ) {
   const [connection] = await tx
@@ -301,6 +334,7 @@ async function slackToolsForEndpoint(
       return [];
     throw error;
   }
+  await ensureSlackBotCatalogCurrent(db, authority.endpoint, authority.userId);
   const entries = await db
     .select({
       entry: toolCatalogEntries,
@@ -311,14 +345,7 @@ async function slackToolsForEndpoint(
       toolConnections,
       eq(toolConnections.id, toolCatalogEntries.connectionId),
     )
-    .where(
-      and(
-        eq(toolCatalogEntries.companyId, session.companyId),
-        eq(toolCatalogEntries.connectionId, authority.endpoint.connectionId),
-        eq(toolCatalogEntries.status, "active"),
-        isNull(toolCatalogEntries.quarantinedAt),
-      ),
-    );
+    .where(slackCallableCatalogPredicate(authority.endpoint));
   const gating = await slackEndpointOptInsForGating(db, authority.endpoint);
   return entries
     .filter(({ entry }) => {
