@@ -66,6 +66,20 @@ Tables:
 - View `upstream_sync_log_view`: readable projection (short sha, URL, flags, pending age).
   `cli.mjs report` renders it as a markdown table for the doc view.
 
+- `upstream_sync_events`: append-only audit trail (migration `0381`). One row per change to
+  `upstream_sync_log`, written by the `upstream_sync_log_audit()` trigger, never by the tool:
+  `operation` (`insert|update|delete`), `changed_columns[]`, `old_values` / `new_values` (changed
+  columns only for an update, the full row for insert/delete), `old_status` / `new_status`,
+  `actor` (`session_user`, i.e. the login that connected), `run_ref`, `application_name`,
+  `created_at`. No-op updates and `updated_at`-only updates are not recorded. Migration `0381`
+  also writes one baseline `insert` event (actor `migration:0381_baseline`) per row that already
+  existed. Indexed on `(upstream_sha, id)`, `(new_status, id)` and `created_at`.
+  The trigger is `SECURITY DEFINER`, so `upstream_sync_runner` needs only `SELECT` on this table;
+  it can cause events but cannot forge, edit or delete them. A trigger also blocks UPDATE, DELETE
+  and TRUNCATE for everyone, owner included (disable the trigger deliberately if you truly must).
+  A worker should tag its work with `SET upstream_sync.run_ref = '<run issue id>'` per run so
+  each event ties back to a Paperclip run.
+
 These tables are **global** (no `company_id`) and are intentionally not RLS targets:
 the ledger is instance-level metadata, so there is no tenant whose rows could leak
 into another tenant. Access control is at the Postgres role level, not the row level:

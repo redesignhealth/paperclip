@@ -2654,6 +2654,13 @@
       "when": 1793193681862,
       "tag": "0380_upstream_sync_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 381,
+      "version": "7",
+      "when": 1793232704845,
+      "tag": "0381_upstream_sync_events",
+      "breakpoints": true
     }
   ]
 }
