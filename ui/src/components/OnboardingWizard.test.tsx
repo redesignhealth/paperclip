@@ -620,6 +620,31 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       await flushReact();
     }
 
+    it("creates a private company by default and a shared one when it is chosen", async () => {
+      mockCompaniesApi.create.mockResolvedValue({ id: "company-new", issuePrefix: "INI" });
+      const first = await openStepOne();
+      const radios = [...document.body.querySelectorAll<HTMLButtonElement>('[role="radio"]')];
+      const byTitle = (title: string) => radios.find((r) => r.textContent?.trim().startsWith(title))!;
+      expect(byTitle("Private").getAttribute("aria-checked")).toBe("true");
+      expect(byTitle("Shared").getAttribute("aria-checked")).toBe("false");
+      expect(document.body.textContent).toContain("can't be changed after the company is created");
+      await clickByText((t) => t.startsWith("Continue"));
+      expect(mockCompaniesApi.create).toHaveBeenLastCalledWith({ name: "Initech", visibility: "private" });
+      void first;
+    });
+
+    it("sends shared when the user picks Shared on step one", async () => {
+      mockCompaniesApi.create.mockResolvedValue({ id: "company-new", issuePrefix: "INI" });
+      await openStepOne();
+      const shared = [...document.body.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find((r) => r.textContent?.trim().startsWith("Shared"))!;
+      await act(async () => {
+        shared.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await clickByText((t) => t.startsWith("Continue"));
+      expect(mockCompaniesApi.create).toHaveBeenLastCalledWith({ name: "Initech", visibility: "shared" });
+    });
+
     it("shows no environment-check card on the model step, and no Mission row on review", async () => {
       // Round-3 walk feedback: the adapter environment check still runs —
       // Connect probes before hiring and blocks on a fail — but its idle card
@@ -631,7 +656,7 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       const { root } = await openStepOne();
       await clickByText((t) => t.startsWith("Continue"));
 
-      expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Initech", visibility: "shared" });
+      expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Initech", visibility: "private" });
       expect(document.body.textContent).not.toContain("Define your mission");
       expect(document.body.textContent).not.toContain("Tell us about your team");
       expect(document.body.textContent).toContain("Create your first agent");
@@ -1596,7 +1621,7 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
     });
     await flushReact();
 
-    expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Created Co", visibility: "shared" });
+    expect(mockCompaniesApi.create).toHaveBeenCalledWith({ name: "Created Co", visibility: "private" });
     expect(mockCompaniesApi.list).toHaveBeenCalledTimes(2);
     expect(document.querySelector("#onboarding-agent-name")).not.toBeNull();
 
