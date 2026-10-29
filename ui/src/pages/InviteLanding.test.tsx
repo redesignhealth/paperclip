@@ -1302,8 +1302,45 @@ describe("InviteLandingPage", () => {
 
       expect(container.querySelector('[data-testid="invite-inline-auth"]')).not.toBeNull();
       expect(container.querySelector('[data-testid="owner-handoff-sso"]')).toBeNull();
-      // The SSO provider list is never fetched for the ordinary invite path.
-      expect(getSsoProvidersMock).not.toHaveBeenCalled();
+      // No provider configured (default mock): no SSO affordance on the ordinary invite.
+      expect(container.querySelector('[data-testid="invite-sso"]')).toBeNull();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("offers SSO only (no password form) for a non-handoff invite", async () => {
+      getInviteMock.mockResolvedValue({
+        ...handoffInvite,
+        ownerHandoff: false,
+        boundEmailHint: null,
+        humanRole: "operator",
+      });
+      getSsoProvidersMock.mockResolvedValue({
+        providers: [{ providerId: "okta", displayName: "Okta", type: "oidc" }],
+        disablePasswordAuth: false,
+      });
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = await renderLanding(queryClient);
+
+      expect(container.querySelector('[data-testid="invite-inline-auth"]')).toBeNull();
+      expect(container.textContent).not.toContain("I already have an account");
+      expect(container.textContent).not.toContain("Create your Paperclip account first");
+      const sso = container.querySelector('[data-testid="invite-sso"]');
+      expect(sso).not.toBeNull();
+      const ssoButton = Array.from(sso!.querySelectorAll("button")).find(
+        (button) => button.textContent === "SSO Login",
+      );
+      expect(ssoButton).toBeTruthy();
+
+      await act(async () => {
+        ssoButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await vi.waitFor(() => expect(signInSsoMock).toHaveBeenCalledTimes(1));
+      expect(signInSsoMock.mock.calls[0][0]).toBe("okta");
+      expect(signInSsoMock.mock.calls[0][1]).toContain("/invite/pcp_invite_test");
 
       await act(async () => {
         root.unmount();

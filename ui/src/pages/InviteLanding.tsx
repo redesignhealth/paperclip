@@ -216,6 +216,9 @@ function AwaitingJoinApprovalPanel({
  * the providers the instance has configured and no password form.
  */
 function OwnerHandoffSsoPanel({
+  title = "Sign in to accept this owner invite",
+  description,
+  testId = "owner-handoff-sso",
   companyDisplayName,
   boundEmailHint,
   providers,
@@ -224,6 +227,9 @@ function OwnerHandoffSsoPanel({
   providersLoading,
   error,
 }: {
+  title?: string;
+  description?: string;
+  testId?: string;
   companyDisplayName: string;
   boundEmailHint: string | null;
   providers: Array<{ providerId: string; displayName: string }>;
@@ -233,13 +239,13 @@ function OwnerHandoffSsoPanel({
   error: string | null;
 }) {
   return (
-    <div className="space-y-4" data-testid="owner-handoff-sso">
+    <div className="space-y-4" data-testid={testId}>
       <div>
-        <h2 className="text-lg font-semibold">Sign in to accept this owner invite</h2>
+        <h2 className="text-lg font-semibold">{title}</h2>
         <p className="mt-1 text-sm text-zinc-400">
-          {boundEmailHint
+          {description ?? (boundEmailHint
             ? `This owner invite is for ${boundEmailHint}. Sign in with your organization's SSO using that account.`
-            : `Sign in with your organization's SSO to accept the owner invite for ${companyDisplayName}.`}
+            : `Sign in with your organization's SSO to accept the owner invite for ${companyDisplayName}.`)}
         </p>
       </div>
       {/* No email/password form on purpose: a password account is never verified, so it could
@@ -408,20 +414,27 @@ export function InviteLandingPage() {
   // account that structurally cannot accept the invite. Handoff invites therefore authenticate
   // through SSO only (approved decision D2).
   const handoffRequiresSso = ownerHandoff && requiresHumanAccount;
-  // Also fetched for the unverified-email panel below, which is shown to a *signed-in* user and
-  // offers the same providers as the way back into a verified account.
+  // Fetched for every invite that needs a human sign-in (an ordinary invite goes SSO-only when
+  // providers exist) and for the unverified-email panel below, which is shown to a *signed-in*
+  // user and offers the same providers as the way back into a verified account.
   const ssoProvidersQuery = useQuery({
     queryKey: ["auth", "sso-providers"],
     queryFn: () => authApi.getSsoProviders(),
-    enabled: handoffRequiresSso || emailUnverified,
+    enabled: requiresHumanAccount || emailUnverified,
     staleTime: 5 * 60 * 1000,
   });
   const ssoProviders = ssoProvidersQuery.data?.providers ?? [];
   const hasSsoProviders = ssoProviders.length > 0;
+  // An ordinary invite signs in through SSO only whenever the instance has any SSO provider
+  // configured. This is deliberately stricter than the sign-in page, which keeps password sign-in
+  // for existing accounts unless `disablePasswordAuth` is set. While the provider list is still
+  // loading we also hold back the password form so it doesn't flash up and then vanish.
+  const inviteRequiresSso =
+    requiresHumanAccount && !ownerHandoff && (ssoProvidersQuery.isLoading || hasSsoProviders);
 
   const inviteCallbackPath = `/invite/${encodeURIComponent(token)}`;
 
-  const handleHandoffSsoSignIn = useCallback(
+  const handleSsoSignIn = useCallback(
     async (providerId: string) => {
       setSsoLoading(providerId);
       setError(null);
@@ -707,7 +720,9 @@ export function InviteLandingPage() {
                     ? "Review the invite details, then submit the agent information below to start the join request."
                     : handoffRequiresSso
                       ? "This owner invite must be accepted from a verified organization account. Sign in with your organization's SSO below."
-                      : requiresHumanAccount
+                      : inviteRequiresSso
+                        ? "Sign in with your organization's SSO to accept this invite."
+                        : requiresHumanAccount
                         ? "Create your Paperclip account first. If you already have one, switch to sign in and continue the invite with the same email."
                         : "Your account is ready. Review the invite details, then accept it to continue."}
                 </p>
@@ -793,7 +808,7 @@ export function InviteLandingPage() {
                         key={provider.providerId}
                         label={ssoProviders.length > 1 ? provider.displayName : "SSO Login"}
                         disabled={ssoLoading !== null}
-                        onClick={() => handleHandoffSsoSignIn(provider.providerId)}
+                        onClick={() => handleSsoSignIn(provider.providerId)}
                       />
                     ))}
                   </div>
@@ -861,7 +876,20 @@ export function InviteLandingPage() {
                 boundEmailHint={boundEmailHint}
                 providers={ssoProviders}
                 loadingProviderId={ssoLoading}
-                onSignIn={handleHandoffSsoSignIn}
+                onSignIn={handleSsoSignIn}
+                providersLoading={ssoProvidersQuery.isLoading}
+                error={error}
+              />
+            ) : inviteRequiresSso ? (
+              <OwnerHandoffSsoPanel
+                title="Sign in to continue"
+                description={`Sign in with your organization's SSO to join ${companyDisplayName}. Your account is created automatically the first time you sign in.`}
+                testId="invite-sso"
+                companyDisplayName={companyDisplayName}
+                boundEmailHint={null}
+                providers={ssoProviders}
+                loadingProviderId={ssoLoading}
+                onSignIn={handleSsoSignIn}
                 providersLoading={ssoProvidersQuery.isLoading}
                 error={error}
               />
