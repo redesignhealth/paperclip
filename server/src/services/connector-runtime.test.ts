@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Db } from "@paperclipai/db";
+import { chatEndpoints, toolCatalogEntries, type Db } from "@paperclipai/db";
+import { forbidden } from "../errors.js";
 import { applyConnectorSkills, connectorToolDefinitionsForSkills, resolveConnectorAssignments, resolvedConnectorToolDefinitionsForSkills, type ConnectorAssignment } from "./connector-runtime.js";
 import { logger } from "../middleware/logger.js";
-import { registerSlackTaskAuthority, type SlackTaskAuthority } from "./connectors/slack-authority.js";
+import { registerSlackTaskAuthority, SLACK_ENDPOINT_SELECTION_REQUIRED, type SlackTaskAuthority } from "./connectors/slack-authority.js";
 
 const resolvers = vi.hoisted(() => ({
   browser: vi.fn(), speko: vi.fn(), slack: vi.fn(), inboxes: vi.fn(),
@@ -174,14 +175,73 @@ describe("Slack connector exposure boundaries", () => {
     resolvers.slack.mockResolvedValue([{ id: "selected", label: "Slack", connectionId: "connection" }]);
     const selected = { id: "selected", companyId: "company", setup: { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] } };
     const other = { id: "other", companyId: "company", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
-    let reads = 0;
-    const db = { select: () => ({ from: () => ({ where: async () => ++reads === 1 ? [selected, other] : [] }) }) } as unknown as Db;
+    const from = vi.fn((table: unknown) => ({ where: async () => {
+      if (table === chatEndpoints) return [selected, other];
+      if (table === toolCatalogEntries) return [];
+      throw new Error("Unexpected permission query");
+    } }));
+    const db = { select: () => ({ from }) } as unknown as Db;
     const unregister = registerSlackTaskAuthority(db, async () => ({ endpoint: selected }) as unknown as SlackTaskAuthority);
     try {
       const assignments = await resolveConnectorAssignments(db, { companyId: "company", agentId: "agent", runId: "run", issueId: "issue" });
       expect(assignments[0]!.tools.map(tool => tool.name)).not.toContain("slack_upload_file");
       expect(assignments[0]!.tools.map(tool => tool.name)).toContain("slack_history");
       for (const tool of JSON.parse(JSON.stringify(assignments[0]!.tools))) expect(tool).not.toHaveProperty("scopes");
+      expect(from).toHaveBeenCalledWith(toolCatalogEntries);
+      expect(from).not.toHaveBeenCalledWith(chatEndpoints);
+    } finally { unregister(); }
+  });
+
+  it.each(["Unlinked user", "No accepted responsible user"])("silently hides tools for expected denial: %s", async reason => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const db = {} as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => { throw forbidden(reason); });
+    resolvers.browser.mockResolvedValue([]);
+    resolvers.speko.mockResolvedValue([]);
+    resolvers.inboxes.mockResolvedValue([]);
+    resolvers.slack.mockResolvedValue([{ id: "slack", label: "Slack", connectionId: "connection" }]);
+    const binding = { companyId: "company", agentId: "agent", runId: "run", issueId: "issue" };
+    try {
+      expect((await resolveConnectorAssignments(db, binding))[0]!.tools).toEqual([]);
+      expect((await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding))[0]!.tools).toEqual([]);
+      expect(warn).not.toHaveBeenCalled();
+    } finally { unregister(); }
+  });
+
+  it("also treats a structured controller 403 as an expected silent denial", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const db = {} as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => { throw Object.assign(new Error("Authorization denied"), { status: 403 }); });
+    try {
+      const specs = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), {
+        companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+      });
+      expect(specs[0]!.tools).toEqual([]);
+      expect(warn).not.toHaveBeenCalled();
+    } finally { unregister(); }
+  });
+
+  it("silently unions only usable endpoints after an expected selection-required denial", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const first = { id: "first", companyId: "company", connectionId: "one", setup: { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] } };
+    const second = { id: "second", companyId: "company", connectionId: "two", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
+    const db = { select: () => ({ from: (table: unknown) => ({ where: async () => {
+      if (table === chatEndpoints) return [first, second];
+      if (table === toolCatalogEntries) return [];
+      throw new Error("Unexpected permission query");
+    } }) }) } as unknown as Db;
+    const unregister = registerSlackTaskAuthority(db, async binding => {
+      if (!binding.endpointId) throw forbidden("Select a connection", { code: SLACK_ENDPOINT_SELECTION_REQUIRED });
+      return { endpoint: binding.endpointId === first.id ? first : second } as unknown as SlackTaskAuthority;
+    });
+    try {
+      const [spec] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), {
+        companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+      });
+      expect(spec!.tools.map(tool => tool.name)).toContain("slack_history");
+      expect(spec!.tools.map(tool => tool.name)).toContain("slack_upload_file");
+      expect(spec!.tools.map(tool => tool.name)).not.toContain("slack_create_channel");
+      expect(warn).not.toHaveBeenCalled();
     } finally { unregister(); }
   });
 

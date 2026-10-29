@@ -6,7 +6,7 @@ import { slackSearchActionToken } from "../../connectors/slack-search-context.js
 import { slackAuthorizationRevision } from "../../connectors/slack-revision.js";
 
 import { instanceSettingsService } from "../../instance-settings.js";
-import { registerSlackTaskAuthority, slackRunOrigin, type SlackTaskBinding } from "../../connectors/slack-authority.js";
+import { registerSlackTaskAuthority, SLACK_ENDPOINT_SELECTION_REQUIRED, slackRunOrigin, type SlackTaskBinding } from "../../connectors/slack-authority.js";
 import { measureRunPhase } from "../../execution-preparation-timing.js";
 import { measureRunTransaction } from "../../execution-transaction-timing.js";
 
@@ -91,7 +91,8 @@ export function createSlackTaskAuthorityRegistration(db: Db, options: SlackTaskA
           eq(chatEndpoints.assignedAgentId, binding.agentId), eq(chatEndpoints.status, "active"),
           ...(binding.endpointId ? [eq(chatEndpoints.id, binding.endpointId)] : []),
         )).for("no key update");
-        if (endpoints.length !== 1) throw forbidden("Select an active Slack connection assigned to this agent");
+        if (endpoints.length !== 1) throw forbidden("Select an active Slack connection assigned to this agent",
+          endpoints.length > 1 ? { code: SLACK_ENDPOINT_SELECTION_REQUIRED } : undefined);
         const endpoint = endpoints[0]!;
         const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, binding.companyId), eq(issues.id, binding.issueId), eq(issues.assigneeAgentId, binding.agentId)));
         if (!issue) throw forbidden("Slack tools require a task assigned to this agent");

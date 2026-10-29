@@ -2,15 +2,13 @@ import { SPEKO_SKILL } from "./voice/speko-skill.js";
 import { spekoAssignedResources } from "./voice/speko-agent-tools.js";
 import { SLACK_TOOLS, slackOptInGroupsForTool } from "@paperclipai/shared";
 import { slackAssignedResource, executeGovernedSlackTool } from "./connectors/slack.js";
-import { slackEnabledToolsForEndpoint } from "./connectors/slack-opt-ins.js";
-import { resolveSlackTaskAuthorization } from "./connectors/slack-authority.js";
+import { slackToolNamesForAgent } from "./connectors/slack-opt-ins.js";
 import { logger } from "../middleware/logger.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { toolCatalogEntries, type Db } from "@paperclipai/db";
-import { and, eq, inArray } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
 import type { AgentSkillSnapshot } from "@paperclipai/shared";
 import {
   resolvePaperclipSkillsDir,
@@ -170,9 +168,9 @@ export function connectorToolDefinitionsForSkills(
 ): Pick<ConnectorAssignment, "tools">[] {
   return connectors.filter(connector => skillKeys.has(skillKey(connector)) && connector.tools.length > 0)
     .map(connector => ({
-      // A run must never be offered a Slack tool this agent has not enabled.
-      // An omitted set is not "everything": every gated Slack tool stays
-      // hidden, so a caller that forgets the lookup fails closed.
+      // A supplied set is an absolute whitelist, including for ungated tools.
+      // With no lookup supplied, only ungated definitions are exposed; gated
+      // tools are never inferred from the skill alone.
       tools: connector.key === "slack"
         ? connector.tools.filter(tool => enabledSlackTools !== undefined
             ? enabledSlackTools.has(tool.name)
@@ -207,10 +205,9 @@ export async function executeConnectorTool(
 }
 
 /**
- * Resolve exactly the endpoint dispatch would use, not a union of the agent's
- * connections. External runs retain their originating endpoint; an ordinary
- * task with multiple endpoints has no default and must supply endpointId.
- * Callers that select an endpoint explicitly get only that endpoint's groups.
+ * Use dispatch authority for the default endpoint, or an authorized union when
+ * an ordinary multi-connection task needs a selector. The union is discovery
+ * only: dispatch still requires endpointId and gates the selected connection.
  *
  * Both assignment discovery and native run preparation use this fail-closed
  * boundary. A transient permission lookup failure hides Slack tools, logs safe
@@ -220,17 +217,7 @@ export async function executeConnectorTool(
 export async function resolveSlackConnectorToolNames(db: Db, binding: AgentBinding): Promise<Set<string>> {
   if (!binding.runId || !binding.issueId) return new Set();
   try {
-    const authority = await resolveSlackTaskAuthorization(db, { ...binding, runId: binding.runId, issueId: binding.issueId });
-    const enabled = await slackEnabledToolsForEndpoint(db, authority.endpoint);
-    // Group consent does not override an operator's separate catalog disable or
-    // quarantine. The gateway also enforces these policies at execution time.
-    const blocked = await db.select({ toolName: toolCatalogEntries.toolName }).from(toolCatalogEntries).where(and(
-      eq(toolCatalogEntries.companyId, binding.companyId),
-      eq(toolCatalogEntries.connectionId, authority.endpoint.connectionId),
-      inArray(toolCatalogEntries.status, ["disabled", "quarantined"]),
-    ));
-    const blockedNames = new Set(blocked.map(entry => entry.toolName));
-    return new Set(enabled.filter(tool => !blockedNames.has(tool.name)).map(tool => tool.name));
+    return await slackToolNamesForAgent(db, binding);
   } catch {
     logger.warn({ companyId: binding.companyId, agentId: binding.agentId, runId: binding.runId,
       endpointId: binding.endpointId }, "Slack tool permission lookup failed; hiding Slack tools for this run");

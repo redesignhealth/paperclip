@@ -93,9 +93,9 @@ async function slackCatalogStatusMatches(
     if (slackOptInGroupsForTool(tool).length === 0) return true;
     const stored = byName.get(`slack_bot:${tool.name}`);
     if (!stored) return false;
-    // An operator-disabled entry is a deliberate decision the sync preserves,
-    // so it is never "stale" just because the group is enabled.
-    if (stored.status === "disabled") return true;
+    // Operator disables and quarantines are deliberate restrictions, not
+    // stale permission state that a catalog sync may restore.
+    if (stored.status === "disabled" || stored.status === "quarantined") return true;
     return (stored.status === "active") === isSlackToolEnabledForOptIns(tool, optIns);
   });
 }
@@ -141,10 +141,11 @@ export async function syncSlackBotTools(
     // An operator turning a tool off is a deliberate decision, distinct from
     // this sync removing a tool because its opt-in group is not enabled. Only
     // opt-in-driven removal is re-activated when the group comes back.
-    const operatorDisabled = gated && existing?.status === "disabled";
-    const status: "active" | "removed" | "disabled" = operatorDisabled
-      ? "disabled"
-      : activated ? "active" : "removed";
+    const operatorStatus = existing?.status === "disabled" || existing?.status === "quarantined"
+      ? existing.status : undefined;
+    const status = gated && operatorStatus
+      ? operatorStatus
+      : activated ? "active" as const : "removed" as const;
     const values = {
       companyId: endpoint.companyId,
       applicationId: connection.applicationId,
@@ -167,8 +168,8 @@ export async function syncSlackBotTools(
     };
     // A gated tool's status follows the enabled opt-in set on every sync, so
     // enabling or dropping a group flips it even when the definition hash is
-    // unchanged. An operator-disabled entry and an ungated tool keep their own
-    // status.
+    // unchanged. Operator-disabled/quarantined entries and ungated tools keep
+    // their own status.
     if (existing?.versionHash === hash && (!gated || existing.status === values.status))
       continue;
     await measureRunPhase("connectors.slack.catalog.write", () => tx

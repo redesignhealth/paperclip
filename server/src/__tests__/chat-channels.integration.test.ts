@@ -7761,7 +7761,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const [saved] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, f.endpoint.id));
         expect(saved!.botExternalId).toBeTruthy();
         expect(saved!.status).toBe("archived");
-        expect(await slackToolNamesForAgent(db, { companyId: f.companyId, agentId: saved!.assignedAgentId })).toEqual(new Set());
+        const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Removed Slack endpoint",
+          status: "todo", assigneeAgentId: saved!.assignedAgentId, responsibleUserId: actor.userId }).returning();
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: saved!.assignedAgentId,
+          status: "running", responsibleUserId: actor.userId, contextSnapshot: { issueId: issue.id, source: "routine" } });
+        await initializeRunIdentity(db, { companyId: f.companyId, runId, issueId: issue.id, responsibleUserId: actor.userId, cause: "routine" });
+        expect(await slackToolNamesForAgent(db, { companyId: f.companyId, agentId: saved!.assignedAgentId,
+          endpointId: saved!.id, runId, issueId: issue.id })).toEqual(new Set());
         await expect(f.service.configure(f.endpoint.id, { action: "resume" }, actor.userId)).rejects.toThrow();
       });
 
@@ -9606,8 +9613,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(runtime.endpoints.get(endpoint.id)!.posts.map(post => post.text)).toEqual(["**Owner User (via Paperclip)**\n\nSmall pool work"]);
   }, 15_000);
 
-  it("uses dispatch endpoint selection rather than unioning groups across two Slack endpoints", async () => {
-    const { resolveConnectorAssignments } = await import("../services/connector-runtime.js");
+  it("offers tools from usable Slack endpoints when dispatch needs an explicit selector", async () => {
+    const { resolveConnectorAssignments, executeConnectorTool } = await import("../services/connector-runtime.js");
     const { executeSlackTool } = await import("../services/connectors/slack.js");
     await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
     const fixture = await seedCompany();
@@ -9616,7 +9623,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId,
       provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UMULTIENDPOINT" }).returning();
     for (const [index, f] of [first, second].entries()) {
-      const groups = index === 1 ? ["file_upload"] : [];
+      const groups = index === 1 ? ["channel_management"] : [];
       await db.update(chatEndpoints).set({ status: "active", setup: sql`${chatEndpoints.setup} || ${JSON.stringify({
         slackOptInScopeGroups: groups, slackInstalledOptInScopeGroups: groups,
       })}::jsonb` }).where(eq(chatEndpoints.id, f.endpoint.id));
@@ -9631,17 +9638,29 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await initializeRunIdentity(db, { companyId: fixture.companyId, runId, issueId: issue.id, responsibleUserId: "owner-user", cause: "routine" });
     const binding = { companyId: fixture.companyId, agentId: fixture.assignedAgentId, runId, issueId: issue.id };
     const names = async (endpointId?: string) => (await resolveConnectorAssignments(db, { ...binding, endpointId }))[0]!.tools.map(tool => tool.name);
-    // Ordinary tasks with two active connections have no default. The agent
-    // must select a resource; neither connection's permissions become a union.
-    expect(await names()).toEqual([]);
-    expect(await names(first.endpoint.id)).not.toContain("slack_upload_file");
+    // No default endpoint: offer the union across individually authorized
+    // connections so the agent can select one, rather than losing Slack tools.
+    const all = await names();
+    expect(all).toContain("slack_history");
+    expect(all).toContain("slack_create_channel");
+    expect(all).not.toContain("slack_upload_file");
+    expect(await names(first.endpoint.id)).not.toContain("slack_create_channel");
     expect(await names(first.endpoint.id)).toContain("slack_history");
-    expect(await names(second.endpoint.id)).toContain("slack_upload_file");
-    await expect(executeSlackTool(db, binding, "slack_upload_file", { endpointId: first.endpoint.id }))
+    expect(await names(second.endpoint.id)).toContain("slack_create_channel");
+    const args = { name: "selected-connection", is_private: true, idempotencyKey: randomUUID() };
+    await expect(executeSlackTool(db, binding, "slack_create_channel", args)).rejects.toThrow("Select an active Slack connection");
+    await expect(executeSlackTool(db, binding, "slack_create_channel", { ...args, endpointId: first.endpoint.id }))
       .rejects.toMatchObject({ status: 403, details: { code: "slack_tool_not_enabled" } });
-    // The other selector passes gating and reaches argument validation.
-    await expect(executeSlackTool(db, binding, "slack_upload_file", { endpointId: second.endpoint.id }))
-      .rejects.toMatchObject({ name: "ZodError" });
+    // The enabled endpoint reaches the ordinary approval gate, rather than an
+    // opt-in denial. Consent never bypasses the existing approval policy.
+    vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "slack-tools-integration-signing-secret");
+    onTestFinished(() => vi.unstubAllEnvs());
+    await expect(executeConnectorTool(db, binding, "slack_create_channel", { ...args, endpointId: second.endpoint.id }))
+      .rejects.toMatchObject({ reasonCode: expect.stringMatching(/approval/) });
+    // An unlinked connection is not usable and must contribute no tools.
+    await second.service.revokeLink(second.endpoint.id, principal.id, "owner-user");
+    expect(await names()).not.toContain("slack_create_channel");
+    expect(await names()).toContain("slack_history");
   });
 
   it("activates a gated Slack tool after an opt-in group is enabled, through the production listing path", async () => {

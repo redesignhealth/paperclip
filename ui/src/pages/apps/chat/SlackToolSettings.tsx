@@ -46,9 +46,10 @@ export function SlackCapabilitiesView({
                   <li key={missing.group}>
                     <span className="font-medium">{missing.label}</span>
                     {" — "}
+                    {missing.description}{" "}
                     {missing.action === "reconnect"
-                      ? `${missing.label} is already requested. Please reconnect this agent's Slack app to grant it.`
-                      : `Turn on ${missing.label} in this agent's Slack setup, then reconnect so Slack grants it.`}
+                      ? "This group is already requested. Please reconnect this agent's Slack app to grant it."
+                      : "Turn on this group in this agent's Slack setup, then reconnect so Slack grants it."}
                     {" "}Unlocks{" "}
                     <span className="font-mono text-xs">
                       {missing.toolNames.join(", ")}

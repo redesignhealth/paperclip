@@ -1,5 +1,6 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { chatEndpoints, type Db } from "@paperclipai/db";
+import { chatEndpoints, toolCatalogEntries, type Db } from "@paperclipai/db";
+import { resolveSlackTaskAuthorization, slackEndpointCandidates, SLACK_ENDPOINT_SELECTION_REQUIRED, type SlackTaskBinding } from "./slack-authority.js";
 import {
   SLACK_TOOLS,
   SLACK_OPT_IN_BOT_SCOPE_GROUPS,
@@ -241,42 +242,56 @@ export async function slackLegacyInstall(
   })).has(input.endpointId);
 }
 
+function isSlackAuthorizationDenial(error: unknown): error is { status: 403; details?: unknown } {
+  return error !== null && typeof error === "object" && "status" in error && error.status === 403;
+}
+
 /**
- * The Slack tools an agent's endpoints currently enable, unioned across its
- * active Slack connections. Used where tool definitions are assembled for a run
- * rather than for one addressed endpoint.
+ * Tool exposure follows dispatch authority. A resolvable default (including an
+ * external run's source endpoint) contributes only that endpoint's tools. When
+ * an ordinary task has multiple connections and needs an explicit selector,
+ * expose the union across individually authorized endpoints so it can choose
+ * one. A listed group is not a grant on another endpoint: dispatch still gates
+ * the selected endpoint, and an unselected ambiguous call still fails.
+ *
+ * Expected authorization denials contribute no tools and are silent. Database
+ * and other real faults propagate to the runtime's logged fail-closed boundary.
  */
 export async function slackToolNamesForAgent(
   db: Db,
-  binding: { companyId: string; agentId: string; endpointId?: string },
+  binding: Pick<SlackTaskBinding, "companyId" | "agentId" | "endpointId" | "identityContextId"> &
+    Partial<Pick<SlackTaskBinding, "runId" | "issueId">>,
 ): Promise<Set<string>> {
-  const rows = await db
-    .select({ id: chatEndpoints.id, setup: chatEndpoints.setup })
-    .from(chatEndpoints)
-    .where(
-      and(
-        eq(chatEndpoints.companyId, binding.companyId),
-        eq(chatEndpoints.assignedAgentId, binding.agentId),
-        eq(chatEndpoints.provider, "slack"),
-        inArray(chatEndpoints.status, ["active", "verifying"]),
-        ...(binding.endpointId
-          ? [eq(chatEndpoints.id, binding.endpointId)]
-          : []),
-      ),
-    );
-  const legacy = await slackLegacyInstallEndpoints(db, {
-    companyId: binding.companyId,
-    agentId: binding.agentId,
-    endpointIds: rows.map((row) => row.id),
-  });
-  const enabled = new Set<string>();
-  for (const row of rows) {
-    for (const tool of slackEnabledToolsForSetup(row.setup, {
-      legacyInstall: legacy.has(row.id),
-    }))
-      enabled.add(tool.name);
+  if (!binding.runId || !binding.issueId) return new Set();
+  const task = { ...binding, runId: binding.runId, issueId: binding.issueId };
+  const namesFor = async (endpoint: typeof chatEndpoints.$inferSelect) => {
+    const enabled = await slackEnabledToolsForEndpoint(db, endpoint);
+    // Consent does not override a separate operator disable or quarantine.
+    const blocked = await db.select({ toolName: toolCatalogEntries.toolName }).from(toolCatalogEntries).where(and(
+      eq(toolCatalogEntries.companyId, binding.companyId),
+      eq(toolCatalogEntries.connectionId, endpoint.connectionId),
+      inArray(toolCatalogEntries.status, ["disabled", "quarantined"]),
+    ));
+    const blockedNames = new Set(blocked.map(entry => entry.toolName));
+    return enabled.filter(tool => !blockedNames.has(tool.name)).map(tool => tool.name);
+  };
+  try {
+    return new Set(await namesFor((await resolveSlackTaskAuthorization(db, task)).endpoint));
+  } catch (error) {
+    if (!isSlackAuthorizationDenial(error)) throw error;
+    if (binding.endpointId || (error.details as { code?: string } | undefined)?.code !== SLACK_ENDPOINT_SELECTION_REQUIRED)
+      return new Set();
   }
-  return enabled;
+  const names = new Set<string>();
+  for (const candidate of await slackEndpointCandidates(db, task)) {
+    try {
+      const authority = await resolveSlackTaskAuthorization(db, { ...task, endpointId: candidate.id });
+      for (const name of await namesFor(authority.endpoint)) names.add(name);
+    } catch (error) {
+      if (!isSlackAuthorizationDenial(error)) throw error;
+    }
+  }
+  return names;
 }
 
 /** Gating for one already-loaded endpoint, resolving its legacy install. */

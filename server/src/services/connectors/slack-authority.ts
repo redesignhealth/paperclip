@@ -13,6 +13,9 @@ import { forbidden } from "../../errors.js";
 import { boundRunIssueId } from "../run-task-binding.js";
 import { chatRunSourceMessageId } from "../chat-channels/run-origin.js";
 
+/** Ordinary multi-connection tasks need an explicit endpoint at dispatch. */
+export const SLACK_ENDPOINT_SELECTION_REQUIRED = "slack_endpoint_selection_required";
+
 export interface SlackTaskBinding {
   companyId: string;
   agentId: string;

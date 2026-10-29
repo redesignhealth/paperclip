@@ -86,7 +86,7 @@ describe("Slack opt-in manifest machinery", () => {
       expect(await slackBotCatalogIsCurrent(db!, withoutSetup)).toBe(false);
     });
 
-    it("detects permission staleness and preserves an operator disable across repeated syncs", async () => {
+    it.each(["disabled", "quarantined"] as const)("preserves %s across repeated syncs without perpetual permission staleness", async status => {
       const f = await fixture();
       await db!.transaction(tx => syncSlackBotTools(tx, f.endpoint, "user", true));
       const withUpload = { ...f.endpoint, setup: { ...f.endpoint.setup,
@@ -94,16 +94,35 @@ describe("Slack opt-in manifest machinery", () => {
       expect(await slackBotCatalogIsCurrent(db!, withUpload)).toBe(false);
       await db!.transaction(tx => syncSlackBotTools(tx, withUpload, "user", true));
       expect(await slackBotCatalogIsCurrent(db!, withUpload)).toBe(true);
-      await db!.update(toolCatalogEntries).set({ status: "disabled" }).where(and(
+      await db!.update(toolCatalogEntries).set({ status }).where(and(
         eq(toolCatalogEntries.connectionId, f.connection.id), eq(toolCatalogEntries.toolName, "slack_upload_file"),
       ));
+      expect(await slackBotCatalogIsCurrent(db!, withUpload)).toBe(true);
       await db!.transaction(tx => syncSlackBotTools(tx, withUpload, "user", true));
       await db!.transaction(tx => syncSlackBotTools(tx, f.endpoint, "user", true));
       await db!.transaction(tx => syncSlackBotTools(tx, withUpload, "user", true));
       const [entry] = await db!.select().from(toolCatalogEntries).where(and(
         eq(toolCatalogEntries.connectionId, f.connection.id), eq(toolCatalogEntries.toolName, "slack_upload_file"),
       ));
-      expect(entry!.status).toBe("disabled");
+      expect(entry!.status).toBe(status);
+      expect(await slackBotCatalogIsCurrent(db!, withUpload)).toBe(true);
+    });
+
+    it("does not reactivate a quarantined gated tool on a definition refresh", async () => {
+      const f = await fixture();
+      const enabled = { ...f.endpoint, setup: { ...f.endpoint.setup,
+        slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: ["file_upload" as const] } };
+      await db!.transaction(tx => syncSlackBotTools(tx, enabled, "user", true));
+      await db!.update(toolCatalogEntries).set({ status: "quarantined", versionHash: "old-definition" }).where(and(
+        eq(toolCatalogEntries.connectionId, f.connection.id), eq(toolCatalogEntries.toolName, "slack_upload_file"),
+      ));
+      await db!.transaction(tx => syncSlackBotTools(tx, enabled, "user", true));
+      const [entry] = await db!.select().from(toolCatalogEntries).where(and(
+        eq(toolCatalogEntries.connectionId, f.connection.id), eq(toolCatalogEntries.toolName, "slack_upload_file"),
+      ));
+      expect(entry!.status).toBe("quarantined");
+      expect(entry!.versionHash).not.toBe("old-definition");
+      expect(await slackBotCatalogIsCurrent(db!, enabled)).toBe(true);
     });
 
     it("writes only its own key, so a concurrent runtimeGeneration bump survives", async () => {
