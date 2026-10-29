@@ -100,7 +100,7 @@ export function SlackScopeOptIns({
                 id={`${idPrefix}-${group}`}
                 checked={checked}
                 disabled={controlsDisabled}
-                aria-describedby={helpId}
+                aria-describedby={`${helpId} ${idPrefix}-${group}-status`}
                 onCheckedChange={(next) =>
                   onChange(
                     next === true
@@ -117,6 +117,7 @@ export function SlackScopeOptIns({
                     {definition.label}
                   </label>
                   <span
+                    id={`${idPrefix}-${group}-status`}
                     data-slack-opt-in-status={status}
                     className={
                       status === "off"

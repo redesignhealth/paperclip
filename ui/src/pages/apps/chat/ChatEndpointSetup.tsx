@@ -1,10 +1,10 @@
 import { SpekoProviderSetup } from "@/components/voice/SpekoProviderSetup";
 import { NativeVoiceConversation } from "@/components/voice/NativeVoiceConversation";
-import { buildSlackAppManifest, defaultSlackAppConfiguration, slackRequestedOptInGroups } from "@paperclipai/shared";
+import { buildSlackAppManifest, defaultSlackAppConfiguration } from "@paperclipai/shared";
 import type { SlackOptInScopeGroup } from "@paperclipai/shared";
 import { SlackAppDetails, SlackSetupAdvanced } from "./SlackAppDetails";
 import { SlackScopeOptIns } from "./SlackScopeOptIns";
-import { sameSlackOptInGroupSet, slackOptInUiState } from "./slack-opt-in-state";
+import { slackOptInUiState } from "./slack-opt-in-state";
 import { SlackSetup } from "./slack/SlackSetup";
 import { isProvisionedSlackSetup, slackSetupState } from "./slack/setup-state";
 import { defaultSlackAppName } from "./slack-app-name";
@@ -347,15 +347,22 @@ function ChatSdkEndpointSetup() {
     mutationFn: (details: SlackAppConfiguration) => chatEndpointsApi.update(endpoint!.id, { slackApp: details }),
     onSuccess: next => syncEndpointSnapshot(next),
   });
+  const slackOptInIntent = useRef(0);
   const saveSlackOptIns = useMutation({
+    // Query's scope serializes every intent, including a return to the initial
+    // set. Never compare with a snapshot captured before an earlier save.
     scope: { id: `slack-opt-ins:${endpoint?.id}` },
-    mutationFn: (slackOptInScopeGroups: SlackOptInScopeGroup[]) =>
-      chatEndpointsApi.update(endpoint!.id, { slackOptInScopeGroups }),
-    onSuccess: next => { setSlackOptInDraft(null); syncEndpointSnapshot(next); },
-    onError: () => {
-      // Roll the optimistic selection back to the server's own state so the UI
-      // never shows a choice the server rejected.
-      setSlackOptInDraft(null);
+    mutationFn: ({ groups }: { groups: SlackOptInScopeGroup[]; revision: number }) =>
+      chatEndpointsApi.update(endpoint!.id, { slackOptInScopeGroups: groups }),
+    onSuccess: (next, { revision }) => {
+      // Update server evidence without replacing a newer local intent. A set
+      // comparison is insufficient for on→off→on: only the last intent owns it.
+      if (revision === slackOptInIntent.current) setSlackOptInDraft(null);
+      syncEndpointSnapshot(next);
+    },
+    onError: (_error, { revision }) => {
+      // A failed older intent must not roll back a newer queued selection.
+      if (revision === slackOptInIntent.current) setSlackOptInDraft(null);
       pushToast({
         title: "Couldn't update Slack permissions",
         body: "Your selection was not saved. Try again.",
@@ -363,11 +370,6 @@ function ChatSdkEndpointSetup() {
       });
     },
   });
-  // Rapid toggles are serialized so a late response cannot overwrite a newer
-  // selection, and the newest selection is always the one sent.
-  const slackOptInSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
-  const latestSlackOptIns = useRef<SlackOptInScopeGroup[]>(slackOptIns);
-  latestSlackOptIns.current = slackOptIns;
   const persistSlackDetails = async () => {
     if (!endpoint) return;
     // Opt-ins are owned by their own save path; never resend them here from a
@@ -377,22 +379,9 @@ function ChatSdkEndpointSetup() {
       await saveSlackDetails.mutateAsync(slackDetailsValidation.data);
   };
   const persistSlackOptIns = (groups: SlackOptInScopeGroup[]) => {
-    // Update the ref synchronously, so a third toggle in the same tick can never
-    // be lost to a render that has not committed yet.
-    latestSlackOptIns.current = groups;
+    const revision = ++slackOptInIntent.current;
     setSlackOptInDraft(groups);
-    if (!endpoint) return;
-    slackOptInSaveQueue.current = slackOptInSaveQueue.current
-      .catch(() => {})
-      .then(async () => {
-        const latest = latestSlackOptIns.current;
-        if (sameSlackOptInGroupSet(latest, slackRequestedOptInGroups(endpoint.setup))) return;
-        await saveSlackOptIns.mutateAsync(latest);
-      })
-      .catch(() => {
-        // onError already rolled back and reported the failure. Consume the
-        // fire-and-forget queue rejection even if no next toggle arrives.
-      });
+    if (endpoint) saveSlackOptIns.mutate({ groups, revision });
   };
   const continueFromAgent = async (exit: boolean) => {
     if (exit && provider !== "slack") { navigate("/apps"); return; }
@@ -628,7 +617,12 @@ function ChatSdkEndpointSetup() {
                 onChange={persistSlackOptIns}
                 // Both setup methods resolve a pending permission change on the
                 // Connect step: managed reinstalls, own app retries the manifest.
-                onReconnect={endpoint ? () => setViewedStep(1) : undefined} />
+                onReconnect={endpoint ? () => {
+                  const resumed = new URLSearchParams(params);
+                  resumed.set("reconnect", "1");
+                  setParams(resumed, { replace: true });
+                  setViewedStep(1);
+                } : undefined} />
               {saveSlackDetails.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack app details. Try again before continuing.</p>}
               {saveSlackOptIns.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack permission groups. Your previous selection is still in effect; try again.</p>}
               {slackChoices.data?.defaultMethod === "managed" && (!endpoint || endpoint.setup?.slackSetupMethod === "managed") && !endpoint?.setup?.slackRegistration && <Button
@@ -944,7 +938,7 @@ function ProviderConnectStep({
     webhookUrl: slackWebhookUrl,
     ...(automaticSlack && endpoint.setup?.slackOAuthCallbackUri ? { redirectUri: endpoint.setup.slackOAuthCallbackUri } : {}),
     // The preview must match what the server stores, including opt-ins.
-    optInScopeGroups: slackRequestedOptInGroups(endpoint.setup),
+    optInScopeGroups: slackOptInUiState(endpoint).requested,
   }), null, 2);
   const slackCreateUrl = `https://api.slack.com/apps?new_app=1&manifest_json=${encodeURIComponent(slackManifest)}`;
   useEffect(() => setManifestCopied(false), [slackManifest]);

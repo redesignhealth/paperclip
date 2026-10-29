@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import type { SlackOptInScopeGroup } from "@paperclipai/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatEndpoint } from "@/api/chatEndpoints";
@@ -37,6 +38,18 @@ vi.mock("@/components/chat/ChatSetupNavigation", () => ({
 }));
 // The provider step is not under test and needs its own Slack APIs.
 vi.mock("./slack/SlackSetup", () => ({ SlackSetup: () => null }));
+
+// Exercise queued change intents at the controlled-component boundary, without
+// depending on whether the checkbox disables itself during a network request.
+const control = vi.hoisted(() => ({ change: null as null | ((groups: SlackOptInScopeGroup[]) => void) }));
+vi.mock("./SlackScopeOptIns", async importOriginal => {
+  const actual = await importOriginal<typeof import("./SlackScopeOptIns")>();
+  return { SlackScopeOptIns: (props: React.ComponentProps<typeof actual.SlackScopeOptIns>) => {
+    control.change = props.onChange;
+    return <actual.SlackScopeOptIns {...props} />;
+  } };
+});
+function Location() { return <output data-testid="location">{useLocation().search}</output>; }
 
 let root: Root;
 let container: HTMLDivElement;
@@ -82,6 +95,7 @@ async function render(search = "provider=slack&purpose=chat&agentId=agent-a") {
       <TooltipProvider>
         <MemoryRouter initialEntries={[`/apps/chat/connect?${search}`]}>
           <Routes><Route path="/apps/chat/connect" element={<ChatEndpointSetup />} /></Routes>
+          <Location />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -112,6 +126,44 @@ function optInCheckbox(label: string) {
 }
 
 describe("Slack opt-ins on the Choose-agent step", () => {
+  it("includes the legacy enabled groups in the manifest preview", async () => {
+    api.get.mockResolvedValue(draft({ botExternalId: "B123", setup: { ...baseSetup, slackSetupMethod: "manual" } }));
+    await render("provider=slack&purpose=chat&resume=endpoint-a&agentId=agent-a");
+    await openAgentStep();
+    expect(optInCheckbox("File upload").getAttribute("aria-checked")).toBe("true");
+    await act(async () => [...container.querySelectorAll("button")].find(node => node.textContent === "Create Slack app")!.click());
+    await act(async () => [...container.querySelectorAll("button")].find(node => node.textContent === "View Slack App Manifest")!.click());
+    const preview = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Slack app manifest"]')!;
+    const scopes = JSON.parse(preview.value).oauth_config.scopes.bot;
+    for (const scope of ["channels:manage", "groups:write", "im:write", "files:write"]) expect(scopes).toContain(scope);
+  });
+
+  it.each([false, true])("persists rapid on→off with final on=%s despite deferred responses", async finalOn => {
+    let serverGroups: SlackOptInScopeGroup[] = [];
+    const pending: (() => void)[] = [];
+    api.update.mockImplementation((_id: string, input: { slackOptInScopeGroups: SlackOptInScopeGroup[] }) =>
+      new Promise(resolve => pending.push(() => {
+        serverGroups = input.slackOptInScopeGroups;
+        resolve(draft({ setup: { ...baseSetup, slackOptInScopeGroups: serverGroups } }));
+      })));
+    await render("provider=slack&purpose=chat&resume=endpoint-a&agentId=agent-a");
+    await openAgentStep();
+    await act(async () => control.change!(["file_upload"]));
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    await act(async () => control.change!([]));
+    if (finalOn) await act(async () => control.change!(["file_upload"]));
+    await act(async () => pending.shift()!());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
+    // The first response must not replace a newer draft while another save waits.
+    expect(optInCheckbox("File upload").getAttribute("aria-checked")).toBe(String(finalOn));
+    while (pending.length) {
+      await act(async () => pending.shift()!());
+      // Even the intermediate off response in on→off→on cannot clear the on draft.
+      expect(optInCheckbox("File upload").getAttribute("aria-checked")).toBe(String(finalOn));
+    }
+    await vi.waitFor(() => expect(serverGroups).toEqual(finalOn ? ["file_upload"] : []));
+    expect(api.update.mock.calls.at(-1)![1].slackOptInScopeGroups).toEqual(finalOn ? ["file_upload"] : []);
+  });
   it("shows all three groups off for a new agent", async () => {
     await render();
     await openAgentStep();
@@ -213,7 +265,7 @@ describe("Slack opt-ins on the Choose-agent step", () => {
         slackInstalledOptInScopeGroups: [],
       },
     }));
-    await render("provider=slack&purpose=chat&resume=endpoint-a&agentId=agent-a&reconnect=1");
+    await render("provider=slack&purpose=chat&resume=endpoint-a&agentId=agent-a");
     await openAgentStep();
     // The panel owns the reinstall action while on the Choose-agent step.
     const reinstall = [...container.querySelectorAll("button")]
@@ -223,6 +275,7 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     // The reinstall lives on the Connect step, which is where it must land.
     expect(container.textContent).toContain("Connect to Slack");
     expect(container.textContent).not.toContain("Which agent do you want to chat with?");
+    expect(container.querySelector('[data-testid="location"]')?.textContent).toContain("reconnect=1");
   });
 
   it("shows the saved request and a pending prompt for a changed installed agent", async () => {

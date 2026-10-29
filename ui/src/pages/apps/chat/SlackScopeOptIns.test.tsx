@@ -123,6 +123,17 @@ describe("SlackScopeOptIns", () => {
     expect(button("Reinstall in Slack")).toBeUndefined();
   });
 
+  it("describes each checkbox with its current dynamic status and scope help", async () => {
+    for (const installed of [[], ["file_upload"]] as SlackOptInScopeGroup[][]) {
+      await render({ idPrefix: prefix("accessible"), value: ["file_upload"], installed });
+      const box = checkboxes("accessible")[2]!;
+      const descriptions = box.getAttribute("aria-describedby")!.split(" ")
+        .map(id => document.getElementById(id)?.textContent).join(" ");
+      expect(descriptions).toContain("files:write");
+      expect(descriptions).toContain(installed.length ? "Enabled" : "Requested — reinstall to activate");
+    }
+  });
+
   it("prompts a managed reinstall once the request differs from the install", async () => {
     const onReconnect = vi.fn();
     await render({
