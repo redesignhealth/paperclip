@@ -13,6 +13,7 @@ import {
   getAppDefinitionForUrl,
   getConnectableAppDefinition,
   getAppStoreDefinition,
+  isAppAvailableForCompanyVisibility,
   getRecommendedConnectionMethod,
   offRiskLevelsFromDefaults,
   recommendedDefaultsForApp,
@@ -855,6 +856,29 @@ describe("AppDefinition catalog", () => {
     expect(appSupportsCatalogSetup(granola)).toBe(true);
     expect(offRiskLevelsFromDefaults(recommendedDefaultsForApp(granola, method.key)))
       .toEqual(new Set(["write", "destructive"]));
+    expect(granola.companyVisibility).toEqual(["private"]);
+  });
+  it("restricts Granola to private companies and fails closed on unclassified companies", () => {
+    const granola = getConnectableAppDefinition("granola")!;
+    expect(isAppAvailableForCompanyVisibility(granola, "private")).toBe(true);
+    expect(isAppAvailableForCompanyVisibility(granola, "shared")).toBe(false);
+    expect(isAppAvailableForCompanyVisibility(granola, null)).toBe(false);
+    expect(isAppAvailableForCompanyVisibility(granola, undefined)).toBe(false);
+  });
+  it("leaves apps without a company visibility restriction available everywhere", () => {
+    const linear = getConnectableAppDefinition("linear")!;
+    expect(linear.companyVisibility).toBeUndefined();
+    expect(isAppAvailableForCompanyVisibility(linear, "private")).toBe(true);
+    expect(isAppAvailableForCompanyVisibility(linear, "shared")).toBe(true);
+    expect(isAppAvailableForCompanyVisibility(linear, null)).toBe(true);
+  });
+  it("accepts an optional company visibility allowlist in the definition schema", () => {
+    const granola = APP_DEFINITIONS.find((app) => app.slug === "granola")!;
+    expect(appDefinitionSchema.parse(granola).companyVisibility).toEqual(["private"]);
+    expect(appDefinitionSchema.safeParse({ ...granola, companyVisibility: [] }).success).toBe(false);
+    expect(appDefinitionSchema.safeParse({ ...granola, companyVisibility: ["team"] }).success).toBe(false);
+    const { companyVisibility: _unused, ...withoutField } = granola;
+    expect(appDefinitionSchema.safeParse(withoutField).success).toBe(true);
   });
   it("defaults explicit read/write capability groups to their write-capable method", () => {
     const drive = APP_DEFINITIONS.find((app) => app.slug === "google-drive")!;

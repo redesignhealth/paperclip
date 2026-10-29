@@ -275,6 +275,8 @@ export {
   appSupportsAutomaticOAuth,
   connectionMethodAcceptsCustomerOAuthClient,
   connectionMethodRequiresConfiguration,
+  isAppAvailableForCompanyVisibility,
+  appCompanyVisibilityUnavailableReason,
   connectionMethodSupportsCatalogSetup,
   connectionMethodSupportsAutomaticOAuth,
   credentialConfigPath,

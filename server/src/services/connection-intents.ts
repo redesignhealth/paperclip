@@ -39,6 +39,7 @@ import {
   type ConnectionSearchResultItem,
   type AggregatorServiceDefinition,
   getAppStoreDefinition,
+  isAppAvailableForCompanyVisibility,
   type ConnectionIntentInteraction,
   type ConnectionIntentSetupOptions,
   type ConnectionRequestResult,
@@ -47,6 +48,7 @@ import {
   type ToolConnection,
   type AiConnectionAttribution,
   type AiConnectionBinding,
+  type CompanyVisibility,
 } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
@@ -56,6 +58,11 @@ import { lockToolConnectionRuntimeInputs, toolAccessService } from "./tool-acces
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import {
+  appCompanyVisibilityDenial,
+  connectionCompanyVisibilityDenial,
+  loadCompanyVisibility,
+} from "./app-company-visibility.js";
 
 type ConnectionRunClaims = Pick<RuntimeToolsTokenClaims, "sub" | "company_id" | "run_id" | "responsible_user_id">;
 
@@ -376,7 +383,14 @@ export function connectionIntentService(db: Db) {
     } } }).assignedInboxes(companyId, agentId);
   }
 
-  async function resolveService(service: string, companyId: string, userId: string, agentId: string, purpose?: "ai" | "channel") {
+  async function resolveService(
+    service: string,
+    companyId: string,
+    userId: string,
+    agentId: string,
+    purpose?: "ai" | "channel",
+    companyVisibility?: CompanyVisibility | null,
+  ) {
     if (!service.startsWith("connection:")) {
       const app = getAppStoreDefinition(service);
       if (!app) throw notFound("Connection service was not found");
@@ -386,7 +400,12 @@ export function connectionIntentService(db: Db) {
       const methods = purpose === "ai" ? getAvailableConnectionMethods(app).filter(method => method.transport === "runtime_auth")
         : purpose === "channel" ? getAvailableConnectionMethods(app).filter(method => method.purpose === "channel")
         : availableToolConnectionMethods(app);
-      return { ...app, available: app.availability?.available !== false,
+      const visibility = companyVisibility === undefined
+        ? await loadCompanyVisibility(db, companyId)
+        : companyVisibility;
+      const available = app.availability?.available !== false
+        && isAppAvailableForCompanyVisibility(app, visibility);
+      return { ...app, available,
         searchCapabilities: methods.map((method) =>
           `${method.whenToUse} ${method.capabilityProfile?.label ?? ""} ${method.capabilityProfile?.description ?? ""}`).join(" "),
         methods: methods.map((method) => ({
@@ -408,7 +427,10 @@ export function connectionIntentService(db: Db) {
     return {
       slug: service, name: connection.name, description: application.description, searchCapabilities: "",
       branding: { logoUrl: undefined, darkLogoUrl: undefined },
-      available: connection.enabled,
+      available: connection.enabled
+        && connectionCompanyVisibilityDenial(connection.config ?? {}, companyVisibility === undefined
+          ? await loadCompanyVisibility(db, companyId)
+          : companyVisibility) === null,
       methods: [{ key: "configured", label: "Use configured connection", auth:
         connection.authKind === "oauth" ? "oauth" as const : connection.authKind === "none" ? "none" as const : "api_key" as const }],
       source: "configured" as const,
@@ -418,8 +440,9 @@ export function connectionIntentService(db: Db) {
   async function search(claims: ConnectionRunClaims, query: string, options: { retryProviderChoice?: boolean } = {}): Promise<ConnectionsSearchResult> {
     const { run, agent, issue } = await loadRunContext(claims);
     const settings = await instanceSettingsService(db).getExperimental();
-    const [company] = await db.select({ prefix: companies.issuePrefix }).from(companies).where(eq(companies.id, run.companyId));
+    const [company] = await db.select({ prefix: companies.issuePrefix, visibility: companies.visibility }).from(companies).where(eq(companies.id, run.companyId));
     if (!company) throw notFound("Company was not found");
+    const companyVisibility = company.visibility ?? null;
     const explicit = explicitAggregatorQuery(query);
     const serviceQuery = explicit?.serviceQuery ?? query;
     const preparedQuery = prepareConnectionSearch(serviceQuery);
@@ -435,7 +458,7 @@ export function connectionIntentService(db: Db) {
         && connection.status !== "archived").map((connection) => `connection:${connection.id}`)];
     for (const service of services) {
       let app;
-      try { app = await resolveService(service, run.companyId, run.responsibleUserId!, agent.id); }
+      try { app = await resolveService(service, run.companyId, run.responsibleUserId!, agent.id, undefined, companyVisibility); }
       catch (error) { if (service.startsWith("connection:") && (error as { status?: number }).status === 404) continue; throw error; }
       const definition = getAppStoreDefinition(service);
       if (definition) {
@@ -469,18 +492,26 @@ export function connectionIntentService(db: Db) {
       const { score, nameScore } = scoreConnectionSearch(preparedQuery, [app.slug, app.name],
         `${app.description ?? ""} ${app.searchCapabilities} ${catalog.map(tool => `${tool.toolName} ${tool.description ?? ""}`).join(" ")}`);
       if (!score) continue;
-      const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
-        responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory });
+      const ready = app.available ? await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
+        responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory }) : null;
       const denied = !aiOnly && !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory);
+      // A catalog app that this company may not use at all keeps its row, so
+      // the agent can explain the restriction instead of silently losing it.
+      const catalogDenial = definition
+        ? appCompanyVisibilityDenial(definition, companyVisibility)
+        : null;
+      const unavailableReason = catalogDenial
+        ?? (app.available ? null : "Connection is disabled or unavailable");
       candidates.push({ score, nameScore, item: {
         service, name: app.name, description: app.description ?? null, logoUrl: app.branding.logoUrl ?? null,
         methods: app.methods, source: app.source,
-        state: ready ? "ready" : (denied && !isRemoteMcpConnectorId(service)) || !app.available || !app.methods.length ? "unavailable"
+        state: ready && !catalogDenial ? "ready" : (denied && !isRemoteMcpConnectorId(service)) || !app.available || !app.methods.length || catalogDenial ? "unavailable"
           : matching.length ? "needs_user_action" : "available",
-        reason: ready ? "Connection is installed and usable by this agent" : denied ? "Ask the responsible user to grant this agent access with connection_request" : !app.available ? "Connection is disabled or unavailable"
+        reason: unavailableReason ? unavailableReason : ready ? "Connection is installed and usable by this agent" : denied
+          ? "Ask the responsible user to grant this agent access with connection_request"
           : matching.some((connection) => isToolConnectionAttentionHealth(connection.healthStatus)) ? "Connection needs attention"
           : matching.length ? "Review identity and access for this agent" : "Connect this service to continue",
-        connectionId: ready?.id ?? null,
+        connectionId: ready && !catalogDenial ? ready.id : null,
       }});
     }
     const publicMatches = searchAggregatorServices(preparedQuery);

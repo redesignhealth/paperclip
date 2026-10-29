@@ -15,6 +15,9 @@
   ],
   "docsUrl": "https://docs.granola.ai/help-center/sharing/integrations/mcp",
   "redirectConstraints": "https-or-loopback-http",
+  "companyVisibility": [
+    "private"
+  ],
   "methods": [
     {
       "key": "mcp-oauth",
