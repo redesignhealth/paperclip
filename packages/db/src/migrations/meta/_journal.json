@@ -2661,6 +2661,13 @@
       "when": 1793232704845,
       "tag": "0381_upstream_sync_events",
       "breakpoints": true
+    },
+    {
+      "idx": 382,
+      "version": "7",
+      "when": 1793235810488,
+      "tag": "0382_upstream_sync_worker_state",
+      "breakpoints": true
     }
   ]
 }

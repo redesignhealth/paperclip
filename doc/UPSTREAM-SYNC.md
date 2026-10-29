@@ -58,8 +58,9 @@ Tables:
   (unique), `upstream_pr`, `title`, `body`, `author`, `files[]`, `upstream_merged_at`,
   `category`, `summary`, `classified_by`, `fork_owned_hits[]`, `touches_migrations`,
   `fork_pr`, `path` (`clean|conflict`), `argus_verdict`, `merged_at`, `prod_pinned_at`,
-  `status` (`pending|in_progress|merged|skipped|conflict|needs-human|reverted`), `skip_reason`,
-  `reverts_sha`, `alert_state`, `alerted_at`, `created_at`, `updated_at`.
+  `status` (`pending|claimed|assessed|skipped|in_review|integrated|promoted|needs_human|failed`),
+  `skip_reason`, `reverts_sha`, `alert_state`, `alerted_at`, `created_at`, `updated_at`, plus the
+  worker columns from migration `0382` (below).
 - `upstream_sync_state`: `upstream_synced_marker`, `detector_paused`, ops-alert episode flags.
 - `upstream_sync_alerts`: alert outbox with a unique `dedup_key` (exactly-once enqueue;
   delivery is at-least-once — see Alerts).
@@ -79,6 +80,58 @@ Tables:
   and TRUNCATE for everyone, owner included (disable the trigger deliberately if you truly must).
   A worker should tag its work with `SET upstream_sync.run_ref = '<run issue id>'` per run so
   each event ties back to a Paperclip run.
+
+- **Worker state on `upstream_sync_log` (migration `0382`, RED-583).** The detector only ever
+  writes `pending` rows. The sync worker adds, per row: a claim/lease (`claimed_by` = Paperclip
+  run id, `claimed_at`, `lease_expires_at`, `attempt`), the merge evidence (`integration_sha`,
+  `resolution_delta_sha256` — non-null exactly for a conflict resolution — `review_pr`,
+  `promote_pr`, `master_sha`) and the review trail (`argus_verdict`, `argus_rounds`, an
+  append-only jsonb array of `{round, sha, verdict, ...}`). Statuses and legal moves:
+
+  ```
+  pending -> claimed -> assessed -> integrated (clean path) -> promoted
+                    \-> skipped      \-> in_review (conflict path) -> integrated
+  any of claimed/assessed/in_review/integrated -> needs_human | failed
+  claimed -> pending (release)       claimed -> claimed (extend, or reclaim after expiry)
+  ```
+
+  Worker fields: `claimed_by` is the Paperclip run id holding the lease, `claimed_at` its start,
+  `lease_expires_at` when another run may reclaim it (set exactly while `claimed`), `attempt` the
+  claim count (starts at 0, +1 per claim or reclaim).
+
+  Claim with one statement (`UPDATE ... WHERE id = (SELECT id ... WHERE status='pending' OR
+  (status='claimed' AND lease_expires_at < now()) ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)`
+  setting `attempt = attempt + 1`); a crashed run is reclaimed after its lease, and the
+  reclaim is an audited event. Row-level evidence is enforced by CHECK constraints (a lease
+  exists exactly while `claimed`; `assessed`+ needs `path`; `integrated`+ needs `integration_sha`
+  and a delta iff the path is `conflict`; `in_review` needs `review_pr`; `promoted` needs
+  `promote_pr` and `master_sha`; `skipped` needs `skip_reason`; sha/hash formats). The
+  `upstream_sync_log_guard` trigger enforces the rest: only the edges above; `id`/`upstream_sha`
+  immutable; `attempt` moves only on a claim, by one; a live lease cannot be taken or shortened;
+  evidence columns are write-once; `argus_rounds` is append-only; `promoted` and `skipped` rows
+  are final apart from alert bookkeeping and `prod_pinned_at`; and an `integrated` conflict
+  resolution needs `argus_verdict = 'approve'` with the last round approving that exact
+  `integration_sha`. **Nothing leaves `needs_human`/`failed` without a human**: a login that is a
+  member of the `upstream_sync_human` role (NOLOGIN, created by the migration) bypasses the
+  guard, and the override is recorded in `upstream_sync_events` under that login. Note that
+  every worker run shares the `upstream_sync_runner` login, so the guard cannot tell one run
+  from another; per-run attribution is `upstream_sync.run_ref` in the events.
+  The `upstream_sync_human` role is cluster-global. If the migration login lacks `CREATEROLE`, the
+  migration continues with a NOTICE and the guard has no override until an operator runs
+  `CREATE ROLE upstream_sync_human NOLOGIN;` and grants it to the human logins that may override.
+  The rh-paperclip bootstrap `SELECT` grant on `upstream_sync_events` is redundant with the
+  migration's grant and can be dropped.
+  `TRUNCATE` on `upstream_sync_log` is blocked for everyone (a `BEFORE TRUNCATE` trigger), as
+  it already is on events.
+
+  Runner privileges (stated in the migration as well as in the rh-paperclip bootstrap script,
+  and a no-op where the login does not exist): `SELECT, INSERT, UPDATE` on `upstream_sync_log`;
+  `SELECT` only on `upstream_sync_events`; no `DELETE`/`TRUNCATE`/`TRIGGER`/`REFERENCES` on
+  either; and it must not own either table (an owner can disable or drop the triggers). The
+  migration aborts if the runner owns either table. The audit and guard functions have
+  `EXECUTE` revoked from `PUBLIC`. `__tests__/worker-state.test.mjs` proves this against real
+  logins: the runner cannot update/delete/truncate events, cannot `DISABLE TRIGGER`/`DROP
+  TRIGGER`, cannot change ownership, and cannot defeat the guard.
 
 These tables are **global** (no `company_id`) and are intentionally not RLS targets:
 the ledger is instance-level metadata, so there is no tenant whose rows could leak
@@ -440,7 +493,7 @@ Run from `<checkout>/tools/upstream-sync` (`cd <checkout>/tools/upstream-sync &&
 - **Move the marker**: `node cli.mjs marker set <sha>` (validated against upstream; must exist). The stored
   marker overrides `UPSTREAM_SYNC_INITIAL_MARKER`. Moving it forward skips the commits in between (they are not
   inserted). Moving it backward re-inserts only commits not already in the ledger. In P1+ the worker advances the
-  marker only to the highest SHA where every earlier row is `merged` or `skipped`; do not move it by hand while
+  marker only to the highest SHA where every earlier row is `promoted` or `skipped`; do not move it by hand while
   the worker is running. The detector refuses to run if the marker is not an ancestor of upstream `master`
   (force-push); fix with `marker set`.
 - **Detector failed with "malformed git log record"**: the run fails closed rather than skipping a

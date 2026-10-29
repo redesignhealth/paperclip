@@ -77,7 +77,7 @@ test("ledger: idempotent detector insert, exactly-once alert enqueue (at-least-o
     await db.query("UPDATE upstream_sync_log SET created_at = now() - interval '49 hours' WHERE upstream_pr = 1");
     const o3 = await opsAlerts(db, lowCfg);
     assert.deepEqual(o3.fired, ["oldest_pending"]);
-    await db.query("UPDATE upstream_sync_log SET status='merged'");
+    await db.query("UPDATE upstream_sync_log SET status='failed'");
     await opsAlerts(db, lowCfg);
     await db.query("UPDATE upstream_sync_log SET status='pending'");
     const o4 = await opsAlerts(db, lowCfg);

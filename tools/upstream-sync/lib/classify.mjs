@@ -132,7 +132,7 @@ const BATCH = 10;
 export async function classifyPending(db, cfg, { fetchImpl = fetch, log = console.error, budget = null } = {}) {
   const { rows } = await db.query(
     `SELECT upstream_sha AS sha, title, body, author, files FROM upstream_sync_log
-     WHERE category IS NULL ORDER BY id`,
+     WHERE category IS NULL AND status NOT IN ('skipped', 'promoted') ORDER BY id`,
   );
   if (rows.length === 0) return { classified: 0, llm: 0, heuristic: 0, deferred: 0 };
   const stats = { classified: 0, llm: 0, heuristic: 0, deferred: 0 };
@@ -142,7 +142,7 @@ export async function classifyPending(db, cfg, { fetchImpl = fetch, log = consol
   const apply = async (c, r, by) => {
     await db.query(
       `UPDATE upstream_sync_log SET category=$2, summary=$3, classified_by=$4, classified_at=now(), updated_at=now()
-       WHERE upstream_sha=$1 AND category IS NULL`,
+       WHERE upstream_sha=$1 AND category IS NULL AND status NOT IN ('skipped', 'promoted')`,
       [c.sha, r.category, r.summary, by],
     );
     stats.classified++;
