@@ -201,6 +201,23 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     expect(serialized).not.toContain(claims.sub);
   });
 
+  it("marks Granola unavailable to an unclassified company and keeps other apps", async () => {
+    // This fixture company has no visibility, which is the fail-closed case:
+    // NULL must not be treated as private.
+    const service = connectionIntentService(db);
+    expect((await service.search(claims, "granola")).results).toEqual([
+      expect.objectContaining({
+        service: "granola",
+        state: "unavailable",
+        reason: "Granola is only available in private companies.",
+        connectionId: null,
+      }),
+    ]);
+    // An app without a company visibility allowlist is unaffected.
+    expect((await service.search(claims, "notion")).results[0])
+      .toMatchObject({ state: "available" });
+  });
+
   it("discovers GitHub review bots independently from chat connectors", async () => {
     const settings = instanceSettingsService(db);
     const previous = await settings.getExperimental();

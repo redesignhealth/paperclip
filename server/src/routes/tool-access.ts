@@ -9,6 +9,10 @@ import { agents, companies, connectionGrants, issueThreadInteractions, toolConne
 import { and, eq, or } from "drizzle-orm";
 import { isArcanaStaticTemplate, isDefaultMcpSeed } from "../services/default-mcp-spec.js";
 import {
+  loadCompanyVisibility,
+  withCompanyVisibilityAvailability,
+} from "../services/app-company-visibility.js";
+import {
   APP_STORE_DEFINITIONS,
   isMemoryConnectorId,
   GITHUB_CONNECTOR_PROFILES,
@@ -844,6 +848,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
         : [];
     const vercelConnect = vercelConnectIntegrationStatus();
     const { enableMemoryConnectors } = await instanceSettingsService(db).getExperimental();
+    const companyVisibility = await loadCompanyVisibility(db, companyId);
     let oauthCallbackUrl: string | undefined;
     try {
       // Setup must display the callback used by its initiating POST. Provider
@@ -875,7 +880,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
         },
       },
       apps: [...APP_STORE_DEFINITIONS.filter((app) => (enableMemoryConnectors || !isMemoryConnectorId(app.slug))).map((app) =>
-        appWithPaperclipCloudConnectorAvailability(app, advertisedProfiles)
+        withCompanyVisibilityAvailability(appWithPaperclipCloudConnectorAvailability(app, advertisedProfiles), companyVisibility)
       ), ...await aiConnectionRouterService(db).catalog()],
     });
   });
