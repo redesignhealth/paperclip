@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
-import { execute } from "./execute.js";
+import { buildPrompt, execute } from "./execute.js";
 import { sessionCodec } from "./index.js";
 
 const SESSION_ID = "20261006_200000_abcdef";
@@ -12,6 +12,7 @@ const INSTRUCTIONS = "Synthetic governance marker: request approval before gover
 
 interface Invocation {
   args: string[];
+  stdin: string | null;
   systemPrompt: string | null;
   runId: string;
 }
@@ -31,8 +32,10 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
     await fs.writeFile(command, `#!${process.execPath}
 const fs = require("node:fs");
 const args = process.argv.slice(2);
+const stdin = args.includes("--query-file") ? fs.readFileSync(0, "utf8") : null;
 fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   args,
+  stdin,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
   runId: process.env.PAPERCLIP_RUN_ID,
 }) + "\\n");
@@ -87,8 +90,24 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   }
 
   function query(invocation: Invocation): string {
-    return invocation.args[invocation.args.indexOf("-q") + 1];
+    return invocation.stdin ?? invocation.args[invocation.args.indexOf("-q") + 1];
   }
+
+  it.each(["x".repeat(150_000), "経験🧠".repeat(10_000)])(
+    "delivers a large prompt intact through a real child pipe (%#)", async (body) => {
+      const ctx = context();
+      ctx.context.paperclipTaskMarkdownAssignment = body;
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(0);
+      const [invocation] = await invocations();
+      expect(invocation.args.slice(0, 3)).toEqual(["chat", "--query-file", "-"]);
+      expect(invocation.args).not.toContain("-q");
+      expect(invocation.stdin).toBe(buildPrompt(ctx, ctx.config));
+      expect(invocation.stdin).toContain(body);
+      expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
+      expect(invocation.args.every((arg) => Buffer.byteLength(arg) < 65_536)).toBe(true);
+    },
+  );
 
   it.each([false, true])("keeps instructions out of fresh and resumed user turns (conversation=%s)", async (conversationMode) => {
     const fresh = context();

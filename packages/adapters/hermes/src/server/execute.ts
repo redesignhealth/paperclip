@@ -1491,7 +1491,10 @@ export async function execute(
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) !== false;
-  const args: string[] = ["chat", "-q", prompt];
+  const promptViaStdin = Buffer.byteLength(prompt, "utf8") >= 64 * 1024;
+  const args: string[] = promptViaStdin
+    ? ["chat", "--query-file", "-"]
+    : ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
   // Never pass a placeholder: omit -m so Hermes uses its configured default.
@@ -2068,6 +2071,7 @@ export async function execute(
     const result = await runChildProcess(ctx.runId, launchCommand, finalArgs, {
       cwd: launchCwd,
       env: finalEnv,
+      stdin: promptViaStdin ? prompt : undefined,
       timeoutSec,
       graceSec,
       onLog: wrappedOnLog,

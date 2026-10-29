@@ -1918,8 +1918,12 @@ bodies and Hermes prompt-template JSON variables remain supported.
 
 This removes the duplicate environment entry, not every possible `E2BIG` cause.
 Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
-Pi, and Hermes) still have argument-size limits. ACP turns, SDK requests, and
-CLI paths that use stdin avoid that separate limit for the wake prompt.
+and Pi) still have argument-size limits. Hermes sends prompts of 64 KiB or more
+(UTF-8 bytes) through `hermes chat --query-file -` on stdin, preserving the full
+prompt; smaller prompts retain `-q` compatibility. This requires the query-file
+support present in the pinned Hermes source. ACP turns, SDK requests, and CLI
+paths that use stdin avoid that separate limit for the wake prompt. Large
+instruction or custom environment entries can still hit environment-size limits.
 
 ## Adding a native Runner harness
 
