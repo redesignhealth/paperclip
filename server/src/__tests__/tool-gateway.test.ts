@@ -112,11 +112,17 @@ function resetManagedInstallCheckMock() {
   vi.mocked(managedInstallCheck).mockReset().mockImplementation(actualDefaultMcpInstallGate.managedInstallCheck);
 }
 
-async function createCompany(db: Db) {
+async function createCompany(
+  db: Db,
+  visibility: "private" | "shared" | null = "private",
+) {
   return db
     .insert(companies)
     .values({
       name: `Gateway ${randomUUID()}`,
+      // Every company is created with a visibility (TECH-7390); private keeps
+      // the pre-existing behavior for apps that do not restrict it.
+      visibility,
       issuePrefix: `TG${randomUUID().slice(0, 6).toUpperCase()}`,
     })
     .returning()
@@ -2828,6 +2834,160 @@ rl.on("line", (line) => {
     }
   });
 
+
+  // Native Granola is only available in private companies. The gateway check
+  // runs in resolveConnectedRemoteTool, which every agent path reaches before
+  // credentials or the upstream, so it also covers an existing non-draft row.
+  it.each(["shared", null] as const)(
+    "refuses a Granola tool call in a %s company before any upstream request",
+    async (visibility) => {
+      const company = await createCompany(db, visibility);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const fake = await startFakeRemoteMcpServer(async () => {
+        throw new Error("Granola must not be reached in a non-private company");
+      });
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "granola",
+          connectionName: "Granola (visibility gate)",
+          toolName: "list_meetings",
+          url: fake.url,
+          connectionConfig: {
+            sourceTemplateKey: "granola",
+            connectionMethodKey: "mcp-oauth",
+            identityModel: "personal_only",
+          },
+        });
+        const { secret } = await writeConnectionCredential(db, {
+          companyId: company.id, connectionName: "Granola", configPath: "oauth.access_token",
+          label: "Access token", value: `granola-token-${randomUUID()}`, ownerUserId: responsibleUserId,
+        });
+        const refs = [{ secretId: secret.id, versionSelector: "latest", configPath: "oauth.access_token" }];
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id, connectionId: remoteTool.connection.id,
+          kind: "user", subjectUserId: responsibleUserId, status: "active", credentialSecretRefs: refs,
+        }).returning();
+        await db.insert(companySecretBindings).values({
+          companyId: company.id, secretId: secret.id, targetType: "connection_grant",
+          targetId: grant!.id, configPath: "oauth.access_token",
+        });
+        await syncConnectionCredentialBindings(db, remoteTool.connection, refs);
+        await allowAllToolsForAgent(db, company.id, agent.id);
+        const gateway = createTestToolGatewayService(db);
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+        expect(connectedTool).toBeTruthy();
+        const error = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        }).catch((err: unknown) => err);
+        expectGatewayError(error, 403, "app_unavailable_for_shared_company");
+        expect((error as ToolGatewayHttpError).message)
+          .toBe("Granola is only available in private companies.");
+        expect(fake.requests).toHaveLength(0);
+      } finally {
+        await fake.close();
+      }
+    },
+  );
+
+  it("still allows a Granola tool call in a private company", async () => {
+    const company = await createCompany(db, "private");
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const responsibleUserId = `user-${randomUUID()}`;
+    await createActiveMember(db, company.id, responsibleUserId);
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+      .where(eq(heartbeatRuns.id, run.id));
+    const accessToken = `granola-personal-${randomUUID()}`;
+    const { secret } = await writeConnectionCredential(db, {
+      companyId: company.id,
+      connectionName: "Granola private",
+      configPath: "oauth.access_token",
+      label: "Access token",
+      value: accessToken,
+      ownerUserId: responsibleUserId,
+    });
+    const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+      expect(fakeRequest.headers.authorization).toBe(`Bearer ${accessToken}`);
+      return {
+        body: {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "ok" }], structuredContent: { meetings: [] } },
+        },
+      };
+    });
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "granola-private",
+        connectionName: "Granola (private)",
+        toolName: "list_meetings",
+        // The pinned source label is what identifies Granola here; the URL is
+        // the local fixture so the allowed path can prove it reaches upstream.
+        url: fake.url,
+        connectionConfig: {
+          sourceTemplateKey: "granola",
+          connectionMethodKey: "mcp-oauth",
+          identityModel: "personal_only",
+        },
+      });
+      const [grant] = await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        kind: "user",
+        subjectUserId: responsibleUserId,
+        status: "active",
+        credentialSecretRefs: [{
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.access_token",
+          required: true,
+          label: "Access token",
+        }],
+      }).returning();
+      await db.insert(companySecretBindings).values({
+        companyId: company.id,
+        secretId: secret.id,
+        targetType: "connection_grant",
+        targetId: grant!.id,
+        configPath: "oauth.access_token",
+      });
+      const [connectionRow] = await db.select().from(toolConnections)
+        .where(eq(toolConnections.id, remoteTool.connection.id));
+      await syncConnectionCredentialBindings(db, connectionRow!, [{
+        secretId: secret.id,
+        versionSelector: "latest",
+        configPath: "oauth.access_token",
+        required: true,
+        label: "Access token",
+      }]);
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: {},
+      });
+      expect(result).toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
   // Regression test for a bug distinct from the RLS tenant-scoping fix above:
   // resolveUserGrantAuthHeader called the generic secrets.resolveSecretValue
   // without allowUserSecretScope, so it always threw secret_scope_invalid for

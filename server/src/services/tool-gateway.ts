@@ -140,6 +140,12 @@ import {
   projectedConnectionToolInputSchema,
 } from "./tool-access.js";
 import { assertGoogleChatToolArgumentsSupported, googleChatToolDescription } from "./google-chat-tool-policy.js";
+import {
+  APP_UNAVAILABLE_FOR_COMPANY_VISIBILITY_CODE,
+  appForConnectionConfig,
+  connectionCompanyVisibilityDenial,
+  loadCompanyVisibility,
+} from "./app-company-visibility.js";
 import { assertGmailArchiveToolArgumentsSupported, gmailArchiveToolDescription } from "./gmail-archive-tool-policy.js";
 import { parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import {
@@ -5660,6 +5666,31 @@ export function createToolGatewayService(
     return findOrganizationGrant();
   }
 
+  /**
+   * Single runtime choke point for apps whose AppDefinition limits company
+   * visibility. Every agent path that reaches credentials or the upstream
+   * resolves its connection through this check, and any status is refused --
+   * an existing non-draft connection is not an exemption.
+   */
+  async function assertConnectionCompanyVisibility(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+  ): Promise<void> {
+    if (!appForConnectionConfig(connection.config)?.companyVisibility) return;
+    const denial = connectionCompanyVisibilityDenial(
+      connection.config,
+      await loadCompanyVisibility(db, session.companyId),
+    );
+    if (denial) {
+      throw new ToolGatewayHttpError(
+        403,
+        denial,
+        APP_UNAVAILABLE_FOR_COMPANY_VISIBILITY_CODE,
+        { connectionId: connection.id },
+      );
+    }
+  }
+
   async function resolveConnectedRemoteTool(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
@@ -5712,6 +5743,7 @@ export function createToolGatewayService(
     if (isRetiredComposioConnection(connection)) {
       throw new ToolGatewayHttpError(422, RETIRED_COMPOSIO_MESSAGE, "composio_broker_retired");
     }
+    await assertConnectionCompanyVisibility(session, connection);
     if (!connection.enabled || connection.status !== "active") {
       throw new ToolGatewayHttpError(
         403,
@@ -6284,6 +6316,7 @@ export function createToolGatewayService(
     params?: Record<string, unknown>;
     callerHeaders?: Record<string, string | string[] | undefined>;
   }): Promise<unknown> {
+    await assertConnectionCompanyVisibility(input.session, input.connection);
     if (await isPersonalOnlyConnection(input.session, input.connection)) {
       throw new ToolGatewayHttpError(
         422,
