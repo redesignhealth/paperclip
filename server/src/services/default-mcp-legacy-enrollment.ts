@@ -216,19 +216,26 @@ export async function enrollLegacyAgentsWithDefaultMcp(
     agentId?: string;
     /** Enroll the board identity without creating a private brain. Preserve ordinary access. */
     commsOnly?: boolean;
+    /** Comms-only: leave private-brain setup absent instead of recording an exclusion. */
+    arcanaBrainPolicy?: "exclude" | "preserve";
     limit?: number;
     afterId?: string;
     dryRun?: boolean;
     env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<LegacyEnrollmentReport> {
+  if (options.arcanaBrainPolicy !== undefined && !options.commsOnly) {
+    throw new Error("arcanaBrainPolicy requires comms-only enrollment");
+  }
   const env = options.env ?? process.env;
   if (!isDefaultMcpSpecEnabled(env)) {
     return { scanned: 0, outcomes: [], nextCursor: null };
   }
   const limit = options.agentId ? 1 : Math.max(1, Math.min(options.limit ?? DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT, DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT));
   const scope = readDefaultMcpTemplateScope();
-  const spec = DEFAULT_MCP_SPEC;
+  const spec = options.commsOnly && options.arcanaBrainPolicy === "preserve"
+    ? DEFAULT_MCP_SPEC.filter((entry) => entry.key !== "arcana-brain")
+    : DEFAULT_MCP_SPEC;
   const excludedSetupKeys = options.commsOnly
     ? new Set(spec.filter((entry) => entry.setupHook && entry.key !== COMMS_BOARD_ENTRY_KEY).map((entry) => entry.key))
     : undefined;

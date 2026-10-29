@@ -232,6 +232,15 @@ pods ignore it and can enroll the whole company. Never send a targeted request t
 the legacy endpoint, including during a mixed-version rollout; use only the new
 path for a single agent. Existing managed snapshots are returned as `already_enrolled`
 and left unchanged; this operation does not remove an existing brain.
+To add comms while leaving the private-brain choice undecided, explicitly send
+`arcanaBrainPolicy: "preserve"` on the same targeted endpoint. This omits the
+Arcana entry instead of recording an exclusion. No brain or memory routine is
+created. A later, explicitly authorized brain backfill can still add it. Existing
+managed snapshots, including existing brain bindings and exclusions, remain
+unchanged in either mode. Omitting the option (or sending `"exclude"`) retains
+the personal-agent exclusion behavior described above. Older servers reject
+this unknown option rather than silently selecting a brain policy.
+
 If no verified creator is recorded, the new path can initialize the unowned
 comms entry and reports `ownerAssignmentRequired: true`. It does not choose a
 company owner or mint a credential. The operator then uses the existing
