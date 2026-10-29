@@ -580,6 +580,27 @@ sweep (every 60 seconds) performs the registration with the same checks as for a
 `agent_not_in_company` (also reported for an id from another company), `owner_ineligible`, `assign_error`. Activity event:
 `agent.default_mcp.comms_owner_assigned` (entry key and owner user id only). A re-run reports `already_has_owner`.
 
+## Following an owner reassignment (comms-owner-sync)
+
+A human-approved reassignment (agent-comms-approvals `/ownership/reassign`, TECH-7389) changes the owner in the ownership registry and
+on the board's agents row and leaves the credential unchanged, but the entry's frozen `ownerUserId` still names the old owner. It is
+read when an agent hires another agent (the child inherits it while that user is an active member), when setup is re-run and when a
+credential is rotated. `server/src/services/comms-owner-sync.ts` makes it follow the registry:
+
+`POST /companies/:companyId/default-mcp/comms-owner-sync` (connection manager, board only). Body: `dryRun` (default `true`), `confirm`,
+`limit` (1-25), `afterId`. A real run needs `dryRun: false` and `"confirm": "sync-comms-board-owner"`. The response is
+`{ dryRun, scanned, outcomes: [{ agentId, companyId, result, registrySub }], counts, nextCursor }`: counts, agent ids and registry subs only.
+
+**The new owner comes only from the registry** (`GET /ownership/{baseSub}`, which needs `ownership:read` on Paperclip's ownership
+token), never from the request. Per ready, dedicated entry with a bound managed secret: an inactive or unknown sub, a rejected token or
+a failed read changes nothing; an owner whose email already matches (case-insensitive) is `already_current`; otherwise the registry
+email must resolve to exactly one user with a verified email and an ACTIVE membership of this company (`registry_owner_not_member`
+or `registry_owner_ambiguous` change nothing). The write sets only `ownerUserId` and restates in its own `WHERE` that the entry is
+still ready, still bound to the same managed secret and still holds the owner that was read (`lost_race` otherwise). A census makes
+the same reads and writes nothing. With no provisioner configuration no call is made. Activity event:
+`agent.default_mcp.comms_owner_synced` (entry key, `fromUserId`, `toUserId`; no email). The company template credential's recorded
+owner is not touched here.
+
 ## Reissuing the comms-board identity after a `board_conflict`
 
 Setup registers an agent on the board under `paperclip-agent-<agentId>` (display name `<name> (<first 8 of the agent id>)`) and never
