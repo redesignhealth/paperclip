@@ -501,7 +501,7 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(fetchMock.calls.mint).toHaveLength(1);
   });
 
-  it("hiring a setup agent with its own metadata keeps the server-managed defaultMcp state", async () => {
+  it.each([[{ note: "from the hire body" }], [null]])("hiring a setup agent with metadata %j keeps the server-managed defaultMcp state", async (hireMetadata) => {
     const companyId = await seedCompany("private");
     const ownerId = await seedOwner(companyId);
     await seedBothTemplates(companyId);
@@ -515,12 +515,12 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     const before = await entryOf(setupId);
     expect(before.setup.state).toBe("ready");
 
-    await agentService(db).create(companyId, { ...base, metadata: { note: "from the hire body" } } as never, { setupAgentId: setupId, claudeLogin: { storedSessionId: null, ownerUserId: ownerId } } as never);
+    await agentService(db).create(companyId, { ...base, metadata: hireMetadata } as never, { setupAgentId: setupId, claudeLogin: { storedSessionId: null, ownerUserId: ownerId } } as never);
     await waitForScheduledDefaultMcpSetups();
 
     expect(await entryOf(setupId)).toEqual(before);
     expect(fetchMock.calls.register).toHaveLength(1);
-    expect((await rowOf(setupId)).metadata).toMatchObject({ note: "from the hire body" });
+    if (hireMetadata) expect((await rowOf(setupId)).metadata).toMatchObject(hireMetadata);
   });
 
   it("a restarted setup rotates the agent's own leftover token secret instead of failing on the key", async () => {
