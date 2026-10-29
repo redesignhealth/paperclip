@@ -414,8 +414,8 @@ export function InviteLandingPage() {
   // account that structurally cannot accept the invite. Handoff invites therefore authenticate
   // through SSO only (approved decision D2).
   const handoffRequiresSso = ownerHandoff && requiresHumanAccount;
-  // Fetched for every invite that needs a human sign-in (the ordinary invite offers SSO beside
-  // the password form) and for the unverified-email panel below, which is shown to a *signed-in*
+  // Fetched for every invite that needs a human sign-in (an ordinary invite goes SSO-only when
+  // providers exist) and for the unverified-email panel below, which is shown to a *signed-in*
   // user and offers the same providers as the way back into a verified account.
   const ssoProvidersQuery = useQuery({
     queryKey: ["auth", "sso-providers"],
@@ -425,9 +425,10 @@ export function InviteLandingPage() {
   });
   const ssoProviders = ssoProvidersQuery.data?.providers ?? [];
   const hasSsoProviders = ssoProviders.length > 0;
-  // An ordinary invite signs in through SSO only whenever the instance has SSO configured, matching
-  // the sign-in page. While the provider list is still loading we also hold back the password form
-  // so it doesn't flash up and then vanish.
+  // An ordinary invite signs in through SSO only whenever the instance has any SSO provider
+  // configured. This is deliberately stricter than the sign-in page, which keeps password sign-in
+  // for existing accounts unless `disablePasswordAuth` is set. While the provider list is still
+  // loading we also hold back the password form so it doesn't flash up and then vanish.
   const inviteRequiresSso =
     requiresHumanAccount && !ownerHandoff && (ssoProvidersQuery.isLoading || hasSsoProviders);
 
@@ -719,7 +720,9 @@ export function InviteLandingPage() {
                     ? "Review the invite details, then submit the agent information below to start the join request."
                     : handoffRequiresSso
                       ? "This owner invite must be accepted from a verified organization account. Sign in with your organization's SSO below."
-                      : requiresHumanAccount
+                      : inviteRequiresSso
+                        ? "Sign in with your organization's SSO to accept this invite."
+                        : requiresHumanAccount
                         ? "Create your Paperclip account first. If you already have one, switch to sign in and continue the invite with the same email."
                         : "Your account is ready. Review the invite details, then accept it to continue."}
                 </p>

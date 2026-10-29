@@ -1327,6 +1327,7 @@ describe("InviteLandingPage", () => {
 
       expect(container.querySelector('[data-testid="invite-inline-auth"]')).toBeNull();
       expect(container.textContent).not.toContain("I already have an account");
+      expect(container.textContent).not.toContain("Create your Paperclip account first");
       const sso = container.querySelector('[data-testid="invite-sso"]');
       expect(sso).not.toBeNull();
       const ssoButton = Array.from(sso!.querySelectorAll("button")).find(
