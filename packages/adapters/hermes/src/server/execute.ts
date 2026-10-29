@@ -1491,7 +1491,7 @@ export async function execute(
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) !== false;
-  const promptViaFile = Buffer.byteLength(prompt, "utf8") >= 64 * 1024;
+  const promptViaFile = Buffer.byteLength(prompt, "utf8") >= 128 * 1024;
   const args: string[] = promptViaFile
     ? ["chat", "--query-file", "-"]
     : ["chat", "-q", prompt];

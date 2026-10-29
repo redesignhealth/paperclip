@@ -1918,7 +1918,7 @@ bodies and Hermes prompt-template JSON variables remain supported.
 
 This removes the duplicate environment entry, not every possible `E2BIG` cause.
 Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
-and Pi) still have argument-size limits. Hermes sends prompts of 64 KiB or more
+and Pi) still have argument-size limits. Hermes sends prompts of 128 KiB or more
 (UTF-8 bytes) through `hermes chat --query-file` using a private per-run file,
 preserving the full prompt; smaller prompts retain `-q` compatibility. The file
 has mode `0600` inside a `0700` temporary directory and is removed on normal

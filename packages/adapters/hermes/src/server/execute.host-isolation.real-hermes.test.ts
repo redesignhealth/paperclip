@@ -131,7 +131,10 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
         command: "hermes", timeoutSec: 120, graceSec: 2, model: "fixture-model", provider: "openrouter",
         env: { OPENROUTER_API_KEY: EXPLICIT_KEY, OPENROUTER_BASE_URL: agent.url },
       },
-      context: { issueId: "issue-g2", wakeReason: "manual" },
+      context: {
+        issueId: "issue-g2", wakeReason: "manual",
+        paperclipTaskMarkdownAssignment: "long-query-start:" + "x".repeat(150_000) + ":long-query-end",
+      },
       authToken: "paperclip-run-token",
       onLog: async (_s: string, c: string) => { logs.push(c); },
       onSpawn: async () => {},
@@ -142,6 +145,7 @@ describeReal("G2: isolated Hermes run against real hermes with ambient host secr
     const everything = JSON.stringify(toolResults) + logs.join("") + JSON.stringify(result);
 
     expect(result.exitCode, logs.join("")).toBe(0);
+    expect(JSON.stringify(agentSeen)).toContain("long-query-start:" + "x".repeat(150_000) + ":long-query-end");
     expect(hostSeen, "host config model server must never be contacted").toHaveLength(0);
     expect(agentSeen.length, logs.join("")).toBeGreaterThan(0);
     expect(agentSeen.every((s) => s.auth === `Bearer ${EXPLICIT_KEY}`)).toBe(true);
