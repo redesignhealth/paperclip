@@ -234,3 +234,112 @@ describe("Slack listing and dispatch agree", () => {
     }
   });
 });
+
+/**
+ * The endpoint selector decides which endpoint is gated, so it must be valid on
+ * its own: a malformed value must never reach a UUID database comparison. The
+ * remaining arguments still parse only after gating, so a disabled tool reports
+ * the permission error first.
+ */
+describe("Slack endpoint selector validation", () => {
+  const binding = { companyId: "company", agentId: "agent", runId: "run", issueId: "issue" };
+
+  function endpointAuthority(endpointId: string, setup: Record<string, unknown>) {
+    return {
+      endpoint: {
+        id: endpointId,
+        companyId: "company",
+        providerAccountId: "T1",
+        botExternalId: "UBOT",
+        allowDirectMessages: true,
+        setup,
+      },
+      conversation: null,
+      slackUserId: "U1",
+      principalId: "principal",
+      userId: "user",
+      deliveryId: null,
+      identityContextId: null,
+      revision: "revision",
+      workMode: "standard",
+      botToken: "xoxb-test",
+    } as unknown as SlackTaskAuthority;
+  }
+
+  it.each([
+    ["not a uuid", "not-a-uuid"],
+    ["a partial uuid", "123e4567-e89b"],
+    ["an empty string", ""],
+    ["an object", { nested: true }],
+    ["a number", 42],
+  ])("rejects %s before resolving authority", async (_label, endpointId) => {
+    const db = {} as Db;
+    // Only the default endpoint is registered: a malformed selector must be
+    // refused before it could be looked up.
+    const unregister = registerSlackTaskAuthority(db, async () => endpointAuthority("11111111-1111-4111-8111-111111111111", {
+      slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"],
+    }));
+    try {
+      await expect(executeSlackTool(db, binding, "slack_upload_file", {
+        endpointId,
+        attachmentId: "00000000-0000-4000-8000-000000000000",
+        channel: "C1",
+        idempotencyKey: "00000000-0000-4000-8000-000000000001",
+      }, vi.fn() as unknown as typeof fetch))
+        .rejects.toMatchObject({ status: 400, details: { code: "slack_endpoint_selector_invalid" } });
+    } finally {
+      unregister();
+    }
+  });
+
+  it("still gates a disabled tool before parsing the rest of its arguments", async () => {
+    // A valid selector, a disabled group, and otherwise invalid arguments: the
+    // permission error must win, because the caller has no access either way.
+    const db = {} as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => endpointAuthority(
+      "22222222-2222-4222-8222-222222222222", { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] },
+    ));
+    try {
+      await expect(executeSlackTool(db, binding, "slack_upload_file", {
+        endpointId: "22222222-2222-4222-8222-222222222222",
+        attachmentId: "not-a-uuid",
+        channel: 12345,
+      }, vi.fn() as unknown as typeof fetch))
+        .rejects.toMatchObject({ status: 403, details: { code: "slack_tool_not_enabled" } });
+    } finally {
+      unregister();
+    }
+  });
+
+  it("gates the endpoint the selector names, not the assigned one", async () => {
+    // Two valid endpoints with different permissions. Only the selector decides
+    // which one is gated, so its state must be the one that is read.
+    const assigned = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const selected = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const permissions: Record<string, Record<string, unknown>> = {
+      [assigned]: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] },
+      [selected]: { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] },
+    };
+    const db = {} as Db;
+    const unregister = registerSlackTaskAuthority(db, async (taskBinding) =>
+      endpointAuthority(taskBinding.endpointId ?? assigned, permissions[taskBinding.endpointId ?? assigned]!));
+    const args = {
+      attachmentId: "00000000-0000-4000-8000-000000000000",
+      channel: "C1",
+      idempotencyKey: "00000000-0000-4000-8000-000000000001",
+    };
+    try {
+      // Selecting the endpoint without the group is refused by gating.
+      await expect(executeSlackTool(db, binding, "slack_upload_file", { ...args, endpointId: selected },
+        vi.fn() as unknown as typeof fetch))
+        .rejects.toMatchObject({ status: 403, details: { code: "slack_tool_not_enabled" } });
+      // Selecting the endpoint with the group gets past gating; whatever fails
+      // after that is not a permission refusal.
+      const error = await executeSlackTool(db, binding, "slack_upload_file", { ...args, endpointId: assigned },
+        vi.fn() as unknown as typeof fetch).catch((failure: unknown) => failure);
+      expect((error as { details?: { code?: string } }).details?.code).not.toBe("slack_tool_not_enabled");
+    } finally {
+      unregister();
+    }
+  });
+});

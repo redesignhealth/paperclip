@@ -29,6 +29,7 @@ import {
   slackEnabledOptInGroups,
   slackEndpointOptInsForGating,
   slackLegacyInstall,
+  type SlackSetupOptIns,
 } from "./slack-opt-ins.js";
 const catalogDefinitions = SLACK_TOOLS.map(tool => ({
   tool,
@@ -43,10 +44,15 @@ const catalogDefinitions = SLACK_TOOLS.map(tool => ({
 
 export async function slackBotCatalogIsCurrent(
   db: Db,
-  endpoint: { id: string; companyId: string; connectionId: string },
+  endpoint: {
+    id: string;
+    companyId: string;
+    connectionId: string;
+    setup?: typeof chatEndpoints.$inferSelect.setup | null;
+  },
 ): Promise<boolean> {
   const [entries, profiles] = await Promise.all([
-    db.select({ name: toolCatalogEntries.name, versionHash: toolCatalogEntries.versionHash })
+    db.select({ name: toolCatalogEntries.name, versionHash: toolCatalogEntries.versionHash, status: toolCatalogEntries.status })
       .from(toolCatalogEntries).where(and(
         eq(toolCatalogEntries.companyId, endpoint.companyId),
         eq(toolCatalogEntries.connectionId, endpoint.connectionId),
@@ -56,8 +62,45 @@ export async function slackBotCatalogIsCurrent(
       eq(toolProfiles.profileKey, `slack-bot:${endpoint.id}`),
     )).limit(1),
   ]);
-  const hashes = new Map(entries.map(entry => [entry.name, entry.versionHash]));
-  return profiles.length > 0 && catalogDefinitions.every(({ tool, hash }) => hashes.get(`slack_bot:${tool.name}`) === hash);
+  if (profiles.length === 0) return false;
+  const byName = new Map(entries.map(entry => [entry.name, entry]));
+  if (!catalogDefinitions.every(({ tool, hash }) => byName.get(`slack_bot:${tool.name}`)?.versionHash === hash))
+    return false;
+  // A definition hash says nothing about permission state. Enabling and
+  // installing an opt-in group (or removing one) changes which gated tools are
+  // active while every hash stays the same, so the caller would skip the sync
+  // and keep the old statuses indefinitely. Treat a mismatch between the
+  // enabled set and the stored statuses as stale.
+  if (endpoint.setup === undefined) return true;
+  return (await slackCatalogStatusMatches(db, endpoint, byName));
+}
+
+/**
+ * Whether every catalog entry's status already reflects the endpoint's current
+ * permission state. Only gated tools are judged: an ungated tool is active or
+ * disabled by the operator, never by opt-ins.
+ */
+async function slackCatalogStatusMatches(
+  db: Db,
+  endpoint: { id: string; companyId: string; setup?: typeof chatEndpoints.$inferSelect.setup | null },
+  byName: Map<string, { status: string }>,
+): Promise<boolean> {
+  const setup: SlackSetupOptIns = endpoint.setup ?? {};
+  const optIns = slackEnabledOptInGroups(
+    setup,
+    setup.slackInstalledOptInScopeGroups === undefined && setup.slackOptInScopeGroups === undefined
+      ? { legacyInstall: await slackLegacyInstall(db, { companyId: endpoint.companyId, endpointId: endpoint.id }) }
+      : {},
+  );
+  return catalogDefinitions.every(({ tool }) => {
+    if (slackOptInGroupsForTool(tool).length === 0) return true;
+    const stored = byName.get(`slack_bot:${tool.name}`);
+    if (!stored) return false;
+    // An operator-disabled entry is a deliberate decision the sync preserves,
+    // so it is never "stale" just because the group is enabled.
+    if (stored.status === "disabled") return true;
+    return (stored.status === "active") === isSlackToolEnabledForOptIns(tool, optIns);
+  });
 }
 
 export async function syncSlackBotTools(
@@ -99,6 +142,15 @@ export async function syncSlackBotTools(
   );
   for (const { tool, hash } of catalogDefinitions) {
     const activated = enabled && isSlackToolEnabledForOptIns(tool, optIns);
+    const gated = slackOptInGroupsForTool(tool).length > 0;
+    const existing = entriesByName.get(`slack_bot:${tool.name}`);
+    // An operator turning a tool off is a deliberate decision, distinct from
+    // this sync removing a tool because its opt-in group is not enabled. Only
+    // opt-in-driven removal is re-activated when the group comes back.
+    const operatorDisabled = gated && existing?.status === "disabled";
+    const status: "active" | "removed" | "disabled" = operatorDisabled
+      ? "disabled"
+      : activated ? "active" : "removed";
     const values = {
       companyId: endpoint.companyId,
       applicationId: connection.applicationId,
@@ -114,16 +166,15 @@ export async function syncSlackBotTools(
       isWrite: tool.risk !== "read",
       versionHash: hash,
       schemaHash: hash,
-      status: activated ? ("active" as const) : ("removed" as const),
+      status,
       reviewedByUserId: userId,
       reviewedAt: new Date(),
       updatedAt: new Date(),
     };
-    const existing = entriesByName.get(values.name);
     // A gated tool's status follows the enabled opt-in set on every sync, so
     // enabling or dropping a group flips it even when the definition hash is
-    // unchanged. An ungated tool keeps the operator's own activation decision.
-    const gated = slackOptInGroupsForTool(tool).length > 0;
+    // unchanged. An operator-disabled entry and an ungated tool keep their own
+    // status.
     if (existing?.versionHash === hash && (!gated || existing.status === values.status))
       continue;
     await measureRunPhase("connectors.slack.catalog.write", () => tx

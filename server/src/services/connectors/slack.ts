@@ -8,6 +8,7 @@ import { measureRunPhase } from "../execution-preparation-timing.js";
 import { measureRunTransaction } from "../execution-transaction-timing.js";
 import { prepareSlackEndpoints } from "./slack-endpoint-preparation.js";
 import {
+  chatEndpoints,
   toolProfiles,
   toolProfileBindings,
   toolProfileEntries,
@@ -50,7 +51,13 @@ async function slackAssignedEndpoint(
       throw error;
     }
   };
-  if (!await slackBotCatalogIsCurrent(db, { ...endpoint, companyId: binding.companyId })) {
+  // Freshness includes permission state, not just definition hashes: an
+  // enabled or removed opt-in group changes which gated tools are active.
+  if (!await slackBotCatalogIsCurrent(db, {
+    ...endpoint,
+    companyId: binding.companyId,
+    setup: (await db.select({ setup: chatEndpoints.setup }).from(chatEndpoints).where(eq(chatEndpoints.id, endpoint.id)))[0]?.setup,
+  })) {
     const authority = await authorize();
     if (!authority || authority.endpoint.connectionId !== endpoint.connectionId) return [];
     await measureRunTransaction(db, "connectors.slack.catalog", (tx) =>
@@ -135,15 +142,26 @@ const messageView = (message: SlackObject, team: string, channel: string) => ({
       : undefined,
 });
 
+const ENDPOINT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 /**
- * The endpoint selector, read without validating the rest of the arguments.
- * Gating must be decided before argument validation so a tool this agent cannot
- * use always answers with the permission error, never an argument error.
+ * The endpoint selector, validated on its own before the rest of the arguments.
+ *
+ * Gating must be decided before full argument validation so a tool this agent
+ * cannot use always answers with the permission error, never an argument error.
+ * The selector cannot wait, though: it chooses which endpoint is gated, so a
+ * malformed value must be rejected here rather than forwarded into a database
+ * lookup as an invalid UUID. Absent (or `null`) means "the assigned endpoint".
  */
 function peekEndpointId(value: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
   const endpointId = (value as { endpointId?: unknown }).endpointId;
-  return typeof endpointId === "string" ? endpointId : undefined;
+  if (endpointId === undefined || endpointId === null) return undefined;
+  if (typeof endpointId !== "string" || !ENDPOINT_ID_PATTERN.test(endpointId))
+    throw badRequest("Slack connection selector must be a connection ID", {
+      code: "slack_endpoint_selector_invalid",
+    });
+  return endpointId;
 }
 
 export async function executeSlackTool(
