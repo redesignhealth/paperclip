@@ -38,6 +38,7 @@ import {
   DEFAULT_CODEX_LOCAL_MODEL,
 } from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
+import { ROUTER_DEFAULT_MODEL, ROUTER_PROVIDER } from "@paperclipai/hermes-paperclip-adapter/ui";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
@@ -924,9 +925,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       ? "Paperclip Computer"
       : "Local";
 
+  // Hermes lists models per selected provider (anthropic, openai, openrouter, router). The server keys
+  // its catalogs by the setup wizard's names, where Hermes' `openai-api` is `openai`; "auto" or an
+  // unset provider has no catalog and falls back to the registry list.
+  const hermesProvider = adapterType === "hermes_local"
+    ? String(isCreate ? props.values.adapterSchemaValues?.provider ?? "" : eff("adapterConfig", "provider", config.provider ?? ""))
+        .trim().toLowerCase().replace(/^openai-api$/, "openai")
+    : "";
   const modelProvider = adapterType === "opencode_local" && aiConnectionBindingSchema.safeParse(
     (overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection,
-  ).data?.provider === "openrouter" ? "openrouter" : runnerProvider;
+  ).data?.provider === "openrouter" ? "openrouter" : adapterType === "hermes_local" ? hermesProvider || undefined : runnerProvider;
   const runnerAcpxAgent = adapterType === "paperclip_runner" && runnerProvider === "acpx"
     ? String(isCreate ? props.values.adapterSchemaValues?.acpxAgent ?? "claude" : eff("adapterConfig", "acpxAgent", config.acpxAgent ?? "claude")) : undefined;
   const modelAiBinding = aiConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data;
@@ -960,7 +968,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   }, [copilotModelScope, selectedCompanyId, isExternalRunner, connectionModels, refreshConnectionModels]);
   const [refreshModelsError, setRefreshModelsError] = useState<string | null>(null);
   const [refreshingModels, setRefreshingModels] = useState(false);
-  const models = connectionModels?.models ?? fetchedModels ?? externalModels ?? [];
+  // Ramp Router serves no model catalog (its IDs depend on the account), so the server list is empty
+  // and the picker would offer nothing. Suggest the Router default, as the setup wizard does.
+  const hermesRouterSelected = hermesProvider === ROUTER_PROVIDER;
+  const baseModels = connectionModels?.models ?? fetchedModels ?? externalModels ?? [];
+  const models = hermesRouterSelected && !baseModels.some((m) => m.id === ROUTER_DEFAULT_MODEL)
+    ? [{ id: ROUTER_DEFAULT_MODEL, label: ROUTER_DEFAULT_MODEL }, ...baseModels]
+    : baseModels;
   const modelError = connectionModels ? connectionModels.error : fetchedModelsError;
   const adapterCommandField = "command";
   const {
@@ -1819,7 +1833,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 }}
                 open={modelOpen}
                 onOpenChange={setModelOpen}
-                defaultLabel={adapterType === "claude_local" ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})` : undefined}
+                defaultLabel={adapterType === "claude_local"
+                  ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})`
+                  : hermesRouterSelected ? `Default (${ROUTER_DEFAULT_MODEL})` : undefined}
                 allowDefault={adapterType !== "opencode_local" && adapterType !== "pi_local" && adapterType !== "paperclip_runner"}
                 required={adapterType === "opencode_local" || adapterType === "pi_local"}
                 groupByProvider={!connectionModels && (adapterType === "opencode_local" || adapterType === "pi_local")}

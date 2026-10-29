@@ -1323,6 +1323,54 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.container.textContent).toContain("Hermes Gateway fields");
   });
 
+  it.each([
+    ["anthropic", "anthropic"],
+    ["openai-api", "openai"],
+    ["router", "router"],
+  ])("loads the %s model catalog for an existing Hermes agent", async (hermesProvider, queryProvider) => {
+    mockAgentsApi.adapterModels.mockResolvedValue([]);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "hermes_local", adapterConfig: { provider: hermesProvider } },
+    );
+    roots.push(result.root);
+
+    await vi.waitFor(() =>
+      expect(mockAgentsApi.adapterModels).toHaveBeenCalledWith(
+        "company-1",
+        "hermes_local",
+        expect.objectContaining({ provider: queryProvider }),
+      ),
+    );
+  });
+
+  it("requests no catalog for a Hermes agent on the auto provider", async () => {
+    mockAgentsApi.adapterModels.mockResolvedValue([]);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "hermes_local", adapterConfig: { provider: "auto" } },
+    );
+    roots.push(result.root);
+
+    await vi.waitFor(() => expect(mockAgentsApi.adapterModels).toHaveBeenCalled());
+    expect(mockAgentsApi.adapterModels).toHaveBeenCalledWith(
+      "company-1",
+      "hermes_local",
+      expect.objectContaining({ provider: "auto" }),
+    );
+  });
+
+  it("suggests the Router default model for a Hermes agent on Ramp Router", async () => {
+    mockAgentsApi.adapterModels.mockResolvedValue([]);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "hermes_local", adapterConfig: { provider: "router" } },
+    );
+    roots.push(result.root);
+
+    await vi.waitFor(() => expect(result.container.textContent).toContain("Default (auto-jev-routing)"));
+  });
+
   it("tests a Codex agent after clearing the primary model to the adapter default", async () => {
     const result = await renderForm([
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
