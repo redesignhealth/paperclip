@@ -106,7 +106,9 @@ BEGIN
 
   IF TG_OP = 'INSERT' THEN
     IF NEW.status <> 'pending' OR NEW.attempt <> 0 OR NEW.claimed_by IS NOT NULL
-       OR NEW.integration_sha IS NOT NULL OR NEW.promote_pr IS NOT NULL OR NEW.master_sha IS NOT NULL THEN
+       OR NEW.integration_sha IS NOT NULL OR NEW.resolution_delta_sha256 IS NOT NULL
+       OR NEW.review_pr IS NOT NULL OR NEW.promote_pr IS NOT NULL OR NEW.master_sha IS NOT NULL
+       OR jsonb_array_length(NEW.argus_rounds) > 0 THEN
       RAISE EXCEPTION 'upstream_sync_log: a new row must be pending and carry no worker state'
         USING ERRCODE = 'check_violation';
     END IF;
@@ -219,7 +221,7 @@ BEGIN
     IF lower(coalesce(NEW.argus_verdict, '')) <> 'approve'
        OR v_last IS NULL
        OR lower(coalesce(v_last ->> 'verdict', '')) <> 'approve'
-       OR (v_last ->> 'sha') IS DISTINCT FROM NEW.integration_sha THEN
+       OR lower(coalesce(v_last ->> 'sha', '')) IS DISTINCT FROM NEW.integration_sha THEN
       RAISE EXCEPTION 'upstream_sync_log: a resolved conflict needs an approving Argus verdict on integration_sha %', NEW.integration_sha
         USING ERRCODE = 'check_violation';
     END IF;

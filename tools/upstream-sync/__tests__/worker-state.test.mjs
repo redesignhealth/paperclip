@@ -18,6 +18,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { classifyPending } from "../lib/classify.mjs";
+import { loadConfig } from "../lib/config.mjs";
 
 const url = process.env.UPSTREAM_SYNC_TEST_DATABASE_URL;
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -167,6 +169,21 @@ test("worker state: transitions, lease, evidence, human override, runner privile
     // ---- inserts -----------------------------------------------------------------------
     await denied(runner, `INSERT INTO upstream_sync_log (upstream_sha, title, status) VALUES ('x1', 't', 'assessed')`, [], /new row must be pending/);
     await denied(runner, `INSERT INTO upstream_sync_log (upstream_sha, title, attempt) VALUES ('x2', 't', 3)`, [], /new row must be pending/);
+    // Insert-time evidence is refused too, not just the status/attempt/claim columns.
+    for (const [col, val] of [
+      ["resolution_delta_sha256", `'${sha64("1")}'`],
+      ["review_pr", "5"],
+      ["argus_rounds", `'[{"round":1,"sha":"${sha40("1")}","verdict":"approve"}]'::jsonb`],
+      ["integration_sha", `'${sha40("1")}'`],
+      ["promote_pr", "5"],
+      ["master_sha", `'${sha40("1")}'`],
+    ]) {
+      await assert.rejects(
+        runner.query(`INSERT INTO upstream_sync_log (upstream_sha, title, ${col}) VALUES ('x3', 't', ${val})`),
+        /new row must be pending|violates check constraint/,
+        `insert with ${col}`,
+      );
+    }
     for (const n of ["a", "b", "c", "d", "e", "f"]) {
       await runner.query(`INSERT INTO upstream_sync_log (upstream_sha, title) VALUES ($1, 't')`, [n.repeat(40)]);
     }
@@ -252,6 +269,12 @@ test("worker state: transitions, lease, evidence, human override, runner privile
     await denied(runner, `UPDATE upstream_sync_log SET skip_reason='changed my mind' WHERE upstream_sha=$1`, [claimedNow], /is final/);
     assert.ok([sha40("a"), skipRow].includes(claimedNow));
 
+    // The classifier selects `category IS NULL`; a final (skipped) row with no category must not
+    // abort it (Argus round 1). It leaves the final row alone and still classifies the rest.
+    const stats = await classifyPending(runner, loadConfig({ UPSTREAM_SYNC_LLM_API_KEY: "" }), { log() {} });
+    assert.ok(stats.classified >= 1, "classifier still runs with a skipped, unclassified row present");
+    assert.equal((await state(admin, claimedNow)).category, null, "final row untouched by the classifier");
+
     // ---- conflict path: needs an approving Argus verdict bound to integration_sha -------
     const conflict = sha40("d");
     // Make sure d is claimable by the runner path: use the real claim statement until d is ours.
@@ -265,19 +288,19 @@ test("worker state: transitions, lease, evidence, human override, runner privile
     }
     assert.equal((await state(admin, conflict)).status, "claimed");
     await runner.query(`UPDATE upstream_sync_log SET status='assessed', path='conflict', lease_expires_at=NULL WHERE upstream_sha=$1`, [conflict]);
-    await illegal(conflict, `status='integrated', integration_sha='${sha40("4")}', resolution_delta_sha256='${sha64("5")}'`, "a conflict never skips in_review");
+    await illegal(conflict, `status='integrated', integration_sha='${sha40("f")}', resolution_delta_sha256='${sha64("5")}'`, "a conflict never skips in_review");
     await denied(runner, `UPDATE upstream_sync_log SET status='in_review' WHERE upstream_sha=$1`, [conflict], /state_review_check/);
     await runner.query(`UPDATE upstream_sync_log SET status='in_review', review_pr=77 WHERE upstream_sha=$1`, [conflict]);
 
     const integrate = (verdict, rounds) => runner.query(
       `UPDATE upstream_sync_log SET status='integrated', integration_sha=$2, resolution_delta_sha256=$3,
               argus_verdict=$4, argus_rounds=$5::jsonb WHERE upstream_sha=$1`,
-      [conflict, sha40("4"), sha64("5"), verdict, JSON.stringify(rounds)],
+      [conflict, sha40("f"), sha64("5"), verdict, JSON.stringify(rounds)],
     );
-    await denied(runner, `UPDATE upstream_sync_log SET status='integrated', integration_sha=$2, resolution_delta_sha256=$3 WHERE upstream_sha=$1`, [conflict, sha40("4"), sha64("5")], /needs an approving Argus verdict/);
+    await denied(runner, `UPDATE upstream_sync_log SET status='integrated', integration_sha=$2, resolution_delta_sha256=$3 WHERE upstream_sha=$1`, [conflict, sha40("f"), sha64("5")], /needs an approving Argus verdict/);
     await assert.rejects(integrate("approve", [{ round: 1, sha: sha40("9"), verdict: "approve" }]), /approving Argus verdict on integration_sha/, "approval for a different sha");
-    await assert.rejects(integrate("approve", [{ round: 1, sha: sha40("4"), verdict: "request_changes" }]), /approving Argus verdict/, "last round must approve");
-    await assert.rejects(integrate("request_changes", [{ round: 1, sha: sha40("4"), verdict: "approve" }]), /approving Argus verdict/, "column verdict must approve");
+    await assert.rejects(integrate("approve", [{ round: 1, sha: sha40("f"), verdict: "request_changes" }]), /approving Argus verdict/, "last round must approve");
+    await assert.rejects(integrate("request_changes", [{ round: 1, sha: sha40("f"), verdict: "approve" }]), /approving Argus verdict/, "column verdict must approve");
     // argus_rounds is append-only: record two rounds first, then rewriting history is refused.
     await runner.query(
       `UPDATE upstream_sync_log SET argus_rounds = $2::jsonb WHERE upstream_sha=$1`,
@@ -287,7 +310,7 @@ test("worker state: transitions, lease, evidence, human override, runner privile
     await denied(runner, `UPDATE upstream_sync_log SET argus_rounds = $2::jsonb WHERE upstream_sha=$1`, [conflict, JSON.stringify([{ round: 1, sha: sha40("3"), verdict: "approve" }])], /append-only/, "rewriting a round");
     await integrate("approve", [
       { round: 1, sha: sha40("3"), verdict: "request_changes" },
-      { round: 2, sha: sha40("4"), verdict: "approve" },
+      { round: 2, sha: sha40("f").toUpperCase(), verdict: "APPROVE" }, // case-insensitive match on both
     ]);
     const done = await state(admin, conflict);
     assert.equal(done.status, "integrated");

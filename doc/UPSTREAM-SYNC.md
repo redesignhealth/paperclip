@@ -95,6 +95,10 @@ Tables:
   claimed -> pending (release)       claimed -> claimed (extend, or reclaim after expiry)
   ```
 
+  Worker fields: `claimed_by` is the Paperclip run id holding the lease, `claimed_at` its start,
+  `lease_expires_at` when another run may reclaim it (set exactly while `claimed`), `attempt` the
+  claim count (starts at 0, +1 per claim or reclaim).
+
   Claim with one statement (`UPDATE ... WHERE id = (SELECT id ... WHERE status='pending' OR
   (status='claimed' AND lease_expires_at < now()) ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)`
   setting `attempt = attempt + 1`); a crashed run is reclaimed after its lease, and the
@@ -112,6 +116,11 @@ Tables:
   guard, and the override is recorded in `upstream_sync_events` under that login. Note that
   every worker run shares the `upstream_sync_runner` login, so the guard cannot tell one run
   from another; per-run attribution is `upstream_sync.run_ref` in the events.
+  The `upstream_sync_human` role is cluster-global. If the migration login lacks `CREATEROLE`, the
+  migration continues with a NOTICE and the guard has no override until an operator runs
+  `CREATE ROLE upstream_sync_human NOLOGIN;` and grants it to the human logins that may override.
+  The rh-paperclip bootstrap `SELECT` grant on `upstream_sync_events` is redundant with the
+  migration's grant and can be dropped.
   `TRUNCATE` on `upstream_sync_log` is blocked for everyone (a `BEFORE TRUNCATE` trigger), as
   it already is on events.
 
@@ -484,7 +493,7 @@ Run from `<checkout>/tools/upstream-sync` (`cd <checkout>/tools/upstream-sync &&
 - **Move the marker**: `node cli.mjs marker set <sha>` (validated against upstream; must exist). The stored
   marker overrides `UPSTREAM_SYNC_INITIAL_MARKER`. Moving it forward skips the commits in between (they are not
   inserted). Moving it backward re-inserts only commits not already in the ledger. In P1+ the worker advances the
-  marker only to the highest SHA where every earlier row is `merged` or `skipped`; do not move it by hand while
+  marker only to the highest SHA where every earlier row is `promoted` or `skipped`; do not move it by hand while
   the worker is running. The detector refuses to run if the marker is not an ancestor of upstream `master`
   (force-push); fix with `marker set`.
 - **Detector failed with "malformed git log record"**: the run fails closed rather than skipping a
