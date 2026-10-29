@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { connectorToolDefinitionsForSkills, resolveConnectorAssignments } from "./connector-runtime.js";
+import { applyConnectorSkills, connectorToolDefinitionsForSkills, resolveConnectorAssignments, resolvedConnectorToolDefinitionsForSkills, type ConnectorAssignment } from "./connector-runtime.js";
+import { logger } from "../middleware/logger.js";
+import { registerSlackTaskAuthority, type SlackTaskAuthority } from "./connectors/slack-authority.js";
 
 const resolvers = vi.hoisted(() => ({
   browser: vi.fn(), speko: vi.fn(), slack: vi.fn(), inboxes: vi.fn(),
@@ -10,7 +12,22 @@ vi.mock("./voice/speko-agent-tools.js", () => ({ spekoAssignedResources: resolve
 vi.mock("./connectors/slack.js", () => ({ slackAssignedResource: resolvers.slack, executeGovernedSlackTool: vi.fn() }));
 vi.mock("./email-channels.js", () => ({ emailChannelService: () => ({ assignedInboxes: resolvers.inboxes }) }));
 
-afterEach(() => vi.resetAllMocks());
+const assets = vi.hoisted(() => ({ materialize: vi.fn() }));
+vi.mock("./native-runtime/runtime-context.js", () => ({ materializeAsset: assets.materialize }));
+afterEach(() => { vi.restoreAllMocks(); vi.resetAllMocks(); });
+
+// Model dispatch's endpoint selection in the tests that stub permission reads.
+// Leave the existing gatingDb helpers unchanged: this attests to one endpoint,
+// rather than implicitly unioning their returned rows.
+function taskDb(select: ReturnType<typeof vi.fn>): Db {
+  const db = { select } as unknown as Db;
+  registerSlackTaskAuthority(db, async () => {
+    const rows = await db.select().from({} as never).where(undefined);
+    if (rows.length !== 1) throw new Error("No unambiguous endpoint");
+    return { endpoint: rows[0] } as unknown as SlackTaskAuthority;
+  });
+  return db;
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -35,7 +52,7 @@ describe("connector assignment preparation", () => {
     resolvers.slack.mockResolvedValue([]);
     resolvers.inboxes.mockResolvedValue([{ id: "inbox", address: "inbox@example.com", connectionId: "email" }]);
     const select = vi.fn();
-    const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
+    const assignments = await resolveConnectorAssignments(taskDb(select), {
       companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
     });
     expect(assignments.map(assignment => assignment.key)).toEqual(["agentmail"]);
@@ -84,7 +101,7 @@ describe("connector assignment preparation", () => {
             slackInstalledOptInScopeGroups: mode === "upload" ? ["file_upload"] : [],
           } }];
     const select = gatingDb(rows);
-    const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
+    const assignments = await resolveConnectorAssignments(taskDb(select), {
       companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
     });
     const names = assignments[0].tools.map(tool => tool.name);
@@ -103,7 +120,7 @@ describe("connector assignment preparation", () => {
     const select = gatingDb([
       { id: "slack", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: [] } },
     ]);
-    const assignments = await resolveConnectorAssignments({ select } as unknown as Db, {
+    const assignments = await resolveConnectorAssignments(taskDb(select), {
       companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
     });
     expect(assignments[0].tools.map(tool => tool.name)).not.toContain("slack_upload_file");
@@ -149,6 +166,76 @@ describe("connector tool definitions fail closed", () => {
   });
 });
 
+describe("Slack connector exposure boundaries", () => {
+  it("does not union another endpoint's groups into the selected endpoint", async () => {
+    resolvers.browser.mockResolvedValue([]);
+    resolvers.speko.mockResolvedValue([]);
+    resolvers.inboxes.mockResolvedValue([]);
+    resolvers.slack.mockResolvedValue([{ id: "selected", label: "Slack", connectionId: "connection" }]);
+    const selected = { id: "selected", companyId: "company", setup: { slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] } };
+    const other = { id: "other", companyId: "company", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
+    let reads = 0;
+    const db = { select: () => ({ from: () => ({ where: async () => ++reads === 1 ? [selected, other] : [] }) }) } as unknown as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => ({ endpoint: selected }) as unknown as SlackTaskAuthority);
+    try {
+      const assignments = await resolveConnectorAssignments(db, { companyId: "company", agentId: "agent", runId: "run", issueId: "issue" });
+      expect(assignments[0]!.tools.map(tool => tool.name)).not.toContain("slack_upload_file");
+      expect(assignments[0]!.tools.map(tool => tool.name)).toContain("slack_history");
+      for (const tool of JSON.parse(JSON.stringify(assignments[0]!.tools))) expect(tool).not.toHaveProperty("scopes");
+    } finally { unregister(); }
+  });
+
+  it("logs and fails closed in both assignment discovery and native tool preparation", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const db = {} as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => { throw new Error("transient DB outage: secret-canary"); });
+    resolvers.browser.mockResolvedValue([]);
+    resolvers.speko.mockResolvedValue([]);
+    resolvers.inboxes.mockResolvedValue([]);
+    resolvers.slack.mockResolvedValue([{ id: "slack", label: "Slack", connectionId: "connection" }]);
+    const binding = { companyId: "company", agentId: "agent", runId: "run", issueId: "issue" };
+    try {
+      const assignments = await resolveConnectorAssignments(db, binding);
+      expect(assignments[0]!.tools).toEqual([]);
+      const native = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
+      expect(native[0]!.tools.map(tool => tool.name)).not.toContain("slack_upload_file");
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-canary");
+    } finally { unregister(); }
+  });
+
+  it("keeps native preparation alive on a transient Slack lookup failure and logs it", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const db = { select: () => { throw new Error("transient database error"); } } as unknown as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => { throw new Error("transient database error"); });
+    try {
+      const specs = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), {
+        companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+      });
+      expect(specs[0]!.tools).toEqual([]);
+      expect(warn).toHaveBeenCalledOnce();
+    } finally { unregister(); }
+  });
+
+  it("strips scope metadata when serializing TOOLS.json even for an older assignment", async () => {
+    assets.materialize.mockResolvedValue({ rootPath: "/test/connector-bundle" });
+    await applyConnectorSkills({}, [], [{
+      key: "slack", label: "Slack", skillKey: "paperclipai/paperclip/slack", resources: [],
+      tools: [{ name: "slack_history", description: "History", inputSchema: {}, scopes: ["channels:history"] }],
+    }] as unknown as ConnectorAssignment[]);
+    const files = assets.materialize.mock.calls[0]![0] as { path: string; content: Buffer }[];
+    const spec = JSON.parse(files.find(file => file.path === "TOOLS.json")!.content.toString());
+    expect(spec).toEqual([{ name: "slack_history", description: "History", inputSchema: {} }]);
+  });
+
+  it("does not serialize internal scope metadata in connector tool definitions", () => {
+    const definitions = connectorToolDefinitionsForSkills(new Set(["paperclipai/paperclip/slack"]), new Set(["slack_upload_file"]));
+    const serialized = JSON.parse(JSON.stringify(definitions));
+    expect(serialized[0].tools.length).toBeGreaterThan(0);
+    for (const tool of serialized[0].tools) expect(Object.keys(tool).sort()).toEqual(["description", "inputSchema", "name"]);
+  });
+});
+
 describe("Slack connector gating is requested and installed", () => {
   function gatingDb(rows: Array<Record<string, unknown>>) {
     let call = 0;
@@ -169,7 +256,7 @@ describe("Slack connector gating is requested and installed", () => {
     resolvers.speko.mockResolvedValue([]);
     resolvers.inboxes.mockResolvedValue([]);
     resolvers.slack.mockResolvedValue([{ id: "slack", label: "Slack", connectionId: "connection" }]);
-    const assignments = await resolveConnectorAssignments({ select: gatingDb([{ id: "slack", setup }]) } as unknown as Db, {
+    const assignments = await resolveConnectorAssignments(taskDb(gatingDb([{ id: "slack", setup }])), {
       companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
     });
     return assignments[0]!.tools.map(tool => tool.name);

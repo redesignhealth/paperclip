@@ -281,7 +281,7 @@ export async function slackToolNamesForAgent(
 
 /** Gating for one already-loaded endpoint, resolving its legacy install. */
 export async function slackEndpointOptInsForGating(
-  db: Db,
+  db: SlackReadExecutor,
   endpoint: { id: string; companyId: string; setup: SlackSetupOptIns | null },
 ): Promise<SlackGatingOptions> {
   if (

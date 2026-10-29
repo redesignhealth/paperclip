@@ -19,7 +19,7 @@ import {
   recordInstalledSlackOptIns,
   slackInstallManifestHash,
 } from "./opt-in-manifest.js";
-import { syncSlackBotTools } from "../../slack-catalog.js";
+import { slackBotCatalogIsCurrent, syncSlackBotTools } from "../../slack-catalog.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -77,6 +77,34 @@ describe("Slack opt-in manifest machinery", () => {
 
   describeDb("database", () => {
     afterAll(async () => { await database?.cleanup(); });
+
+    it("treats missing permission setup as stale even when every definition hash matches", async () => {
+      const f = await fixture();
+      await db!.transaction(tx => syncSlackBotTools(tx, f.endpoint, "user", true));
+      expect(await slackBotCatalogIsCurrent(db!, f.endpoint)).toBe(true);
+      const { setup: _omitted, ...withoutSetup } = f.endpoint;
+      expect(await slackBotCatalogIsCurrent(db!, withoutSetup)).toBe(false);
+    });
+
+    it("detects permission staleness and preserves an operator disable across repeated syncs", async () => {
+      const f = await fixture();
+      await db!.transaction(tx => syncSlackBotTools(tx, f.endpoint, "user", true));
+      const withUpload = { ...f.endpoint, setup: { ...f.endpoint.setup,
+        slackOptInScopeGroups: ["file_upload" as const], slackInstalledOptInScopeGroups: ["file_upload" as const] } };
+      expect(await slackBotCatalogIsCurrent(db!, withUpload)).toBe(false);
+      await db!.transaction(tx => syncSlackBotTools(tx, withUpload, "user", true));
+      expect(await slackBotCatalogIsCurrent(db!, withUpload)).toBe(true);
+      await db!.update(toolCatalogEntries).set({ status: "disabled" }).where(and(
+        eq(toolCatalogEntries.connectionId, f.connection.id), eq(toolCatalogEntries.toolName, "slack_upload_file"),
+      ));
+      await db!.transaction(tx => syncSlackBotTools(tx, withUpload, "user", true));
+      await db!.transaction(tx => syncSlackBotTools(tx, f.endpoint, "user", true));
+      await db!.transaction(tx => syncSlackBotTools(tx, withUpload, "user", true));
+      const [entry] = await db!.select().from(toolCatalogEntries).where(and(
+        eq(toolCatalogEntries.connectionId, f.connection.id), eq(toolCatalogEntries.toolName, "slack_upload_file"),
+      ));
+      expect(entry!.status).toBe("disabled");
+    });
 
     it("writes only its own key, so a concurrent runtimeGeneration bump survives", async () => {
       const f = await fixture();

@@ -46,8 +46,7 @@ import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pa
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { readNativeLocalProcessStop, PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
 import { remoteLeaseCleanupScope } from "../remote-execution-termination.js";
-import { connectorToolDefinitionsForSkills, SLACK_CONNECTOR_SKILL_KEY } from "../connector-runtime.js";
-import { slackToolNamesForAgent } from "../connectors/slack-opt-ins.js";
+import { resolvedConnectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { preserveNativeFailedWorkspace } from "./native-failed-workspace-recovery.js";
 import {
@@ -11619,16 +11618,7 @@ async function createRunnerdBackendWithinSessionClaim(
   ));
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
   const connectorAssignments = input.execution.provider.kind !== "muse"
-    ? connectorToolDefinitionsForSkills(
-        pinnedSkills,
-        pinnedSkills.has(SLACK_CONNECTOR_SKILL_KEY)
-          // TECH-7988: only advertise Slack tools this agent has enabled.
-          ? await slackToolNamesForAgent(input.db, {
-              companyId: input.execution.binding.companyId,
-              agentId: input.execution.binding.agentId,
-            })
-          : undefined,
-      )
+    ? await resolvedConnectorToolDefinitionsForSkills(input.db, pinnedSkills, input.execution.binding)
     : [];
   const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
     .from(heartbeatRuns).where(and(

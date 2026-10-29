@@ -28,7 +28,6 @@ import {
   isSlackToolEnabledForSetup,
   slackEnabledOptInGroups,
   slackEndpointOptInsForGating,
-  slackLegacyInstall,
   type SlackSetupOptIns,
 } from "./slack-opt-ins.js";
 const catalogDefinitions = SLACK_TOOLS.map(tool => ({
@@ -71,7 +70,7 @@ export async function slackBotCatalogIsCurrent(
   // active while every hash stays the same, so the caller would skip the sync
   // and keep the old statuses indefinitely. Treat a mismatch between the
   // enabled set and the stored statuses as stale.
-  if (endpoint.setup === undefined) return true;
+  if (endpoint.setup === undefined) return false;
   return (await slackCatalogStatusMatches(db, endpoint, byName));
 }
 
@@ -88,9 +87,7 @@ async function slackCatalogStatusMatches(
   const setup: SlackSetupOptIns = endpoint.setup ?? {};
   const optIns = slackEnabledOptInGroups(
     setup,
-    setup.slackInstalledOptInScopeGroups === undefined && setup.slackOptInScopeGroups === undefined
-      ? { legacyInstall: await slackLegacyInstall(db, { companyId: endpoint.companyId, endpointId: endpoint.id }) }
-      : {},
+    await slackEndpointOptInsForGating(db, { ...endpoint, setup }),
   );
   return catalogDefinitions.every(({ tool }) => {
     if (slackOptInGroupsForTool(tool).length === 0) return true;
@@ -135,10 +132,7 @@ export async function syncSlackBotTools(
   // kept its scope. A legacy install keeps its implied grant until first edit.
   const optIns = slackEnabledOptInGroups(
     endpoint.setup,
-    endpoint.setup.slackInstalledOptInScopeGroups === undefined &&
-      endpoint.setup.slackOptInScopeGroups === undefined
-      ? { legacyInstall: await slackLegacyInstall(tx, { companyId: endpoint.companyId, endpointId: endpoint.id }) }
-      : {},
+    await slackEndpointOptInsForGating(tx, endpoint),
   );
   for (const { tool, hash } of catalogDefinitions) {
     const activated = enabled && isSlackToolEnabledForOptIns(tool, optIns);

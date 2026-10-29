@@ -475,10 +475,9 @@ export interface SlackToolCapabilities {
   grantedScopes: string[] | null;
   missingScopes: string[];
   /**
-   * A permission group the operator can enable to unlock more tools, with the
-   * tools it would add. Present only for groups the agent does not have
-   * enabled, so the settings UI can name the switch instead of only listing
-   * raw scopes.
+   * A permission group not yet enabled, with the tools it would add. The action
+   * distinguishes a group not requested yet from one awaiting reauthorization,
+   * so settings can explain the next step instead of only listing raw scopes.
    */
   missingGroups?: Array<{
     group: string;
@@ -486,6 +485,8 @@ export interface SlackToolCapabilities {
     description: string;
     scopes: string[];
     toolNames: string[];
+    /** Reconnect if already requested; otherwise enable the group first. */
+    action?: "enable" | "reconnect";
   }>;
   tools: Array<{
     name: string;

@@ -35,18 +35,21 @@ export function SlackCapabilitiesView({
           {capabilities.missingGroups && capabilities.missingGroups.length > 0 && (
             <div className="rounded-lg border border-border bg-muted p-3 space-y-2">
               <p className="text-sm font-medium">
-                Enable a permission group to unlock more tools
+                Slack permission groups
               </p>
               <p className="text-sm">
-                Your existing connection still works. Turn on a group in this
-                agent&apos;s Slack setup, then reconnect so Slack grants it.
+                Your existing connection still works. Complete the steps below
+                to unlock more tools.
               </p>
               <ul className="space-y-1 text-sm">
                 {capabilities.missingGroups.map((missing) => (
                   <li key={missing.group}>
                     <span className="font-medium">{missing.label}</span>
                     {" — "}
-                    {missing.description} Unlocks{" "}
+                    {missing.action === "reconnect"
+                      ? `${missing.label} is already requested. Please reconnect this agent's Slack app to grant it.`
+                      : `Turn on ${missing.label} in this agent's Slack setup, then reconnect so Slack grants it.`}
+                    {" "}Unlocks{" "}
                     <span className="font-mono text-xs">
                       {missing.toolNames.join(", ")}
                     </span>

@@ -87,6 +87,9 @@ export async function slackCapabilities(
             description: definition.description,
             scopes: [...definition.scopes],
             toolNames,
+            action: row.endpoint.setup.slackOptInScopeGroups?.includes(group)
+              ? "reconnect" as const
+              : "enable" as const,
           };
     })
     .filter((entry): entry is NonNullable<typeof entry> => entry !== null);

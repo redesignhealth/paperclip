@@ -9606,6 +9606,44 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(runtime.endpoints.get(endpoint.id)!.posts.map(post => post.text)).toEqual(["**Owner User (via Paperclip)**\n\nSmall pool work"]);
   }, 15_000);
 
+  it("uses dispatch endpoint selection rather than unioning groups across two Slack endpoints", async () => {
+    const { resolveConnectorAssignments } = await import("../services/connector-runtime.js");
+    const { executeSlackTool } = await import("../services/connectors/slack.js");
+    await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
+    const fixture = await seedCompany();
+    const first = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: false });
+    const second = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: false });
+    const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId,
+      provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UMULTIENDPOINT" }).returning();
+    for (const [index, f] of [first, second].entries()) {
+      const groups = index === 1 ? ["file_upload"] : [];
+      await db.update(chatEndpoints).set({ status: "active", setup: sql`${chatEndpoints.setup} || ${JSON.stringify({
+        slackOptInScopeGroups: groups, slackInstalledOptInScopeGroups: groups,
+      })}::jsonb` }).where(eq(chatEndpoints.id, f.endpoint.id));
+      await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: f.endpoint.id,
+        principalId: principal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
+    }
+    const [issue] = await db.insert(issues).values({ companyId: fixture.companyId, title: "Two Slack endpoints",
+      status: "todo", assigneeAgentId: fixture.assignedAgentId, responsibleUserId: "owner-user" }).returning();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: fixture.companyId, agentId: fixture.assignedAgentId,
+      status: "running", responsibleUserId: "owner-user", contextSnapshot: { issueId: issue.id, source: "routine" } });
+    await initializeRunIdentity(db, { companyId: fixture.companyId, runId, issueId: issue.id, responsibleUserId: "owner-user", cause: "routine" });
+    const binding = { companyId: fixture.companyId, agentId: fixture.assignedAgentId, runId, issueId: issue.id };
+    const names = async (endpointId?: string) => (await resolveConnectorAssignments(db, { ...binding, endpointId }))[0]!.tools.map(tool => tool.name);
+    // Ordinary tasks with two active connections have no default. The agent
+    // must select a resource; neither connection's permissions become a union.
+    expect(await names()).toEqual([]);
+    expect(await names(first.endpoint.id)).not.toContain("slack_upload_file");
+    expect(await names(first.endpoint.id)).toContain("slack_history");
+    expect(await names(second.endpoint.id)).toContain("slack_upload_file");
+    await expect(executeSlackTool(db, binding, "slack_upload_file", { endpointId: first.endpoint.id }))
+      .rejects.toMatchObject({ status: 403, details: { code: "slack_tool_not_enabled" } });
+    // The other selector passes gating and reaches argument validation.
+    await expect(executeSlackTool(db, binding, "slack_upload_file", { endpointId: second.endpoint.id }))
+      .rejects.toMatchObject({ name: "ZodError" });
+  });
+
   it("activates a gated Slack tool after an opt-in group is enabled, through the production listing path", async () => {
     const { resolveConnectorAssignments } = await import("../services/connector-runtime.js");
     const { slackBotCatalogIsCurrent } = await import("../services/connectors/slack-catalog.js");
@@ -9666,11 +9704,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .from(toolCatalogEntries)
       .where(and(eq(toolCatalogEntries.connectionId, endpoint.connectionId), eq(toolCatalogEntries.toolName, toolName))))[0]?.status;
 
+    // A real active endpoint: prove the production listing offers the tool
+    // before the operator disables it, rather than passing vacuously on an
+    // endpoint that cannot resolve authority.
+    await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, endpoint.id));
     // Enable and install the group, and sync once so the tool is active.
     await db.update(chatEndpoints).set({ setup: sql`${chatEndpoints.setup} || ${JSON.stringify({ slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] })}::jsonb` }).where(eq(chatEndpoints.id, endpoint.id));
     let [row] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, endpoint.id));
     await db.transaction(tx => syncSlackBotTools(tx, row!, "owner-user", true));
     expect(await readStatus("slack_upload_file")).toBe("active");
+    expect((await resolveConnectorAssignments(db, binding))[0]!.tools.map(tool => tool.name)).toContain("slack_upload_file");
 
     // The operator explicitly disables the tool.
     await db.update(toolCatalogEntries).set({ status: "disabled" }).where(and(eq(toolCatalogEntries.connectionId, endpoint.connectionId), eq(toolCatalogEntries.toolName, "slack_upload_file")));
@@ -9736,7 +9779,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const transactions = vi.spyOn(db, "transaction");
     try {
       expect(await resolveConnectorAssignments(db, binding)).toEqual(assignments);
-      expect(transactions).toHaveBeenCalledTimes(2);
+      // Resource discovery and the tool-permission lookup each resolve the
+      // same task authority. No union-only endpoint shortcut bypasses it.
+      expect(transactions).toHaveBeenCalledTimes(4);
     } finally { transactions.mockRestore(); }
 
     await expect(resolveSlackTaskAuthority(db, binding)).resolves.toMatchObject({ conversation: null, userId: "owner-user", slackUserId: "UROUTINE" });
@@ -9820,6 +9865,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     let capabilities: Awaited<ReturnType<typeof slackCapabilities>>;
     try {
       capabilities = await slackCapabilities(db, fixture.companyId, endpoint.id);
+      expect(capabilities.missingGroups?.find(group => group.group === "channel_management")?.action).toBe("enable");
+      // A requested-but-uninstalled group needs reconnect, not another enable.
+      await db.update(chatEndpoints).set({ setup: sql`${chatEndpoints.setup} || ${JSON.stringify({
+        slackOptInScopeGroups: ["file_upload"],
+      })}::jsonb` }).where(eq(chatEndpoints.id, endpoint.id));
+      const pendingCapabilities = await slackCapabilities(db, fixture.companyId, endpoint.id);
+      expect(pendingCapabilities.missingGroups?.find(group => group.group === "file_upload")?.action).toBe("reconnect");
     } finally {
       vi.stubGlobal("fetch", originalFetch);
     }
