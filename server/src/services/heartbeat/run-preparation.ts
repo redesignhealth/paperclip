@@ -1022,6 +1022,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         (connection.config?.sourceTemplateKey === "github" ||
           connection.transportConfig?.sourceTemplateKey === "github")) ||
         connection.credentialPolicy === "per_user" ||
+        connection.credentialPolicy === "per_agent" ||
         !isToolConnectionAttentionHealth(connection.healthStatus)) &&
       (connection.transport === "mcp_remote" ||
         connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id) || spekoConnectionIds.has(connection.id)),
@@ -1497,6 +1498,7 @@ export async function createManagedMcpRunConfig(input: {
       enabled: toolConnections.enabled,
       status: toolConnections.status,
       healthStatus: toolConnections.healthStatus,
+      credentialPolicy: toolConnections.credentialPolicy,
       config: toolConnections.config,
       transportConfig: toolConnections.transportConfig,
     })
@@ -1554,9 +1556,10 @@ export async function createManagedMcpRunConfig(input: {
             (install) =>
               install.enabled &&
               install.status === "active" &&
-              !["degraded", "failed", "error", "missing_secret"].includes(
-                install.healthStatus,
-              ),
+              (install.credentialPolicy === "per_agent" ||
+                !["degraded", "failed", "error", "missing_secret"].includes(
+                  install.healthStatus,
+                )),
           )
           .map((install) => ({
             id: install.connectionId,

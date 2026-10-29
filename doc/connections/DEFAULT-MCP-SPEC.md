@@ -104,6 +104,18 @@ A managed per-agent connection cannot change its credential policy or arbitrary 
 
 Removing the install blocks the next session and the next call. It does not cancel a call that is already running, revoke a valid already-issued token, or remove installed access merely because the feature flag is later turned off. Per-agent disable controls runtime access; external token revocation remains a separate concern.
 
+## Cached tool discovery and credential health
+
+User- and agent-specific (`per_user` / `per_agent`) connections keep their active,
+unquarantined cached tools discoverable when a company-level health probe records
+`missing_secret` or another failure. Their credentials belong to grants, so the
+shared health result alone cannot decide whether a particular caller can use them.
+Agent visibility, explicit install requirements, tool policies and credential
+resolution still apply. A missing, revoked or different agent's grant cannot use
+an organization credential as a fallback. A deleted credential fails before a
+provider request. A successful authorized call updates connection health normally;
+discovery itself does not validate or repair credentials.
+
 ## Provisioning and identity checks
 
 The setup hook provisions only after the agent row, company membership, template, and owner prerequisites have been checked. The stored `ownerUserId` is resolved to an active, verified human company member. Paperclip validates the ownership reply's `owner_email` after trimming and case-folding against that verified human email. A human actor becomes the owner at creation. An agent that creates another agent (hire or create route) passes its own id as the creator, and the new agent inherits the creating agent's frozen `comms-board` `ownerUserId` (`resolveCreatorOwnerUserId`), but only while that user is still an active member of the same company with a resolvable, verified email; the creator is read from its own company only. When the creator has no owner, its owner is no longer an active member, or the actor is a built-in or plugin, the owner stays null and setup waits for `owner_required` rather than provisioning as a human: no company-wide default and no guess are ever used. An approving human may still bind the owner at approval only where none exists. An entry that keeps waiting at `owner_required` for about a day (24 or more attempts, retries are roughly hourly) logs a warning once per 24 attempts (about daily), including whether an owner was ever assigned; state and retry cadence are unchanged.
