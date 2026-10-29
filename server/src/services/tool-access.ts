@@ -230,6 +230,13 @@ import {
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
 import {
+  assertAppAvailableInCompany,
+  assertConnectionAvailableInCompany,
+  assertConnectionConfigAvailableInCompany,
+  isGranolaConfig,
+  loadCompanyVisibility,
+} from "./app-company-visibility.js";
+import {
   checkMcpRemoteHeaderName,
   checkMcpRemoteHeaderValue,
   mcpRemoteHeaderNameFromConfigPath,
@@ -1196,17 +1203,6 @@ function appRequiresPersonalGrants(app: AppDefinition | null): boolean {
  * give a connection a company identity: create, organization install, OAuth
  * finalization and callback, and a credential-policy change.
  */
-function isGranolaConfig(config: Record<string, unknown>): boolean {
-  if (config.sourceTemplateKey === "granola") return true;
-  try {
-    const url = new URL(String(config.url ?? ""));
-    return url.protocol === "https:" && url.hostname === "mcp.granola.ai"
-      && url.port === "" && url.pathname === "/mcp" && !url.username && !url.password;
-  } catch {
-    return false;
-  }
-}
-
 function assertPersonalOnlyGrantKind(
   connection: Pick<typeof toolConnections.$inferSelect, "config">,
   grantKind: ConnectionGrantKind,
@@ -11358,6 +11354,7 @@ export function toolAccessService(
     galleryEntry: AppDefinition | null;
     actor?: ActorInfo;
   }) {
+    await assertConnectionAvailableInCompany(db, input.connection);
     if (isGranolaConfig(input.connection.config)
       && !process.env.PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID?.trim()) {
       throw badRequest("Native Granola sign-in requires PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID to be configured by the deployment administrator");
@@ -11880,6 +11877,7 @@ export function toolAccessService(
       heartbeatRunId?: string | null;
     },
   ): Promise<typeof toolConnections.$inferSelect> {
+    await assertConnectionAvailableInCompany(db, connection);
     const oauth = oauthConfig(connection);
     if (
       typeof oauth.tokenUrl !== "string" ||
@@ -12329,6 +12327,7 @@ export function toolAccessService(
       input.connectionId,
       input.companyId,
     );
+    await assertConnectionAvailableInCompany(db, connection);
     const initialGrant = await getOAuthGrantRow(input);
     const oauth = oauthConfig(connection);
     const oauthProvider =
@@ -13313,6 +13312,15 @@ export function toolAccessService(
         code: "gallery_entry_unavailable",
       });
     }
+    // Fail closed on company visibility before any new or resumed row is
+    // written. Existing non-draft rows are not exempt: a shared company must
+    // not be able to reconnect an app that only private companies may use.
+    if (definition?.companyVisibility) {
+      assertAppAvailableInCompany(definition, await loadCompanyVisibility(db, companyId));
+    }
+    if (input.link) {
+      await assertConnectionConfigAvailableInCompany(db, companyId, { url: input.link });
+    }
     let existingApplication: typeof toolApplications.$inferSelect | null = null;
     let requestedResumeConnection: typeof toolConnections.$inferSelect | null =
       null;
@@ -13329,6 +13337,7 @@ export function toolAccessService(
           ),
         );
       if (!connection) throw notFound("Incomplete app connection not found");
+      await assertConnectionAvailableInCompany(db, connection);
       assertSupportedConnection(connection);
       if (input.resumeConnectionId && connection.status !== "draft") {
         throw conflict("Only an incomplete app connection can resume setup", {
@@ -15647,6 +15656,7 @@ export function toolAccessService(
   ): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId, companyId);
     assertSupportedConnection(connection);
+    await assertConnectionAvailableInCompany(db, connection);
     await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");
     assertPersonalInstanceNotRewritable(connection);
     if (connection.status === "archived")
@@ -15996,6 +16006,7 @@ export function toolAccessService(
     },
   ): Promise<ToolOAuthStartResult> {
     let connection = await getConnectionRow(connectionId, companyId);
+    await assertConnectionAvailableInCompany(db, connection);
     if (isDefaultMcpSeed(connection.config)) {
       throw conflict(
         "Managed default-MCP seed connections cannot start sign in directly",
@@ -17654,6 +17665,7 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    await assertConnectionAvailableInCompany(db, connection);
     if (!stateRow.subjectUserId && isPersonalDefaultMcpTemplate(connection)) {
       throw badRequest(
         "This connection is personal-only and cannot use a shared company identity",
@@ -18373,6 +18385,7 @@ export function toolAccessService(
     if (requestingAgentId)
       await assertAgentsInCompany(companyId, [requestingAgentId]);
     let connection = await getConnectionRow(connectionId, companyId);
+    await assertConnectionAvailableInCompany(db, connection);
     const preFinalizeLifecycle = {
       status: connection.status,
       enabled: connection.enabled,
@@ -18819,11 +18832,15 @@ export function toolAccessService(
 
   async function preflightGalleryAppMetadata(
     galleryKey: string,
-    methodKey?: string | null,
+    methodKey: string | null | undefined,
+    companyId: string,
   ): Promise<ToolAppMetadataPreflightResult> {
     const app = getConnectableAppDefinition(galleryKey);
     if (!app || app.availability?.available === false)
       throw notFound("App not found");
+    if (app.companyVisibility) {
+      assertAppAvailableInCompany(app, await loadCompanyVisibility(db, companyId));
+    }
     const method = connectionMethodFor(app, methodKey);
     await assertExperimentalConnectorSetupEnabled(app.slug);
     if (method.transport !== "mcp_remote" || !method.defaults?.serverUrl) {
@@ -20259,6 +20276,7 @@ export function toolAccessService(
         ),
       );
       if (isGranolaConfig(config)) config.sourceTemplateKey = "granola";
+      await assertConnectionConfigAvailableInCompany(db, companyId, config);
       const publicTransportConfig = input.transportConfig
         ? stripDefaultMcpProtectedConfigKeys(input.transportConfig)
         : undefined;
@@ -21540,6 +21558,8 @@ export function toolAccessService(
       }
       // Native Granola identity cannot be removed by replacing public config.
       if (isGranolaConfig(existing.config) || isGranolaConfig(config)) config.sourceTemplateKey = "granola";
+      await assertConnectionAvailableInCompany(db, existing);
+      await assertConnectionConfigAvailableInCompany(db, existing.companyId, config);
       if (input.config?.methodConfig !== undefined && typeof config.sourceTemplateKey === "string") {
         const app = getConnectableAppDefinition(config.sourceTemplateKey);
         if (app) normalizeConnectionMethodConfig(connectionMethodForConnection(app, { ...existing, config }), asRecord(config.methodConfig));
@@ -22719,6 +22739,9 @@ export function toolAccessService(
         input.connectionId,
         input.companyId,
       );
+      // The broker exports credentials straight to the agent, so it does not
+      // pass through the gateway's visibility check. Apply the same gate here.
+      await assertConnectionAvailableInCompany(db, connection);
       if (isDaytonaConnection(connection)) throw forbidden("Daytona credentials stay in the governed tool gateway and cannot be exported.");
       if (isBrowserUseConnection(connection)) throw forbidden("Browser Use credentials stay in the governed tool gateway and cannot be exported.");
       if (connection.connectionPurpose === "ai") throw unprocessable("AI credentials are available only through the runtime resolver");

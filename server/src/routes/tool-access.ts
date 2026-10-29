@@ -890,7 +890,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const methodKey = typeof req.query.methodKey === "string" ? req.query.methodKey.trim() || null : null;
-    res.json(await svc.preflightGalleryAppMetadata(req.params.galleryKey as string, methodKey));
+    res.json(await svc.preflightGalleryAppMetadata(req.params.galleryKey as string, methodKey, companyId));
   });
 
   /**
