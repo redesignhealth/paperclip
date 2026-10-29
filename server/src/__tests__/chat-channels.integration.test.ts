@@ -7518,6 +7518,52 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         return f;
       }
 
+      it("re-pushes reverted Slack permissions after the changed manifest reached Slack but before reauthorization", async () => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        await applyOwnApp(f);
+        expect((await setupOf(f, f.endpoint.id)).slackRegistration).toMatchObject({ status: "install", errorCode: null });
+        expect(sentManifests(f).at(-1)!.oauth_config.scopes.bot).toContain("files:write");
+
+        // Revert after Slack accepted the manifest, without granting its scopes.
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
+        expect((await setupOf(f, f.endpoint.id)).slackRegistration).toMatchObject({
+          status: "install", errorCode: "slack_permissions_update_pending",
+        });
+        // Repeating the same edit must not clear the marker before the restored
+        // manifest has actually reached Slack.
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
+        await expect(f.install()).rejects.toThrow(/permissions/i);
+        f.provider.mockClear();
+        await applyOwnApp(f);
+        expect(sentManifests(f)).toHaveLength(1);
+        expect([...sentManifests(f)[0]!.oauth_config.scopes.bot].sort()).toEqual([...SLACK_DEFAULT_BOT_SCOPES].sort());
+        await reauthorizeOwnApp(f, SLACK_DEFAULT_BOT_SCOPES);
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({
+          slackRegistration: { status: "configured", errorCode: null },
+          slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [],
+        });
+      });
+
+      it("rotates only the Slack signing secret against the installed grant while an opt-in addition is pending", async () => {
+        const f = await installedOwnApp();
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        // No new bot token: normalizedCredentials reuses the existing token,
+        // which correctly lacks files:write until the pending reinstall lands.
+        await f.service.configure(f.endpoint.id, {
+          action: "reconnect", credentials: { signingSecret: "rotated-signing-secret" },
+        }, actor.userId);
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({
+          slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: [],
+          slackRegistration: { errorCode: "slack_permissions_update_pending" },
+        });
+        // Supplying a bot token still verifies the replacement against the
+        // requested group; secret rotation must not weaken this check.
+        await expect(f.service.configure(f.endpoint.id, {
+          action: "reconnect", credentials: { botToken: f.token },
+        }, actor.userId)).rejects.toMatchObject({ details: { code: "chat_provider_permissions_missing", missingScopes: ["files:write"] } });
+      });
+
       it("removes a granted opt-in group end-to-end through the managed manifest update, reinstall and resume", async () => {
         const f = await managedFixture(); await f.provision();
         await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);

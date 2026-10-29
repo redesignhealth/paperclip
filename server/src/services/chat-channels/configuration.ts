@@ -679,6 +679,10 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
     const previousSpekoSigningSecret = endpoint.provider === "speko"
       ? (await resolveCredentials(endpoint).catch(() => ({} as Record<string, string>))).signingSecret : undefined;
     const replacingCredentials = Boolean(input.credentials && Object.keys(input.credentials).length > 0);
+    // Supplying only a signing secret merges with the stored bot token; it is
+    // not a new Slack grant. Only an explicitly supplied bot token represents
+    // the replacement install whose scopes must match the requested groups.
+    const replacingSlackBotToken = Boolean(input.credentials?.botToken);
     let credentials =
       replacingCredentials
         ? await normalizedCredentials(endpoint, input.credentials!)
@@ -696,7 +700,7 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
     const identity = await verifyCredentials(
       endpoint.provider,
       credentials,
-      slackRequiredOptInScopes(endpoint, replacingCredentials ? "replacement" : "installed"),
+      slackRequiredOptInScopes(endpoint, replacingSlackBotToken ? "replacement" : "installed"),
     );
     // Once setup has claimed a provider bot identity, every credential repair
     // must prove that same identity before secrets can be replaced. A process

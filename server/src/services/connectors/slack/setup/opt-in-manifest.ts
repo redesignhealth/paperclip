@@ -106,20 +106,30 @@ export async function applySlackOptInManifestChange(
   });
   const manifestHash = slackInstallManifestHash(manifest);
   if (unchanged) {
-    // Requested groups now match what Slack already granted. Restore the saved
-    // manifest and clear the pending marker so installs are not blocked.
+    // Matching the live grant does not prove Slack still has that manifest:
+    // configureManifest may already have pushed another request and moved the
+    // registration to install. In that window the restored manifest must be
+    // pushed again before authorizing. Keep the marker across repeated edits.
+    // A still-configured registration has not pushed the pending change, so
+    // withdrawing it can simply clear the permission-change marker.
+    const mustRepush = row.status !== "configured" &&
+      (row.manifestHash !== manifestHash || row.errorCode === SLACK_PERMISSIONS_UPDATE_PENDING);
     if (row.manifestHash === manifestHash && row.errorCode !== SLACK_PERMISSIONS_UPDATE_PENDING) return;
     await executor
       .update(chatSlackRegistrations)
       .set({
         manifest,
         manifestHash,
-        // Restore the pre-pending status: a configured app is installable
-        // again. Only a permission change is withdrawn here; a new app's own
-        // first manifest update (event settings) still has to reach Slack.
-        ...(row.errorCode === SLACK_PERMISSIONS_UPDATE_PENDING
-          ? { errorCode: null }
-          : {}),
+        // Never clear a new app's first event-settings update. Otherwise an
+        // already-pushed change needs the restored manifest applied again;
+        // only an unpushed permission change can be withdrawn locally.
+        ...(row.errorCode === "slack_manifest_update_pending"
+          ? {}
+          : mustRepush
+            ? { errorCode: SLACK_PERMISSIONS_UPDATE_PENDING }
+            : row.errorCode === SLACK_PERMISSIONS_UPDATE_PENDING
+              ? { errorCode: null }
+              : {}),
         updatedAt: new Date(),
       })
       .where(
