@@ -6,6 +6,7 @@ import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assig
 import { COMMS_IDENTITY_REISSUE_MAX_AGENTS } from "../services/comms-identity-reissue.js";
 import { BRAIN_BINDING_BATCH_LIMIT } from "../services/arcana-brain-binding.js";
 import { COMMS_SHARED_SYNC_BATCH_LIMIT } from "../services/comms-shared-sync.js";
+import { COMMS_OWNER_SYNC_BATCH_LIMIT } from "../services/comms-owner-sync.js";
 import { COMMS_RESCOPE_BATCH_LIMIT } from "../services/comms-credential-rescope.js";
 import { ARCANA_BACKFILL_BATCH_LIMIT } from "../services/arcana-brain-backfill.js";
 import { DEFAULT_MCP_LEGACY_ENROLLMENT_BATCH_LIMIT } from "../services/default-mcp-legacy-enrollment.js";
@@ -1437,6 +1438,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/comms-owner-assignment",
   "POST /api/companies/{companyId}/default-mcp/comms-identity-reissue",
   "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
+  "POST /api/companies/{companyId}/default-mcp/comms-owner-sync",
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-binding",
   "POST /api/companies/{companyId}/visibility-backfill",
   "POST /api/companies/{companyId}/default-mcp/missing-entry-enrollment",
@@ -3705,6 +3707,26 @@ registry.registerPath({
         dryRun: z.boolean().optional(),
         confirm: z.string().optional(),
         limit: z.number().int().min(1).max(COMMS_SHARED_SYNC_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-owner-sync",
+  tags: ["agents"],
+  summary: "Sync existing comms-board agents' stored owner onto the ownership registry's owner",
+  description: "After a human-approved owner reassignment, reads each ready, dedicated comms-board agent's owner from the ownership registry and updates the agent's frozen owner to that person, only when they are a verified, active member of this company and the entry is unchanged since it was read. The owner is never taken from the request. Defaults to a read-only census; a real run needs dryRun=false and the confirmation string. Reports counts, agent ids and registry subs only. Admin-only (owner/admin membership, tools:manage_connections, or instance admin).",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_OWNER_SYNC_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
       }),
     ),

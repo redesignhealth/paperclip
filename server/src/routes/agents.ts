@@ -139,6 +139,12 @@ import {
   syncCommsShared,
 } from "../services/comms-shared-sync.js";
 import {
+  COMMS_OWNER_SYNC_BATCH_LIMIT,
+  CommsOwnerSyncConfirmationError,
+  CommsOwnerSyncInProgressError,
+  syncCommsOwner,
+} from "../services/comms-owner-sync.js";
+import {
   BRAIN_BINDING_BATCH_LIMIT,
   BrainBindingConfirmationError,
   BrainBindingInProgressError,
@@ -4241,6 +4247,52 @@ export function agentRoutes(
     } catch (err) {
       if (err instanceof CommsSharedSyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       if (err instanceof CommsSharedSyncInProgressError) throw conflict("A shared sync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Admin-only, company-scoped. Makes each ready agent's frozen comms-board `ownerUserId` follow the ownership registry's
+  // owner after a human-approved reassignment (one registry read per agent; the owner is never taken from the request).
+  // Census by default; a real run needs dryRun:false plus the confirmation string.
+  router.post("/companies/:companyId/default-mcp/comms-owner-sync", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
+    const manager =
+      req.actor.source === "local_implicit" ||
+      req.actor.isInstanceAdmin ||
+      membership?.membershipRole === "owner" ||
+      membership?.membershipRole === "admin" ||
+      (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
+    if (!manager) throw forbidden("Only a connection manager can sync comms-board owners");
+
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.limit !== undefined &&
+      (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > COMMS_OWNER_SYNC_BATCH_LIMIT)
+    ) {
+      throw badRequest(`limit must be an integer between 1 and ${COMMS_OWNER_SYNC_BATCH_LIMIT}`);
+    }
+    if (body.afterId !== undefined && (typeof body.afterId !== "string" || !UUID_PATTERN.test(body.afterId))) {
+      throw badRequest("afterId must be a UUID");
+    }
+
+    try {
+      const report = await syncCommsOwner(db, {
+        companyId,
+        dryRun: body.dryRun !== false,
+        confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+        limit: typeof body.limit === "number" ? body.limit : undefined,
+        afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+      });
+      res.json(report);
+    } catch (err) {
+      if (err instanceof CommsOwnerSyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsOwnerSyncInProgressError) throw conflict("An owner sync run is already in progress for this company");
       throw err;
     }
   });

@@ -680,3 +680,51 @@ export async function rotateCommsBoardCredential(
     tokenExpiresAt: typeof expiresAt === "string" && expiresAt.length > 0 ? expiresAt : null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Ownership registry read (owner sync)
+// ---------------------------------------------------------------------------
+
+export type ReadOwnershipOutcome =
+  | { ok: true; ownerEmail: string; active: boolean }
+  | { ok: false; reason: "registry_sub_unknown" | "registry_rejected" | "registry_failed" | "invalid_subject" };
+
+/**
+ * `GET {ownershipApiUrl}/ownership/{sub}` (needs `ownership:read` on the ownership token): the registry's current
+ * owner of a sub. The registry is the authority for ownership (a human-approved reassignment writes it first and the
+ * board row follows), so this is the read the owner sync follows. Read-only, never retried here. The reply is only
+ * trusted when it names the same sub; nothing else in it (token expiry included) is returned.
+ */
+export async function readCommsBoardOwnership(
+  config: CommsBoardProvisionerConfig,
+  request: { baseSub: string },
+  fetchImpl: FetchLike = fetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<ReadOwnershipOutcome> {
+  if (!BASE_SUB_PATTERN.test(request.baseSub)) return { ok: false, reason: "invalid_subject" };
+  let response: Response;
+  try {
+    response = await fetchImpl(`${config.ownershipApiUrl}/ownership/${encodeURIComponent(request.baseSub)}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${config.ownershipApiToken}` },
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
+    });
+  } catch {
+    return { ok: false, reason: "registry_failed" };
+  }
+  if (response.status === 404) return { ok: false, reason: "registry_sub_unknown" };
+  if (response.status === 401 || response.status === 403) return { ok: false, reason: "registry_rejected" };
+  if (response.status !== 200) return { ok: false, reason: "registry_failed" };
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, reason: "registry_failed" };
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "registry_failed" };
+  const { sub, owner_email: ownerEmail, active } = body as Record<string, unknown>;
+  if (sub !== request.baseSub || typeof active !== "boolean") return { ok: false, reason: "registry_failed" };
+  if (typeof ownerEmail !== "string" || ownerEmail.trim().length === 0) return { ok: false, reason: "registry_failed" };
+  return { ok: true, ownerEmail, active };
+}
