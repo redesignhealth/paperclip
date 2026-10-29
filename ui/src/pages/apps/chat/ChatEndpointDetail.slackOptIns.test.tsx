@@ -128,6 +128,47 @@ function buttonWithText(text: string) {
 }
 
 describe("Slack permission opt-ins on the connection settings page", () => {
+  it.each(["managed", "automatic"] as const)("keeps the %s configuration action after a pushed manifest is reverted to the live grant", async slackSetupMethod => {
+    const pushed = slackEndpoint({ setup: { ...baseSetup, slackSetupMethod,
+      slackOptInScopeGroups: ["proactive_dms", "file_upload"], slackInstalledOptInScopeGroups: ["proactive_dms"],
+      slackRegistration: { status: "install", appId: "A123" },
+    } });
+    mocks.get.mockResolvedValue(pushed);
+    mocks.update.mockResolvedValue(slackEndpoint({ setup: { ...baseSetup, slackSetupMethod,
+      slackOptInScopeGroups: ["proactive_dms"], slackInstalledOptInScopeGroups: ["proactive_dms"],
+      slackRegistration: { status: "install", appId: "A123", errorCode: "slack_permissions_update_pending" },
+    } }));
+    await render();
+    await act(async () => optInCheckbox("File upload").click());
+    await vi.waitFor(() => expect(optInCheckbox("File upload").getAttribute("aria-checked")).toBe("false"));
+    expect(buttonWithText(slackSetupMethod === "managed" ? "Reinstall in Slack" : "Update app and reinstall")).toBeDefined();
+    expect(container.textContent).toContain("configuration still needs");
+    expect(container.querySelectorAll('[data-slack-opt-in-status="enabled"]')).toHaveLength(1);
+    expect(optInCheckbox("Proactive DMs").getAttribute("aria-checked")).toBe("true");
+    expect(container.querySelectorAll('[data-slack-opt-in-status="off"]')).toHaveLength(2);
+  });
+
+  it("does not replace new permission choices with an older general-settings response", async () => {
+    let resolveGeneral!: (endpoint: ChatEndpoint) => void;
+    const older = slackEndpoint({ allowDirectMessages: false });
+    mocks.update.mockImplementation(async (_id: string, input: { slackOptInScopeGroups?: SlackOptInScopeGroup[] }) => {
+      if (!input.slackOptInScopeGroups) return new Promise<ChatEndpoint>(resolve => { resolveGeneral = resolve; });
+      return slackEndpoint({ setup: { ...baseSetup, slackOptInScopeGroups: input.slackOptInScopeGroups, slackInstalledOptInScopeGroups: [] } });
+    });
+    await render();
+    const dmLabel = [...container.querySelectorAll("p")].find(node => node.textContent === "Allow direct messages")!;
+    const dmToggle = dmLabel.closest(".flex")!.querySelector<HTMLButtonElement>('button[role="switch"]')!;
+    await act(async () => dmToggle.click());
+    await vi.waitFor(() => expect(resolveGeneral).toBeDefined());
+    await act(async () => optInCheckbox("File upload").click());
+    await vi.waitFor(() => expect(optInCheckbox("File upload").getAttribute("aria-checked")).toBe("true"));
+    await act(async () => resolveGeneral(older));
+    await settle();
+    await act(async () => optInCheckbox("Proactive DMs").click());
+    await vi.waitFor(() => expect(mocks.update).toHaveBeenLastCalledWith("endpoint-a", {
+      slackOptInScopeGroups: ["proactive_dms", "file_upload"],
+    }));
+  });
   it("renders the three groups off for an agent with no opt-ins", async () => {
     await render();
     expect(container.textContent).toContain("Extra Slack permissions");

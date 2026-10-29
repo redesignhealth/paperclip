@@ -43,6 +43,7 @@ export function SlackScopeOptIns({
   value,
   installed,
   setupMethod,
+  manifestErrorCode,
   disabled,
   pending,
   onChange,
@@ -55,6 +56,8 @@ export function SlackScopeOptIns({
   installed?: readonly SlackOptInScopeGroup[];
   /** Selects the reconnect wording: managed reinstalls, own-app retries first. */
   setupMethod?: SlackOptInSetupMethod;
+  /** Server evidence that even a reverted request still needs to be pushed. */
+  manifestErrorCode?: string | null;
   disabled?: boolean;
   /** A save is in flight. */
   pending?: boolean;
@@ -155,10 +158,12 @@ export function SlackScopeOptIns({
         approve this agent&apos;s install again. Until then the agent keeps its
         current permissions.
       </p>
-      {pendingChange && (
+      {(pendingChange || manifestErrorCode === "slack_permissions_update_pending") && (
         <div role="status" className="space-y-2 rounded-lg border border-border bg-muted p-3 text-sm">
           <p>
-            {managed
+            {!pendingChange
+              ? "The Slack app configuration still needs to be updated. Apply the restored manifest before reconnecting, even though your selection matches the live grant."
+              : managed
               ? "Your selection differs from what Slack granted. Reinstall this agent's app to apply it."
               : "Your selection differs from what Slack granted. Update the app configuration, then reinstall it in Slack, to apply it."}
           </p>

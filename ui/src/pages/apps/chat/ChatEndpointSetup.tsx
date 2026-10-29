@@ -624,6 +624,7 @@ function ChatSdkEndpointSetup() {
               <SlackScopeOptIns value={slackOptIns} disabled={!slackOptInsEditable}
                 pending={saveSlackOptIns.isPending} installed={savedSlackOptIns.installed}
                 setupMethod={endpoint?.setup?.slackSetupMethod}
+                manifestErrorCode={endpoint?.setup?.slackRegistration?.errorCode}
                 onChange={persistSlackOptIns}
                 // Both setup methods resolve a pending permission change on the
                 // Connect step: managed reinstalls, own app retries the manifest.

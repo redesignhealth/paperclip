@@ -26,7 +26,7 @@ import { EmailConnectionAccess } from "@/components/EmailConnectionAccess";
 import { emailApi } from "@/api/email";
 import { toolsApi } from "@/api/tools";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowDownLeft,
@@ -431,7 +431,7 @@ function EndpointExecutionDefaults({ endpoint }: { endpoint: ChatEndpoint }) {
     value={endpoint.executionDefaults}
     onSave={async (executionDefaults) => {
       const next = await chatEndpointsApi.update(endpoint.id, { executionDefaults });
-      queryClient.setQueryData(queryKeys.chatEndpoints.detail(endpoint.id), next);
+      reconcileEndpointSettings(queryClient, next, ["executionDefaults"]);
     }}
   /></section>;
 }
@@ -460,6 +460,19 @@ function EmailAccess({ endpoint }: { endpoint: ChatEndpoint }) {
     {credentialId !== endpoint.connectionId && <p className="text-sm text-muted-foreground">These settings apply to the saved AgentMail account and all inboxes using it.</p>}
     <EmailConnectionAccess key={credentialId} companyId={endpoint.companyId} connectionId={credentialId} agents={agents.data} />
   </section>;
+}
+
+/**
+ * PATCH responses are full snapshots, not revisions. Only apply fields owned by
+ * this write: an older response must not undo a concurrent permission save (or
+ * the reverse). All endpoint-settings writers on this page use this reconciler.
+ */
+function reconcileEndpointSettings(client: QueryClient, next: ChatEndpoint, fields: readonly (keyof ChatEndpoint)[]) {
+  client.setQueryData<ChatEndpoint>(queryKeys.chatEndpoints.detail(next.id), current => {
+    if (!current) return next;
+    const patch = Object.fromEntries(fields.map(field => [field, next[field]]));
+    return { ...current, ...patch };
+  });
 }
 
 function Settings({
@@ -501,12 +514,9 @@ function Settings({
       }),
   });
   const updateEndpoint = useMutation({
-    mutationFn: chatEndpointsApi.update.bind(null, endpointId),
-    onSuccess: (next) =>
-      queryClient.setQueryData(
-        queryKeys.chatEndpoints.detail(endpointId),
-        next,
-      ),
+    mutationFn: (input: Parameters<typeof chatEndpointsApi.update>[1]) => chatEndpointsApi.update(endpointId, input),
+    onSuccess: (next, input) =>
+      reconcileEndpointSettings(queryClient, next, Object.keys(input) as (keyof ChatEndpoint)[]),
     onError: (error) =>
       pushToast({
         title: "Couldn't update settings",
@@ -521,11 +531,7 @@ function Settings({
     scope: { id: `slack-opt-ins:${endpointId}` },
     mutationFn: (slackOptInScopeGroups: SlackOptInScopeGroup[]) =>
       chatEndpointsApi.update(endpointId, { slackOptInScopeGroups }),
-    onSuccess: (next) =>
-      queryClient.setQueryData(
-        queryKeys.chatEndpoints.detail(endpointId),
-        next,
-      ),
+    onSuccess: (next) => reconcileEndpointSettings(queryClient, next, ["setup"]),
     onError: (error) =>
       pushToast({
         title: "Couldn't update Slack permissions",
@@ -716,7 +722,7 @@ function Settings({
         value={endpoint.communicationInstructions ?? ""}
         onSave={async (communicationInstructions) => {
           const next = await chatEndpointsApi.update(endpointId, { communicationInstructions });
-          queryClient.setQueryData(queryKeys.chatEndpoints.detail(endpointId), next);
+          reconcileEndpointSettings(queryClient, next, ["communicationInstructions"]);
         }}
       />}
       {endpoint.provider === "slack" && <SlackSetupAdvanced label="Slack permissions">
@@ -726,6 +732,7 @@ function Settings({
           value={slackOptIns.requested}
           installed={slackOptIns.installed}
           setupMethod={endpoint.setup?.slackSetupMethod}
+          manifestErrorCode={endpoint.setup?.slackRegistration?.errorCode}
           pending={saveSlackOptIns.isPending}
           onChange={(slackOptInScopeGroups) => saveSlackOptIns.mutate(slackOptInScopeGroups)}
           onReconnect={() => navigate(`/apps/chat/connect?provider=slack&purpose=chat&resume=${endpointId}&reconnect=1`)}
@@ -789,21 +796,13 @@ function Access({
   const updatePolicy = useMutation({
     mutationFn: (value: boolean) =>
       chatEndpointsApi.update(endpointId, { allowUnlinkedPeople: value }),
-    onSuccess: (next) =>
-      queryClient.setQueryData(
-        queryKeys.chatEndpoints.detail(endpointId),
-        next,
-      ),
+    onSuccess: (next) => reconcileEndpointSettings(queryClient, next, ["allowUnlinkedPeople"]),
     onError: (error) => pushToast({ title: "Couldn’t update access", body: error instanceof Error ? error.message : "Try again.", tone: "error" }),
   });
   const updateTrust = useMutation({
     mutationFn: (value: boolean) =>
       chatEndpointsApi.update(endpointId, { trustUnlinkedPeople: value }),
-    onSuccess: (next) =>
-      queryClient.setQueryData(
-        queryKeys.chatEndpoints.detail(endpointId),
-        next,
-      ),
+    onSuccess: (next) => reconcileEndpointSettings(queryClient, next, ["trustUnlinkedPeople"]),
     onError: (error) => pushToast({ title: "Couldn’t update access", body: error instanceof Error ? error.message : "Try again.", tone: "error" }),
   });
   const createIntent = useMutation({

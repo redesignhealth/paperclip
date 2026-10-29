@@ -80,9 +80,12 @@ action. The path depends on the setup method:
   reinstall the app in Slack.
 
 The saved change is stored immediately, so leaving the page does not lose it. It
-applies only after the manifest update and reinstall succeed. Turning a pending
-group back off clears the pending marker; an abandoned change does not block
-setup.
+applies only after the manifest update and reinstall succeed. Restoring the
+installed group set clears the pending marker only if the changed manifest has
+not yet been pushed to Slack. After a push, the restored manifest must be applied
+again before reconnecting. Paperclip keeps the configuration action visible until
+that update finishes, even when requested and installed groups match. Group
+badges still describe the live grant, not the pending manifest.
 
 ### Legacy installations
 
