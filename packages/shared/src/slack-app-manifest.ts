@@ -135,6 +135,7 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_configuration_credential_forbidden: "This saved Slack token belongs to another Paperclip account. Use your own token.",
     slack_manifest_invalid: "Slack rejected this app configuration. Check the app details or use manual setup.",
     slack_manifest_update_pending: "Your Slack app is saved, but its event settings still need to be applied. Enter an app configuration access token to retry configuring the same app.",
+    slack_permissions_update_pending: "This agent's Slack permissions changed. Update the Slack app and re-authorize it to apply them. Until then the agent keeps its current permissions.",
     slack_tool_not_enabled: "This Slack action is not enabled for this agent. Enable the matching permission group in the agent's Slack setup, then reconnect so Slack grants it.",
     slack_setup_rate_limited: "Slack is limiting setup requests. Wait a minute and try again.",
     slack_setup_permission_denied: "Slack requires permission to create or install this app. Ask your workspace administrator.",
@@ -143,7 +144,7 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_install_expired: "Slack authorization expired. Install the same app again to continue.",
     slack_install_failed: "Slack installation could not be completed. Authorize the same app again.",
     slack_install_identity_mismatch: "Slack returned a different app, workspace, or bot. Install the app created for this connection.",
-    slack_install_scopes_missing: "Slack did not grant all required bot permissions. Install the app again and approve its requested permissions.",
+    slack_install_scopes_missing: "Slack did not grant all required bot permissions. Install the app again and approve its requested permissions, or turn off the permission group you don't want in this agent's Slack setup.",
     slack_bot_already_connected: "This Slack bot is already connected to Paperclip. Resume its existing connection or use a different app.",
     slack_install_token_invalid: "Slack rejected the saved bot credentials. Continue in Slack to authorize this app again.",
     slack_configuration_incomplete: "The app is installed, but Paperclip could not finish connecting it. Retry connecting the saved installation.",
@@ -151,6 +152,20 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_install_account_conflict: "This Slack account already has an existing link. Manage account links in connection settings, or authorize with your own Slack account.",
   };
   return messages[code] ?? "Slack setup could not be completed. Resume setup and try again.";
+}
+
+/**
+ * A saved Slack app whose stored manifest still has to be pushed to Slack.
+ *
+ * Two causes share the same follow-up (apply the manifest, then install) but
+ * need different words for the user:
+ * - `slack_manifest_update_pending`: a newly created app whose event settings
+ *   are not applied yet.
+ * - `slack_permissions_update_pending`: an installed app whose per-agent opt-in
+ *   permissions changed and must be re-authorized.
+ */
+export function isSlackManifestUpdatePending(code: string | null | undefined): boolean {
+  return code === "slack_manifest_update_pending" || code === "slack_permissions_update_pending";
 }
 
 /** Persisted legacy values keep their original meaning. Missing means manual. */

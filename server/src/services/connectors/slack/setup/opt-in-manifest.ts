@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { chatEndpoints, chatSlackRegistrations, type Db } from "@paperclipai/db";
 import {
   buildSlackAppManifest,
+  isSlackManifestUpdatePending,
   slackAppConfigurationSchema,
   slackOptInGroupsForSetup,
   slackOptInGroupsFromScopes,
@@ -10,7 +11,16 @@ import {
   type SlackOptInScopeGroup,
 } from "@paperclipai/shared";
 import { conflict } from "../../../../errors.js";
+import { sameSlackOptInGroups } from "../../slack-opt-ins.js";
 import { object } from "./provider-client.js";
+
+/**
+ * An installed app's per-agent permissions changed and its manifest must be
+ * pushed to Slack and re-authorized. Distinct from a new app's first manifest
+ * update (`slack_manifest_update_pending`) so the user is told the real reason;
+ * `isSlackManifestUpdatePending` treats both as the same follow-up.
+ */
+export const SLACK_PERMISSIONS_UPDATE_PENDING = "slack_permissions_update_pending";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type Executor = Db | DbTransaction;
@@ -45,8 +55,9 @@ export function slackInstallManifestHash(manifest: unknown): string {
  * TECH-7988: an opt-in change after the app exists can only take effect through
  * a Slack manifest update followed by a reinstall. Rather than inventing a
  * parallel mechanism, rewrite the registration's stored manifest and mark it
- * `slack_manifest_update_pending` -- exactly the state the existing
- * configuration-token retry and managed reconnect paths already resolve.
+ * `slack_permissions_update_pending`. Every path that resolves a pending
+ * manifest update (the configuration-token retry and the managed reconnect)
+ * recognizes it through `isSlackManifestUpdatePending`.
  *
  * The prior installation keeps its granted scopes until the reinstall lands
  * (see `slackOptInGroupsForSetup`), so a pending change never silently drops
@@ -84,9 +95,7 @@ export async function applySlackOptInManifestChange(
     );
   const requested = slackRequestedOptInGroups(input.setup);
   const installed = slackOptInGroupsForSetup(input.setup);
-  const unchanged =
-    JSON.stringify([...requested].sort()) ===
-    JSON.stringify([...installed].sort());
+  const unchanged = sameSlackOptInGroups(requested, installed);
   const app = slackAppConfigurationSchema.parse(input.app);
   const manifest = buildSlackAppManifest({
     app,
@@ -97,19 +106,30 @@ export async function applySlackOptInManifestChange(
   });
   const manifestHash = slackInstallManifestHash(manifest);
   if (unchanged) {
-    // Requested groups now match what Slack already granted. Restore the saved
-    // manifest and clear the pending marker so installs are not blocked.
-    if (row.manifestHash === manifestHash && row.errorCode !== "slack_manifest_update_pending") return;
+    // Matching the live grant does not prove Slack still has that manifest:
+    // configureManifest may already have pushed another request and moved the
+    // registration to install. In that window the restored manifest must be
+    // pushed again before authorizing. Keep the marker across repeated edits.
+    // A still-configured registration has not pushed the pending change, so
+    // withdrawing it can simply clear the permission-change marker.
+    const mustRepush = row.status !== "configured" &&
+      (row.manifestHash !== manifestHash || row.errorCode === SLACK_PERMISSIONS_UPDATE_PENDING);
+    if (row.manifestHash === manifestHash && row.errorCode !== SLACK_PERMISSIONS_UPDATE_PENDING) return;
     await executor
       .update(chatSlackRegistrations)
       .set({
         manifest,
         manifestHash,
-        // Restore the pre-pending status: a configured app is installable
-        // again, while a draft stays in its own creation stage.
+        // Never clear a new app's first event-settings update. Otherwise an
+        // already-pushed change needs the restored manifest applied again;
+        // only an unpushed permission change can be withdrawn locally.
         ...(row.errorCode === "slack_manifest_update_pending"
-          ? { errorCode: null }
-          : {}),
+          ? {}
+          : mustRepush
+            ? { errorCode: SLACK_PERMISSIONS_UPDATE_PENDING }
+            : row.errorCode === SLACK_PERMISSIONS_UPDATE_PENDING
+              ? { errorCode: null }
+              : {}),
         updatedAt: new Date(),
       })
       .where(
@@ -120,13 +140,18 @@ export async function applySlackOptInManifestChange(
       );
     return;
   }
-  if (manifestHash === row.manifestHash && row.errorCode === "slack_manifest_update_pending") return;
+  if (manifestHash === row.manifestHash && isSlackManifestUpdatePending(row.errorCode)) return;
   await executor
     .update(chatSlackRegistrations)
     .set({
       manifest,
       manifestHash,
-      errorCode: "slack_manifest_update_pending",
+      // A new app still awaiting its first manifest update keeps that reason:
+      // applying it pushes this newest manifest anyway, and nothing is installed
+      // yet that would need re-authorizing.
+      errorCode: row.errorCode === "slack_manifest_update_pending"
+        ? row.errorCode
+        : SLACK_PERMISSIONS_UPDATE_PENDING,
       updatedAt: new Date(),
     })
     .where(

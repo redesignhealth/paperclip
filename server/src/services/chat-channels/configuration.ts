@@ -7,7 +7,10 @@ import { createGitHubAppSetup } from "./github/app-setup.js";
 
 import type { VerifiedProviderIdentity } from "./runtime-types.js";
 
-import { isProvisionedSlackSetup } from "@paperclipai/shared";
+import {
+  isProvisionedSlackSetup,
+  slackOptInGroupsFromScopes,
+} from "@paperclipai/shared";
 
 import { slackCallbackMatchesPublicUrl } from "./slack/callback-verification.js";
 
@@ -74,6 +77,25 @@ import {
 
 import type { EndpointRecord } from "./runtime-types.js";
 import type { createChatCredentials } from "./credentials.js";
+import { isSlackLegacyInstall, slackVerificationOptInScopes } from "../connectors/slack-opt-ins.js";
+/**
+ * TECH-7988: the opt-in scopes a Slack token must hold on top of the chat floor.
+ *
+ * A stored token is the live install, so it must still hold the groups recorded
+ * as installed. A newly supplied token replaces the install, so it is checked
+ * against the groups the operator requested, which is what its manifest asked
+ * Slack for. Checking a replacement against the old grant would make removing a
+ * group impossible. Neither case requires the implied legacy grant.
+ */
+function slackRequiredOptInScopes(
+  endpoint: { provider: string; setup: ChatEndpointSetupState },
+  token: "replacement" | "installed",
+) {
+  return endpoint.provider === "slack"
+    ? slackVerificationOptInScopes(endpoint.setup, token)
+    : undefined;
+}
+
 type ChatConfigurationOptions = Pick<ReturnType<typeof createChatCredentials>, "normalizedCredentials" | "verifyCredentials" | "nativeBotIdentityMatches" | "legacyGitHubLabelsMatchVerifiedCredentials" | "assertNativeBotIdentityAvailable" | "isNativeBotIdentityUniqueViolation" | "nativeBotIdentityConflict" | "persistCredentials" | "clearCredentials" | "resolveCredentials" | "prepareProviderInventory"> & {
   endpointRecord: (endpointId: string) => Promise<EndpointRecord | null>;
   get: (endpointId: string) => Promise<ChatEndpoint>;
@@ -242,7 +264,13 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
           code: "chat_endpoint_credentials_missing",
         });
       });
-      const identity = await verifyCredentials(endpoint.provider, credentials);
+      // Resume re-verifies the stored token, so it must still hold what is
+      // recorded as installed. A legacy row needs only the chat floor.
+      const identity = await verifyCredentials(
+        endpoint.provider,
+        credentials,
+        slackRequiredOptInScopes(endpoint, "installed"),
+      );
       const upgradingLegacyGitHubIdentity =
         endpoint.provider === "github" &&
         !endpoint.botExternalId &&
@@ -650,9 +678,14 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
 
     const previousSpekoSigningSecret = endpoint.provider === "speko"
       ? (await resolveCredentials(endpoint).catch(() => ({} as Record<string, string>))).signingSecret : undefined;
+    const replacingCredentials = Boolean(input.credentials && Object.keys(input.credentials).length > 0);
+    // Supplying only a signing secret merges with the stored bot token; it is
+    // not a new Slack grant. Only an explicitly supplied bot token represents
+    // the replacement install whose scopes must match the requested groups.
+    const replacingSlackBotToken = Boolean(input.credentials?.botToken);
     let credentials =
-      input.credentials && Object.keys(input.credentials).length > 0
-        ? await normalizedCredentials(endpoint, input.credentials)
+      replacingCredentials
+        ? await normalizedCredentials(endpoint, input.credentials!)
         : await resolveCredentials(endpoint).catch(() => {
             throw unprocessable(
               `${PROVIDER_LABELS[endpoint.provider]} credentials are required`,
@@ -661,7 +694,14 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
     if (endpoint.provider === "imessage-photon") {
       credentials = preparePhotonConfiguration(endpoint, input, credentials);
     }
-    const identity = await verifyCredentials(endpoint.provider, credentials);
+    // A supplied token (including every Slack reinstall) replaces the live
+    // install and is verified against what was requested, so removing a group
+    // can complete. Re-verifying the stored token keeps the installed check.
+    const identity = await verifyCredentials(
+      endpoint.provider,
+      credentials,
+      slackRequiredOptInScopes(endpoint, replacingSlackBotToken ? "replacement" : "installed"),
+    );
     // Once setup has claimed a provider bot identity, every credential repair
     // must prove that same identity before secrets can be replaced. A process
     // interruption can leave the endpoint in `attention` after the claim but
@@ -808,6 +848,17 @@ export function createChatConfiguration(db: Db, options: ChatConfigurationOption
                 ? preserveSlackVerification ? (current.setup.webhookVerifiedAt ?? null) : null
                 : (current.setup.webhookVerifiedAt ?? null),
               runtimeGeneration: runtimeGeneration(current.setup) + 1,
+              // TECH-7988: record what the verified token actually holds, never
+              // what was requested. A manual app that lacks a group's scopes
+              // therefore leaves that group's tools gated, and a removed group
+              // stops being recorded once the reinstall's token lacks it.
+              // Only a legacy install (judged before this credential replaced
+              // it) keeps its implied grant; a never-connected row records one,
+              // so it cannot later be mistaken for a legacy install.
+              ...(endpoint.provider === "slack" &&
+              !isSlackLegacyInstall({ botExternalId: endpoint.botExternalId, setup: current.setup })
+                ? { slackInstalledOptInScopeGroups: slackOptInGroupsFromScopes(identity.grantedScopes ?? []) }
+                : {}),
             } as InternalSetupState,
             updatedAt,
           })

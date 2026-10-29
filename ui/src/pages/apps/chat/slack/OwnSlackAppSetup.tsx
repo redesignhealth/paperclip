@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Loader2 } from "lucide-react";
 import type { SlackConfigurationCredential } from "@paperclipai/shared";
-import { slackRegistrationErrorMessage } from "@paperclipai/shared";
+import { isSlackManifestUpdatePending, slackRegistrationErrorMessage } from "@paperclipai/shared";
 import { chatEndpointsApi, type ChatEndpoint } from "@/api/chatEndpoints";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -57,7 +57,9 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
   const uncertain = registration?.status === "uncertain";
   const creating = registration?.status === "creating";
   const created = Boolean(registration?.appId);
-  const configurationPending = registration?.errorCode === "slack_manifest_update_pending";
+  // A new app's first manifest update and a later permission change both
+  // need the same configuration-token retry to push the saved manifest.
+  const configurationPending = isSlackManifestUpdatePending(registration?.errorCode);
   const optimistic = justSaved && justSaved.basis === slackSetupOptions ? justSaved.credential : null;
   const credentials = optimistic
     ? [...(slackSetupOptions?.configurationCredentials ?? []).filter(credential => credential.id !== optimistic.id), optimistic]

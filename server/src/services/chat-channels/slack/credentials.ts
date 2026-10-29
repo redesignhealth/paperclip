@@ -6,12 +6,19 @@ import {
 
 import type { VerifiedProviderIdentity } from "../runtime-types.js";
 
+/** The chat floor every bot needs; callers add the endpoint's opt-in scopes. */
 const REQUIRED_SLACK_BOT_SCOPES = SLACK_CHAT_BOT_SCOPES;
 
+/**
+ * Verify a Slack bot token. `requiredOptInScopes` are the opt-in scopes the
+ * caller requires on top of the chat floor: the installed groups' scopes for a
+ * stored token, or the requested groups' scopes for a replacement token.
+ */
 export async function verifySlackCredentials(
   credentials: Record<string, string>,
   fetchImpl: typeof fetch,
   PROVIDER_CREDENTIAL_CHECK_TIMEOUT_MS: number,
+  requiredOptInScopes: readonly string[] = [],
 ): Promise<VerifiedProviderIdentity> {
   const response = await fetchImpl("https://slack.com/api/auth.test", {
     method: "POST",
@@ -40,7 +47,7 @@ export async function verifySlackCredentials(
       .map((scope) => scope.trim())
       .filter(Boolean),
   );
-  const missingScopes = REQUIRED_SLACK_BOT_SCOPES.filter(
+  const missingScopes = [...new Set([...REQUIRED_SLACK_BOT_SCOPES, ...requiredOptInScopes])].filter(
     (scope) => !grantedScopes.has(scope),
   );
   if (missingScopes.length > 0) {
@@ -56,6 +63,8 @@ export async function verifySlackCredentials(
   return {
     providerAccountId: result.team_id,
     providerAccountLabel: result.team,
+    // Reported so callers record installs from the real grant.
+    grantedScopes: [...grantedScopes],
     botExternalId: result.user_id,
     botUsername: result.user,
     botLabel: result.user,
