@@ -2383,7 +2383,8 @@ rl.on("line", (line) => {
   it.each([
     { toolName: "comms_inbox", connectionPrefix: "rh-comms-board" },
     { toolName: "recall", connectionPrefix: "rh-arcana-brain" },
-  ])("recovers cached per-agent $connectionPrefix tools after a credential-less health probe", async ({ toolName, connectionPrefix }) => {
+  ].flatMap((entry) => (["missing_secret", "error", "failed", "degraded"] as const)
+    .map((healthStatus) => ({ ...entry, healthStatus }))))("recovers cached per-agent $connectionPrefix tools after a $healthStatus probe", async ({ toolName, connectionPrefix, healthStatus }) => {
     const company = await createCompany(db);
     const initialAgent = await createAgent(db, company.id);
     const agent = await db.update(agents).set({ adapterType: "codex_local" })
@@ -2407,7 +2408,7 @@ rl.on("line", (line) => {
         toolName,
         riskLevel: "read",
         url: fake.url,
-        healthStatus: "missing_secret",
+        healthStatus,
       });
       await db.update(toolConnections).set({ credentialPolicy: "per_agent" }).where(eq(toolConnections.id, connection.id));
       await db.insert(connectionGrants).values({
@@ -2430,11 +2431,17 @@ rl.on("line", (line) => {
       const named = await gateway.createNamedGateway({ companyId: company.id, body: { name: "Recovery gateway", profileId: profile.id } });
       const managed = await createManagedMcpRunConfig({ db, agent, runId: run.id, config: {}, projectId: null, issueId: null });
       expect(managed?.gateways.map((entry) => entry.id)).toEqual([named.id]);
-      const otherAgent = await createAgent(db, company.id);
+      const initialOtherAgent = await createAgent(db, company.id);
+      const otherAgent = await db.update(agents).set({ adapterType: "codex_local" })
+        .where(eq(agents.id, initialOtherAgent.id)).returning().then((rows) => rows[0]!);
       const { run: otherRun } = await createIssueAndRun(db, company.id, otherAgent.id);
       await allowAllToolsForAgent(db, company.id, otherAgent.id);
       const otherSession = await gateway.createSession({ companyId: company.id, agentId: otherAgent.id, runId: otherRun.id });
       expect((await gateway.listToolsForSession(otherSession.token)).some((entry) => entry.catalogEntryId === catalogEntry.id)).toBe(false);
+      const otherSnapshot = await resolveNativeRuntimeMcpSnapshot({ db, agent: otherAgent, runId: otherRun.id });
+      expect(otherSnapshot.bindingId).toBeNull();
+      expect(await buildPaperclipRuntimeMcpServers({ db, agent: otherAgent, runId: otherRun.id, expectedAssignmentDigest: otherSnapshot.digest })).toEqual([]);
+      expect(await createManagedMcpRunConfig({ db, agent: otherAgent, runId: otherRun.id, config: {}, projectId: null, issueId: null })).toBeNull();
       expect(fake.requests).toHaveLength(0);
       const result = await gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: { key: "a", value: "b" } });
       expect(result.status).toBe("completed");
