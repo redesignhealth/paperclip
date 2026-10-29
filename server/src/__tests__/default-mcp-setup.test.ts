@@ -501,6 +501,28 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(fetchMock.calls.mint).toHaveLength(1);
   });
 
+  it("hiring a setup agent with its own metadata keeps the server-managed defaultMcp state", async () => {
+    const companyId = await seedCompany("private");
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const base = { name: "Setup Bot", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null };
+    const setupId = randomUUID();
+    await agentService(db).create(companyId, { ...base, id: setupId, metadata: { setupAdapterPending: true } } as never, { setupOnly: true, claudeLogin: { storedSessionId: null, ownerUserId: ownerId } } as never);
+    await waitForScheduledDefaultMcpSetups();
+    const before = await entryOf(setupId);
+    expect(before.setup.state).toBe("ready");
+
+    await agentService(db).create(companyId, { ...base, metadata: { note: "from the hire body" } } as never, { setupAgentId: setupId, claudeLogin: { storedSessionId: null, ownerUserId: ownerId } } as never);
+    await waitForScheduledDefaultMcpSetups();
+
+    expect(await entryOf(setupId)).toEqual(before);
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect((await rowOf(setupId)).metadata).toMatchObject({ note: "from the hire body" });
+  });
+
   it("a restarted setup rotates the agent's own leftover token secret instead of failing on the key", async () => {
     const companyId = await seedCompany("private");
     const ownerId = await seedOwner(companyId);

@@ -271,7 +271,7 @@ export async function snapshotDefaultMcpForNewAgent(
 
   for (const entry of spec) {
     const prior = existingEntries[entry.key];
-    if (prior && (prior.binding || prior.setup.state !== "pending" || prior.setup.registerAttemptedAt || prior.setup.mintAttemptedAt)) {
+    if (prior && (prior.binding || prior.setup.registerAttemptedAt || prior.setup.mintAttemptedAt || !["pending", "not_required"].includes(prior.setup.state))) {
       entries[entry.key] = prior;
       keptKeys.add(entry.key);
       continue;

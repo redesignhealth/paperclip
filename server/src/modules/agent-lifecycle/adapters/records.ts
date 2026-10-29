@@ -53,6 +53,12 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
           status: status === "pending_approval" ? "pending_approval" : status === "terminated" ? "terminated" : "paused",
           companyId,
         };
+        // Hiring a setup agent rewrites its row; server-managed `defaultMcp` carries the progress of the setup
+        // run that already started, so a caller-supplied `metadata` must not replace it.
+        const setupDefaultMcp = setup?.metadata && typeof setup.metadata === "object" ? (setup.metadata as Record<string, unknown>)["defaultMcp"] : undefined;
+        if (options?.setupAgentId && setupDefaultMcp !== undefined && values.metadata && typeof values.metadata === "object") {
+          values.metadata = { ...(values.metadata as Record<string, unknown>), defaultMcp: setupDefaultMcp };
+        }
         const created = await (options?.setupAgentId
           ? tx.update(agents).set({ ...values, updatedAt: new Date() }).where(eq(agents.id, options.setupAgentId))
           : tx.insert(agents).values(values))
