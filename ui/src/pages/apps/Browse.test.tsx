@@ -314,6 +314,32 @@ describe("Connectors landing page", () => {
     expect(navigateMock).toHaveBeenCalledWith("/apps/connect?source=bedrock");
   });
 
+  it("disables Granola with the private-company reason a shared company receives", async () => {
+    // The server projects this exact availability; the UI must reuse the
+    // existing disabled state instead of offering a connect action.
+    const granola = getAppStoreDefinition("granola")!;
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("notion"), {
+      ...granola,
+      availability: {
+        available: false,
+        reason: "Granola is only available in private companies.",
+      },
+    }] });
+    await renderBrowse();
+    const row = container.querySelector('[data-app-slug="granola"]')!;
+    expect(row).not.toBeNull();
+    const button = row.querySelector<HTMLButtonElement>(
+      'button[aria-label="Unavailable Granola"]',
+    );
+    expect(button).not.toBeNull();
+    expect(button!.disabled).toBe(true);
+    expect(button!.title).toBe("Granola is only available in private companies.");
+    expect(row.textContent).not.toContain("Connect");
+    // An app without the restriction keeps its connect action.
+    const notion = container.querySelector('[data-app-slug="notion"]')!;
+    expect(notion.querySelector('button[aria-label="Connect Notion"]')).not.toBeNull();
+  });
+
   it("offers assistant setup from Connections without choosing an agent", async () => {
     await renderBrowse();
     const button = container.querySelector<HTMLButtonElement>('[aria-label="Set up Assistant Connection (MCP)"]');
