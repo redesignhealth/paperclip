@@ -154,6 +154,10 @@ export interface ChatEndpoint {
     slackRegistration?: SlackRegistrationState;
     slackAvatar?: SlackAvatarState;
     slackAccount?: SlackAccountState;
+    /** TECH-7988: requested opt-in groups; each adds non-Low-risk scopes. */
+    slackOptInScopeGroups?: import("@paperclipai/shared").SlackOptInScopeGroup[];
+    /** The groups the live installation holds, until a reinstall lands. */
+    slackInstalledOptInScopeGroups?: import("@paperclipai/shared").SlackOptInScopeGroup[];
     slackOAuthCallbackUri?: string | null;
     webhookVerifiedAt?: string | null;
     webhookSecretConfigured?: boolean;
@@ -212,7 +216,13 @@ export const chatEndpointsApi = {
     api.get<ChatEndpoint>(`/chat-endpoints/${endpointId}`),
   create: (
     companyId: string,
-    input: { provider: ChatProvider; assignedAgentId: string; slackApp?: SlackAppConfiguration; slackSetupMethod?: "managed" | "automatic" | "manual" | "existing" },
+    input: {
+      provider: ChatProvider;
+      assignedAgentId: string;
+      slackApp?: SlackAppConfiguration;
+      slackSetupMethod?: "managed" | "automatic" | "manual" | "existing";
+      slackOptInScopeGroups?: import("@paperclipai/shared").SlackOptInScopeGroup[];
+    },
   ) => api.post<ChatEndpoint>(`/companies/${companyId}/chat-endpoints`, input),
   update: (
     endpointId: string,

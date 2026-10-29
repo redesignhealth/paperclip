@@ -24,6 +24,83 @@ Creation, installation, message waiting, and success use the same production
 components and server evidence as the own-app flow. A click or OAuth return does
 not constitute successful configuration.
 
+## Per-agent permission opt-ins
+
+Each agent's Slack app requests only the workspace's **Low risk** bot scopes by
+default: 27 scopes that cover reading channels and DMs, replying, reactions,
+pins, bookmarks, canvases, lists, and topics. Slack's app-approval rule can
+therefore auto-approve a managed or own-app install without a human review. This
+is a security boundary: a scope stays in the default set only when it is safe to
+grant every agent.
+
+Three capabilities are not Low risk. They are grouped so an operator can see what
+an agent gains:
+
+| Group | Bot scopes | What it adds |
+| --- | --- | --- |
+| Channel management | `channels:manage`, `groups:write` | Create channels and invite people. |
+| Proactive DMs | `im:write` | Open a DM with the person the agent works for. |
+| File upload | `files:write` | Upload task attachments into Slack. |
+
+An agent starts with every group **off**. Choose agent and the connection's
+**Settings → Slack permissions** section list each group with its description and
+exact scopes. Turning a group on adds its scopes to that agent's manifest only.
+
+### Admin approval and reauthorization
+
+Adding a non-Low-risk scope moves the install out of the auto-approve bucket. The
+Slack approval rule then routes that agent's install to a workspace admin, who
+approves or denies the new permissions. A denial leaves the connection exactly as
+it was.
+
+Enabling a group for an app that is already installed does not change what the
+bot can do until Slack grants the new scopes. Until then the connection keeps its
+previous permissions and the affected tools stay unavailable. The UI shows each
+group as:
+
+- **Off** — neither requested nor installed.
+- **Requested — applied at install** — before the first install, the group is
+  part of the request Slack will grant.
+- **Requested — reinstall to activate** — you asked for it after an install, and
+  the running installation does not hold it yet.
+- **Enabled** — requested and granted by the current install.
+- **Enabled — stays on until you reinstall** — you removed it, but the running
+  installation still holds it.
+
+### After a change
+
+A saved change differs from the live grant, so Paperclip shows a reinstall
+action. The path depends on the setup method:
+
+- **Managed** — select **Reinstall in Slack** on the connection page (or
+  **Continue in Slack** in the setup wizard). Paperclip writes the new manifest,
+  then reinstalls the same app. A workspace admin approves the new scopes.
+- **Own app** — select **Update app and reinstall**, then supply the app
+  configuration access token again so Paperclip pushes the updated manifest, then
+  reinstall the app in Slack.
+
+The saved change is stored immediately, so leaving the page does not lose it. It
+applies only after the manifest update and reinstall succeed. Turning a pending
+group back off clears the pending marker; an abandoned change does not block
+setup.
+
+### Legacy installations
+
+An installation that predates per-agent opt-ins carries no saved request. It
+keeps the full grant it was installed with, so Settings shows all three groups
+enabled and shows no reinstall prompt. Nothing is pending until an operator
+changes a group. The first change then becomes an ordinary pending change.
+
+New drafts always store an explicit (possibly empty) request, so a new agent never
+inherits the legacy full grant.
+
+The shared model and helpers live in
+[`packages/shared/src/slack-scopes.ts`](../../packages/shared/src/slack-scopes.ts).
+The UI controls are
+[`ui/src/pages/apps/chat/SlackScopeOptIns.tsx`](../../ui/src/pages/apps/chat/SlackScopeOptIns.tsx)
+with state derivation in
+[`slack-opt-in-state.ts`](../../ui/src/pages/apps/chat/slack-opt-in-state.ts).
+
 ## Cloud deployment prerequisites
 
 Managed setup is disabled by default. Qualification requires all of:

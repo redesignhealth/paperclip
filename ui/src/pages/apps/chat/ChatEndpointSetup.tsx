@@ -1,7 +1,10 @@
 import { SpekoProviderSetup } from "@/components/voice/SpekoProviderSetup";
 import { NativeVoiceConversation } from "@/components/voice/NativeVoiceConversation";
-import { buildSlackAppManifest, defaultSlackAppConfiguration } from "@paperclipai/shared";
+import { buildSlackAppManifest, defaultSlackAppConfiguration, slackRequestedOptInGroups } from "@paperclipai/shared";
+import type { SlackOptInScopeGroup } from "@paperclipai/shared";
 import { SlackAppDetails, SlackSetupAdvanced } from "./SlackAppDetails";
+import { SlackScopeOptIns } from "./SlackScopeOptIns";
+import { sameSlackOptInGroupSet, slackOptInUiState } from "./slack-opt-in-state";
 import { SlackSetup } from "./slack/SlackSetup";
 import { isProvisionedSlackSetup, slackSetupState } from "./slack/setup-state";
 import { defaultSlackAppName } from "./slack-app-name";
@@ -198,6 +201,7 @@ function ChatSdkEndpointSetup() {
   const [automaticBusy, setAutomaticBusy] = useState(false);
   const [managedAutoStart, setManagedAutoStart] = useState(Boolean(resumeEndpointId));
   const [slackDraft, setSlackDraft] = useState<{ agentId: string; app: SlackAppConfiguration } | null>(null);
+  const [slackOptInDraft, setSlackOptInDraft] = useState<SlackOptInScopeGroup[] | null>(null);
   const [endpoint, setEndpoint] = useState<ChatEndpoint | null>(null);
   const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [generatedWebhookSecret, setGeneratedWebhookSecret] = useState("");
@@ -274,6 +278,10 @@ function ChatSdkEndpointSetup() {
   const slackDetailsValidation = slackAppConfigurationSchema.safeParse(slackDetails);
   const slackDetailsEditable = !automaticBusy && (!endpoint || endpoint.status === "draft" && !endpoint.botExternalId
     && (!endpoint.setup?.slackRegistration || endpoint.setup.slackRegistration.status === "failed"));
+  // TECH-7988: a draft selection wins until the server answers. An existing
+  // endpoint reflects its saved request, including a pending change.
+  const savedSlackOptIns = slackOptInUiState(endpoint);
+  const slackOptIns = slackOptInDraft ?? savedSlackOptIns.requested;
   const syncEndpointSnapshot = (
     next: ChatEndpoint,
     onlyIfStillVisible = false,
@@ -305,10 +313,18 @@ function ChatSdkEndpointSetup() {
       return chatEndpointsApi.create(selectedCompanyId!, {
         provider: provider!,
         assignedAgentId: agentId,
-        ...(provider === "slack" ? { slackSetupMethod: ownApp ? "automatic" : slackChoices.data!.defaultMethod, slackApp: slackDetailsValidation.success ? slackDetailsValidation.data : slackDetails } : {}),
+        ...(provider === "slack" ? {
+          slackSetupMethod: ownApp ? "automatic" : slackChoices.data!.defaultMethod,
+          slackApp: slackDetailsValidation.success ? slackDetailsValidation.data : slackDetails,
+          // Explicit even when empty: a created endpoint must never fall into
+          // the legacy "no request means the full grant" branch.
+          slackOptInScopeGroups: slackOptIns,
+        } : {}),
       });
     },
     onSuccess: (next, { exit }) => {
+      // The created endpoint is authoritative; never keep a draft selection.
+      setSlackOptInDraft(null);
       setManagedAutoStart(!exit);
       setViewedStep(exit ? 0 : null);
       syncEndpointSnapshot(next);
@@ -331,10 +347,52 @@ function ChatSdkEndpointSetup() {
     mutationFn: (details: SlackAppConfiguration) => chatEndpointsApi.update(endpoint!.id, { slackApp: details }),
     onSuccess: next => syncEndpointSnapshot(next),
   });
+  const saveSlackOptIns = useMutation({
+    scope: { id: `slack-opt-ins:${endpoint?.id}` },
+    mutationFn: (slackOptInScopeGroups: SlackOptInScopeGroup[]) =>
+      chatEndpointsApi.update(endpoint!.id, { slackOptInScopeGroups }),
+    onSuccess: next => { setSlackOptInDraft(null); syncEndpointSnapshot(next); },
+    onError: () => {
+      // Roll the optimistic selection back to the server's own state so the UI
+      // never shows a choice the server rejected.
+      setSlackOptInDraft(null);
+      pushToast({
+        title: "Couldn't update Slack permissions",
+        body: "Your selection was not saved. Try again.",
+        tone: "error",
+      });
+    },
+  });
+  // Rapid toggles are serialized so a late response cannot overwrite a newer
+  // selection, and the newest selection is always the one sent.
+  const slackOptInSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const latestSlackOptIns = useRef<SlackOptInScopeGroup[]>(slackOptIns);
+  latestSlackOptIns.current = slackOptIns;
   const persistSlackDetails = async () => {
-    if (endpoint && slackDetailsEditable && slackDetailsValidation.success
+    if (!endpoint) return;
+    // Opt-ins are owned by their own save path; never resend them here from a
+    // possibly stale closure.
+    if (slackDetailsEditable && slackDetailsValidation.success
       && JSON.stringify(slackDetailsValidation.data) !== JSON.stringify(endpoint.setup?.slackApp))
       await saveSlackDetails.mutateAsync(slackDetailsValidation.data);
+  };
+  const persistSlackOptIns = (groups: SlackOptInScopeGroup[]) => {
+    // Update the ref synchronously, so a third toggle in the same tick can never
+    // be lost to a render that has not committed yet.
+    latestSlackOptIns.current = groups;
+    setSlackOptInDraft(groups);
+    if (!endpoint) return;
+    slackOptInSaveQueue.current = slackOptInSaveQueue.current
+      .catch(() => {})
+      .then(async () => {
+        const latest = latestSlackOptIns.current;
+        if (sameSlackOptInGroupSet(latest, slackRequestedOptInGroups(endpoint.setup))) return;
+        await saveSlackOptIns.mutateAsync(latest);
+      })
+      .catch(() => {
+        // onError already rolled back and reported the failure. Consume the
+        // fire-and-forget queue rejection even if no next toggle arrives.
+      });
   };
   const continueFromAgent = async (exit: boolean) => {
     if (exit && provider !== "slack") { navigate("/apps"); return; }
@@ -486,7 +544,8 @@ function ChatSdkEndpointSetup() {
   const availableStep = isSlack ? slackNavigation.availableStage : !endpoint ? 0
     : !repairing && (endpoint.setup?.step === "test" || endpoint.setup?.step === "complete") ? tryStep : 1;
   const step = Math.min(viewedStep ?? availableStep, availableStep);
-  const agentStepBusy = automaticBusy || createEndpoint.isPending || saveSlackDetails.isPending || useOwnSlackApp.isPending;
+  const agentStepBusy = automaticBusy || createEndpoint.isPending || saveSlackDetails.isPending || saveSlackOptIns.isPending || useOwnSlackApp.isPending;
+  const slackOptInsEditable = !automaticBusy && !agentStepBusy;
   const slackVerificationQuery = useQuery({
     queryKey: ["chat-endpoint-slack-webhook-verification", endpoint?.id],
     queryFn: () => chatEndpointsApi.get(endpoint!.id),
@@ -562,7 +621,15 @@ function ChatSdkEndpointSetup() {
               <SlackAppDetails value={slackDetails} readOnly={!slackDetailsEditable || agentStepBusy}
                 onChange={app => setSlackDraft({ agentId, app })}
                 onBlur={() => void persistSlackDetails().catch(() => {})} />
+              <SlackScopeOptIns value={slackOptIns} disabled={!slackOptInsEditable}
+                pending={saveSlackOptIns.isPending} installed={savedSlackOptIns.installed}
+                setupMethod={endpoint?.setup?.slackSetupMethod}
+                onChange={persistSlackOptIns}
+                // Both setup methods resolve a pending permission change on the
+                // Connect step: managed reinstalls, own app retries the manifest.
+                onReconnect={endpoint ? () => setViewedStep(1) : undefined} />
               {saveSlackDetails.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack app details. Try again before continuing.</p>}
+              {saveSlackOptIns.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack permission groups. Your previous selection is still in effect; try again.</p>}
               {slackChoices.data?.defaultMethod === "managed" && (!endpoint || endpoint.setup?.slackSetupMethod === "managed") && !endpoint?.setup?.slackRegistration && <Button
                 variant="link" className="h-auto p-0 text-muted-foreground"
                 disabled={agentStepBusy || !slackDetailsValidation.success}
@@ -875,6 +942,8 @@ function ProviderConnectStep({
     app: { appName: slackAppName, botName: slackBotName, command: slackCommand }, agentName,
     webhookUrl: slackWebhookUrl,
     ...(automaticSlack && endpoint.setup?.slackOAuthCallbackUri ? { redirectUri: endpoint.setup.slackOAuthCallbackUri } : {}),
+    // The preview must match what the server stores, including opt-ins.
+    optInScopeGroups: slackRequestedOptInGroups(endpoint.setup),
   }), null, 2);
   const slackCreateUrl = `https://api.slack.com/apps?new_app=1&manifest_json=${encodeURIComponent(slackManifest)}`;
   useEffect(() => setManifestCopied(false), [slackManifest]);

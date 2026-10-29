@@ -11,6 +11,8 @@ import { AgentAvatar } from "@/components/AgentAvatar";
 import { SlackSetupAdvanced } from "./SlackAppDetails";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { SlackToolsSettings, SlackSearchAccess } from "./SlackToolSettings";
+import { SlackScopeOptIns } from "./SlackScopeOptIns";
+import { slackOptInUiState } from "./slack-opt-in-state";
 import { ChatCommunicationInstructions } from "./ChatCommunicationInstructions";
 import { ChatExecutionDefaults } from "./ChatExecutionDefaults";
 import { agentsApi } from "@/api/agents";
@@ -48,6 +50,7 @@ import {
   type ChatEndpointResource,
   type ChatProvider,
 } from "@/api/chatEndpoints";
+import type { SlackOptInScopeGroup } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
@@ -467,6 +470,7 @@ function Settings({
   endpoint: Awaited<ReturnType<typeof chatEndpointsApi.get>>;
 }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { pushToast } = useToast();
   const resourcesQuery = useQuery({
     queryKey: queryKeys.chatEndpoints.resources(endpointId),
@@ -510,7 +514,27 @@ function Settings({
         tone: "error",
       }),
   });
+  // TECH-7988: the permission opt-ins save on their own path. Sending only the
+  // groups keeps an unrelated in-flight settings save from overwriting them and
+  // keeps this save from resurrecting a stale field.
+  const saveSlackOptIns = useMutation({
+    scope: { id: `slack-opt-ins:${endpointId}` },
+    mutationFn: (slackOptInScopeGroups: SlackOptInScopeGroup[]) =>
+      chatEndpointsApi.update(endpointId, { slackOptInScopeGroups }),
+    onSuccess: (next) =>
+      queryClient.setQueryData(
+        queryKeys.chatEndpoints.detail(endpointId),
+        next,
+      ),
+    onError: (error) =>
+      pushToast({
+        title: "Couldn't update Slack permissions",
+        body: error instanceof Error ? error.message : "Your selection was not saved. Try again.",
+        tone: "error",
+      }),
+  });
   if (endpoint.provider === "speko") return null;
+  const slackOptIns = slackOptInUiState(endpoint);
   const resources = resourcesQuery.data ?? [];
   const destinationResources = resources.filter((resource) =>
     isIndividuallyToggleableResource(endpoint.provider, resource.type),
@@ -695,6 +719,18 @@ function Settings({
           queryClient.setQueryData(queryKeys.chatEndpoints.detail(endpointId), next);
         }}
       />}
+      {endpoint.provider === "slack" && <SlackSetupAdvanced label="Slack permissions">
+        {/* TECH-7988: this control owns the "reinstall to apply" notice; do not
+            render a second one for the same permission change. */}
+        <SlackScopeOptIns
+          value={slackOptIns.requested}
+          installed={slackOptIns.installed}
+          setupMethod={endpoint.setup?.slackSetupMethod}
+          pending={saveSlackOptIns.isPending}
+          onChange={(slackOptInScopeGroups) => saveSlackOptIns.mutate(slackOptInScopeGroups)}
+          onReconnect={() => navigate(`/apps/chat/connect?provider=slack&purpose=chat&resume=${endpointId}&reconnect=1`)}
+        />
+      </SlackSetupAdvanced>}
       {endpoint.provider === "slack" && <SlackSetupAdvanced label="Slack tools"><SlackToolsSettings companyId={endpoint.companyId} endpointId={endpointId} /></SlackSetupAdvanced>}
     </section>
   );
