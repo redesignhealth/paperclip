@@ -74,6 +74,10 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     const rowOf = async (sha) => (await admin.query(`SELECT * FROM upstream_sync_log WHERE upstream_sha = $1`, [sha])).rows[0];
 
     // ---- claim: oldest first, attributed to the run; run_ref is transaction-local ----------
+    // unclassified rows (category IS NULL) are not claimable; once classified they are
+    assert.equal(await claim(pool, { runId: "run-A" }), null, "no category -> not claimed");
+    assert.equal((await rowOf(fx.U0)).status, "pending");
+    await admin.query(`UPDATE upstream_sync_log SET category = 'fix'`);
     const c0 = await claim(pool, { runId: "run-A" });
     assert.equal(c0.upstream_sha, fx.U0);
     assert.equal(c0.status, "claimed");
@@ -89,6 +93,7 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     const a0 = await assess(pool, fx.dir, { sha: fx.U0, runId: "run-A", ...refs });
     assert.deepEqual([a0.status, a0.reason], ["skipped", "already_present"]);
     assert.equal((await rowOf(fx.U0)).skip_reason, "already_present");
+    assert.notEqual((await rowOf(fx.U0)).category, null, "a skipped row carries a category");
     assert.equal((await rowOf(fx.U0)).lease_expires_at, null);
 
     // ---- assess: clean and conflict ------------------------------------------------------------

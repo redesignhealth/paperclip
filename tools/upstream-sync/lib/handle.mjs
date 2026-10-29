@@ -91,7 +91,9 @@ function requireRun(runId) {
 // ---- claim -----------------------------------------------------------------------------
 
 // One race-free statement: the oldest pending row, or a claimed row whose lease expired.
-// Returns the row, or null when the queue is empty.
+// Only classified rows (category IS NOT NULL) are claimable: classifyPending runs before the
+// worker, and a row that reaches a terminal state without a category can never be set one
+// (final-row lock) and would be invisible to alerts. Returns the row, or null when nothing is claimable.
 export async function claim(db, { runId, leaseMinutes = 15 } = {}) {
   runId = requireRun(runId);
   if (!Number.isFinite(leaseMinutes) || leaseMinutes <= 0) throw new Error("leaseMinutes must be > 0");
@@ -101,7 +103,7 @@ export async function claim(db, { runId, leaseMinutes = 15 } = {}) {
           SET status = 'claimed', claimed_by = $1, claimed_at = now(),
               lease_expires_at = now() + make_interval(mins => $2::int), attempt = attempt + 1, updated_at = now()
         WHERE id = (SELECT id FROM upstream_sync_log
-                     WHERE status = 'pending' OR (status = 'claimed' AND lease_expires_at < now())
+                     WHERE category IS NOT NULL AND (status = 'pending' OR (status = 'claimed' AND lease_expires_at < now()))
                      ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
     RETURNING *`,
       [runId, Math.ceil(leaseMinutes)],
