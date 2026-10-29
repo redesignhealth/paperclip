@@ -257,8 +257,25 @@ export async function snapshotDefaultMcpForNewAgent(
   const nowIso = (input.now ?? new Date()).toISOString();
   const entries: Record<string, DefaultMcpEntryState> = {};
   const service = toolAccessService(db as unknown as Db);
+  // A setup agent (wizard step 1) is snapshotted again when it is hired (step 2). By then its first setup run may
+  // already have registered, minted and stored a credential, and that progress lives only in the entry. An entry
+  // that has made progress is never rewritten: the rewrite would drop the binding and the next run would register
+  // the same identity again (`board_conflict`) and collide with the stored secret (`secret_store_failed`).
+  const [existingRow] = await db
+    .select({ metadata: agents.metadata })
+    .from(agents)
+    .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
+    .limit(1);
+  const existingEntries = readDefaultMcpState(existingRow?.metadata)?.entries ?? {};
+  const keptKeys = new Set<string>();
 
   for (const entry of spec) {
+    const prior = existingEntries[entry.key];
+    if (prior && (prior.binding || prior.setup.state !== "pending" || prior.setup.registerAttemptedAt || prior.setup.mintAttemptedAt)) {
+      entries[entry.key] = prior;
+      keptKeys.add(entry.key);
+      continue;
+    }
     const excluded = input.excludedSetupKeys?.has(entry.key) === true;
     // Scoped by company: a same-named connection in another tenant is never matched.
     const templates = excluded ? [] : await db
@@ -328,12 +345,23 @@ export async function snapshotDefaultMcpForNewAgent(
 
   const state: DefaultMcpAgentState = { version: 1, entries };
   // Only the protected key is written, merged into whatever metadata the row currently holds.
-  await db
-    .update(agents)
-    .set({
-      metadata: sql`jsonb_set(coalesce(${agents.metadata}, '{}'::jsonb), ARRAY[${DEFAULT_MCP_METADATA_KEY}::text], ${JSON.stringify(state)}::jsonb, true)`,
-    })
-    .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
+  if (keptKeys.size === 0) {
+    await db
+      .update(agents)
+      .set({
+        metadata: sql`jsonb_set(coalesce(${agents.metadata}, '{}'::jsonb), ARRAY[${DEFAULT_MCP_METADATA_KEY}::text], ${JSON.stringify(state)}::jsonb, true)`,
+      })
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
+    return state;
+  }
+  // Entries that kept their progress are not in the write at all, so a checkpoint landing now cannot be lost.
+  for (const [key, value] of Object.entries(entries)) {
+    if (keptKeys.has(key)) continue;
+    await db
+      .update(agents)
+      .set({ metadata: sql`jsonb_set(${agents.metadata}, ${entryPathSql(key)}, ${JSON.stringify(value)}::jsonb, true)` })
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
+  }
   return state;
 }
 
@@ -1230,20 +1258,45 @@ export const commsBoardIdentityHook: DefaultMcpSetupHook = async (input) => {
 
     let secretId: string;
     try {
-      const secret = await secretService(db).create(
-        companyId,
-        {
-          name: `Comms Board token (agent ${agentId})`,
-          key: `comms_board.${agentId}`,
-          provider: "local_encrypted",
-          value: minted.boardToken,
-          description: `Managed comms-board token for agent ${agentId}. Provisioned at agent creation.`,
-        },
-        { userId: current.ownerUserId },
-      );
-      secretId = secret.id;
-    } catch {
+      // A crash or a restarted setup can leave this agent's own secret behind. `getByKey` hides soft-deleted rows, so
+      // look at every row for the key: an active live one is rotated to the token just minted (the old value belongs
+      // to an identity this entry no longer holds); one that is not active was revoked on purpose and is never revived.
+      const secretKey = `comms_board.${agentId}`;
+      const rows = await db
+        .select({ id: companySecrets.id, status: companySecrets.status, deletedAt: companySecrets.deletedAt, latestVersion: companySecrets.latestVersion })
+        .from(companySecrets)
+        .where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.key, secretKey)));
+      if (rows.length > 1) return { kind: "error", reason: "secret_unavailable" };
+      const existing = rows[0];
+      if (existing) {
+        if (existing.status !== "active" || existing.deletedAt) return { kind: "error", reason: "secret_unavailable" };
+        await secretService(db).rotate(
+          existing.id,
+          { value: minted.boardToken, expectedLatestVersion: existing.latestVersion },
+          { userId: current.ownerUserId },
+        );
+        secretId = existing.id;
+      } else {
+        const secret = await secretService(db).create(
+          companyId,
+          {
+            name: `Comms Board token (agent ${agentId})`,
+            key: secretKey,
+            provider: "local_encrypted",
+            value: minted.boardToken,
+            description: `Managed comms-board token for agent ${agentId}. Provisioned at agent creation.`,
+          },
+          { userId: current.ownerUserId },
+        );
+        secretId = secret.id;
+      }
+    } catch (err) {
       // The token cannot be fetched again; the identity stays on the entry so the orphan is identifiable.
+      // Only the error class is logged: never a message, key or value.
+      logger.warn(
+        { agentId, entryKey: entry.key, errorClass: err instanceof Error ? err.constructor.name : typeof err },
+        "comms board token storage failed",
+      );
       return { kind: "error", reason: "secret_store_failed" };
     }
     binding = { ...binding, secretId, secretVersion: "latest", tokenExpiresAt: minted.tokenExpiresAt, commsScopeVersion: COMMS_BOARD_TOKEN_SCOPES_VERSION };

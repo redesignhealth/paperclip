@@ -479,6 +479,55 @@ describeEmbeddedPostgres("default MCP spec: setup, dedicated connections, effect
     expect(readCommsBoardBindingReference((await rowOf(agent.id)).metadata)).toEqual(entry.binding);
   });
 
+  it("hiring a setup agent snapshots again without dropping the progress of the first setup run", async () => {
+    const companyId = await seedCompany("private");
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+    const before = await entryOf(agent.id);
+    expect(before.setup.state).toBe("ready");
+
+    await db.transaction(async (tx) => {
+      await snapshotDefaultMcpForNewAgent(tx as never, { companyId, agentId: agent.id, existingMetadata: null, ownerUserId: ownerId });
+    });
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock }, { companyId, agentId: agent.id });
+
+    expect(await entryOf(agent.id)).toEqual(before);
+    expect(fetchMock.calls.register).toHaveLength(1);
+    expect(fetchMock.calls.mint).toHaveLength(1);
+  });
+
+  it("a restarted setup rotates the agent's own leftover token secret instead of failing on the key", async () => {
+    const companyId = await seedCompany("private");
+    const ownerId = await seedOwner(companyId);
+    await seedBothTemplates(companyId);
+    enableFeature({ downstream: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId);
+    const first = await entryOf(agent.id);
+    // Lose the entry's progress but keep the secret, as an older snapshot rewrite did.
+    await db.update(agents).set({
+      metadata: sql`jsonb_set(${agents.metadata}, '{defaultMcp,entries,comms-board}', ${JSON.stringify({
+        ...first,
+        binding: null,
+        connectionId: null,
+        setup: { ...first.setup, state: "pending", attemptCount: 0, registerAttemptedAt: null, mintAttemptedAt: null },
+      })}::jsonb)`,
+    }).where(eq(agents.id, agent.id));
+    await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock }, { companyId, agentId: agent.id });
+
+    const after = await entryOf(agent.id);
+    expect(after.setup).toMatchObject({ state: "ready", reason: null });
+    expect(after.binding!.secretId).toBe(first.binding!.secretId);
+    expect(await secretService(db).resolveSecretValue(companyId, after.binding!.secretId!, "latest")).toBe(BOARD_TOKEN);
+  });
+
   it("two agents get separate connections, grants, secrets and bindings; no shared token reaches either", async () => {
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);
