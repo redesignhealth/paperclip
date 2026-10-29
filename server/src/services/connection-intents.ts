@@ -492,8 +492,8 @@ export function connectionIntentService(db: Db) {
       const { score, nameScore } = scoreConnectionSearch(preparedQuery, [app.slug, app.name],
         `${app.description ?? ""} ${app.searchCapabilities} ${catalog.map(tool => `${tool.toolName} ${tool.description ?? ""}`).join(" ")}`);
       if (!score) continue;
-      const ready = await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
-        responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory });
+      const ready = app.available ? await usableConnectionForAgent({ companyId: run.companyId, agentId: agent.id,
+        responsibleUserId: run.responsibleUserId!, serviceSlug: service, purpose: aiOnly ? "ai" : service === "agentmail" ? "channel" : undefined, inventory }) : null;
       const denied = !aiOnly && !ready && matching.length > 0 && await administrativeDenial(run.companyId, agent.id, service, inventory);
       // A catalog app that this company may not use at all keeps its row, so
       // the agent can explain the restriction instead of silently losing it.
@@ -507,8 +507,8 @@ export function connectionIntentService(db: Db) {
         methods: app.methods, source: app.source,
         state: ready && !catalogDenial ? "ready" : (denied && !isRemoteMcpConnectorId(service)) || !app.available || !app.methods.length || catalogDenial ? "unavailable"
           : matching.length ? "needs_user_action" : "available",
-        reason: ready && !catalogDenial ? "Connection is installed and usable by this agent" : denied ? "Ask the responsible user to grant this agent access with connection_request" : unavailableReason
-          ? unavailableReason
+        reason: unavailableReason ? unavailableReason : ready ? "Connection is installed and usable by this agent" : denied
+          ? "Ask the responsible user to grant this agent access with connection_request"
           : matching.some((connection) => isToolConnectionAttentionHealth(connection.healthStatus)) ? "Connection needs attention"
           : matching.length ? "Review identity and access for this agent" : "Connect this service to continue",
         connectionId: ready && !catalogDenial ? ready.id : null,
