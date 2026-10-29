@@ -45,6 +45,17 @@ it("requests explicit reinstall when reconnecting a configured app", async () =>
   await act(async () => button!.click());
   expect(api.provisionManagedSlack).toHaveBeenCalledWith("endpoint", expect.objectContaining({ grantId: "grant", reconnect: true, requestId: expect.any(String) }));
 });
+it.each(["slack_manifest_update_pending", "slack_permissions_update_pending"])("offers a managed retry for %s without manual app instructions", async errorCode => {
+  endpoint.setup!.slackRegistration = { status: "configured", appId: "app", managerGrantId: "grant", errorCode } as NonNullable<ChatEndpoint["setup"]>["slackRegistration"];
+  await render({ autoStart: false, reconnect: true });
+  const alert = container.querySelector('[role="alert"]')!.textContent;
+  expect(alert).toContain("Continue in Slack");
+  expect(alert).not.toContain("Update the Slack app");
+  if (errorCode === "slack_permissions_update_pending") expect(alert).toContain("permissions");
+  const button = Array.from(container.querySelectorAll("button")).find(item => item.textContent === "Continue in Slack")!;
+  await act(async () => button.click());
+  expect(api.provisionManagedSlack).toHaveBeenCalledWith("endpoint", expect.objectContaining({ grantId: "grant", reconnect: true }));
+});
 it("reuses the reconnect receipt after a lost response and failed recovery read", async () => {
   endpoint.setup!.slackRegistration = { status: "configured", appId: "app", managerGrantId: "grant" } as NonNullable<ChatEndpoint["setup"]>["slackRegistration"];
   api.provisionManagedSlack.mockRejectedValue(new Error("Response lost"));

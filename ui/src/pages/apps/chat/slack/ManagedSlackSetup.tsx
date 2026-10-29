@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ComponentProps } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
-import { slackRegistrationErrorMessage } from "@paperclipai/shared";
+import { isSlackManifestUpdatePending, slackRegistrationErrorMessage } from "@paperclipai/shared";
 import { chatEndpointsApi } from "@/api/chatEndpoints";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -62,8 +62,10 @@ export function ManagedSlackSetup({ endpoint, disabled, saveDetails, onSaved, on
     autoStarted.current = true;
     void run(connect);
   });
-  const setupError = (code: string) => code === "slack_manifest_update_pending"
-    ? "Your app was created. Retry to finish its configuration."
+  const setupError = (code: string) => isSlackManifestUpdatePending(code)
+    ? code === "slack_permissions_update_pending"
+      ? "This agent's Slack permissions changed. Select Continue in Slack to apply them and reconnect. Until then the agent keeps its current permissions."
+      : "Your app was created. Select Continue in Slack to finish its configuration."
     : code === "slack_creation_uncertain" ? "Slack may have created your app. Check Slack app settings before trying again."
     : slackRegistrationErrorMessage(code);
   const message = error ?? (endpoint.setup?.slackManagerError ? setupError(endpoint.setup.slackManagerError) : null) ?? (choices.isError ? "Couldn't load your Slack workspaces. Try again." : registration?.errorCode ? setupError(registration.errorCode) : null);

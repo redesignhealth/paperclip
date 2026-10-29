@@ -120,7 +120,7 @@ import {
 import { defaultGitHubReviewPolicy, type ChatProvider } from "@paperclipai/shared";
 // Namespaced so these names never collide with the named imports above.
 import * as slackShared from "@paperclipai/shared";
-import { slackLegacyInstall } from "../services/connectors/slack-opt-ins.js";
+import { slackLegacyInstall, slackToolNamesForAgent } from "../services/connectors/slack-opt-ins.js";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
 import type { Attachment, Author, Message, Thread } from "chat";
 import { errorHandler } from "../middleware/index.js";
@@ -7674,6 +7674,49 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         // Toggling back to the installed set clears the marker.
         await f.service.update(f.endpoint.id, { slackOptInScopeGroups: [] }, actor.userId);
         expect(await f.service.slackRegistration.registration(f.endpoint.id)).toMatchObject({ status: "configured", errorCode: null });
+      });
+
+      it("records a manual Slack token's actual grant before its first opt-in edit and resumes without invented scopes", async () => {
+        const f = await fixture();
+        await f.service.update(f.endpoint.id, { slackSetupMethod: "manual" }, actor.userId);
+        // Simulate an L1-era draft: it has neither opt-in field, but has never
+        // connected a bot. Connect through the real credential path, not a
+        // hand-written botExternalId that would fabricate a legacy install.
+        await db.update(chatEndpoints).set({
+          setup: sql`(${chatEndpoints.setup} - 'slackOptInScopeGroups') - 'slackInstalledOptInScopeGroups'`,
+        }).where(eq(chatEndpoints.id, f.endpoint.id));
+        f.state.grantedScopes = [...slackShared.SLACK_DEFAULT_BOT_SCOPES];
+        await f.service.configure(f.endpoint.id, {
+          action: "configure", credentials: { botToken: f.token, signingSecret: "manual-signing-secret" },
+        }, actor.userId);
+        expect(await f.service.slackRegistration.registration(f.endpoint.id)).toBeUndefined();
+        expect((await setupOf(f, f.endpoint.id)).slackInstalledOptInScopeGroups).toEqual([]);
+        expect(await slackLegacyInstall(db, { companyId: f.companyId, endpointId: f.endpoint.id })).toBe(false);
+
+        await f.service.update(f.endpoint.id, { slackOptInScopeGroups: ["file_upload"] }, actor.userId);
+        expect(await setupOf(f, f.endpoint.id)).toMatchObject({
+          slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: [],
+        });
+        await db.update(chatEndpoints).set({ status: "active",
+          setup: sql`jsonb_set(${chatEndpoints.setup}, '{step}', '"complete"'::jsonb)`,
+        }).where(eq(chatEndpoints.id, f.endpoint.id));
+        await f.service.configure(f.endpoint.id, { action: "pause" }, actor.userId);
+        expect((await f.service.configure(f.endpoint.id, { action: "resume" }, actor.userId)).status).toBe("active");
+        expect((await setupOf(f, f.endpoint.id)).slackInstalledOptInScopeGroups).toEqual([]);
+      });
+
+      it("never exposes tools from a removed legacy Slack registration with a lingering bot identity", async () => {
+        const f = await managedFixture(); await f.provision();
+        await db.update(chatEndpoints).set({
+          setup: sql`(${chatEndpoints.setup} - 'slackOptInScopeGroups') - 'slackInstalledOptInScopeGroups'`,
+        }).where(eq(chatEndpoints.id, f.endpoint.id));
+        await f.service.configure(f.endpoint.id, { action: "remove" }, actor.userId);
+        expect(await f.service.slackRegistration.registration(f.endpoint.id)).toMatchObject({ status: "removed" });
+        const [saved] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, f.endpoint.id));
+        expect(saved!.botExternalId).toBeTruthy();
+        expect(saved!.status).toBe("archived");
+        expect(await slackToolNamesForAgent(db, { companyId: f.companyId, agentId: saved!.assignedAgentId })).toEqual(new Set());
+        await expect(f.service.configure(f.endpoint.id, { action: "resume" }, actor.userId)).rejects.toThrow();
       });
 
       it("resumes a legacy install whose app holds only the chat floor", async () => {
