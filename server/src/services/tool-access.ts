@@ -15084,6 +15084,7 @@ export function toolAccessService(
     },
   ): Promise<FinishToolAppResult> {
     const connection = await getConnectionRow(connectionId, companyId);
+    await assertConnectionAvailableInCompany(db, connection);
     assertNotManagedTemplate(connection);
     if (isPersonalDefaultMcpInstance(connection)) {
       const subject = trusted?.personalSubjectUserId ?? (actor?.actorType === "user" ? actor.actorId : null);
@@ -20797,6 +20798,7 @@ export function toolAccessService(
       actor?: ActorInfo,
     ) => {
       const connection = await getConnectionRow(idOrUid);
+      await assertConnectionAvailableInCompany(db, connection);
       assertNotManagedTemplate(connection);
       if (isPersonalDefaultMcpInstance(connection)) {
         throw unprocessable("Personal default-MCP instances cannot use a shared company identity", {
