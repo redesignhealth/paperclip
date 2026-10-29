@@ -84,6 +84,15 @@ Permissions → Bot Token Scopes** in Slack and reinstall the app. Scope possess
 alone is not a guarantee: Slack feature availability, destination access and
 Paperclip per-action policy still apply.
 
+Channel creation, proactive DMs, and file upload depend on the non-Low-risk
+permission groups described in
+[Slack app ownership and setup → Per-agent permission opt-ins](slack-setup.md#per-agent-permission-opt-ins).
+Those groups are off by default. A tool whose scope is not in the live grant is
+rejected before the Slack call instead of failing at Slack with `missing_scope`.
+The error names the group to enable. Turn the group on in the agent's Slack setup,
+then reinstall so Slack grants it; the tool stays unavailable until the reinstall
+lands.
+
 ## Delivery and retry behavior
 
 Native and HTTP tool calls pass through the same existing policy/approval gateway.
