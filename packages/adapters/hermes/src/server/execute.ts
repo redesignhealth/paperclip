@@ -1491,7 +1491,10 @@ export async function execute(
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) !== false;
-  const args: string[] = ["chat", "-q", prompt];
+  const promptViaFile = Buffer.byteLength(prompt, "utf8") >= 128 * 1024;
+  const args: string[] = promptViaFile
+    ? ["chat", "--query-file", "-"]
+    : ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
   // Never pass a placeholder: omit -m so Hermes uses its configured default.
@@ -1856,7 +1859,14 @@ export async function execute(
 
   let tempHome: string | null = null;
   let runHome: RunHome | null = null;
+  let promptHome: RunHome | null = null;
   try {
+    if (promptViaFile) {
+      promptHome = await createRunHome({ prefix: "paperclip-hermes-prompt-" });
+      const promptPath = path.join(promptHome.path, "query.txt");
+      await fs.writeFile(promptPath, prompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      args[2] = promptPath;
+    }
     if (usingIsolatedHome) {
       // Home placement and host inheritance are separate decisions: hosted runs and every Router run
       // get a fresh per-run home with the Hermes profile inside it (never the host profiles tree);
@@ -2164,6 +2174,9 @@ export async function execute(
 
     return executionResult;
   } finally {
+    if (promptHome) {
+      await promptHome.cleanup().catch(() => onCleanupWarning("Temporary prompt cleanup encountered an error"));
+    }
     const remainingFlushed = redactor?.flushDetailed() ?? [];
     for (const fl of remainingFlushed) {
       await emitClassifiedChunk(fl.stream, fl.rawChunk, fl.chunk).catch(() => {});

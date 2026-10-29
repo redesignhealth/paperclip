@@ -1,10 +1,10 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
-import { execute } from "./execute.js";
+import { buildPrompt, execute } from "./execute.js";
 import { sessionCodec } from "./index.js";
 
 const SESSION_ID = "20261006_200000_abcdef";
@@ -12,6 +12,7 @@ const INSTRUCTIONS = "Synthetic governance marker: request approval before gover
 
 interface Invocation {
   args: string[];
+  queryFile: { path: string; body: string | null; mode: number; directoryMode: number } | null;
   systemPrompt: string | null;
   runId: string;
 }
@@ -30,12 +31,24 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
     await fs.writeFile(instructionsFilePath, INSTRUCTIONS);
     await fs.writeFile(command, `#!${process.execPath}
 const fs = require("node:fs");
+const path = require("node:path");
 const args = process.argv.slice(2);
+const queryPath = args.includes("--query-file") ? args[args.indexOf("--query-file") + 1] : null;
+const exitBeforeRead = process.env.FIXTURE_EXIT_BEFORE_READ === "1";
+const queryFile = queryPath ? {
+  path: queryPath,
+  body: exitBeforeRead ? null : fs.readFileSync(queryPath, "utf8"),
+  mode: fs.statSync(queryPath).mode & 0o777,
+  directoryMode: fs.statSync(path.dirname(queryPath)).mode & 0o777,
+} : null;
 fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   args,
+  queryFile,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
   runId: process.env.PAPERCLIP_RUN_ID,
 }) + "\\n");
+if (exitBeforeRead) process.exit(2);
+if (process.env.FIXTURE_HANG_AFTER_CAPTURE === "1") setInterval(() => {}, 1000);
 if (process.env.FIXTURE_STDOUT) console.log(process.env.FIXTURE_STDOUT);
 if (args.includes("missing-session")) {
   console.error("\\u001b[1;31mSession missing-session not found.\\u001b[0m");
@@ -87,8 +100,98 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   }
 
   function query(invocation: Invocation): string {
-    return invocation.args[invocation.args.indexOf("-q") + 1];
+    return invocation.queryFile?.body ?? invocation.args[invocation.args.indexOf("-q") + 1];
   }
+
+  it.each(["x".repeat(150_000), "経験🧠".repeat(20_000)])(
+    "delivers a large prompt intact through a private file (%#)", async (body) => {
+      const ctx = context();
+      ctx.context.paperclipTaskMarkdownAssignment = body;
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(0);
+      const [invocation] = await invocations();
+      expect(invocation.args.slice(0, 3)).toEqual(["chat", "--query-file", invocation.queryFile?.path]);
+      expect(invocation.args).not.toContain("-q");
+      expect(invocation.queryFile?.body).toBe(buildPrompt(ctx, ctx.config));
+      expect(invocation.queryFile?.body).toContain(body);
+      if (process.platform !== "win32") {
+        expect(invocation.queryFile?.mode).toBe(0o600);
+        expect(invocation.queryFile?.directoryMode).toBe(0o700);
+      }
+      expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
+      expect(invocation.args.every((arg) => Buffer.byteLength(arg) < 65_536)).toBe(true);
+      await expect(fs.stat(path.dirname(invocation.queryFile!.path))).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each([131_071, 131_072])("selects transport at the UTF-8 byte boundary (%i)", async (bytes) => {
+    const ctx = context();
+    ctx.context.paperclipTaskMarkdownAssignment = "x";
+    const fixedBytes = Buffer.byteLength(buildPrompt(ctx, ctx.config)) - 1;
+    ctx.context.paperclipTaskMarkdownAssignment = "x".repeat(bytes - fixedBytes);
+    const prompt = buildPrompt(ctx, ctx.config);
+    expect(Buffer.byteLength(prompt)).toBe(bytes);
+    expect((await execute(ctx)).exitCode).toBe(0);
+    const [invocation] = await invocations();
+    expect(query(invocation)).toBe(prompt);
+    if (bytes < 131_072) {
+      expect(invocation.args).toContain("-q");
+      expect(invocation.args).not.toContain("--query-file");
+      expect(invocation.queryFile).toBeNull();
+    } else {
+      expect(invocation.args).toContain("--query-file");
+      expect(invocation.args).not.toContain("-q");
+    }
+  });
+
+  it("delivers a large resumed turn and retains its session", async () => {
+    const ctx = context();
+    ctx.runtime.sessionParams = { sessionId: SESSION_ID };
+    ctx.context.paperclipTaskMarkdownAssignmentCompact = "x".repeat(150_000);
+    expect((await execute(ctx)).exitCode).toBe(0);
+    const [invocation] = await invocations();
+    expect(invocation.args).toContain("--query-file");
+    expect(invocation.args.slice(invocation.args.indexOf("--resume"))).toEqual(["--resume", SESSION_ID]);
+    expect(query(invocation)).toBe(buildPrompt(ctx, ctx.config, { resumedSession: true }));
+  });
+
+  it("removes the private directory when writing the prompt fails", async () => {
+    const ctx = context();
+    ctx.context.paperclipTaskMarkdownAssignment = "x".repeat(150_000);
+    const write = vi.spyOn(fs, "writeFile").mockRejectedValueOnce(new Error("Synthetic prompt write failure"));
+    try {
+      await expect(execute(ctx)).rejects.toThrow("Synthetic prompt write failure");
+      const promptPath = String(write.mock.calls[0][0]);
+      expect(path.basename(promptPath)).toBe("query.txt");
+      await expect(fs.stat(path.dirname(promptPath))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it("handles an early child exit and removes its unread large prompt", async () => {
+    const ctx = context();
+    ctx.context.paperclipTaskMarkdownAssignment = "x".repeat(1_000_000);
+    ctx.config.env = { CAPTURE_PATH: capturePath, FIXTURE_EXIT_BEFORE_READ: "1" };
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(2);
+    const [invocation] = await invocations();
+    expect(invocation.queryFile?.body).toBeNull();
+    await expect(fs.stat(path.dirname(invocation.queryFile!.path))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("removes a large prompt after the child times out", async () => {
+    const ctx = context();
+    ctx.context.paperclipTaskMarkdownAssignment = "x".repeat(150_000);
+    ctx.config.env = { CAPTURE_PATH: capturePath, FIXTURE_HANG_AFTER_CAPTURE: "1" };
+    ctx.config.timeoutSec = 5;
+    const result = await execute(ctx);
+    expect(result.timedOut).toBe(true);
+    if (process.platform !== "win32") expect(result.signal).toBe("SIGTERM");
+    const [invocation] = await invocations();
+    expect(invocation.queryFile?.body).toContain("x".repeat(150_000));
+    await expect(fs.stat(path.dirname(invocation.queryFile!.path))).rejects.toMatchObject({ code: "ENOENT" });
+  }, 10_000);
 
   it.each([false, true])("keeps instructions out of fresh and resumed user turns (conversation=%s)", async (conversationMode) => {
     const fresh = context();
