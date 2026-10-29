@@ -2,7 +2,7 @@
 --
 -- The upstream-sync ledger's real schema is owned by Paperclip's Drizzle
 -- migration chain: packages/db/src/schema/upstream_sync.ts plus
--- packages/db/src/migrations/0380_upstream_sync_ledger.sql. Embedded-PG dev
+-- packages/db/src/migrations/0380_upstream_sync_ledger.sql (+ 0381 events, 0382 worker state). Embedded-PG dev
 -- and test databases only ever get that chain, and `cli.mjs migrate` verifies
 -- those objects exist rather than creating anything.
 --
@@ -36,13 +36,36 @@ CREATE TABLE IF NOT EXISTS upstream_sync_log (
   merged_at           timestamptz,
   prod_pinned_at      timestamptz,
   status              text        NOT NULL DEFAULT 'pending'
-                      CHECK (status IN ('pending','in_progress','merged','skipped','conflict','needs-human','reverted')),
+                      CHECK (status IN ('pending','claimed','assessed','skipped','in_review','integrated','promoted','needs_human','failed')),
   skip_reason         text,
   reverts_sha         text,                         -- upstream revert linked to original
   alert_state         text        CHECK (alert_state IN ('sent','suppressed')),
   alerted_at          timestamptz,
   created_at          timestamptz NOT NULL DEFAULT now(),
-  updated_at          timestamptz NOT NULL DEFAULT now()
+  updated_at          timestamptz NOT NULL DEFAULT now(),
+  -- Worker claim/lease and merge evidence (migration 0382, RED-583).
+  claimed_by          text,                         -- Paperclip run id holding the lease
+  claimed_at          timestamptz,
+  lease_expires_at    timestamptz,                  -- non-null exactly while status = 'claimed'
+  attempt             integer     NOT NULL DEFAULT 0,
+  integration_sha     text,                         -- merge commit on `integration`
+  resolution_delta_sha256 text,                     -- non-null iff the merge needed a conflict resolution
+  review_pr           integer,                      -- Argus review PR for the resolution
+  promote_pr          integer,                      -- human-merged integration -> master PR
+  master_sha          text,
+  argus_rounds        jsonb       NOT NULL DEFAULT '[]'::jsonb,   -- append only
+  CONSTRAINT upstream_sync_log_attempt_check CHECK (attempt >= 0),
+  CONSTRAINT upstream_sync_log_claim_check CHECK ((status = 'claimed' and claimed_by is not null and claimed_at is not null and lease_expires_at is not null) or (status <> 'claimed' and lease_expires_at is null)),
+  CONSTRAINT upstream_sync_log_integration_sha_check CHECK (integration_sha ~ '^[0-9a-f]{40}$'),
+  CONSTRAINT upstream_sync_log_master_sha_check CHECK (master_sha ~ '^[0-9a-f]{40}$'),
+  CONSTRAINT upstream_sync_log_delta_sha256_check CHECK (resolution_delta_sha256 ~ '^[0-9a-f]{64}$'),
+  CONSTRAINT upstream_sync_log_pr_numbers_check CHECK ((review_pr is null or review_pr > 0) and (promote_pr is null or promote_pr > 0)),
+  CONSTRAINT upstream_sync_log_argus_rounds_check CHECK (jsonb_typeof(argus_rounds) = 'array'),
+  CONSTRAINT upstream_sync_log_state_path_check CHECK (status not in ('assessed', 'in_review', 'integrated', 'promoted') or path is not null),
+  CONSTRAINT upstream_sync_log_state_integrated_check CHECK (status not in ('integrated', 'promoted') or (integration_sha is not null and (path = 'conflict') = (resolution_delta_sha256 is not null))),
+  CONSTRAINT upstream_sync_log_state_promoted_check CHECK (status <> 'promoted' or (promote_pr is not null and master_sha is not null)),
+  CONSTRAINT upstream_sync_log_state_review_check CHECK (status <> 'in_review' or review_pr is not null),
+  CONSTRAINT upstream_sync_log_state_skipped_check CHECK (status <> 'skipped' or skip_reason is not null)
 );
 CREATE INDEX IF NOT EXISTS upstream_sync_log_status_idx   ON upstream_sync_log (status, id);
 CREATE INDEX IF NOT EXISTS upstream_sync_log_category_idx ON upstream_sync_log (category);

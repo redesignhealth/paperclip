@@ -65,6 +65,24 @@ export const upstreamSyncLog = pgTable(
     prodPinnedAt: timestamp("prod_pinned_at", { withTimezone: true }),
     status: text("status").$type<UpstreamSyncStatus>().notNull().default("pending"),
     skipReason: text("skip_reason"),
+    // Worker claim/lease (RED-583). `claimedBy` is the Paperclip run id of the
+    // worker that holds (or last held) the row; `leaseExpiresAt` is non-null
+    // exactly while status = 'claimed'; `attempt` counts claims.
+    claimedBy: text("claimed_by"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    attempt: integer("attempt").notNull().default(0),
+    // Merge-into-`integration` result: the merge commit and the sha256 of its
+    // resolution delta (null for an empty delta, i.e. a clean merge).
+    integrationSha: text("integration_sha"),
+    resolutionDeltaSha256: text("resolution_delta_sha256"),
+    // Argus review PR for a conflict resolution, and the human-merged
+    // `integration` -> `master` promotion PR plus the resulting master sha.
+    reviewPr: integer("review_pr"),
+    promotePr: integer("promote_pr"),
+    masterSha: text("master_sha"),
+    // Append-only array of `{ round, sha, verdict, ... }` objects.
+    argusRounds: jsonb("argus_rounds").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
     // Upstream revert linked back to the original commit it reverts.
     revertsSha: text("reverts_sha"),
     alertState: text("alert_state").$type<"sent" | "suppressed">(),
@@ -86,7 +104,44 @@ export const upstreamSyncLog = pgTable(
     check("upstream_sync_log_path_check", sql`${table.path} in ('clean', 'conflict')`),
     check(
       "upstream_sync_log_status_check",
-      sql`${table.status} in ('pending', 'in_progress', 'merged', 'skipped', 'conflict', 'needs-human', 'reverted')`,
+      sql`${table.status} in ('pending', 'claimed', 'assessed', 'skipped', 'in_review', 'integrated', 'promoted', 'needs_human', 'failed')`,
+    ),
+    check("upstream_sync_log_attempt_check", sql`${table.attempt} >= 0`),
+    // A lease exists exactly while the row is claimed.
+    check(
+      "upstream_sync_log_claim_check",
+      sql`(${table.status} = 'claimed' and ${table.claimedBy} is not null and ${table.claimedAt} is not null and ${table.leaseExpiresAt} is not null) or (${table.status} <> 'claimed' and ${table.leaseExpiresAt} is null)`,
+    ),
+    check("upstream_sync_log_integration_sha_check", sql`${table.integrationSha} ~ '^[0-9a-f]{40}$'`),
+    check("upstream_sync_log_master_sha_check", sql`${table.masterSha} ~ '^[0-9a-f]{40}$'`),
+    check("upstream_sync_log_delta_sha256_check", sql`${table.resolutionDeltaSha256} ~ '^[0-9a-f]{64}$'`),
+    check(
+      "upstream_sync_log_pr_numbers_check",
+      sql`(${table.reviewPr} is null or ${table.reviewPr} > 0) and (${table.promotePr} is null or ${table.promotePr} > 0)`,
+    ),
+    check("upstream_sync_log_argus_rounds_check", sql`jsonb_typeof(${table.argusRounds}) = 'array'`),
+    // Evidence a row must carry in each state. The guard trigger (hand-written
+    // in migration 0382) enforces the transition graph and the Argus binding.
+    check(
+      "upstream_sync_log_state_path_check",
+      sql`${table.status} not in ('assessed', 'in_review', 'integrated', 'promoted') or ${table.path} is not null`,
+    ),
+    // A conflict resolution always has a non-empty delta, a clean merge never does.
+    check(
+      "upstream_sync_log_state_integrated_check",
+      sql`${table.status} not in ('integrated', 'promoted') or (${table.integrationSha} is not null and (${table.path} = 'conflict') = (${table.resolutionDeltaSha256} is not null))`,
+    ),
+    check(
+      "upstream_sync_log_state_promoted_check",
+      sql`${table.status} <> 'promoted' or (${table.promotePr} is not null and ${table.masterSha} is not null)`,
+    ),
+    check(
+      "upstream_sync_log_state_review_check",
+      sql`${table.status} <> 'in_review' or ${table.reviewPr} is not null`,
+    ),
+    check(
+      "upstream_sync_log_state_skipped_check",
+      sql`${table.status} <> 'skipped' or ${table.skipReason} is not null`,
     ),
     check(
       "upstream_sync_log_alert_state_check",
@@ -175,9 +230,11 @@ export type UpstreamSyncCategory = "feature" | "fix" | "perf" | "security" | "in
 
 export type UpstreamSyncStatus =
   | "pending"
-  | "in_progress"
-  | "merged"
+  | "claimed"
+  | "assessed"
   | "skipped"
-  | "conflict"
-  | "needs-human"
-  | "reverted";
+  | "in_review"
+  | "integrated" // merged into `integration`
+  | "promoted" // in `master`
+  | "needs_human"
+  | "failed";

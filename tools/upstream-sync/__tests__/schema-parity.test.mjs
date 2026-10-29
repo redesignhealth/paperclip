@@ -24,13 +24,17 @@ const skip = url ? false : "UPSTREAM_SYNC_TEST_DATABASE_URL not set";
 
 const FIXTURE_SCHEMA = "upstream_sync_fixture";
 const MIGRATION_SCHEMA = "upstream_sync_migration";
-const MIGRATION_FILE = "0380_upstream_sync_ledger.sql";
+// 0381 (events) and 0382 (worker state) are applied too: the fixture is the final shape.
+const MIGRATION_FILES = [
+  "0380_upstream_sync_ledger.sql",
+  "0381_upstream_sync_events.sql",
+  "0382_upstream_sync_worker_state.sql",
+];
 const TABLES = ["upstream_sync_log", "upstream_sync_state", "upstream_sync_alerts"];
 
-const migrationSql = fs.readFileSync(
-  path.join(here, "../../../packages/db/src/migrations", MIGRATION_FILE),
-  "utf8",
-);
+const migrationSql = MIGRATION_FILES.map((file) =>
+  fs.readFileSync(path.join(here, "../../../packages/db/src/migrations", file), "utf8"),
+).join("\n--> statement-breakpoint\n");
 
 async function resetSchema(client, schema) {
   await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
@@ -96,7 +100,7 @@ async function applyToSchema(client, schema, sql) {
   await resetSchema(client, schema);
   await client.query(`SET search_path TO ${schema}`);
   try {
-    // 0380 carries drizzle's statement separators; schema.sql executes whole.
+    // the migrations carry drizzle's statement separators; schema.sql executes whole.
     for (const statement of sql.split("--> statement-breakpoint")) {
       if (statement.trim().length > 0) await client.query(statement);
     }
@@ -105,7 +109,7 @@ async function applyToSchema(client, schema, sql) {
   }
 }
 
-test("schema.sql fixture matches migration 0380 on columns, constraints and indexes", { skip }, async () => {
+test("schema.sql fixture matches migrations 0380-0382 on columns, constraints and indexes", { skip }, async () => {
   const client = new pg.Client({ connectionString: url });
   await client.connect();
   try {
@@ -115,17 +119,17 @@ test("schema.sql fixture matches migration 0380 on columns, constraints and inde
     assert.deepEqual(
       await readColumns(client, MIGRATION_SCHEMA),
       await readColumns(client, FIXTURE_SCHEMA),
-      "columns differ between 0380 and tools/upstream-sync/schema.sql",
+      "columns differ between migrations 0380-0382 and tools/upstream-sync/schema.sql",
     );
     assert.deepEqual(
       await readConstraints(client, MIGRATION_SCHEMA),
       await readConstraints(client, FIXTURE_SCHEMA),
-      "constraints differ between 0380 and tools/upstream-sync/schema.sql",
+      "constraints differ between migrations 0380-0382 and tools/upstream-sync/schema.sql",
     );
     assert.deepEqual(
       await readIndexes(client, MIGRATION_SCHEMA),
       await readIndexes(client, FIXTURE_SCHEMA),
-      "indexes differ between 0380 and tools/upstream-sync/schema.sql",
+      "indexes differ between migrations 0380-0382 and tools/upstream-sync/schema.sql",
     );
 
     // The hand-appended view is not modelled by Drizzle, so nothing but this
@@ -140,7 +144,7 @@ test("schema.sql fixture matches migration 0380 on columns, constraints and inde
       return rows;
     };
     const migrationView = await viewColumns(MIGRATION_SCHEMA);
-    assert.ok(migrationView.length > 0, "0380 must create upstream_sync_log_view");
+    assert.ok(migrationView.length > 0, "migrations must create upstream_sync_log_view");
     assert.deepEqual(migrationView, await viewColumns(FIXTURE_SCHEMA));
 
     // Column names/types alone would not notice a changed expression (a
@@ -161,11 +165,11 @@ test("schema.sql fixture matches migration 0380 on columns, constraints and inde
       return normalizeViewDef(rows[0].definition, schema);
     };
     const migrationViewDef = await viewDef(MIGRATION_SCHEMA);
-    assert.ok(migrationViewDef.length > 0, "0380 must create upstream_sync_log_view");
+    assert.ok(migrationViewDef.length > 0, "migrations must create upstream_sync_log_view");
     assert.equal(
       migrationViewDef,
       await viewDef(FIXTURE_SCHEMA),
-      "view definition differs between 0380 and tools/upstream-sync/schema.sql",
+      "view definition differs between migrations 0380-0382 and tools/upstream-sync/schema.sql",
     );
   } finally {
     await client.query(`DROP SCHEMA IF EXISTS ${FIXTURE_SCHEMA} CASCADE`).catch(() => {});
