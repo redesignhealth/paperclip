@@ -16,7 +16,7 @@ import {
   writePaperclipSkillSyncPreference,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
-import { forbidden } from "../errors.js";
+import { forbidden, HttpError } from "../errors.js";
 import { emailChannelService } from "./email-channels.js";
 import {
   AGENTMAIL_TOOLS,
@@ -218,9 +218,14 @@ export async function resolveSlackConnectorToolNames(db: Db, binding: AgentBindi
   if (!binding.runId || !binding.issueId) return new Set();
   try {
     return await slackToolNamesForAgent(db, binding);
-  } catch {
+  } catch (error) {
+    // Classify using fixed labels, never exception names/messages or arbitrary codes.
+    const errorClass = error instanceof HttpError ? "HttpError" : error instanceof Error ? "Error" : "unknown";
+    const status = error && typeof error === "object" && "status" in error &&
+      typeof error.status === "number" && Number.isInteger(error.status) && error.status >= 400 && error.status <= 599
+      ? error.status : undefined;
     logger.warn({ companyId: binding.companyId, agentId: binding.agentId, runId: binding.runId,
-      endpointId: binding.endpointId }, "Slack tool permission lookup failed; hiding Slack tools for this run");
+      issueId: binding.issueId, endpointId: binding.endpointId, errorClass, status }, "Slack tool permission lookup failed; hiding Slack tools for this run");
     return new Set();
   }
 }

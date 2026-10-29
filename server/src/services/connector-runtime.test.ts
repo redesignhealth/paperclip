@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chatEndpoints, toolCatalogEntries, type Db } from "@paperclipai/db";
+import { SLACK_TOOLS } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { applyConnectorSkills, connectorToolDefinitionsForSkills, resolveConnectorAssignments, resolvedConnectorToolDefinitionsForSkills, type ConnectorAssignment } from "./connector-runtime.js";
 import { logger } from "../middleware/logger.js";
-import { registerSlackTaskAuthority, SLACK_ENDPOINT_SELECTION_REQUIRED, type SlackTaskAuthority } from "./connectors/slack-authority.js";
+import { registerSlackTaskAuthority, SLACK_ENDPOINT_SELECTION_REQUIRED, SLACK_TASK_AUTHORIZATION_DENIED, type SlackTaskAuthority } from "./connectors/slack-authority.js";
 
 const resolvers = vi.hoisted(() => ({
   browser: vi.fn(), speko: vi.fn(), slack: vi.fn(), inboxes: vi.fn(),
@@ -13,6 +14,7 @@ vi.mock("./voice/speko-agent-tools.js", () => ({ spekoAssignedResources: resolve
 vi.mock("./connectors/slack.js", () => ({ slackAssignedResource: resolvers.slack, executeGovernedSlackTool: vi.fn() }));
 vi.mock("./email-channels.js", () => ({ emailChannelService: () => ({ assignedInboxes: resolvers.inboxes }) }));
 
+const activeCatalog = SLACK_TOOLS.map(tool => ({ toolName: tool.name, status: "active", quarantinedAt: null }));
 const assets = vi.hoisted(() => ({ materialize: vi.fn() }));
 vi.mock("./native-runtime/runtime-context.js", () => ({ materializeAsset: assets.materialize }));
 afterEach(() => { vi.restoreAllMocks(); vi.resetAllMocks(); });
@@ -24,7 +26,7 @@ function taskDb(select: ReturnType<typeof vi.fn>): Db {
   const db = { select } as unknown as Db;
   registerSlackTaskAuthority(db, async () => {
     const rows = await db.select().from({} as never).where(undefined);
-    if (rows.length !== 1) throw new Error("No unambiguous endpoint");
+    if (rows.length !== 1) throw forbidden("No unambiguous endpoint", { code: SLACK_ENDPOINT_SELECTION_REQUIRED });
     return { endpoint: rows[0] } as unknown as SlackTaskAuthority;
   });
   return db;
@@ -73,7 +75,7 @@ describe("connector assignment preparation", () => {
         from: () => ({
           where: async () => {
             if (rows instanceof Error) throw rows;
-            return isEndpointRead ? rows : [];
+            return isEndpointRead ? rows : activeCatalog;
           },
           innerJoin: () => ({
             where: async () => {
@@ -168,6 +170,20 @@ describe("connector tool definitions fail closed", () => {
 });
 
 describe("Slack connector exposure boundaries", () => {
+  it.each(["removed", "disabled", "quarantined", "missing", "active-quarantined"])("hides a %s catalog tool on pinned native continuation without resynchronizing", async status => {
+    const endpoint = { id: "selected", companyId: "company", connectionId: "connection", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
+    const db = { select: () => ({ from: () => ({ where: async () => status === "missing" ? [] : [{
+      toolName: "slack_upload_file", status: status === "active-quarantined" ? "active" : status,
+      quarantinedAt: status === "active-quarantined" ? new Date() : null,
+    }] }) }) } as unknown as Db;
+    const unregister = registerSlackTaskAuthority(db, async () => ({ endpoint }) as unknown as SlackTaskAuthority);
+    try {
+      const [spec] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), {
+        companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
+      });
+      expect(spec!.tools.map(tool => tool.name)).not.toContain("slack_upload_file");
+    } finally { unregister(); }
+  });
   it("does not union another endpoint's groups into the selected endpoint", async () => {
     resolvers.browser.mockResolvedValue([]);
     resolvers.speko.mockResolvedValue([]);
@@ -177,7 +193,7 @@ describe("Slack connector exposure boundaries", () => {
     const other = { id: "other", companyId: "company", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
     const from = vi.fn((table: unknown) => ({ where: async () => {
       if (table === chatEndpoints) return [selected, other];
-      if (table === toolCatalogEntries) return [];
+      if (table === toolCatalogEntries) return activeCatalog;
       throw new Error("Unexpected permission query");
     } }));
     const db = { select: () => ({ from }) } as unknown as Db;
@@ -195,7 +211,7 @@ describe("Slack connector exposure boundaries", () => {
   it.each(["Unlinked user", "No accepted responsible user"])("silently hides tools for expected denial: %s", async reason => {
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
     const db = {} as Db;
-    const unregister = registerSlackTaskAuthority(db, async () => { throw forbidden(reason); });
+    const unregister = registerSlackTaskAuthority(db, async () => { throw forbidden(reason, { code: SLACK_TASK_AUTHORIZATION_DENIED }); });
     resolvers.browser.mockResolvedValue([]);
     resolvers.speko.mockResolvedValue([]);
     resolvers.inboxes.mockResolvedValue([]);
@@ -208,7 +224,7 @@ describe("Slack connector exposure boundaries", () => {
     } finally { unregister(); }
   });
 
-  it("also treats a structured controller 403 as an expected silent denial", async () => {
+  it("logs an unexpected structured controller 403 without exposing its message", async () => {
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
     const db = {} as Db;
     const unregister = registerSlackTaskAuthority(db, async () => { throw Object.assign(new Error("Authorization denied"), { status: 403 }); });
@@ -217,7 +233,8 @@ describe("Slack connector exposure boundaries", () => {
         companyId: "company", agentId: "agent", runId: "run", issueId: "issue",
       });
       expect(specs[0]!.tools).toEqual([]);
-      expect(warn).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ issueId: "issue", errorClass: "Error", status: 403 }), expect.any(String));
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("Authorization denied");
     } finally { unregister(); }
   });
 
@@ -227,7 +244,7 @@ describe("Slack connector exposure boundaries", () => {
     const second = { id: "second", companyId: "company", connectionId: "two", setup: { slackOptInScopeGroups: ["file_upload"], slackInstalledOptInScopeGroups: ["file_upload"] } };
     const db = { select: () => ({ from: (table: unknown) => ({ where: async () => {
       if (table === chatEndpoints) return [first, second];
-      if (table === toolCatalogEntries) return [];
+      if (table === toolCatalogEntries) return activeCatalog;
       throw new Error("Unexpected permission query");
     } }) }) } as unknown as Db;
     const unregister = registerSlackTaskAuthority(db, async binding => {
@@ -260,6 +277,7 @@ describe("Slack connector exposure boundaries", () => {
       const native = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
       expect(native[0]!.tools.map(tool => tool.name)).not.toContain("slack_upload_file");
       expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn.mock.calls[0]?.[0]).toMatchObject({ issueId: "issue", errorClass: "Error" });
       expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-canary");
     } finally { unregister(); }
   });
@@ -304,7 +322,7 @@ describe("Slack connector gating is requested and installed", () => {
       const first = call === 1;
       return {
         from: () => ({
-          where: async () => (first ? rows : []),
+          where: async () => (first ? rows : activeCatalog),
           innerJoin: () => ({ where: async () => [] }),
         }),
       };

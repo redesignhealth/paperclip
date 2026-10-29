@@ -15,6 +15,8 @@ import { chatRunSourceMessageId } from "../chat-channels/run-origin.js";
 
 /** Ordinary multi-connection tasks need an explicit endpoint at dispatch. */
 export const SLACK_ENDPOINT_SELECTION_REQUIRED = "slack_endpoint_selection_required";
+/** Expected task eligibility denials may hide tools quietly; other failures must be logged. */
+export const SLACK_TASK_AUTHORIZATION_DENIED = "slack_task_authorization_denied";
 
 export interface SlackTaskBinding {
   companyId: string;

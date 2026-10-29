@@ -13,6 +13,7 @@ import { secretService } from "../secrets.js";
 import { slackClient } from "./slack-client.js";
 import {
   isSlackToolEnabledForOptIns,
+  slackActiveCatalogToolNames,
   slackEnabledOptInGroups,
   slackEndpointOptInsForGating,
 } from "./slack-opt-ins.js";
@@ -71,6 +72,7 @@ export async function slackCapabilities(
   const gating = await slackEndpointOptInsForGating(db, row.endpoint);
   const enabled = slackEnabledOptInGroups(row.endpoint.setup, gating);
   const tools = SLACK_TOOLS.filter((tool) => isSlackToolEnabledForOptIns(tool, enabled));
+  const activeNames = await slackActiveCatalogToolNames(db, row.endpoint);
   // Guidance names the permission group to enable, not just raw scopes: a
   // scope can be enabled through a switch the operator recognises.
   const missingGroups = SLACK_OPT_IN_SCOPE_GROUPS.filter((group) => !enabled.includes(group))
@@ -87,7 +89,7 @@ export async function slackCapabilities(
             description: definition.description,
             scopes: [...definition.scopes],
             toolNames,
-            action: row.endpoint.setup.slackOptInScopeGroups?.includes(group)
+            action: row.endpoint.setup?.slackOptInScopeGroups?.includes(group)
               ? "reconnect" as const
               : "enable" as const,
           };
@@ -102,18 +104,20 @@ export async function slackCapabilities(
   return {
     grantedScopes: scopes,
     missingScopes: scopes ? [...required].filter((scope) => !scopes.includes(scope)) : [],
-    missingGroups: scopes ? missingGroups : [],
+    missingGroups,
     // Only tools this agent may actually call are listed: a gated-off group's
     // tool is neither offered nor reported as merely unavailable.
     tools: tools.map((t) => ({
       name: t.name,
       description: t.description,
       risk: t.risk,
-      available: t.name === "slack_search"
-        ? true
-        : scopes
-          ? t.scopes.every((s) => s.split("|").some((scope) => scopes.includes(scope)))
-          : null,
+      available: !activeNames.has(t.name)
+        ? false
+        : t.name === "slack_search"
+          ? true
+          : scopes
+            ? t.scopes.every((s) => s.split("|").some((scope) => scopes.includes(scope)))
+            : null,
     })),
   };
 }

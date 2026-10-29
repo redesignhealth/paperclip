@@ -11618,7 +11618,7 @@ async function createRunnerdBackendWithinSessionClaim(
   ));
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
   const connectorAssignments = input.execution.provider.kind !== "muse"
-    ? await resolvedConnectorToolDefinitionsForSkills(input.db, pinnedSkills, input.execution.binding)
+    ? await timeController("connector_assignments", () => resolvedConnectorToolDefinitionsForSkills(input.db, pinnedSkills, input.execution.binding))
     : [];
   const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
     .from(heartbeatRuns).where(and(

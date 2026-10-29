@@ -9845,7 +9845,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   });
 
   it("drops a removed Slack opt-in group from the tool listing and rejects it at dispatch", async () => {
-    const { resolveConnectorAssignments, executeConnectorTool } = await import("../services/connector-runtime.js");
+    const { resolveConnectorAssignments, resolvedConnectorToolDefinitionsForSkills, executeConnectorTool } = await import("../services/connector-runtime.js");
+    const { toolCatalogEntries } = await import("@paperclipai/db");
     const { executeSlackTool } = await import("../services/connectors/slack.js");
     const { slackCapabilities } = await import("../services/connectors/slack-capabilities.js");
     await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
@@ -9863,6 +9864,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const listed = async () => (await resolveConnectorAssignments(db, binding))[0]?.tools.map(tool => tool.name) ?? [];
     expect(await listed()).toContain("slack_create_channel");
 
+    // A pinned native continuation does not run assignment/catalog sync. Even
+    // with consent and installed scopes, only dispatchable catalog entries may
+    // be exposed. Exercise the real SQL predicate, not just a stubbed catalog.
+    const catalogWhere = and(eq(toolCatalogEntries.companyId, fixture.companyId),
+      eq(toolCatalogEntries.connectionId, endpoint.connectionId), eq(toolCatalogEntries.toolName, "slack_create_channel"));
+    for (const status of ["removed", "disabled", "quarantined"] as const) {
+      await db.update(toolCatalogEntries).set({ status }).where(catalogWhere);
+      const [native] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
+      expect(native!.tools.map(tool => tool.name)).not.toContain("slack_create_channel");
+    }
+    await db.update(toolCatalogEntries).set({ status: "active", quarantinedAt: new Date() }).where(catalogWhere);
+    const [quarantinedNative] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
+    expect(quarantinedNative!.tools.map(tool => tool.name)).not.toContain("slack_create_channel");
+    await db.update(toolCatalogEntries).set({ quarantinedAt: null }).where(catalogWhere);
+    const [activeNative] = await resolvedConnectorToolDefinitionsForSkills(db, new Set(["paperclipai/paperclip/slack"]), binding);
+    expect(activeNative!.tools.map(tool => tool.name)).toContain("slack_create_channel");
+
     // The operator removes the group. Slack may keep the scope on the existing
     // installation; the request is what decides.
     await db.update(chatEndpoints).set({ setup: sql`${chatEndpoints.setup} || ${JSON.stringify({ slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: ["channel_management"] })}::jsonb` }).where(eq(chatEndpoints.id, endpoint.id));
@@ -9879,8 +9897,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
       throw new Error(`Unexpected Slack call ${String(input)}`);
     };
-    const originalFetch = globalThis.fetch;
     vi.stubGlobal("fetch", authFetch);
+    onTestFinished(() => vi.unstubAllGlobals());
     let capabilities: Awaited<ReturnType<typeof slackCapabilities>>;
     try {
       capabilities = await slackCapabilities(db, fixture.companyId, endpoint.id);
@@ -9892,7 +9910,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const pendingCapabilities = await slackCapabilities(db, fixture.companyId, endpoint.id);
       expect(pendingCapabilities.missingGroups?.find(group => group.group === "file_upload")?.action).toBe("reconnect");
     } finally {
-      vi.stubGlobal("fetch", originalFetch);
+      vi.unstubAllGlobals();
     }
     expect(capabilities.tools.map(tool => tool.name)).not.toContain("slack_create_channel");
     // ...and offered back as a group the operator can re-enable.
