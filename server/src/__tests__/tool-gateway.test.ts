@@ -83,6 +83,7 @@ import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool
 import { resolveConnectionGrantSecret, writeConnectionCredential } from "../services/connection-credentials.js";
 import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
 import { secretService } from "../services/secrets.js";
+import * as remoteHttpFetch from "../services/remote-http-fetch.js";
 import * as appDefinitions from "@paperclipai/shared";
 import * as cogneeBridge from "../services/cognee-connection.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
@@ -2988,6 +2989,81 @@ rl.on("line", (line) => {
       await fake.close();
     }
   });
+
+  // Untagged legacy rows reach the MCP proxy because they are not classified
+  // personal_only. The visibility guard must still recognize the canonical URL.
+  it.each(["shared", null, "private"] as const)(
+    "checks company visibility before a Granola MCP-proxy request (%s)",
+    async (visibility) => {
+      const company = await createCompany(db, visibility);
+      const credentialValue = `granola-proxy-secret-${randomUUID()}`;
+      const secret = await secretService(db).create(company.id, {
+        name: "Legacy Granola proxy", key: `granola_proxy_${randomUUID()}`,
+        provider: "local_encrypted", value: credentialValue,
+      });
+      const seeded = await createRemoteMcpTool(db, company.id, {
+        connectionName: "Legacy Granola proxy",
+        url: "https://mcp.granola.ai/mcp",
+        toolName: "list_meetings",
+        credentialRefs: [{
+          name: "credentials.authorization", secretId: secret.id, version: "latest",
+          placement: "header", key: "Authorization", prefix: "Bearer ",
+        }],
+        credentialSecretRefs: [{
+          secretId: secret.id, versionSelector: "latest", configPath: "credentials.authorization",
+          required: true, label: "Granola credential",
+        }],
+      });
+      const [profile] = await db.insert(toolProfiles).values({
+        companyId: company.id, profileKey: `proxy-${randomUUID()}`,
+        name: "Granola proxy", defaultAction: "deny",
+      }).returning();
+      await db.insert(toolProfileEntries).values({
+        companyId: company.id, profileId: profile!.id,
+        selectorType: "connection", effect: "include", connectionId: seeded.connection.id,
+      });
+      const gateway = createTestToolGatewayService(db);
+      const created = await gateway.createNamedGateway({
+        companyId: company.id, body: { name: "Granola proxy", profileId: profile!.id },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id, gatewayId: created.id, body: { name: "Native runner" },
+      });
+      const fetchMock = vi.spyOn(remoteHttpFetch, "guardedRemoteHttpFetch")
+        .mockResolvedValue(new Response(JSON.stringify({
+          jsonrpc: "2.0", id: "fixture",
+          result: { resources: [{ uri: "granola://meeting/1", name: "Meeting one" }] },
+        }), { headers: { "content-type": "application/json" } }));
+      try {
+        const response = await request(createGatewayRouteApp(db, gateway))
+          .post(`/api/tool-gateway/gateways/${created.id}/mcp`)
+          .set("authorization", `Bearer ${token.token}`)
+          .send({ jsonrpc: "2.0", id: 1, method: "resources/list" });
+        if (visibility === "private") {
+          expect(response.status, JSON.stringify(response.body)).toBe(200);
+          expect(response.body.result.resources).toEqual([
+            expect.objectContaining({ name: "Legacy Granola proxy: Meeting one" }),
+          ]);
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+          expect(new Headers(fetchMock.mock.calls[0]![1].headers).get("authorization"))
+            .toBe(`Bearer ${credentialValue}`);
+        } else {
+          expect(response.status).toBe(403);
+          expect(JSON.stringify(response.body)).not.toContain(credentialValue);
+          expect(response.body.error).toMatchObject({
+            message: "Granola is only available in private companies.",
+            data: { reasonCode: "app_unavailable_for_shared_company" },
+          });
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(await db.select().from(secretAccessEvents)
+            .where(eq(secretAccessEvents.companyId, company.id))).toEqual([]);
+        }
+      } finally {
+        fetchMock.mockRestore();
+      }
+    },
+  );
+
   // Regression test for a bug distinct from the RLS tenant-scoping fix above:
   // resolveUserGrantAuthHeader called the generic secrets.resolveSecretValue
   // without allowUserSecretScope, so it always threw secret_scope_invalid for

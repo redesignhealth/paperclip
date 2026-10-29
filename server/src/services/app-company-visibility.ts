@@ -35,8 +35,11 @@ export function isGranolaConfig(config: Record<string, unknown>): boolean {
   }
 }
 
+/** Minimal handle: a pool or a transaction both have `select`. */
+type VisibilityReader = Pick<Db, "select">;
+
 export async function loadCompanyVisibility(
-  db: Db,
+  db: VisibilityReader,
   companyId: string,
 ): Promise<CompanyVisibility | null> {
   const [row] = await db
@@ -76,7 +79,7 @@ export function connectionCompanyVisibilityDenial(
 
 /** Fail-closed check for a config that is about to be persisted. */
 export async function assertConnectionConfigAvailableInCompany(
-  db: Db,
+  db: VisibilityReader,
   companyId: string,
   config: Record<string, unknown>,
 ): Promise<void> {
@@ -95,7 +98,7 @@ export async function assertConnectionConfigAvailableInCompany(
  * including existing non-draft connections.
  */
 export async function assertConnectionAvailableInCompany(
-  db: Db,
+  db: VisibilityReader,
   connection: { companyId: string; config: Record<string, unknown> },
 ): Promise<void> {
   await assertConnectionConfigAvailableInCompany(db, connection.companyId, connection.config);

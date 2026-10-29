@@ -230,6 +230,7 @@ import {
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
 import {
+  APP_UNAVAILABLE_FOR_COMPANY_VISIBILITY_CODE,
   assertAppAvailableInCompany,
   assertConnectionAvailableInCompany,
   assertConnectionConfigAvailableInCompany,
@@ -7968,6 +7969,10 @@ export function toolAccessService(
     unavailableServices: string[] = [],
   ): Promise<McpToolDescriptor[]> {
     assertSupportedConnection(connection);
+    // Every remote MCP network path runs through here. Gate before credential
+    // resolution so an unexpired legacy or static token still cannot reach
+    // the provider from a company that may not use the app.
+    await assertConnectionAvailableInCompany(db, connection);
     let headers = credentialHeaders ?? {
       ...projectedConnectionHeaders(connection),
       ...(await resolveCredentialHeaders(connection, actor)),
@@ -8350,6 +8355,10 @@ export function toolAccessService(
     unavailableServices: string[] = [],
   ): Promise<McpToolDescriptor[]> {
     assertSupportedConnection(connection);
+    // Discovery reaches the provider, so the visibility gate must run before
+    // any credential resolution or network access -- not only when a refresh
+    // happens to need a new token.
+    await assertConnectionAvailableInCompany(db, connection);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections provide runtime authentication, not tool actions");
     if (isDaytonaConnection(connection)) {
       const headers = credentialHeaders ?? await resolveCredentialHeaders(connection, actor);
@@ -8468,6 +8477,8 @@ export function toolAccessService(
   ): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId);
     if (connection.connectionPurpose === "ai") return { connection: toConnection(connection), runtimeSlot: null };
+    // A health check is a provider probe too; refuse it before any network work.
+    await assertConnectionAvailableInCompany(db, connection);
     const unavailableServices: string[] = [];
     try {
       assertSupportedConnection(connection);
@@ -8569,7 +8580,8 @@ export function toolAccessService(
     } catch (error) {
       if (
         error instanceof HttpError &&
-        asRecord(error.details).code === "github_access_changed"
+        (asRecord(error.details).code === "github_access_changed"
+          || asRecord(error.details).code === APP_UNAVAILABLE_FOR_COMPANY_VISIBILITY_CODE)
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
@@ -8615,6 +8627,9 @@ export function toolAccessService(
   ): Promise<ToolCatalogRefreshResult> {
     const connection = await getConnectionRow(connectionId);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections do not have a tool catalog");
+    // Refuse before the try block: a visibility denial is a policy answer, not
+    // a provider failure, so it must not rewrite connection health.
+    await assertConnectionAvailableInCompany(db, connection);
     const refreshedAt = now();
     const unavailableServices: string[] = [];
     let descriptors: McpToolDescriptor[];
@@ -8628,7 +8643,8 @@ export function toolAccessService(
     } catch (error) {
       if (
         error instanceof HttpError &&
-        asRecord(error.details).code === "github_access_changed"
+        (asRecord(error.details).code === "github_access_changed"
+          || asRecord(error.details).code === APP_UNAVAILABLE_FOR_COMPANY_VISIBILITY_CODE)
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
@@ -21144,6 +21160,9 @@ export function toolAccessService(
     ): Promise<{ installed: boolean; bound: boolean }> => {
       assertNotManagedTemplate(connection);
       if (connection.connectionPurpose === "ai") return { installed: false, bound: false };
+      // Both modes add access (an install or a profile binding). Cleanup uses
+      // putConnectionInstalls instead and remains allowed below.
+      await assertConnectionAvailableInCompany(dbClient, connection);
       if (options.install) {
         await dbClient
           .insert(toolConnectionInstalls)
@@ -21257,6 +21276,18 @@ export function toolAccessService(
         //  - Otherwise a dedicated entry's org template / another agent's dedicated connection is
         //    provisioning-only for the agent being added.
         const additionsToCheck = [...requested.values()].filter((install) => !existingKeys.has(`${install.targetType}:${install.targetId}`));
+        // A visibility-limited app may never gain reach in a company that may
+        // not use it. Reach is an install row OR its profile binding, so a
+        // re-save that would recreate a missing binding is gated too.
+        // Removal-only cleanup stays allowed, so an existing install can be
+        // cleared even after the company stops qualifying.
+        const bindingKeys = new Set(bindings.map((binding) => `${binding.targetType}:${binding.targetId}`));
+        const addsReach = input.installs.some((install) =>
+          !existingKeys.has(`${install.targetType}:${install.targetId}`)
+          || !bindingKeys.has(`${install.targetType}:${install.targetId}`));
+        if (addsReach) {
+          await assertConnectionAvailableInCompany(tx, connection);
+        }
         if (additionsToCheck.length > 0) {
           if (isPersonalDefaultMcpInstance(connection)) {
             if (actor?.actorType !== "user" || !actor.actorId || actor.actorId !== connection.createdByUserId) {
