@@ -104,15 +104,41 @@ describe("usage availability reporting projection", () => {
 
   it("reports runs without a receipt separately and excludes them from coverage", async () => {
     const owner = await company();
+    const v2 = { accountingProjectionVersion: "v2" };
     await receipted(owner, owner.claude, { event: { ...tokens, costCents: 1 } });
-    await receipted(owner, owner.hermes, { event: false }); // terminal, nothing ever recorded
-    // Late-settling run: receipt has not been accounted yet, so it has no event now.
-    await receipted(owner, owner.hermes, { event: false, run: { costAccountingPending: true, costAccountedAt: null } });
-    await receipted(owner, owner.codex, { event: false, run: { status: "running", finishedAt: null } }); // active runs are not missing a receipt
+    // Owed: v2 run that is terminal with nothing recorded.
+    await receipted(owner, owner.hermes, { event: false, run: v2 });
+    // Owed and late-settling: receipt has not been accounted yet, so it has no event now.
+    await receipted(owner, owner.hermes, { event: false, run: { ...v2, costAccountingPending: true, costAccountedAt: null } });
+    await receipted(owner, owner.codex, { event: false, run: { ...v2, status: "running", finishedAt: null } }); // active runs are not missing a receipt
     const report = await usageAvailabilityReport(db, owner.companyId, range);
     expect(report.total.eventCount).toBe(1);
     expect(report.coverageRate).toBe(1);
     expect(report.runsWithoutReceipt).toEqual({ total: 2, pendingAccounting: 1, byAdapter: [{ adapterType: "hermes_local", count: 2 }] });
+    expect(report.runsNotOwedReceipt.total).toBe(0);
+  });
+
+  it("does not count runs that owe no receipt as missing receipts", async () => {
+    const owner = await company();
+    const v2 = { accountingProjectionVersion: "v2" };
+    // Legacy: finished before receipts existed (no pending flag, no v2 projection).
+    await receipted(owner, owner.hermes, { event: false });
+    await receipted(owner, owner.hermes, { event: false });
+    // Failed before any provider work, by either marker.
+    await receipted(owner, owner.claude, { event: false, run: { ...v2, status: "failed", resultJson: { executionRecovery: { providerWorkStarted: false } } } });
+    await receipted(owner, owner.codex, { event: false, run: { ...v2, status: "failed", usageJson: { accountingProviderWorkStarted: false } } });
+    // Genuine debt: v2, provider work started (marker true), still no receipt.
+    await receipted(owner, owner.claude, { event: false, run: { ...v2, resultJson: { executionRecovery: { providerWorkStarted: true } } } });
+    // Another company's missing receipts never leak in.
+    const other = await company();
+    await receipted(other, other.hermes, { event: false, run: v2 });
+    const report = await usageAvailabilityReport(db, owner.companyId, range);
+    expect(report.runsWithoutReceipt).toEqual({ total: 1, pendingAccounting: 0, byAdapter: [{ adapterType: "claude_local", count: 1 }] });
+    expect(report.runsNotOwedReceipt).toEqual({ total: 4, byAdapter: [
+      { adapterType: "claude_local", count: 1 }, { adapterType: "codex_local", count: 1 }, { adapterType: "hermes_local", count: 2 }] });
+    // Date range still applies to both cohorts.
+    const empty = await usageAvailabilityReport(db, owner.companyId, { from: new Date("2026-09-01T00:00:00Z"), to: new Date("2026-09-30T00:00:00Z") });
+    expect(empty.runsWithoutReceipt.total + empty.runsNotOwedReceipt.total).toBe(0);
   });
 
   it("classifies a late-settled receipt like any other once its event exists", async () => {

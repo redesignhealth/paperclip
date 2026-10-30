@@ -269,11 +269,18 @@ export interface UsageAvailabilityReport {
   byAdapter: UsageAvailabilityByAdapter[];
   /** Retained from the ledger, never recomputed. */
   pricingProvenance: Array<{ source: string; eventCount: number; costCentsExact: string }>;
-  /** Terminal runs with no ledger event. Excluded from every coverage rate above. */
+  /** Terminal runs that owe a receipt (pending or v2-projected, provider work not ruled out)
+   * but have no ledger event. Excluded from every coverage rate above. */
   runsWithoutReceipt: {
     total: number;
     /** Subset still waiting for accounting to settle (late receipt possible). */
     pendingAccounting: number;
+    byAdapter: Array<{ adapterType: string; count: number }>;
+  };
+  /** Terminal runs with no event that owe none: runs from before receipts existed, and runs
+   * that failed before any provider work. Not data loss; excluded from every rate. */
+  runsNotOwedReceipt: {
+    total: number;
     byAdapter: Array<{ adapterType: string; count: number }>;
   };
   /** Human-readable statement of the token field contract. */

@@ -106,15 +106,25 @@ export async function usageAvailabilityReport(db: Db, companyId: string, range?:
 
     const runFrom = period.from ? sql`and coalesce(r.finished_at, r.created_at) >= ${period.from.toISOString()}::timestamptz` : sql``;
     const runTo = period.to ? sql`and coalesce(r.finished_at, r.created_at) <= ${period.to.toISOString()}::timestamptz` : sql``;
-    const missing = await tx.execute<{ adapterType: string; count: number; pending: number }>(sql`
-      select coalesce(a.adapter_type, 'unknown') as "adapterType", count(*)::int as count,
+    // A run owes a receipt only under the predicate the accounting integrity check uses:
+    // pending or v2-projected, and provider work was not ruled out. Everything else without
+    // an event (older runs from before receipts existed, runs that failed before the
+    // provider was called) owes none and is counted apart so it cannot read as data loss.
+    const owesReceipt = sql`((r.cost_accounting_pending or r.accounting_projection_version = 'v2')
+      and r.result_json->'executionRecovery'->>'providerWorkStarted' is distinct from 'false'
+      and r.usage_json->>'accountingProviderWorkStarted' is distinct from 'false')`;
+    const missing = await tx.execute<{ adapterType: string; owed: boolean; count: number; pending: number }>(sql`
+      select coalesce(a.adapter_type, 'unknown') as "adapterType", ${owesReceipt} as owed, count(*)::int as count,
         count(*) filter (where r.cost_accounting_pending)::int as pending
       from heartbeat_runs r left join agents a on a.id = r.agent_id and a.company_id = r.company_id
       where r.company_id = ${companyId} and r.status in (${sql.join(TERMINAL_STATUSES.map(value => sql`${value}`), sql`, `)}) ${runFrom} ${runTo}
         and not exists (select 1 from cost_events e where e.company_id = r.company_id and e.heartbeat_run_id = r.id
           and e.usage_kind = 'agent' and e.idempotency_key like 'heartbeat:%')
-      group by 1 order by 1`);
+      group by 1, 2 order by 1, 2`);
     const missingRows = Array.from(missing);
+    const owedRows = missingRows.filter(row => row.owed);
+    const notOwedRows = missingRows.filter(row => !row.owed);
+    const byAdapterCount = (rows: typeof missingRows) => rows.map(row => ({ adapterType: row.adapterType, count: Number(row.count) }));
 
     return {
       companyId, total, receiptRunCount: ledger.runCount,
@@ -124,9 +134,13 @@ export async function usageAvailabilityReport(db: Db, companyId: string, range?:
       availability, byAdapter,
       pricingProvenance: [...provenance.values()].sort((a, b) => a.source.localeCompare(b.source)),
       runsWithoutReceipt: {
-        total: missingRows.reduce((sum, row) => sum + Number(row.count), 0),
-        pendingAccounting: missingRows.reduce((sum, row) => sum + Number(row.pending), 0),
-        byAdapter: missingRows.map(row => ({ adapterType: row.adapterType, count: Number(row.count) })),
+        total: owedRows.reduce((sum, row) => sum + Number(row.count), 0),
+        pendingAccounting: owedRows.reduce((sum, row) => sum + Number(row.pending), 0),
+        byAdapter: byAdapterCount(owedRows),
+      },
+      runsNotOwedReceipt: {
+        total: notOwedRows.reduce((sum, row) => sum + Number(row.count), 0),
+        byAdapter: byAdapterCount(notOwedRows),
       },
       tokenSemantics: TOKEN_SEMANTICS,
     };

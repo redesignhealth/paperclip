@@ -80,6 +80,10 @@ Each receipt-backed agent event (`heartbeat:*` idempotency key) is one of:
 Coverage rate per adapter is `(reported + estimated) / receipt-backed events`; a
 measured zero is not coverage. Terminal runs with no ledger event appear only under
 `runsWithoutReceipt` (with the subset still pending accounting) and never in a rate.
+Only runs that owe a receipt count there: pending or v2-projected runs where provider
+work was not ruled out, the same rule the accounting integrity check uses. Runs from
+before receipts existed and runs that failed before any provider work are reported
+under `runsNotOwedReceipt`, so they cannot be read as data loss.
 Subscription and unknown billing are counted per adapter in `billingKindEventCounts`
 and are not folded into metered totals. Pricing provenance is read from the ledger as
 stored. The four availability subtotals add up exactly to `ledgerCostCentsExact`;
