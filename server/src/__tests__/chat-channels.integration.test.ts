@@ -10257,6 +10257,47 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("denies a revoked Slack identity instead of admitting it as a guest, while never-linked people stay guests", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, wakeup } = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: true });
+    const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UREVOKED" }).returning();
+    await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: endpoint.id, principalId: principal.id, paperclipUserId: "owner-user", status: "revoked", revokedAt: new Date() });
+    const send = (id: string, userId: string) => deliverMessage({ callbacks, endpointId: endpoint.id,
+      thread: makeThread({ channelId: `D-${userId}`, id: `slack:D-${userId}:`, isDM: true }).thread,
+      message: makeMessage({ id, text: "Please help", userId }), trigger: "direct_message" });
+    await send("7600.1", "UREVOKED");
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(await readChatConversationsByEndpointId(endpoint.id)).toHaveLength(0);
+    await send("7600.2", "UNEVERLINKED");
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(await readChatConversationsByEndpointId(endpoint.id)).toHaveLength(1);
+    await service.shutdown();
+  });
+
+  it("does not turn a revoked Slack identity back into a pending link when it sends connect", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: true });
+    const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UREVOKED" }).returning();
+    await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: endpoint.id, principalId: principal.id, paperclipUserId: "owner-user", status: "revoked", revokedAt: new Date() });
+    await callbacks.onSlashCommand!({
+      endpointId: endpoint.id,
+      provider: "slack",
+      event: {
+        command: String(endpoint.setup.command ?? (await service.get(endpoint.id)).setup.command),
+        text: "connect",
+        triggerId: randomUUID(),
+        channel: { id: "slack:D-REVOKED-CONNECT", isDM: true, name: "Revoked connect" } as never,
+        user: { userId: "UREVOKED", userName: "revoked", fullName: "Revoked Person", isBot: false, isMe: false, isSystem: false },
+        raw: { command: "/maya", text: "connect", channel_id: "D-REVOKED-CONNECT", user_id: "UREVOKED" },
+        adapter: {} as never,
+        openModal: async () => undefined,
+      },
+    });
+    expect(await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, endpoint.id)))
+      .toEqual([expect.objectContaining({ status: "revoked", paperclipUserId: "owner-user", confirmationTokenHash: null })]);
+    await service.shutdown();
+  });
+
   it.each([false, true])("requires at-mentions by default only in Slack channels (DM=%s)", async (isDM) => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service, wakeup } = await configuredSlackEndpoint(fixture, { requireAtMention: true });
@@ -24957,7 +24998,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         principalId: null,
         state: "filtered",
         redactedError:
-          authorizationChange === "viewer"
+          authorizationChange === "viewer" || authorizationChange === "link_revoked"
             ? "Linked Paperclip account is not currently permitted"
             : "External identity must be linked to a Paperclip account",
         normalizedEvent: {
@@ -55402,7 +55443,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         redactedError:
           authorizationChange === "resource_disabled"
             ? "Destination is not enabled in Paperclip"
-            : authorizationChange === "viewer"
+            : authorizationChange === "viewer" || authorizationChange === "link_revoked"
               ? "Linked Paperclip account is not currently permitted"
               : "External identity must be linked to a Paperclip account",
         state: "filtered",

@@ -156,7 +156,9 @@ export function createSlackCommands(db: Db, options: SlackCommandsOptions) {
           eq(chatIdentityLinks.endpointId, event.endpointId), eq(chatIdentityLinks.principalId, principal.principal.id),
         )).then((rows) => rows[0]);
         let notice = "Your Slack account is already connected to Paperclip. You can return to Slack and message the agent.";
-        if (currentLink?.status !== "linked") {
+        if (currentLink?.status === "revoked") {
+          notice = "Your access to this agent was removed. Ask a manager of this connection to restore it.";
+        } else if (currentLink?.status !== "linked") {
           const token = randomBytes(32).toString("base64url");
           const tokenHash = createHash("sha256").update(token).digest("hex");
           const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
