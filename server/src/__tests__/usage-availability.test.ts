@@ -141,6 +141,20 @@ describe("usage availability reporting projection", () => {
     expect(empty.runsWithoutReceipt.total + empty.runsNotOwedReceipt.total).toBe(0);
   });
 
+  it("reports one not-owed entry per adapter when legacy and marker-false runs share an adapter", async () => {
+    const owner = await company();
+    const v2 = { accountingProjectionVersion: "v2" };
+    // Same adapter, two different reasons for owing nothing: legacy (NULL projection version) and marker-false.
+    await receipted(owner, owner.hermes, { event: false });
+    await receipted(owner, owner.hermes, { event: false, run: { ...v2, status: "failed", resultJson: { executionRecovery: { providerWorkStarted: false } } } });
+    // Same adapter, pending debt plus a genuine v2 miss: one owed entry.
+    await receipted(owner, owner.claude, { event: false, run: { ...v2, costAccountingPending: true, costAccountedAt: null } });
+    await receipted(owner, owner.claude, { event: false, run: v2 });
+    const report = await usageAvailabilityReport(db, owner.companyId, range);
+    expect(report.runsNotOwedReceipt).toEqual({ total: 2, byAdapter: [{ adapterType: "hermes_local", count: 2 }] });
+    expect(report.runsWithoutReceipt).toEqual({ total: 2, pendingAccounting: 1, byAdapter: [{ adapterType: "claude_local", count: 2 }] });
+  });
+
   it("classifies a late-settled receipt like any other once its event exists", async () => {
     const owner = await company();
     const late = new Date(at.getTime() + 20 * 60_000);

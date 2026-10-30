@@ -110,9 +110,11 @@ export async function usageAvailabilityReport(db: Db, companyId: string, range?:
     // pending or v2-projected, and provider work was not ruled out. Everything else without
     // an event (older runs from before receipts existed, runs that failed before the
     // provider was called) owes none and is counted apart so it cannot read as data loss.
-    const owesReceipt = sql`((r.cost_accounting_pending or r.accounting_projection_version = 'v2')
+    // accounting_projection_version is nullable, so the predicate is wrapped in coalesce: legacy
+    // rows (NULL) must land in the same `false` group as marker-false rows, never a separate NULL one.
+    const owesReceipt = sql`coalesce((r.cost_accounting_pending or r.accounting_projection_version = 'v2')
       and r.result_json->'executionRecovery'->>'providerWorkStarted' is distinct from 'false'
-      and r.usage_json->>'accountingProviderWorkStarted' is distinct from 'false')`;
+      and r.usage_json->>'accountingProviderWorkStarted' is distinct from 'false', false)`;
     const missing = await tx.execute<{ adapterType: string; owed: boolean; count: number; pending: number }>(sql`
       select coalesce(a.adapter_type, 'unknown') as "adapterType", ${owesReceipt} as owed, count(*)::int as count,
         count(*) filter (where r.cost_accounting_pending)::int as pending
@@ -122,9 +124,14 @@ export async function usageAvailabilityReport(db: Db, companyId: string, range?:
           and e.usage_kind = 'agent' and e.idempotency_key like 'heartbeat:%')
       group by 1, 2 order by 1, 2`);
     const missingRows = Array.from(missing);
-    const owedRows = missingRows.filter(row => row.owed);
-    const notOwedRows = missingRows.filter(row => !row.owed);
-    const byAdapterCount = (rows: typeof missingRows) => rows.map(row => ({ adapterType: row.adapterType, count: Number(row.count) }));
+    const owedRows = missingRows.filter(row => row.owed === true);
+    const notOwedRows = missingRows.filter(row => row.owed !== true);
+    // One entry per adapter, even if the query ever returned several rows for it.
+    const byAdapterCount = (rows: typeof missingRows) => {
+      const counts = new Map<string, number>();
+      for (const row of rows) counts.set(row.adapterType, (counts.get(row.adapterType) ?? 0) + Number(row.count));
+      return [...counts].map(([adapterType, count]) => ({ adapterType, count }));
+    };
 
     return {
       companyId, total, receiptRunCount: ledger.runCount,
