@@ -145,6 +145,11 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
       }
       return { principal, userId: link.userId, linkedDenied: false };
     }
+    // A manager disconnected this identity. Revocation is an explicit deny and
+    // must not fall back to guest access.
+    if (link?.status === "revoked") {
+      return { principal, userId: null, linkedDenied: true };
+    }
     return { principal, userId: null, linkedDenied: false };
   }
 
@@ -243,6 +248,9 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
         linkedDenied: !allowed,
         userId: allowed ? link.userId : null,
       };
+    }
+    if (link?.status === "revoked") {
+      return { allowed: false, linkedDenied: true, userId: null };
     }
     if (!endpoint.allowUnlinkedPeople) {
       return { allowed: false, linkedDenied: false, userId: null };
