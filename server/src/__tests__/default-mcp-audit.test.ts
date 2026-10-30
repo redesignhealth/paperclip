@@ -1401,7 +1401,7 @@ describeEmbeddedPostgres("default MCP adversarial audit (TECH-7204)", () => {
 
     const row = await agentRow(agent.id);
     const state = readDefaultMcpState(row.metadata)!;
-    expect(Object.keys(state.entries).sort()).toEqual(["arcana-brain", "argus-review", "comms-board", "rh-google-mcp", "rh-mcp"]); // server state, not the forged object
+    expect(Object.keys(state.entries).sort()).toEqual(["arcana-brain", "argus-review", "comms-board", "rh-google-mcp", "rh-mcp", "rh-mcp-service"]); // server state, not the forged object
     expect(row.metadata).toMatchObject({ keep: { defaultMcp: { nested: true } }, DefaultMcp: "not-reserved", note: "x" });
     // The nested/differently-cased keys are inert: only the exact top-level reserved key is read.
     expect(readCommsBoardBindingReference({ keep: state })).toBeNull();

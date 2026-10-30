@@ -31,7 +31,7 @@ import {
   readCommsBoardProvisionerSnapshot,
   snapshotFromEnv,
 } from "../secrets/comms-board-provisioner-credentials.js";
-import type { DefaultMcpSetupReason } from "./default-mcp-spec.js";
+import { RH_MCP_SERVICE_TOOLS_BY_SCOPE, type DefaultMcpSetupReason } from "./default-mcp-spec.js";
 import {
   buildMcpToolCallRequest,
   extractMcpToolCallResult,
@@ -63,15 +63,26 @@ export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write", "comms:pro
 export const COMMS_BOARD_TOKEN_SCOPES_VERSION = 2;
 /** The company template credential (TECH-7271) is discovery-only: read, never write/admin/ownership. */
 export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
+/**
+ * Scopes of the per-org rh-mcp service credential of a shared org (TECH-8066). A separate token from the comms-board
+ * ones, minted through the same ownership API. rh-mcp enforces one scope per tool, so the scopes are exactly the keys of
+ * `RH_MCP_SERVICE_TOOLS_BY_SCOPE` (default-mcp-spec.ts), which also lists the tools they cover. Read scopes for tools
+ * that need no person only: `supabase:read` is deliberately absent (the supabase tools expose the Ashby ATS views with
+ * no identity gate), and so is every `:write` scope, `argus:secrets` and `auth:impersonate`.
+ */
+export const RH_MCP_SERVICE_TOKEN_SCOPES: readonly string[] = Object.freeze(Object.keys(RH_MCP_SERVICE_TOOLS_BY_SCOPE));
+/** Bump whenever `RH_MCP_SERVICE_TOKEN_SCOPES` changes so existing tokens can be rotated onto the new set. */
+export const RH_MCP_SERVICE_TOKEN_SCOPES_VERSION = 1;
 
 /**
  * Closed, typed credential purpose. The scopes sent downstream are looked up from this table only; there
  * is no caller-supplied scope list, so no code path can request `comms:admin` or `ownership:*`.
  */
-export type CommsBoardCredentialPurpose = "bot" | "template";
+export type CommsBoardCredentialPurpose = "bot" | "template" | "rh_mcp_service";
 const CREDENTIAL_SCOPES_BY_PURPOSE: Readonly<Record<CommsBoardCredentialPurpose, readonly string[]>> = Object.freeze({
   bot: COMMS_BOARD_TOKEN_SCOPES,
   template: COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
+  rh_mcp_service: RH_MCP_SERVICE_TOKEN_SCOPES,
 });
 
 const BASE_SUB_PATTERN = /^[a-z0-9][a-z0-9-]{0,127}$/;
@@ -147,6 +158,16 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 export function composeTemplateSub(companyId: string): string | null {
   if (!UUID_PATTERN.test(companyId)) return null;
   const sub = `paperclip-company-template-${companyId.toLowerCase()}`;
+  return BASE_SUB_PATTERN.test(sub) && !sub.includes("::") ? sub : null;
+}
+
+/**
+ * Token subject of a shared org's rh-mcp service credential (TECH-8066): `paperclip-rh-mcp-<lowercase company UUID>`
+ * (52 chars, no "::"). Null for anything that is not a canonical UUID. One credential per org, so the sub names the org.
+ */
+export function composeRhMcpServiceSub(companyId: string): string | null {
+  if (!UUID_PATTERN.test(companyId)) return null;
+  const sub = `paperclip-rh-mcp-${companyId.toLowerCase()}`;
   return BASE_SUB_PATTERN.test(sub) && !sub.includes("::") ? sub : null;
 }
 
@@ -624,6 +645,23 @@ export async function mintCommsBoardTemplateCredential(
   return mintCredentialForPurpose(config, { baseSub, ownerEmail: request.ownerEmail, purpose: "template" }, fetchImpl, timeoutMs);
 }
 
+/**
+ * Per-org rh-mcp service credential (`RH_MCP_SERVICE_TOKEN_SCOPES` ONLY, TECH-8066), minted through the same ownership
+ * API with the server's existing ownership token. `request.companyId` must be a canonical UUID; the subject is always
+ * `composeRhMcpServiceSub(companyId)`, never caller-supplied. The registry's insert-only rule applies: a second mint for
+ * the same org is `ownership_conflict`, and the caller then rotates instead.
+ */
+export async function mintRhMcpServiceCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { companyId: string; ownerEmail: string },
+  fetchImpl: FetchLike = fetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<PurposeMintOutcome> {
+  const baseSub = composeRhMcpServiceSub(request.companyId);
+  if (!baseSub) return { ok: false, reason: "invalid_subject" };
+  return mintCredentialForPurpose(config, { baseSub, ownerEmail: request.ownerEmail, purpose: "rh_mcp_service" }, fetchImpl, timeoutMs);
+}
+
 // ---------------------------------------------------------------------------
 // Board credential rotation (rescope)
 // ---------------------------------------------------------------------------
@@ -644,16 +682,38 @@ export async function rotateCommsBoardCredential(
   fetchImpl: FetchLike = fetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<RotateOutcome> {
-  if (!BASE_SUB_PATTERN.test(request.baseSub)) return { ok: false, reason: "invalid_subject" };
+  return rotateCredentialWithScopes(config, request.baseSub, COMMS_BOARD_TOKEN_SCOPES, fetchImpl, timeoutMs);
+}
+
+/** Re-issues the per-org rh-mcp service credential with the CURRENT `RH_MCP_SERVICE_TOKEN_SCOPES` (TECH-8066). */
+export async function rotateRhMcpServiceCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { companyId: string },
+  fetchImpl: FetchLike = fetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<RotateOutcome> {
+  const baseSub = composeRhMcpServiceSub(request.companyId);
+  if (!baseSub) return { ok: false, reason: "invalid_subject" };
+  return rotateCredentialWithScopes(config, baseSub, RH_MCP_SERVICE_TOKEN_SCOPES, fetchImpl, timeoutMs);
+}
+
+async function rotateCredentialWithScopes(
+  config: CommsBoardProvisionerConfig,
+  baseSub: string,
+  scopes: readonly string[],
+  fetchImpl: FetchLike,
+  timeoutMs: number,
+): Promise<RotateOutcome> {
+  if (!BASE_SUB_PATTERN.test(baseSub)) return { ok: false, reason: "invalid_subject" };
   let response: Response;
   try {
-    response = await fetchImpl(`${config.ownershipApiUrl}/agents/${encodeURIComponent(request.baseSub)}/rotate`, {
+    response = await fetchImpl(`${config.ownershipApiUrl}/agents/${encodeURIComponent(baseSub)}/rotate`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${config.ownershipApiToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ scopes: [...COMMS_BOARD_TOKEN_SCOPES], expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS }),
+      body: JSON.stringify({ scopes: [...scopes], expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS }),
       signal: AbortSignal.timeout(timeoutMs),
       redirect: "error",
     });
@@ -672,7 +732,7 @@ export async function rotateCommsBoardCredential(
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "rotate_failed" };
   const { token, token_expires_at: expiresAt, sub, active } = body as Record<string, unknown>;
-  if (sub !== request.baseSub || active !== true) return { ok: false, reason: "rotate_failed" };
+  if (sub !== baseSub || active !== true) return { ok: false, reason: "rotate_failed" };
   if (typeof token !== "string" || token.length === 0) return { ok: false, reason: "rotate_failed" };
   return {
     ok: true,
