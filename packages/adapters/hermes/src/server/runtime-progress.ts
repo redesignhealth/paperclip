@@ -9,11 +9,13 @@ const { parentPort, workerData } = require('node:worker_threads');
 const { lstatSync } = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
 let previous = '';
+let unavailable = false;
 function sample() {
   let db;
   try {
-    if (!lstatSync(workerData.file).isFile()) return;
-    db = new DatabaseSync(workerData.file, { readOnly: true, timeout: 25, allowExtension: false });
+    if (!lstatSync(workerData.file).isFile()) throw new Error('state unavailable');
+    db = new DatabaseSync(workerData.file, { readOnly: true, allowExtension: false });
+    db.exec('PRAGMA busy_timeout = 25');
     const row = db.prepare(
       'SELECT COALESCE(SUM(message_count), 0) AS message_count, ' +
       'COALESCE(SUM(tool_call_count), 0) AS tool_call_count, ' +
@@ -21,11 +23,17 @@ function sample() {
     ).get();
     if (!row) return;
     const counts = [row.message_count, row.tool_call_count, row.api_call_count];
-    if (!counts.every(n => Number.isSafeInteger(n) && n >= 0)) return;
+    if (!counts.every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('counts unavailable');
     const key = JSON.stringify(counts);
-    if (key !== previous) { previous = key; parentPort.postMessage(counts); }
-  } catch {
-    // Missing/not-yet-migrated/busy state is not an agent failure. Do not log SQL errors.
+    if (unavailable || key !== previous) {
+      unavailable = false; previous = key; parentPort.postMessage(counts);
+    }
+  } catch (error) {
+    // A not-yet-created database is expected. Other read failures are distinct
+    // from agent inactivity; report no raw SQL, paths, or database contents.
+    if ((error.code !== 'ENOENT' || previous !== '') && !unavailable) {
+      unavailable = true; parentPort.postMessage({ unavailable: true });
+    }
   } finally { if (db) db.close(); }
 }
 sample();
@@ -42,6 +50,8 @@ export function startHermesProgress(
   let lastChangeAt = startedAt;
   let warned = false;
   let stopped = false;
+  let failed = false;
+  let samplingAvailable = true;
   let pending = Promise.resolve();
   const send = (event: AdapterRuntimeEvent) => {
     pending = pending.then(async () => { if (!stopped) await emit(event); }).catch(() => {});
@@ -60,9 +70,19 @@ export function startHermesProgress(
       message: "Detailed agent progress is unavailable; execution continues." });
     return { async stop() { stopped = true; } };
   }
+  // Discard native SQLite warnings rather than buffering unread output.
+  worker.stdout?.resume();
+  worker.stderr?.resume();
   worker.on("message", (counts: unknown) => {
+    if (counts && typeof counts === "object" && "unavailable" in counts) {
+      samplingAvailable = false;
+      send({ eventType: "hermes.progress_unavailable", stream: "system", level: "warn",
+        message: "Detailed agent progress is unavailable; execution continues." });
+      return;
+    }
     if (!Array.isArray(counts) || counts.length !== 3 ||
         !counts.every(n => Number.isSafeInteger(n) && n >= 0)) return;
+    samplingAvailable = true;
     lastChangeAt = Date.now();
     warned = false;
     const [messages, tools, modelCalls] = counts as number[];
@@ -70,14 +90,19 @@ export function startHermesProgress(
       message: `Agent activity: ${modelCalls} completed model calls, ${tools} recorded tool calls, ${messages} messages.`,
       payload: { messages, tools, modelCalls, elapsedMs: lastChangeAt - startedAt } });
   });
-  worker.on("error", () => {
+  const workerFailed = () => {
+    if (stopped || failed) return;
+    failed = true;
+    clearInterval(timer);
     send({ eventType: "hermes.progress_unavailable", stream: "system", level: "warn",
       message: "Detailed agent progress is unavailable; execution continues." });
-  });
+  };
+  worker.on("error", workerFailed);
+  worker.on("exit", workerFailed);
   // A warning is not evidence of useful work and never cancels or retries the run.
   const stalledAfterMs = options.stalledAfterMs ?? 120_000;
   const timer = setInterval(() => {
-    if (!warned && Date.now() - lastChangeAt >= stalledAfterMs) {
+    if (!failed && samplingAvailable && !warned && Date.now() - lastChangeAt >= stalledAfterMs) {
       warned = true;
       send({ eventType: "hermes.activity_stale", stream: "system", level: "warn",
         message: "No new recorded agent activity. The model or a tool may still be working.",

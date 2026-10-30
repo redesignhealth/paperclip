@@ -55,12 +55,26 @@ describe("isolated Hermes progress through a real SQLite worker", () => {
     try { await vi.waitFor(() => expect(emit).toHaveBeenCalledWith(expect.objectContaining({ eventType: "hermes.progress" }))); }
     finally { db.close(); }
   });
+  it("reports unreadable state separately from inactivity and recovers after repair", async () => {
+    const h = await home();
+    await fs.writeFile(path.join(h, "state.db"), "not a SQLite database");
+    const emit = vi.fn(async (_event: AdapterRuntimeEvent) => {});
+    const monitor = startHermesProgress(h, emit, { intervalMs: 20, stalledAfterMs: 40 }); monitors.push(monitor);
+    await vi.waitFor(() => expect(emit).toHaveBeenCalledWith(expect.objectContaining({ eventType: "hermes.progress_unavailable" })));
+    emit.mockClear();
+    await new Promise(r => setTimeout(r, 100));
+    expect(emit.mock.calls.some(([event]) => event.eventType === "hermes.activity_stale")).toBe(false);
+    await fs.unlink(path.join(h, "state.db"));
+    const db = createDb(h);
+    try { await vi.waitFor(() => expect(emit).toHaveBeenCalledWith(expect.objectContaining({ eventType: "hermes.progress" }))); }
+    finally { db.close(); }
+  });
   it("does not open a symlink to another home's database", async () => {
     const other = await home(); const db = createDb(other); db.close();
     const h = await home(); await fs.symlink(path.join(other, "state.db"), path.join(h, "state.db"));
     const emit = vi.fn(async (_event: AdapterRuntimeEvent) => {});
     const monitor = startHermesProgress(h, emit, { intervalMs: 20, stalledAfterMs: 40 }); monitors.push(monitor);
-    await vi.waitFor(() => expect(emit).toHaveBeenCalledWith(expect.objectContaining({ eventType: "hermes.activity_stale" })));
+    await vi.waitFor(() => expect(emit).toHaveBeenCalledWith(expect.objectContaining({ eventType: "hermes.progress_unavailable" })));
     expect(emit.mock.calls.some(([event]) => event.eventType === "hermes.progress")).toBe(false);
   });
   it("stops despite a diagnostic sink that never completes", async () => {
