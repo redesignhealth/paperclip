@@ -81,6 +81,7 @@ vi.mock("./router-readiness.js", async (importOriginal) => {
 import { execute } from "./execute.js";
 import { detectModel } from "./detect-model.js";
 import YAML from "yaml";
+import * as progressModule from "./runtime-progress.js";
 import {
   hasExplicitHermesProviderCredential,
   hermesHostIsolationEnabled,
@@ -282,6 +283,24 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
         servers: [{ name: "test", url: "https://mcp.example.com", token: "test-token", connectionId: "test", allowedTools: ["read"] }],
         extraConfig: { provider: "anthropic", model: "claude-sonnet-5-5", requestTimeoutSec: 0 } }));
       expect(YAML.parse(captured!.hermesConfigYaml)?.providers).toBeUndefined();
+    });
+
+    it.each(["ok", "timeout", "throw"] as const)("stops metadata observation before isolated-home cleanup on %s", async (behavior) => {
+      const stop = vi.fn(async () => {
+        expect(await exists(captured!.hermesHome!)).toBe(true);
+      });
+      const start = vi.spyOn(progressModule, "startHermesProgress").mockReturnValue({ stop });
+      childBehavior = behavior;
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, logs });
+      ctx.onEvent = vi.fn(async () => {});
+      try {
+        if (behavior === "throw") await expect(execute(ctx)).rejects.toThrow("spawn exploded");
+        else await execute(ctx);
+        expect(start).toHaveBeenCalledWith(captured!.hermesHome, ctx.onEvent);
+        expect(stop).toHaveBeenCalledOnce();
+        expect(await exists(captured!.hermesHome!)).toBe(false);
+      } finally { start.mockRestore(); }
     });
 
     it("runs in a fresh per-run home with the explicit key, never the host ~/.hermes, and cleans up", async () => {
