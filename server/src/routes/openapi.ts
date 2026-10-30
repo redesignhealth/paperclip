@@ -6062,6 +6062,7 @@ const costSummaryPaths = [
   "quota-windows",
   "subscriptions",
   "data-quality",
+  "usage-availability",
 ] as const;
 
 for (const segment of costSummaryPaths) {

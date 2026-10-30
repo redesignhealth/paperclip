@@ -7,6 +7,7 @@ import { canManageAiConnections } from "./ai-connections.js";
 import { importProviderCostsSchema } from "@paperclipai/shared";
 import { accountingIntegrityService } from "../services/accounting-integrity.js";
 import { costDataQualityReport } from "../services/cost-data-quality.js";
+import { usageAvailabilityReport } from "../services/usage-availability.js";
 import { billingReconciliationService } from "../services/billing-reconciliation.js";
 import { adjustCostSchema, importBillingInvoiceSchema, repairAccountingSchema, retryAccountingSchema } from "@paperclipai/shared";
 import { Router } from "express";
@@ -237,6 +238,14 @@ export function costRoutes(
     const excludeRoot = req.query.excludeRoot === "true" || req.query.excludeRoot === "1";
     const summary = await costs.issueTreeSummary(issue.companyId, issue.id, { excludeRoot });
     res.json(summary);
+  });
+
+  router.get("/companies/:companyId/costs/usage-availability", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
+    const range = parseCostDateRange(req.query);
+    res.json(await usageAvailabilityReport(db, companyId, range));
   });
 
   router.get("/companies/:companyId/costs/by-user", async (req, res) => {
