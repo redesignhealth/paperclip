@@ -66,6 +66,7 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
     endpoint: EndpointRow,
     author: Author,
     raw?: unknown,
+    options: { linkByEmail?: boolean } = {},
   ) {
     const providerAccountId = endpoint.providerAccountId ?? "unknown";
     const externalId = stableExternalPrincipalId(
@@ -128,7 +129,8 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
     let link = await readLink();
     // A never-linked Slack person may be linked by their verified email. Any
     // existing row (pending, linked, or revoked) keeps its current meaning.
-    if (!link && endpoint.provider === "slack" && principal.kind === "user" && !principal.isBot) {
+    // Only inbound messages opt in; setup, reactions, callbacks, and commands do not.
+    if (options.linkByEmail && !link && endpoint.provider === "slack" && principal.kind === "user" && !principal.isBot) {
       if (await linkSlackPrincipalByEmail(endpoint, principal.id, externalId)) link = await readLink();
     }
     if (link?.status === "linked" && link.userId) {

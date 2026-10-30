@@ -8892,6 +8892,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
       for (const canary of [configToken, signingSecret, clientSecret, f.token, "oauth-code-canary"]) expect(JSON.stringify({ saved, activities, response: completed.text })).not.toContain(canary);
     });
+    it("links the OAuth installer to the signed-in account even when their Slack email matches another member", async () => {
+      vi.stubEnv("PAPERCLIP_SLACK_EMAIL_MATCH_ENABLED", "true");
+      vi.stubEnv("PAPERCLIP_SLACK_DIRECTORY_TOKENS", JSON.stringify({ TAUTO: "xoxb-directory" }));
+      onTestFinished(() => vi.unstubAllEnvs());
+      const f = await fixture();
+      const otherId = `email-match-${randomUUID()}`;
+      const email = `${otherId}@example.test`;
+      const now = new Date();
+      await db.insert(authUsers).values({ id: otherId, name: "Other Member", email, emailVerified: true, createdAt: now, updatedAt: now });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: otherId, status: "active", membershipRole: "operator" });
+      Object.assign(f.state.user, { profile: { email } });
+      await f.create();
+      const state = await f.install();
+      await request(f.app).get(`/api/chat-slack/oauth/callback?state=${state}&code=oauth-code-canary`).set("Sec-Fetch-Site", "same-origin").expect(303);
+      expect((await f.service.get(f.endpoint.id)).setup.slackAccount).toMatchObject({ externalUserId: f.installerId, paperclipUserId: actor.userId, status: "linked" });
+      expect(await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, f.endpoint.id)))
+        .toEqual([expect.objectContaining({ status: "linked", paperclipUserId: actor.userId })]);
+      expect(f.provider.mock.calls.filter(([, init]) => new Headers(init?.headers).get("authorization") === "Bearer xoxb-directory")).toHaveLength(0);
+    });
     it("adds events only after saving signing credentials and answers Slack's update-time challenge before OAuth", async () => {
       const f = await fixture({ scheduleDeferredWork: () => undefined });
       f.state.beforeManifestUpdate = async () => {

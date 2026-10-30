@@ -1685,6 +1685,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         endpoint,
         message.author,
         message.raw,
+        { linkByEmail: true },
       );
       const resourceAdmission = await admitMessageResource({ endpoint, thread, addressed, suppressSetupDestinationActivation, surfaceKind });
       const { enabledResourceCount, resource } = resourceAdmission;
