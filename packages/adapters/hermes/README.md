@@ -17,6 +17,17 @@ type keys did not change during package consolidation.
 
 ## Key Features
 
+### Hosted model request timeout
+
+Hosted Anthropic runs set `providers.anthropic.request_timeout_seconds` to 300
+in their generated profile, replacing Hermes's 900-second default. Set the
+adapter's positive numeric `requestTimeoutSec` to override it. This bounds inactive
+network waits within each request, not total streaming response duration.
+Hermes still owns provider retries, and `timeoutSec` still bounds
+the whole run. Other providers and local host configuration are unchanged.
+Native session resume remains disabled for isolated runs; this change does not
+share homes, change models, raise budgets or modify persistent memories.
+
 This adapter provides:
 
 - **8 inference providers** — Anthropic, OpenRouter, OpenAI, Nous, OpenAI Codex, ZAI, Kimi Coding, MiniMax
