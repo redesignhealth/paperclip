@@ -257,11 +257,31 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
       expect(vi.mocked(runChildProcess).mock.calls.at(-1)?.[3].timeoutSec).toBe(30);
     });
 
-    it.each([0, -1, Infinity, NaN])("rejects invalid request timeout %s before dispatch", async (requestTimeoutSec) => {
+    it.each([0, -1, Infinity, NaN, "abc", "45"])("rejects invalid request timeout %s before dispatch", async (requestTimeoutSec) => {
       const logs: Array<{ stream: string; chunk: string }> = [];
       await expect(execute(makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, logs,
         extraConfig: { requestTimeoutSec } }))).rejects.toThrow(/positive finite/);
       expect(captured).toBeNull();
+    });
+
+    it("bounds Anthropic requests when hosted auto mode leaves provider selection to Hermes", async () => {
+      await execute(makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, logs: [],
+        extraConfig: { provider: "auto", model: undefined, requestTimeoutSec: 45 } }));
+      expect(YAML.parse(captured!.hermesConfigYaml).providers.anthropic.request_timeout_seconds).toBe(45);
+    });
+
+    it("does not validate or inject the unused setting for an explicit different provider", async () => {
+      await execute(makeContext({ env: { OPENROUTER_API_KEY: EXPLICIT_KEY }, logs: [],
+        extraConfig: { provider: "openrouter", model: "openai/gpt-6.1-sol", requestTimeoutSec: 0 } }));
+      expect(YAML.parse(captured!.hermesConfigYaml)?.providers).toBeUndefined();
+    });
+
+    it("does not apply the request setting to non-isolated runs", async () => {
+      process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "false";
+      await execute(makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, logs: [],
+        servers: [{ name: "test", url: "https://mcp.example.com", token: "test-token", connectionId: "test", allowedTools: ["read"] }],
+        extraConfig: { provider: "anthropic", model: "claude-sonnet-5-5", requestTimeoutSec: 0 } }));
+      expect(YAML.parse(captured!.hermesConfigYaml)?.providers).toBeUndefined();
     });
 
     it("runs in a fresh per-run home with the explicit key, never the host ~/.hermes, and cleans up", async () => {

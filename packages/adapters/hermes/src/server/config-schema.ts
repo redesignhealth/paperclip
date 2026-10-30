@@ -43,7 +43,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Model request timeout seconds",
         type: "number",
         default: 300,
-        hint: "Hosted Anthropic requests only. Bounds each model request; the total run timeout stays separate.",
+        hint: "Hosted Anthropic requests, including auto-selection. Bounds inactive network waits; the total run timeout stays separate.",
       },
       {
         key: "graceSec",
