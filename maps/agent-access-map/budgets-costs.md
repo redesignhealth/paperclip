@@ -160,7 +160,7 @@ Review: `baseline`.
 
 API: `present` — GET /api/companies/{companyId}/costs/data-quality; GET /api/companies/{companyId}/costs/usage-availability (read-only projection, same permission as other cost reports); POST /api/companies/{companyId}/costs/retry-accounting. Separate board operational inspection also uses GET /api/companies/{companyId}/accounting/inspect and POST /api/companies/{companyId}/accounting/retry.
 
-Agent access: `restricted` — quality and retry routes require board identity and company cost-read permission. The separate accounting inspection/retry namespace is board-only. There is no ordinary-agent cost-repair tool implied by permission to read a run.
+Agent access: `restricted` — quality and retry routes require board identity and company cost-read permission. The read-only usage-availability route calls only company access and cost-read checks, like /costs/summary, so an agent holding cost-read permission can read its aggregate coverage report; it exposes no per-run content and has no write path. The separate accounting inspection/retry namespace is board-only. There is no ordinary-agent cost-repair tool implied by permission to read a run.
 
 Policy: Company boundaries and cost visibility apply to the UI report. Viewers may read permitted reports but cannot retry recording. A retry names a run in the same company, logs its request, and calls saved-cost accounting; it does not invoke the adapter. Projection repair is a different operational action with an inspection fingerprint and reason, not the UI Retry cost recording control.
 
