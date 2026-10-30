@@ -93,8 +93,10 @@ The ledger does not store cache writes separately.
 
 Known limit: the ledger cannot prove an adapter supplied a zero explicitly, because
 the recorder always writes a usage object (see below). `measured_zero` therefore relies
-on the evidence list above and may undercount real measured zeros. It never turns an
-unavailable receipt into a measured one.
+on the evidence list above. It is a heuristic that errs in both directions: it may
+undercount real measured zeros (no evidence supplied), and it may overstate a zero when
+a provider reports cost but no tokens. Do not treat it as a lower or upper bound. A
+receipt with none of the evidence is always `unavailable`, never `measured_zero`.
 
 ### Where each adapter drops usage
 

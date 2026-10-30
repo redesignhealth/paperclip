@@ -51,6 +51,7 @@ describe("usage-availability route authorization", () => {
     expect((await request(app("agent", "other-company")).get(path)).status).toBe(403);
     expect((await request(app()).get("/api/companies/other/costs/usage-availability")).status).toBe(403);
     expect((await request(app()).get(`${path}?from=2026-10-09&to=2026-10-01`)).status).toBe(400);
+    expect((await request(app()).get(`${path}?from=not-a-date`)).status).toBe(400);
     mocks.decide.mockResolvedValue({ allowed: false });
     expect((await request(app()).get(path)).status).toBe(403);
     expect(mocks.report).not.toHaveBeenCalled();

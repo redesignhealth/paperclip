@@ -162,6 +162,22 @@ describe("usage availability reporting projection", () => {
     expect(report.reconciled).toBe(true);
   });
 
+  it("classifies zero-token provider_reported and zero-token estimated receipts by evidence, not by cost status", async () => {
+    const owner = await company();
+    // provider_reported provenance with 0 tokens counts as evidence (documented overstate risk).
+    await receipted(owner, owner.claude, { event: { costStatus: "reported", costCents: 2, pricingProvenance: { source: "provider_reported" } } });
+    // estimated with 0 tokens and no evidence is unavailable, not estimated.
+    await receipted(owner, owner.codex, { event: { provider: "openai", costStatus: "estimated", pricingProvenance: { source: "rate_card", version: "v1" } } });
+    // estimated with 0 tokens but a provider request id is a measured zero.
+    await receipted(owner, owner.codex, { event: { provider: "openai", costStatus: "estimated", providerRequestId: "req_est", pricingProvenance: { source: "rate_card", version: "v1" } } });
+    const report = await usageAvailabilityReport(db, owner.companyId, range);
+    expect(report.availability.measured_zero.eventCount).toBe(2);
+    expect(report.availability.unavailable.eventCount).toBe(1);
+    expect(report.availability.estimated.eventCount).toBe(0);
+    expect(report.availability.reported.eventCount).toBe(0);
+    expect(report.reconciled).toBe(true);
+  });
+
   it("does not let a malformed usageByModel value break classification", async () => {
     const owner = await company();
     await receipted(owner, owner.claude, { run: { usageJson: { usageByModel: "not-an-array" } }, event: {} });

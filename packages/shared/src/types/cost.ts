@@ -222,8 +222,9 @@ export interface CostByProject {
  * provider request id, no usage payload). It is never evidence of zero consumption.
  * `measured_zero` means 0 tokens with independent evidence: a provider request id, a
  * non-empty per-model usage payload, or provider-reported/invoiced pricing provenance.
- * That rule can undercount real zeros for adapters that supply none of these, and can
- * overstate a zero when a provider reports cost but no tokens; treat it as a lower bound. */
+ * This is a heuristic, not an exact count, and it errs in both directions: it can
+ * undercount real zeros for adapters that supply none of this evidence, and it can
+ * overstate a zero when a provider reports cost but no tokens. Do not read it as a bound. */
 export type UsageAvailability = "reported" | "estimated" | "unavailable" | "measured_zero";
 
 /** Billing kind is kept separate from availability so subscription and unknown
