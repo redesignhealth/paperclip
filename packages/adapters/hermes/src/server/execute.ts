@@ -1281,7 +1281,13 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   // Extract cost
   const costMatch = combined.match(COST_REGEX);
   if (costMatch?.[1]) {
-    result.costUsd = parseFloat(costMatch[1]);
+    // The regex's `[\d.]+` capture can be punctuation only (e.g. "cost." in prose), which
+    // parseFloat turns into NaN. A NaN costUsd fails the adapter result schema and marks an
+    // otherwise successful run failed, so treat a non-finite value as "cost not reported".
+    const parsedCost = parseFloat(costMatch[1]);
+    if (Number.isFinite(parsedCost) && parsedCost >= 0) {
+      result.costUsd = parsedCost;
+    }
   }
 
   // Check for error patterns in stderr
