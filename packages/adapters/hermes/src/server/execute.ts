@@ -22,6 +22,7 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import { startHermesProgress } from "./runtime-progress.js";
 
 /**
  * Shared regular expression escaping utility from @paperclipai/adapter-utils.
@@ -2075,15 +2076,24 @@ export async function execute(
       launchCwd = bound.plan.cwd;
     }
 
-    const result = await runChildProcess(ctx.runId, launchCommand, finalArgs, {
-      cwd: launchCwd,
-      env: finalEnv,
-      timeoutSec,
-      graceSec,
-      onLog: wrappedOnLog,
-      onSpawn: ctx.onSpawn,
-      unsetEnvKeys: [...HERMES_FORBIDDEN_ENV_VARS, ...[...routerStrippedEnvNames].sort()],
-    });
+    // Quiet CLI output remains clean. Progress comes from metadata in this run's
+    // own ephemeral database, never from another agent's/host's conversation.
+    const progress = tempHome && ctx.onEvent ? startHermesProgress(tempHome, ctx.onEvent) : null;
+    const result = await (async () => {
+      try {
+        return await runChildProcess(ctx.runId, launchCommand, finalArgs, {
+          cwd: launchCwd,
+          env: finalEnv,
+          timeoutSec,
+          graceSec,
+          onLog: wrappedOnLog,
+          onSpawn: ctx.onSpawn,
+          unsetEnvKeys: [...HERMES_FORBIDDEN_ENV_VARS, ...[...routerStrippedEnvNames].sort()],
+        });
+      } finally {
+        await progress?.stop();
+      }
+    })();
 
     const flushedLogs = redactor.flushDetailed();
     for (const fl of flushedLogs) {

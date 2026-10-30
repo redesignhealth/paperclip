@@ -17,6 +17,22 @@ type keys did not change during package consolidation.
 
 ## Key Features
 
+### Hosted run progress
+
+Isolated local runs keep quiet output enabled. A read-only worker samples only
+the current run's session message, tool-call and completed-model-call counts
+every five seconds. It never reads conversation bodies, tool arguments or the
+host database. Changes appear as `hermes.progress` run events. Two minutes
+without changed counters produces a warning, not a claim that the process is
+dead and not an automatic retry. Missing, busy or incompatible state databases
+do not fail the agent. Read failures and a stopped worker emit
+`hermes.progress_unavailable` and suppress `hermes.activity_stale` while
+observation is unavailable. Successful reads can restore observation.
+The worker stops before the temporary home is removed.
+
+Native session resume remains disabled for isolated runs; this change does not
+share homes, change models, raise budgets or modify persistent memories.
+
 This adapter provides:
 
 - **8 inference providers** — Anthropic, OpenRouter, OpenAI, Nous, OpenAI Codex, ZAI, Kimi Coding, MiniMax
