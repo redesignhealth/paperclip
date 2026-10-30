@@ -1841,6 +1841,11 @@ the run and, where applicable, agent configuration for future usage. Normal
 credits and fixed billing are not unknown billing warnings. Unavailable historic
 prices require no cleanup and must not be presented as zero-cost receipts.
 
+`GET /companies/:companyId/costs/usage-availability` is a read-only projection of
+the same ledger. It classifies receipt-backed events as reported, estimated,
+measured-zero or unavailable, gives per-adapter coverage, and reports runs without a
+receipt separately. It does not change receipts, events, or pricing.
+
 `POST /companies/:companyId/costs/retry-accounting` accepts a run ID, requires a
 board cost reader with a non-viewer membership, and uses the existing audited,
 idempotent accounting service. It never executes an agent. The UI offers retry

@@ -158,7 +158,7 @@ Capability ID: `budgets-costs/accounting-recovery`.
 
 Review: `baseline`.
 
-API: `present` — GET /api/companies/{companyId}/costs/data-quality; POST /api/companies/{companyId}/costs/retry-accounting. Separate board operational inspection also uses GET /api/companies/{companyId}/accounting/inspect and POST /api/companies/{companyId}/accounting/retry.
+API: `present` — GET /api/companies/{companyId}/costs/data-quality; GET /api/companies/{companyId}/costs/usage-availability (read-only projection, same permission as other cost reports); POST /api/companies/{companyId}/costs/retry-accounting. Separate board operational inspection also uses GET /api/companies/{companyId}/accounting/inspect and POST /api/companies/{companyId}/accounting/retry.
 
 Agent access: `restricted` — quality and retry routes require board identity and company cost-read permission. The separate accounting inspection/retry namespace is board-only. There is no ordinary-agent cost-repair tool implied by permission to read a run.
 

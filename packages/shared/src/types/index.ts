@@ -905,7 +905,7 @@ export type {
   RoutineExecutionIssueOrigin,
   RoutineListItem,
 } from "./routine.js";
-export type { CostEvent, CostSummary, CostDataQualityItem, CostDataQualityReport, CostDataQualityReason, IssueCostSummary, CostByUser, CostByUserReport, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
+export type { CostEvent, CostSummary, CostDataQualityItem, CostDataQualityReport, CostDataQualityReason, UsageAvailability, UsageBillingKind, UsageAvailabilityTotals, UsageAvailabilityByAdapter, UsageAvailabilityReport, IssueCostSummary, CostByUser, CostByUserReport, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
 export type { FinanceEvent, FinanceSummary, FinanceByBiller, FinanceByKind } from "./finance.js";
 export type {
   AgentWakeupResponse,

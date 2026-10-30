@@ -62,6 +62,58 @@ other cost reports. Details contain no provider errors or credentials and load
 only when expanded in the UI. Authorized board members can request recording at
 `POST /api/companies/{companyId}/costs/retry-accounting` with `{ "runId": "uuid" }`.
 
+## Usage availability (reporting only)
+
+Run receipts can reach the ledger with `0/0/0` tokens and `unpriced` status even
+though the run worked for minutes. That zero means usage was not available, not that
+nothing was consumed. `GET /api/companies/{companyId}/costs/usage-availability`
+(same date bounds and permissions as other cost reports) projects the existing
+ledger without changing it. Original receipts and cost events stay untouched.
+
+Each receipt-backed agent event (`heartbeat:*` idempotency key) is one of:
+
+- `reported`: tokens are present and the event is not `estimated`. Pricing can still be `unpriced`; check `unpricedEventCount`.
+- `estimated`: tokens are present and the cost came from a rate card (`costStatus = estimated`).
+- `measured_zero`: tokens are 0 and the receipt carries independent usage evidence (a provider request id, a per-model usage payload, or a provider-reported cost).
+- `unavailable`: tokens are 0 and none of that evidence exists.
+
+Coverage rate per adapter is `(reported + estimated) / receipt-backed events`; a
+measured zero is not coverage. Terminal runs with no ledger event appear only under
+`runsWithoutReceipt` (with the subset still pending accounting) and never in a rate.
+Subscription and unknown billing are counted per adapter in `billingKindEventCounts`
+and are not folded into metered totals. Pricing provenance is read from the ledger as
+stored. The four availability subtotals add up exactly to `ledgerCostCentsExact`;
+`reconciled` reports that.
+
+Token fields: `inputTokens` includes cache-write tokens and excludes cache-read
+tokens, `cachedInputTokens` is cache reads only, and
+`totalTokens = inputTokens + cachedInputTokens + outputTokens`, so nothing is counted
+twice. Legacy pre-receipt Codex rows get the same normalization as the by-agent view.
+The ledger does not store cache writes separately.
+
+Known limit: the ledger cannot prove an adapter supplied a zero explicitly, because
+the recorder always writes a usage object (see below). `measured_zero` therefore relies
+on the evidence list above and may undercount real measured zeros. It never turns an
+unavailable receipt into a measured one.
+
+### Where each adapter drops usage
+
+Output means the adapter never emits usage. Settlement means usage existed or was
+defaulted after the adapter returned.
+
+| Stage | Adapter | What happens |
+| --- | --- | --- |
+| Output | `hermes_local` | Usage is scraped from free-text output with one regex (`tokens: N input ... M output`). No match means no usage and no cost, so the receipt settles at zero. |
+| Output | `claude_local` | If the stream has no usage and no `modelUsage`, the adapter returns an explicit `{0,0,0}` built from `parsed.usage` defaults with no `usageBasis`. This is a fabricated zero at the adapter boundary. |
+| Output | `codex_local` | Usage is only reported when a terminal event carries valid `input_tokens` and `output_tokens`. A run without one sets `usageReported = false` and `costStatus = unpriced`. |
+| Output | ACPX engine | Tokens come from the runtime's cumulative breakdown; a stale unchanged breakdown is suppressed, and a missing one yields `usage = null`. Cache writes are folded into `inputTokens`, cache reads go to `cachedInputTokens`. |
+| Settlement | Usage recorder (`usage-receipts.ts`) | `capture` always rebuilds `usage` by summing attempts with `?? 0`, so "adapter supplied nothing" and "adapter supplied zero" become the same stored value. |
+| Settlement | `accountRunCost` (`run-cost-accounting.ts`) | Missing token keys default to 0. For any non-`process` adapter a receipt counts as billable evidence, so a zero-token, priceless receipt is stored as `unpriced`. |
+
+This change does not alter adapter capture or settlement. Preserving an
+"adapter supplied usage" flag through the recorder is the follow-up that would make
+`measured_zero` exact.
+
 ## Cost Events API
 
 Cost events can also be reported directly:
