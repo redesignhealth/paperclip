@@ -538,7 +538,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const getTaskBaseUrl = () => runtimeCanonicalOrigin() ?? options.publicBaseUrl;
   const getWebhookPublicBaseUrl = () => configuredWebhookPublicBaseUrl ?? getPublicBaseUrl();
   const voiceStore = voiceSessionStore(db, { allowLocalBoard: options.allowLocalVoiceBoard === true });
-  const { findAuthorizedIdentityLink, ensurePrincipal, sponsorAllowsGuest, lockCurrentPrincipalAuthorization, requireCurrentExternalActionAuthorization, isExternalActionAuthorizationChange, ensureResource } = createChatInboundAuthority(db, { voiceStore, runtimeCallbackEndpoint });
+  const { findAuthorizedIdentityLink, ensurePrincipal, sponsorAllowsGuest, lockCurrentPrincipalAuthorization, requireCurrentExternalActionAuthorization, isExternalActionAuthorizationChange, ensureResource } = createChatInboundAuthority(db, { voiceStore, runtimeCallbackEndpoint, fetchImpl });
   const voice = createSpekoChannelService(db, { endpointRecord, resolveCredentialRefs: (...args) => resolveCredentialRefs(...args), fetchImpl,
     allowLocalBoard: options.allowLocalVoiceBoard === true,
     onQuestionAnswered: (interactionId) => scheduleMessageProcessing(async () => {
