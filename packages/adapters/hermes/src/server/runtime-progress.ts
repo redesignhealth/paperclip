@@ -52,6 +52,7 @@ export function startHermesProgress(
   let stopped = false;
   let failed = false;
   let samplingAvailable = true;
+  let previousCounts = "";
   let pending = Promise.resolve();
   const send = (event: AdapterRuntimeEvent) => {
     pending = pending.then(async () => { if (!stopped) await emit(event); }).catch(() => {});
@@ -74,6 +75,7 @@ export function startHermesProgress(
   worker.stdout?.resume();
   worker.stderr?.resume();
   worker.on("message", (counts: unknown) => {
+    if (stopped || failed) return;
     if (counts && typeof counts === "object" && "unavailable" in counts) {
       samplingAvailable = false;
       send({ eventType: "hermes.progress_unavailable", stream: "system", level: "warn",
@@ -83,6 +85,9 @@ export function startHermesProgress(
     if (!Array.isArray(counts) || counts.length !== 3 ||
         !counts.every(n => Number.isSafeInteger(n) && n >= 0)) return;
     samplingAvailable = true;
+    const key = JSON.stringify(counts);
+    if (key === previousCounts) return; // Read recovery is not new agent work.
+    previousCounts = key;
     lastChangeAt = Date.now();
     warned = false;
     const [messages, tools, modelCalls] = counts as number[];
