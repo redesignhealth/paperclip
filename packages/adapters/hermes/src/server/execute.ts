@@ -1336,10 +1336,6 @@ export async function execute(
   const hermesCmd = resolveHermesCommand(config);
   const configuredModel = normalizeConfiguredModel(cfgString(config.model));
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
-  const requestTimeoutSec = cfgNumber(config.requestTimeoutSec) ?? 300;
-  if (!Number.isFinite(requestTimeoutSec) || requestTimeoutSec <= 0) {
-    throw new Error("Hermes requestTimeoutSec must be a positive finite number");
-  }
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
@@ -1884,8 +1880,6 @@ export async function execute(
         onWarning: onCleanupWarning,
         canonicalRouterEndpoint: isRouterRun,
         isolatedFromHost: hostIsolated,
-        ...(hostIsolated && resolvedProvider === "anthropic"
-          ? { anthropicRequestTimeoutSec: requestTimeoutSec } : {}),
         ...(runHome ? { tempDirPrefix: path.join(runHome.path, "hermes-") } : {}),
       });
       tempHome = preparedHome.homeDir;

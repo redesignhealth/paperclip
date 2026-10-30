@@ -80,7 +80,6 @@ vi.mock("./router-readiness.js", async (importOriginal) => {
 
 import { execute } from "./execute.js";
 import { detectModel } from "./detect-model.js";
-import YAML from "yaml";
 import * as progressModule from "./runtime-progress.js";
 import {
   hasExplicitHermesProviderCredential,
@@ -248,21 +247,6 @@ describe("hermes execute with host isolation (TECH-7102)", () => {
   describe("isolation ON", () => {
     beforeEach(() => {
       process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
-    });
-
-    it.each([undefined, 45])("bounds hosted Anthropic requests (%s) without changing the run timeout", async (requestTimeoutSec) => {
-      const logs: Array<{ stream: string; chunk: string }> = [];
-      await execute(makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, logs,
-        extraConfig: { provider: "anthropic", model: "claude-sonnet-5-5", requestTimeoutSec } }));
-      expect(YAML.parse(captured!.hermesConfigYaml).providers.anthropic.request_timeout_seconds).toBe(requestTimeoutSec ?? 300);
-      expect(vi.mocked(runChildProcess).mock.calls.at(-1)?.[3].timeoutSec).toBe(30);
-    });
-
-    it.each([0, -1, Infinity, NaN])("rejects invalid request timeout %s before dispatch", async (requestTimeoutSec) => {
-      const logs: Array<{ stream: string; chunk: string }> = [];
-      await expect(execute(makeContext({ env: { ANTHROPIC_API_KEY: EXPLICIT_KEY }, logs,
-        extraConfig: { requestTimeoutSec } }))).rejects.toThrow(/positive finite/);
-      expect(captured).toBeNull();
     });
 
     it.each(["ok", "timeout", "throw"] as const)("stops metadata observation before isolated-home cleanup on %s", async (behavior) => {
