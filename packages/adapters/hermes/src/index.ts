@@ -87,6 +87,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 | model | string | (Hermes configured default) | Optional explicit model in provider/model format. Leave blank (or "auto") to use Hermes's configured default model. When a NEW agent is created with no provider choice, no model, no provider credential and no platform-default OpenAI key actually bound, Paperclip saves the Ramp Router default model (auto-jev-routing); explicit choices and existing agents are unchanged. |
 | provider | string | (auto) | API provider: auto, router, openrouter, nous, openai-codex, zai, kimi-coding, minimax, minimax-cn. "router" is Ramp Router (RAMP_ROUTER_API_KEY) and is never inferred from a model name. At create time only, an otherwise-unchosen, credential-free new agent is given provider "router" (suppressed when the platform-default OpenAI key is actually bound); an explicit provider, an explicit model, a supplied credential or an existing agent is never changed. An agent saved with no provider keeps the adapter's runtime resolution. |
 | timeoutSec | number | 300 | Execution timeout in seconds |
+| requestTimeoutSec | number | 300 | Positive finite inactive network wait for hosted Anthropic, including auto-selection |
 | graceSec | number | 10 | Grace period after SIGTERM before SIGKILL |
 
 ## Tool Configuration

@@ -38,6 +38,23 @@ describe("Hermes MCP Config", () => {
     }
   });
 
+  describe("Anthropic request timeout profile", () => {
+    it.each([45, 45.5, 300])("serializes a supported positive timeout %s", (value) => {
+      const yaml = serializeHermesMcpYaml({}, "", false, value);
+      expect(YAML.parse(yaml).providers.anthropic.request_timeout_seconds).toBe(value);
+    });
+    it.each([0, -1, Infinity, NaN])("rejects invalid timeout %s at the serializer boundary", (value) => {
+      expect(() => serializeHermesMcpYaml({}, "", false, value)).toThrow(/positive finite/);
+    });
+    it("keeps the optional setting absent and preserves sanitized host configuration", () => {
+      const host = sanitizeHostConfigYaml("model:\n  default: claude-sonnet-5-5\nproviders:\n  anthropic:\n    request_timeout_seconds: 900\n");
+      expect(YAML.parse(serializeHermesMcpYaml({}, host)).providers).toBeUndefined();
+      const generated = YAML.parse(serializeHermesMcpYaml({}, host, false, 45));
+      expect(generated.model.default).toBe("claude-sonnet-5-5");
+      expect(generated.providers.anthropic.request_timeout_seconds).toBe(45);
+    });
+  });
+
   describe("Validation & Rejection", () => {
     it("rejects tokens containing carriage return or newline or null byte", () => {
       const baseServer: AdapterRuntimeMcpServer = {

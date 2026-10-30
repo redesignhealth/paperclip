@@ -39,6 +39,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         default: DEFAULT_TIMEOUT_SEC,
       },
       {
+        key: "requestTimeoutSec",
+        label: "Model request timeout seconds",
+        type: "number",
+        default: 300,
+        hint: "Hosted Anthropic requests, including auto-selection. Bounds inactive network waits; the total run timeout stays separate.",
+      },
+      {
         key: "graceSec",
         label: "Grace seconds",
         type: "number",
