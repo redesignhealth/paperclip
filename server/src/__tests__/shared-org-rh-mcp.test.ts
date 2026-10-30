@@ -508,6 +508,18 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     expect(await connectionsOf(priv)).toHaveLength(0);
   });
 
+  it("visits every shared company across pages, not just the first page", async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const id = await seedCompany();
+      await seedOwner(id);
+      ids.push(id);
+    }
+    const fetchMock = makeFetch();
+    expect(await sweepSharedOrgRhMcp({ ...ctxFor(fetchMock), pageSize: 2 })).toBe(5);
+    for (const id of ids) expect(await connectionsOf(id)).toHaveLength(1);
+  });
+
   it("keeps sweeping after one company fails", async () => {
     const broken = await seedCompany();
     const fine = await seedCompany();

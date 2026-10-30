@@ -18,7 +18,7 @@
  * credentials. An archived `rh-mcp-service` connection is an org opt-out and is never re-created. No token, secret
  * value, header or upstream text is ever logged or returned: outcomes carry closed reason codes only.
  */
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { agents, companies, companySecrets, toolCatalogEntries, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import {
@@ -45,7 +45,7 @@ export const SHARED_ORG_RH_MCP_ENABLED_ENV = "PAPERCLIP_SHARED_ORG_RH_MCP_ENABLE
 export const SHARED_ORG_RH_MCP_URL_ENV = "PAPERCLIP_DEFAULT_MCP_RH_MCP_URL";
 export const SHARED_ORG_RH_MCP_CONNECTION_NAME = "rh-mcp-service";
 export const SHARED_ORG_RH_MCP_INTERVAL_MS = 5 * 60_000;
-export const SHARED_ORG_RH_MCP_SWEEP_LIMIT = 50;
+export const SHARED_ORG_RH_MCP_SWEEP_PAGE_SIZE = 50;
 /** Re-issue the token once it has this long left. Tokens last 365 days (ownership API default for bot credentials). */
 export const SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
 /** Non-secret expiry of the stored token, on the connection's `config`. */
@@ -332,27 +332,40 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
   return kind === "provisioned" ? { kind, installed } : kind === "rotated" ? { kind, installed } : { kind: "ready", installed };
 }
 
-/** Companies that are shared, active/paused and inside the rollout scope. */
-export async function sweepSharedOrgRhMcp(ctx: SharedOrgRhMcpContext & { limit?: number }): Promise<number> {
+/** Every shared, active/paused company inside the rollout scope, visited in keyset pages so none is starved. */
+export async function sweepSharedOrgRhMcp(ctx: SharedOrgRhMcpContext & { pageSize?: number }): Promise<number> {
   const env = ctx.env ?? process.env;
   if (!isDefaultMcpSpecEnabled(env) || !isEnabled(env)) return 0;
-  const rows = await ctx.db
-    .select({ id: companies.id })
-    .from(companies)
-    .where(and(inArray(companies.status, ["active", "paused"]), eq(companies.visibility, "shared")))
-    .orderBy(companies.createdAt)
-    .limit(ctx.limit ?? SHARED_ORG_RH_MCP_SWEEP_LIMIT);
-  for (const row of rows) {
-    try {
-      const outcome = await ensureSharedOrgRhMcp(ctx, row.id);
-      if (outcome.kind === "error") {
-        logger.warn({ companyId: row.id, reason: outcome.reason }, "shared-org rh-mcp setup incomplete");
+  const pageSize = ctx.pageSize ?? SHARED_ORG_RH_MCP_SWEEP_PAGE_SIZE;
+  let visited = 0;
+  let cursor: string | null = null;
+  for (;;) {
+    const rows: Array<{ id: string }> = await ctx.db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(
+        and(
+          inArray(companies.status, ["active", "paused"]),
+          eq(companies.visibility, "shared"),
+          cursor ? gt(companies.id, cursor) : undefined,
+        ),
+      )
+      .orderBy(companies.id)
+      .limit(pageSize);
+    for (const row of rows) {
+      try {
+        const outcome = await ensureSharedOrgRhMcp(ctx, row.id);
+        if (outcome.kind === "error") {
+          logger.warn({ companyId: row.id, reason: outcome.reason }, "shared-org rh-mcp setup incomplete");
+        }
+      } catch (err) {
+        logger.warn({ companyId: row.id, errorClass: errorClass(err) }, "shared-org rh-mcp sweep item failed");
       }
-    } catch (err) {
-      logger.warn({ companyId: row.id, errorClass: errorClass(err) }, "shared-org rh-mcp sweep item failed");
     }
+    visited += rows.length;
+    if (rows.length < pageSize) return visited;
+    cursor = rows[rows.length - 1]!.id;
   }
-  return rows.length;
 }
 
 /** Periodic backstop: startup plus every few minutes, unref'd, cleared on shutdown. A flag-gated no-op when off. */
