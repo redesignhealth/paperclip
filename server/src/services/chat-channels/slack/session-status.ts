@@ -58,6 +58,9 @@ type SlackSessionStatusOptions = {
   slackSessionSyncSelectionBarrier?: () => Promise<void>;
 };
 
+/** Attempts before a repeatedly failing session status sync is marked rejected instead of retried. */
+export const SLACK_SESSION_SYNC_MAX_ATTEMPTS = 12;
+
 export function createSlackSessionStatus(db: Db, options: SlackSessionStatusOptions) {
   const { endpointRecord, withCredentialMutationLease, runtimeCallbackEndpoint, nonDirectDestinationAllowed, runIdFromMilestonePublication, resolveCredentials, fetchImpl, redactError } = options;
 
@@ -352,9 +355,13 @@ export function createSlackSessionStatus(db: Db, options: SlackSessionStatusOpti
         // Unlike posting a message, repeating setStatus cannot duplicate any
         // content. Ambiguous transport/receipt failures remain retryable, but
         // a definite scope/auth/destination rejection waits for new activity.
+        // Bounded: a provider error that never clears (for example a thread that no longer exists) must not
+        // retry forever; prod carried 185 such rows at ~6,900 attempts each. The status is cosmetic and new
+        // activity on the thread queues a fresh sync, so giving up here loses nothing.
         const retryable =
-          disposition.kind === "retry" ||
-          disposition.kind === "delivery_unknown";
+          (disposition.kind === "retry" ||
+            disposition.kind === "delivery_unknown") &&
+          attempts < SLACK_SESSION_SYNC_MAX_ATTEMPTS;
         const retryMs =
           disposition.kind === "retry"
             ? disposition.retryAfterMs
