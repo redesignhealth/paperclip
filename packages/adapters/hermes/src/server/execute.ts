@@ -22,6 +22,7 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { execFile, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import { startHermesProgress } from "./runtime-progress.js";
 
 /**
  * Shared regular expression escaping utility from @paperclipai/adapter-utils.
@@ -1335,6 +1336,10 @@ export async function execute(
   const hermesCmd = resolveHermesCommand(config);
   const configuredModel = normalizeConfiguredModel(cfgString(config.model));
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
+  const requestTimeoutSec = cfgNumber(config.requestTimeoutSec) ?? 300;
+  if (!Number.isFinite(requestTimeoutSec) || requestTimeoutSec <= 0) {
+    throw new Error("Hermes requestTimeoutSec must be a positive finite number");
+  }
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
@@ -1879,6 +1884,8 @@ export async function execute(
         onWarning: onCleanupWarning,
         canonicalRouterEndpoint: isRouterRun,
         isolatedFromHost: hostIsolated,
+        ...(hostIsolated && resolvedProvider === "anthropic"
+          ? { anthropicRequestTimeoutSec: requestTimeoutSec } : {}),
         ...(runHome ? { tempDirPrefix: path.join(runHome.path, "hermes-") } : {}),
       });
       tempHome = preparedHome.homeDir;
@@ -2075,15 +2082,24 @@ export async function execute(
       launchCwd = bound.plan.cwd;
     }
 
-    const result = await runChildProcess(ctx.runId, launchCommand, finalArgs, {
-      cwd: launchCwd,
-      env: finalEnv,
-      timeoutSec,
-      graceSec,
-      onLog: wrappedOnLog,
-      onSpawn: ctx.onSpawn,
-      unsetEnvKeys: [...HERMES_FORBIDDEN_ENV_VARS, ...[...routerStrippedEnvNames].sort()],
-    });
+    // Quiet CLI output remains clean. Progress comes from metadata in this run's
+    // own ephemeral database, never from another agent's/host's conversation.
+    const progress = tempHome && ctx.onEvent ? startHermesProgress(tempHome, ctx.onEvent) : null;
+    const result = await (async () => {
+      try {
+        return await runChildProcess(ctx.runId, launchCommand, finalArgs, {
+          cwd: launchCwd,
+          env: finalEnv,
+          timeoutSec,
+          graceSec,
+          onLog: wrappedOnLog,
+          onSpawn: ctx.onSpawn,
+          unsetEnvKeys: [...HERMES_FORBIDDEN_ENV_VARS, ...[...routerStrippedEnvNames].sort()],
+        });
+      } finally {
+        await progress?.stop();
+      }
+    })();
 
     const flushedLogs = redactor.flushDetailed();
     for (const fl of flushedLogs) {

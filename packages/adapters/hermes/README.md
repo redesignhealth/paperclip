@@ -17,6 +17,25 @@ type keys did not change during package consolidation.
 
 ## Key Features
 
+### Hosted run progress and slow requests
+
+Isolated local runs keep quiet output enabled. A read-only worker samples only
+the current run's session message, tool-call and completed-model-call counts
+every five seconds. It never reads conversation bodies, tool arguments or the
+host database. Changes appear as `hermes.progress` run events. Two minutes
+without changed counters produces a warning, not a claim that the process is
+dead and not an automatic retry. Missing, busy or incompatible state databases
+do not fail the agent. The worker stops before the temporary home is removed.
+
+Hosted Anthropic runs set `providers.anthropic.request_timeout_seconds` to 300
+in their generated profile, replacing Hermes's 900-second default. Set the
+adapter's positive numeric `requestTimeoutSec` to override it. This bounds inactive
+network waits within each request, not total streaming response duration.
+Hermes still owns provider retries, and `timeoutSec` still bounds
+the whole run. Other providers and local host configuration are unchanged.
+Native session resume remains disabled for isolated runs; this change does not
+share homes, change models, raise budgets or modify persistent memories.
+
 This adapter provides:
 
 - **8 inference providers** — Anthropic, OpenRouter, OpenAI, Nous, OpenAI Codex, ZAI, Kimi Coding, MiniMax
