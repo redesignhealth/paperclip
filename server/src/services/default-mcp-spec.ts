@@ -119,9 +119,11 @@ export const ARCANA_BRAIN_REVIEWED_TOOLS: readonly string[] = Object.freeze([
 ]);
 
 /**
- * Argus review service tools (TECH-7792, version 1). Shared service-token connection, deliberately separate from the
- * personal OAuth `rh-mcp` read ceiling: `argus_start_review`/`argus_cancel_review` act (they enqueue and cancel a job),
- * so they never belong in a read ceiling. `argus_get_proxy_token` is intentionally absent: it mints credentials.
+ * Argus review service tools (TECH-7792, version 1). Shared service-token connection (the `argus-review` entry below).
+ * The personal OAuth `rh-mcp` ceiling ALSO lists these three verbs (operator decision): an agent that is
+ * given the personal connection can start, poll and cancel a review as the connection's user. `argus_start_review`
+ * and `argus_cancel_review` act (they enqueue and cancel a job), so this is the one place an action sits in that
+ * ceiling. `argus_get_proxy_token` is intentionally absent from THIS list: it mints credentials.
  */
 export const ARGUS_REVIEW_REVIEWED_TOOLS_VERSION = 1;
 export const ARGUS_REVIEW_REVIEWED_TOOLS: readonly string[] = Object.freeze([
@@ -233,6 +235,9 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
       "mdm_get_granola_note",
       "mdm_get_granola_transcript",
       "argus_get_proxy_token",
+      "argus_start_review",
+      "argus_get_review",
+      "argus_cancel_review",
       "zoom__get_transcript",
       "zoom__get_meeting_transcript",
       "zoom__get_meeting",
