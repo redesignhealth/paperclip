@@ -132,6 +132,74 @@ export const ARGUS_REVIEW_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "argus_cancel_review",
 ]);
 
+/**
+ * rh-mcp tools an agent of a SHARED org may use through the org's service token (TECH-8066), keyed by the rh-auth scope
+ * rh-mcp requires for each one. A mirror of `TOOL_SCOPES` in rh-data-platform `services/rh-mcp/scopes.py`, restricted
+ * to the scopes in `RH_MCP_SERVICE_TOKEN_SCOPES`: the token's scopes decide what rh-mcp will run, and this list makes
+ * the offered tools match, so agents are not shown tools that can only fail with `insufficient_scope`. The keys ARE the
+ * token's scope set. Never `supabase:read` (the supabase tools expose the Ashby ATS views with no identity gate;
+ * MDM keeps Ashby behind `mdm:ashby:read`), a `:write` scope, `argus:secrets` or `auth:impersonate`.
+ *
+ * Left out although a scope above covers them, because they read one person's data and fail for a service token that
+ * has no person: `mdm_get_user_annotations`, `mdm_granola_status`, `voice_get_style_guide`, `voice_list_voices` and
+ * `voice_list_source_docs`. Keep this in step with rh-mcp when a tool is added or re-scoped there.
+ */
+export const RH_MCP_SERVICE_TOOLS_BY_SCOPE = Object.freeze({
+  "argus:review": ["argus_start_review", "argus_get_review", "argus_cancel_review"],
+  "mdm:read": [
+    "mdm_get_person",
+    "mdm_get_persons",
+    "mdm_search_persons",
+    "mdm_get_org",
+    "mdm_get_orgs",
+    "mdm_search_orgs",
+    "mdm_get_concept",
+    "mdm_get_concepts",
+    "mdm_search_concepts",
+    "mdm_get_opportunity",
+    "mdm_search_opportunities",
+    "mdm_get_opportunity_lists",
+    "mdm_get_person_interactions",
+    "mdm_get_org_interactions",
+    "mdm_get_founder_engagement",
+    "mdm_get_duplicate_candidate",
+    "mdm_get_org_duplicate_candidate",
+    "mdm_get_unmerge_request",
+  ],
+  "opik:read": ["opik_get_prompt", "opik_list_prompts"],
+  "coresignal:read": [
+    "coresignal__resolve_company",
+    "coresignal__preview_company",
+    "coresignal__search_companies",
+    "coresignal__search_employees",
+    "coresignal__get_company_employees",
+    "coresignal__get_company",
+    "coresignal__get_employee",
+    "coresignal__get_credit_summary",
+  ],
+  "definitive_healthcare:read": [
+    "definitive_healthcare__search_hospitals",
+    "definitive_healthcare__get_hospital",
+    "definitive_healthcare__get_hospital_technologies",
+    "definitive_healthcare__get_hospital_executives",
+    "definitive_healthcare__get_hospital_quality",
+    "definitive_healthcare__search_physicians",
+    "definitive_healthcare__get_physician",
+    "definitive_healthcare__get_physician_affiliations",
+    "definitive_healthcare__resolve_hospital",
+    "definitive_healthcare__search_organizations",
+    "definitive_healthcare__search_executives",
+    "definitive_healthcare__get_organization",
+  ],
+  "voice:read": ["voice_get_humanizer_checklist"],
+} as const satisfies Record<string, readonly string[]>);
+
+/** Version of `RH_MCP_SERVICE_REVIEWED_TOOLS`. Bump it whenever the tool or scope set changes. */
+export const RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION = 1;
+export const RH_MCP_SERVICE_REVIEWED_TOOLS: readonly string[] = Object.freeze(
+  Object.values(RH_MCP_SERVICE_TOOLS_BY_SCOPE).flatMap((tools) => [...tools]),
+);
+
 /** Hard ceiling for any per-call or per-tool gateway timeout (matches the gateway's per-call clamp). */
 export const MAX_TOOL_TIMEOUT_MS = 60_000;
 /** api-main (Lambda) can take 8-15 s on a cold start, so the Argus verbs get 30 s instead of the 10 s default. */
@@ -204,6 +272,20 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     authKind: "managed_token",
     defaultEnabled: false,
     reviewedTools: { version: ARGUS_REVIEW_REVIEWED_TOOLS_VERSION, allow: ARGUS_REVIEW_REVIEWED_TOOLS },
+    toolTimeoutMs: Object.fromEntries(ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS])),
+  },
+  {
+    // Per-org rh-mcp service token for SHARED orgs (TECH-8066). An ORDINARY (non-dedicated) entry: the org's
+    // `rh-mcp-service` connection is created by `shared-org-rh-mcp.ts` (one rh-auth service token per org, minted through
+    // the ownership API), never by an operator, and only for companies whose visibility is `shared`. Every other company
+    // has no such connection, so the entry is recorded with no template there and does nothing. ON for every new agent
+    // of an org that has the connection. `reviewedTools` is the agent ceiling: exactly the tools the token's scopes cover.
+    key: "rh-mcp-service",
+    displayName: "RH MCP (service token)",
+    connectionName: "rh-mcp-service",
+    authKind: "managed_token",
+    defaultEnabled: true,
+    reviewedTools: { version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION, allow: RH_MCP_SERVICE_REVIEWED_TOOLS },
     toolTimeoutMs: Object.fromEntries(ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS])),
   },
   {

@@ -546,7 +546,7 @@ describe("per-tool timeout (argus-review)", () => {
     expect(defaultToolTimeoutMs("rh-mcp-argus-review", "toString")).toBeUndefined();
     expect(defaultToolTimeoutMs("rh-mcp", "argus_start_review")).toBeUndefined();
     expect(defaultToolTimeoutMs("some-other-connection", "argus_start_review")).toBeUndefined();
-    for (const entry of DEFAULT_MCP_SPEC.filter((candidate) => candidate.key !== "argus-review")) {
+    for (const entry of DEFAULT_MCP_SPEC.filter((candidate) => candidate.key !== "argus-review" && candidate.key !== "rh-mcp-service")) {
       expect(entry.toolTimeoutMs).toBeUndefined();
     }
   });
@@ -567,7 +567,7 @@ describe("arcana-brain spec: default ON (TECH-7253)", () => {
     expect(arcana.setupHook).toBe("arcana_brain");
     expect(arcana.templateBootstrap).toBe("static");
     expect(arcana.reviewedTools?.allow).toEqual(["recall", "search_pages", "read_page", "coverage", "open_source"]);
-    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.defaultEnabled).map((entry) => entry.key)).toEqual(["arcana-brain"]);
+    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.defaultEnabled).map((entry) => entry.key)).toEqual(["arcana-brain", "rh-mcp-service"]);
   });
 });
 
