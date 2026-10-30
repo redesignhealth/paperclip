@@ -128,7 +128,7 @@ async function workerCommand(db, argv) {
     let shas = v.shas ? v.shas.split(",").filter(Boolean) : null;
     const flagged = new Set();
     const { rows } = await db.query(
-      `SELECT upstream_sha, fork_owned_hits, touches_migrations FROM upstream_sync_log WHERE ${shas ? "upstream_sha = ANY($1)" : "status IN ('pending', 'assessed')"} ORDER BY id`,
+      `SELECT upstream_sha, fork_owned_hits, touches_migrations FROM upstream_sync_log WHERE ${shas ? "upstream_sha = ANY($1)" : "status = 'assessed'"} ORDER BY id`,
       shas ? [shas] : [],
     );
     for (const r of rows) if (handle.needsWholeDiffReview(r)) flagged.add(r.upstream_sha);
@@ -248,7 +248,7 @@ async function main() {
       }
       return console.log(lines.join("\n"));
     }
-    if (WORKER_COMMANDS.has(cmd)) return workerCommand(pool, [sub, ...rest].filter((a) => a !== undefined));
+    if (WORKER_COMMANDS.has(cmd)) return await workerCommand(pool, [sub, ...rest].filter((a) => a !== undefined));
     console.log(USAGE);
     process.exitCode = 2;
   } finally {
