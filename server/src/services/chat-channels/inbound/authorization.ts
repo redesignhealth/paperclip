@@ -19,6 +19,7 @@ import {
 import type { Db } from "@paperclipai/db";
 
 import {
+  authUsers,
   chatConversations,
   chatEndpointResources,
   chatExternalPrincipals,
@@ -31,6 +32,10 @@ import {
   forbidden,
 } from "../../../errors.js";
 
+import { logActivity } from "../../activity-log.js";
+
+import { resolveSlackEmail } from "../slack/directory.js";
+
 import type {
   Author,
   Thread,
@@ -40,9 +45,10 @@ type ResourceRow = typeof chatEndpointResources.$inferSelect;
 type InboundAuthorityOptions = {
   voiceStore: Pick<ReturnType<typeof voiceSessionStore>, "authorizePrincipal">;
   runtimeCallbackEndpoint: (tx: DbTransaction, endpointId: string, context: LifecycleRuntimeFence, statuses: EndpointRow["status"][]) => Promise<EndpointRow | null>;
+  fetchImpl?: typeof fetch;
 };
 export function createChatInboundAuthority(db: Db, options: InboundAuthorityOptions) {
-  const { voiceStore, runtimeCallbackEndpoint } = options;
+  const { voiceStore, runtimeCallbackEndpoint, fetchImpl } = options;
 
 
   async function findAuthorizedIdentityLink(endpoint: EndpointRow, userId: string) {
@@ -60,6 +66,7 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
     endpoint: EndpointRow,
     author: Author,
     raw?: unknown,
+    options: { linkByEmail?: boolean } = {},
   ) {
     const providerAccountId = endpoint.providerAccountId ?? "unknown";
     const externalId = stableExternalPrincipalId(
@@ -106,7 +113,7 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
         return { principal, userId: null, linkedDenied: true };
       }
     }
-    const link = await db
+    const readLink = () => db
       .select({
         userId: chatIdentityLinks.paperclipUserId,
         status: chatIdentityLinks.status,
@@ -119,6 +126,13 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
         ),
       )
       .then((rows) => rows[0] ?? null);
+    let link = await readLink();
+    // A never-linked Slack person may be linked by their verified email. Any
+    // existing row (pending, linked, or revoked) keeps its current meaning.
+    // Only inbound messages opt in; setup, reactions, callbacks, and commands do not.
+    if (options.linkByEmail && !link && endpoint.provider === "slack" && principal.kind === "user" && !principal.isBot) {
+      if (await linkSlackPrincipalByEmail(endpoint, principal.id, externalId)) link = await readLink();
+    }
     if (link?.status === "linked" && link.userId) {
       const membership = await db
         .select({
@@ -151,6 +165,45 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
       return { principal, userId: null, linkedDenied: true };
     }
     return { principal, userId: null, linkedDenied: false };
+  }
+
+  /** Returns whether a link row may now exist for this principal. */
+  async function linkSlackPrincipalByEmail(endpoint: EndpointRow, principalId: string, slackUserId: string): Promise<boolean> {
+    if (!endpoint.providerAccountId) return false;
+    // Resolve over the network before taking any lock.
+    const email = await resolveSlackEmail({ workspaceId: endpoint.providerAccountId, slackUserId, fetchImpl });
+    if (!email) return false;
+    // user.email is not unique; an ambiguous address must never pick an account.
+    const users = await db.select({ id: authUsers.id, emailVerified: authUsers.emailVerified }).from(authUsers)
+      .where(sql`lower(${authUsers.email}) = ${email}`).limit(2);
+    if (users.length !== 1 || !users[0].emailVerified) return false;
+    const userId = users[0].id;
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${endpoint.companyId}:${principalId}`}, 0))`);
+      const membership = await tx.select({ status: companyMemberships.status, membershipRole: companyMemberships.membershipRole })
+        .from(companyMemberships)
+        .where(and(eq(companyMemberships.companyId, endpoint.companyId), eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, userId)))
+        .for("update").then((rows) => rows[0] ?? null);
+      if (membership?.status !== "active" || membership.membershipRole === "viewer") return false;
+      const conflictingLink = await tx.select({ id: chatIdentityLinks.id }).from(chatIdentityLinks)
+        .where(and(eq(chatIdentityLinks.companyId, endpoint.companyId), eq(chatIdentityLinks.principalId, principalId),
+          eq(chatIdentityLinks.status, "linked"), ne(chatIdentityLinks.paperclipUserId, userId)))
+        .limit(1).then((rows) => rows[0] ?? null);
+      if (conflictingLink) return false;
+      // Never overwrite a row written since the unlocked read (revoked, pending, or linked).
+      const inserted = await tx.insert(chatIdentityLinks).values({ companyId: endpoint.companyId, endpointId: endpoint.id, principalId,
+        paperclipUserId: userId, status: "linked", confirmedAt: new Date() })
+        .onConflictDoNothing({ target: [chatIdentityLinks.endpointId, chatIdentityLinks.principalId] })
+        .returning({ id: chatIdentityLinks.id });
+      // A concurrently written row exists; the caller re-reads it as-is.
+      if (!inserted.length) return true;
+      await logActivity(tx as unknown as Db, {
+        companyId: endpoint.companyId, actorType: "system", actorId: `chat:${principalId}`,
+        action: "chat.slack_identity_email_linked", entityType: "chat_endpoint", entityId: endpoint.id,
+        details: { principalId, paperclipUserId: userId },
+      });
+      return true;
+    });
   }
 
   async function sponsorAllowsGuest(endpoint: EndpointRow): Promise<boolean> {

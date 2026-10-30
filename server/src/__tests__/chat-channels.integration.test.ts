@@ -8892,6 +8892,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
       for (const canary of [configToken, signingSecret, clientSecret, f.token, "oauth-code-canary"]) expect(JSON.stringify({ saved, activities, response: completed.text })).not.toContain(canary);
     });
+    it("links the OAuth installer to the signed-in account even when their Slack email matches another member", async () => {
+      vi.stubEnv("PAPERCLIP_SLACK_EMAIL_MATCH_ENABLED", "true");
+      vi.stubEnv("PAPERCLIP_SLACK_DIRECTORY_TOKENS", JSON.stringify({ TAUTO: "xoxb-directory" }));
+      onTestFinished(() => vi.unstubAllEnvs());
+      const f = await fixture();
+      const otherId = `email-match-${randomUUID()}`;
+      const email = `${otherId}@example.test`;
+      const now = new Date();
+      await db.insert(authUsers).values({ id: otherId, name: "Other Member", email, emailVerified: true, createdAt: now, updatedAt: now });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: otherId, status: "active", membershipRole: "operator" });
+      Object.assign(f.state.user, { profile: { email } });
+      await f.create();
+      const state = await f.install();
+      await request(f.app).get(`/api/chat-slack/oauth/callback?state=${state}&code=oauth-code-canary`).set("Sec-Fetch-Site", "same-origin").expect(303);
+      expect((await f.service.get(f.endpoint.id)).setup.slackAccount).toMatchObject({ externalUserId: f.installerId, paperclipUserId: actor.userId, status: "linked" });
+      expect(await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, f.endpoint.id)))
+        .toEqual([expect.objectContaining({ status: "linked", paperclipUserId: actor.userId })]);
+      expect(f.provider.mock.calls.filter(([, init]) => new Headers(init?.headers).get("authorization") === "Bearer xoxb-directory")).toHaveLength(0);
+    });
     it("adds events only after saving signing credentials and answers Slack's update-time challenge before OAuth", async () => {
       const f = await fixture({ scheduleDeferredWork: () => undefined });
       f.state.beforeManifestUpdate = async () => {
@@ -10296,6 +10315,91 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, endpoint.id)))
       .toEqual([expect.objectContaining({ status: "revoked", paperclipUserId: "owner-user", confirmationTokenHash: null })]);
     await service.shutdown();
+  });
+
+  async function slackEmailMatchFixture(input: { enabled: boolean; users: { email: string; emailVerified?: boolean; membership?: boolean }[]; slackEmail: string; revoked?: boolean }) {
+    vi.stubEnv("PAPERCLIP_SLACK_EMAIL_MATCH_ENABLED", input.enabled ? "true" : "false");
+    vi.stubEnv("PAPERCLIP_SLACK_DIRECTORY_TOKENS", JSON.stringify({ "T-PAPERCLIP": "xoxb-directory" }));
+    onTestFinished(() => vi.unstubAllEnvs());
+    const fixture = await seedCompany();
+    const now = new Date();
+    const userIds = input.users.map(() => `email-match-${randomUUID()}`);
+    for (const [index, user] of input.users.entries()) {
+      await db.insert(authUsers).values({ id: userIds[index], name: "Email Match", email: user.email, emailVerified: user.emailVerified ?? true, createdAt: now, updatedAt: now });
+      if (user.membership !== false) {
+        await db.insert(companyMemberships).values({ companyId: fixture.companyId, principalType: "user", principalId: userIds[index], status: "active", membershipRole: "operator" });
+      }
+    }
+    const slack = fakeSlackFetch();
+    const directoryLookups: string[] = [];
+    const fetchImpl = ((request: string | URL | Request, init?: RequestInit) => {
+      if (String(request) === "https://slack.com/api/users.info" && new Headers(init?.headers).get("authorization") === "Bearer xoxb-directory") {
+        const user = new URLSearchParams(String(init?.body)).get("user")!;
+        directoryLookups.push(user);
+        return Promise.resolve(Response.json({ ok: true, user: { id: user, team_id: "T-PAPERCLIP", deleted: false, is_bot: false, profile: { email: input.slackEmail } } }));
+      }
+      return slack(request, init);
+    }) as typeof globalThis.fetch;
+    const configured = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: false, fetch: fetchImpl });
+    if (input.revoked) {
+      const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UEMAIL" }).returning();
+      await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: configured.endpoint.id, principalId: principal.id, paperclipUserId: userIds[0], status: "revoked", revokedAt: new Date() });
+    }
+    await deliverMessage({ callbacks: configured.callbacks, endpointId: configured.endpoint.id,
+      thread: makeThread({ channelId: "D-UEMAIL", id: "slack:D-UEMAIL:", isDM: true }).thread,
+      message: makeMessage({ id: `7700.${randomUUID()}`, text: "Please help", userId: "UEMAIL" }), trigger: "direct_message" });
+    const links = await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, configured.endpoint.id));
+    const conversations = await readChatConversationsByEndpointId(configured.endpoint.id);
+    await configured.service.shutdown();
+    return { ...configured, userIds, directoryLookups, links, conversations };
+  }
+
+  it("links a never-linked Slack sender to the one verified company member with their email", async () => {
+    const email = `match-${randomUUID()}@example.test`;
+    const { userIds, directoryLookups, links, conversations, wakeup } = await slackEmailMatchFixture({ enabled: true, users: [{ email }], slackEmail: email.toUpperCase() });
+    expect(directoryLookups).toEqual(["UEMAIL"]);
+    expect(links).toEqual([expect.objectContaining({ status: "linked", paperclipUserId: userIds[0], confirmedAt: expect.any(Date) })]);
+    expect(conversations).toHaveLength(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, conversations[0].issueId));
+    expect(issue.createdByUserId).toBe(userIds[0]);
+  });
+
+  it("does not link a Slack sender whose email belongs to more than one Paperclip account", async () => {
+    const email = `dupe-${randomUUID()}@example.test`;
+    const { directoryLookups, links, conversations } = await slackEmailMatchFixture({ enabled: true, users: [{ email }, { email: email.toUpperCase() }], slackEmail: email });
+    expect(directoryLookups).toEqual(["UEMAIL"]);
+    expect(links).toEqual([]);
+    expect(conversations).toHaveLength(0);
+  });
+
+  it("does not link a Slack sender whose email matches a non-member or unverified account", async () => {
+    const outsider = `outsider-${randomUUID()}@example.test`;
+    const notMember = await slackEmailMatchFixture({ enabled: true, users: [{ email: outsider, membership: false }], slackEmail: outsider });
+    expect(notMember.directoryLookups).toEqual(["UEMAIL"]);
+    expect(notMember.links).toEqual([]);
+    expect(notMember.conversations).toHaveLength(0);
+    const unverified = `unverified-${randomUUID()}@example.test`;
+    const notVerified = await slackEmailMatchFixture({ enabled: true, users: [{ email: unverified, emailVerified: false }], slackEmail: unverified });
+    expect(notVerified.directoryLookups).toEqual(["UEMAIL"]);
+    expect(notVerified.links).toEqual([]);
+    expect(notVerified.conversations).toHaveLength(0);
+  });
+
+  it("keeps a revoked Slack identity denied even when its email matches a member", async () => {
+    const email = `revoked-${randomUUID()}@example.test`;
+    const { userIds, directoryLookups, links, conversations } = await slackEmailMatchFixture({ enabled: true, users: [{ email }], slackEmail: email, revoked: true });
+    expect(directoryLookups).toEqual([]);
+    expect(links).toEqual([expect.objectContaining({ status: "revoked", paperclipUserId: userIds[0] })]);
+    expect(conversations).toHaveLength(0);
+  });
+
+  it("does not look up Slack emails when email matching is disabled", async () => {
+    const email = `disabled-${randomUUID()}@example.test`;
+    const { directoryLookups, links, conversations } = await slackEmailMatchFixture({ enabled: false, users: [{ email }], slackEmail: email });
+    expect(directoryLookups).toEqual([]);
+    expect(links).toEqual([]);
+    expect(conversations).toHaveLength(0);
   });
 
   it.each([false, true])("requires at-mentions by default only in Slack channels (DM=%s)", async (isDM) => {
