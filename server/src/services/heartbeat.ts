@@ -1009,6 +1009,7 @@ export function heartbeatService(
     sweepOrphanedActiveLeases,
     drainRunningRunsForShutdown,
   } = createHeartbeatRecovery(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
     enterShutdown: () => { shutdownInProgress = true; },
     scheduleBoundedRetryForRun,
     appendRunEvent,
@@ -3017,7 +3018,7 @@ export function heartbeatService(
       // and the per-failure reason for a partial sync.
       const referencedProjectObservability =
         buildReferencedProjectRunObservability({
-          syncedProjectIds: resolvedWorkspace.additionalWorkspaces.map(
+          syncedProjectIds: resolvedWorkspace.runnerTaskProjectIds?.filter(id => id !== resolvedWorkspace.projectId) ?? resolvedWorkspace.additionalWorkspaces.map(
             (additional) => additional.projectId,
           ),
           failures: resolvedWorkspace.referencedProjectFailures,
