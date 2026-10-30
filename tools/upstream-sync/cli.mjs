@@ -30,7 +30,7 @@ const USAGE = `usage: node tools/upstream-sync/cli.mjs <command>
 worker commands (JSON on stdout; common flags: --run-id, --repo, --integration-ref, --master-ref):
   claim                   claim the oldest pending/expired row   [--lease-minutes]
   assess --sha S          claimed row -> skipped (already present) or assessed clean|conflict
-  merge-plan --shas A,B,..  longest clean prefix to merge into integration (oldest first; default: pending rows)
+  merge-plan --shas A,B,..  longest clean prefix to merge into integration (oldest first; default: assessed rows)
   delta --base B --upstream U --merge M [--expect SHA256]   resolution delta of merge commit M
   record --shas A,B --status S [--path --integration-sha --delta-sha256 --review-pr --promote-pr --master-sha
          --skip-reason --argus-verdict] [--argus-round JSON] [--argus-round-cap N (default 10)]
@@ -125,15 +125,9 @@ async function workerCommand(db, argv) {
   if (cmd === "claim") return out(await handle.claim(db, { runId, leaseMinutes: num("lease-minutes") ?? w.leaseMinutes }));
   if (cmd === "assess") return out(await handle.assess(db, repo, { sha: v.sha, runId, ...refs }));
   if (cmd === "merge-plan") {
-    let shas = v.shas ? v.shas.split(",").filter(Boolean) : null;
-    const flagged = new Set();
-    const { rows } = await db.query(
-      `SELECT upstream_sha, fork_owned_hits, touches_migrations FROM upstream_sync_log WHERE ${shas ? "upstream_sha = ANY($1)" : "status = 'assessed'"} ORDER BY id`,
-      shas ? [shas] : [],
-    );
-    for (const r of rows) if (handle.needsWholeDiffReview(r)) flagged.add(r.upstream_sha);
-    shas ??= rows.map((r) => r.upstream_sha);
-    return out(await handle.mergePlan(repo, shas, { integrationRef: refs.integrationRef, isFlagged: (s) => flagged.has(s) }));
+    const { shas, flagged, blockedBy } = await handle.planCandidates(db, { shas: v.shas ? v.shas.split(",").filter(Boolean) : null });
+    const plan = await handle.mergePlan(repo, shas, { integrationRef: refs.integrationRef, isFlagged: (s) => flagged.has(s) });
+    return out({ ...plan, blockedBy });
   }
   if (cmd === "delta") {
     return out(await handle.delta(repo, { base: v.base, upstreamSha: v.upstream, mergeCommit: v.merge, expectSha256: v.expect ?? null }));

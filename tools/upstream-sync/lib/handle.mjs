@@ -163,6 +163,48 @@ export async function assess(db, repo, { sha, runId, integrationRef, masterRef }
 
 // ---- merge-plan ------------------------------------------------------------------------
 
+// Ledger rows that still stand between the integration branch and a given commit. Merging a
+// sha merges every earlier upstream commit with it, so a plan may only name a sha when every
+// earlier row is already in integration (or skipped) or is itself part of the plan and was
+// assessed. Anything else would reach integration without its own assessment and, for flagged
+// commits, without whole-diff Argus review.
+const RESOLVED_STATUSES = ["skipped", "integrated", "promoted"];
+
+// Returns { shas, flagged, blockedBy }: `shas` oldest first, `flagged` the subset that needs
+// whole-diff review. Default (no `shas`): the unbroken run of `assessed` rows starting at the
+// oldest unresolved row; `blockedBy` is the first row that ended the run (or null). With
+// explicit `shas`: every one must be an assessed ledger row, and no unresolved row older than
+// the newest may be left out.
+export async function planCandidates(db, { shas = null } = {}) {
+  const { rows } = await db.query(
+    `SELECT id, upstream_sha, status, fork_owned_hits, touches_migrations FROM upstream_sync_log
+      WHERE status <> ALL($1::text[]) ORDER BY id`,
+    [RESOLVED_STATUSES],
+  );
+  const flagged = new Set();
+  let picked;
+  let blockedBy = null;
+  if (shas) {
+    const bySha = new Map(rows.map((r) => [r.upstream_sha, r]));
+    for (const s of shas) {
+      const r = bySha.get(s);
+      if (!r) throw new Error(`no unresolved ledger row for ${s}`);
+      if (r.status !== "assessed") throw new Error(`row ${s} is ${r.status}, not assessed`);
+    }
+    const newest = Math.max(...shas.map((s) => bySha.get(s).id));
+    const wanted = new Set(shas);
+    const gap = rows.find((r) => r.id < newest && !wanted.has(r.upstream_sha));
+    if (gap) throw new Error(`merging ${shas.length} commit(s) would also merge ${gap.upstream_sha} (${gap.status}), which is not in the plan`);
+    picked = rows.filter((r) => wanted.has(r.upstream_sha));
+  } else {
+    const stop = rows.findIndex((r) => r.status !== "assessed");
+    picked = stop === -1 ? rows : rows.slice(0, stop);
+    if (stop !== -1) blockedBy = { sha: rows[stop].upstream_sha, status: rows[stop].status };
+  }
+  for (const r of picked) if (needsWholeDiffReview(r)) flagged.add(r.upstream_sha);
+  return { shas: picked.map((r) => r.upstream_sha), flagged, blockedBy };
+}
+
 // Longest run of `shas` (oldest first, upstream first-parent order) that merges cleanly
 // into `integrationRef`, found by bisect on "merging shas[k-1] is clean": merging a sha
 // brings in every earlier one, so the prefix is exactly what one merge of its last sha
