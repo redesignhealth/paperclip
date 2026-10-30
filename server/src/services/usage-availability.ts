@@ -34,7 +34,8 @@ function addInto(target: UsageAvailabilityTotals, row: UsageAvailabilityTotals) 
  * provider itself reported. Anything else is unavailable, never an invented zero. */
 const tokenTotal = sql`(${ordinaryInputTokens} + ${costEvents.cachedInputTokens} + ${costEvents.outputTokens})`;
 const hasUsageEvidence = sql`(${costEvents.providerRequestId} is not null
-  or (jsonb_typeof(${heartbeatRuns.usageJson}->'usageByModel') = 'array' and jsonb_array_length(${heartbeatRuns.usageJson}->'usageByModel') > 0)
+  or (case when jsonb_typeof(${heartbeatRuns.usageJson}->'usageByModel') = 'array'
+       then jsonb_array_length(${heartbeatRuns.usageJson}->'usageByModel') > 0 else false end)
   or ${costEvents.pricingProvenance}->>'source' in ('provider_reported', 'provider_invoice'))`;
 const availabilityExpr = sql<UsageAvailability>`case
   when ${tokenTotal} > 0 then (case when ${costEvents.costStatus} = 'estimated' then 'estimated' else 'reported' end)

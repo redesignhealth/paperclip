@@ -129,12 +129,45 @@ describe("usage availability reporting projection", () => {
     await receipted(owner, owner.claude, { event: { ...tokens, costCents: 2 } });
     await receipted(other, other.claude, { event: { ...tokens, costCents: 9 } });
     await db.insert(costEvents).values({ companyId: owner.companyId, agentId: owner.claude, provider: "anthropic", model: "m", costCents: 7, occurredAt: at });
-    const before = await db.execute(sql`select count(*)::int as n, coalesce(sum(cost_cents),0)::text as c from cost_events where company_id = ${owner.companyId}`);
+    const before = await db.execute(sql`select count(*)::int as n, md5(coalesce(string_agg(e::text, '|' order by e.id), '')) as digest, (select md5(coalesce(string_agg(r::text, '|' order by r.id), '')) from heartbeat_runs r where r.company_id = ${owner.companyId}) as runs from cost_events e where e.company_id = ${owner.companyId}`);
     const report = await usageAvailabilityReport(db, owner.companyId, range);
     expect(report.ledgerCostCentsExact).toBe(normalizeCents("2"));
     expect(report.total.eventCount).toBe(1);
-    const after = await db.execute(sql`select count(*)::int as n, coalesce(sum(cost_cents),0)::text as c from cost_events where company_id = ${owner.companyId}`);
+    const after = await db.execute(sql`select count(*)::int as n, md5(coalesce(string_agg(e::text, '|' order by e.id), '')) as digest, (select md5(coalesce(string_agg(r::text, '|' order by r.id), '')) from heartbeat_runs r where r.company_id = ${owner.companyId}) as runs from cost_events e where e.company_id = ${owner.companyId}`);
     expect(Array.from(after)).toEqual(Array.from(before));
+  });
+
+  it("covers invoice provenance, subscription overage, non-succeeded terminal runs and date boundaries", async () => {
+    const owner = await company();
+    // provider_invoice with 0 tokens is measured evidence; subscription_overage is subscription billing kind.
+    await receipted(owner, owner.claude, { event: { costStatus: "reported", pricingProvenance: { source: "provider_invoice" } } });
+    await receipted(owner, owner.codex, { event: { ...tokens, provider: "openai", billingType: "subscription_overage", costStatus: "reported", costCents: 1 } });
+    // No evidence at all on non-succeeded terminal runs: unavailable, and each status still has a receipt.
+    for (const status of ["failed", "timed_out", "cancelled", "interrupted"]) {
+      await receipted(owner, owner.hermes, { run: { status }, event: { provider: "unknown", model: "unknown", costStatus: "unpriced" } });
+    }
+    // Inclusive date bounds: events exactly on from/to count, one millisecond outside does not.
+    const edge = (offset: number) => new Date(range.from.getTime() + offset);
+    await receipted(owner, owner.claude, { event: { ...tokens, costCents: 1, occurredAt: range.from } });
+    await receipted(owner, owner.claude, { event: { ...tokens, costCents: 1, occurredAt: range.to } });
+    await receipted(owner, owner.claude, { event: { ...tokens, costCents: 1, occurredAt: edge(-1) } });
+    await receipted(owner, owner.claude, { event: { ...tokens, costCents: 1, occurredAt: new Date(range.to.getTime() + 1) } });
+    const report = await usageAvailabilityReport(db, owner.companyId, range);
+    expect(report.availability.measured_zero.eventCount).toBe(1);
+    expect(report.availability.unavailable.eventCount).toBe(4);
+    expect(report.availability.reported.eventCount).toBe(3); // overage + two boundary events
+    expect(report.pricingProvenance).toEqual(expect.arrayContaining([expect.objectContaining({ source: "provider_invoice", eventCount: 1 })]));
+    expect(report.byAdapter.find(row => row.adapterType === "codex_local")?.billingKindEventCounts.subscription).toBe(1);
+    expect(report.total.eventCount).toBe(8);
+    expect(report.reconciled).toBe(true);
+  });
+
+  it("does not let a malformed usageByModel value break classification", async () => {
+    const owner = await company();
+    await receipted(owner, owner.claude, { run: { usageJson: { usageByModel: "not-an-array" } }, event: {} });
+    await receipted(owner, owner.claude, { run: { usageJson: { usageByModel: [] } }, event: {} });
+    const report = await usageAvailabilityReport(db, owner.companyId, range);
+    expect(report.availability.unavailable.eventCount).toBe(2);
   });
 
   it("returns null coverage rather than zero when nothing is receipt-backed", async () => {

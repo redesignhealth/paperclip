@@ -219,7 +219,11 @@ export interface CostByProject {
 
 /** Reporting-only classification of how a ledger event's token usage was obtained.
  * `unavailable` means a receipt exists but carries no usable usage (0/0 tokens, no
- * provider request id, no usage payload). It is never evidence of zero consumption. */
+ * provider request id, no usage payload). It is never evidence of zero consumption.
+ * `measured_zero` means 0 tokens with independent evidence: a provider request id, a
+ * non-empty per-model usage payload, or provider-reported/invoiced pricing provenance.
+ * That rule can undercount real zeros for adapters that supply none of these, and can
+ * overstate a zero when a provider reports cost but no tokens; treat it as a lower bound. */
 export type UsageAvailability = "reported" | "estimated" | "unavailable" | "measured_zero";
 
 /** Billing kind is kept separate from availability so subscription and unknown
