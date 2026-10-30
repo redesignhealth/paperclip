@@ -1,4 +1,5 @@
 import { idleWorkSnapshot } from "../services/task-admission.js";
+import { SLACK_SESSION_SYNC_MAX_ATTEMPTS } from "../services/chat-channels/slack/session-status.js";
 import { requestTaskRetry } from "../services/task-retry.js";
 import { stageReceiptReactionRemovals } from "../services/chat-receipt-reactions.js";
 import type { Db } from "@paperclipai/db";
@@ -34686,6 +34687,77 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await first.service.shutdown();
       await second?.service.shutdown();
     }
+  });
+
+  it("stops retrying a Slack session status that keeps failing with an unrecognized provider error", async () => {
+    const fixture = await seedCompany();
+    const ordinaryFetch = fakeSlackFetch();
+    let statusCalls = 0;
+    const fetch: typeof globalThis.fetch = async (input) => {
+      if (String(input) !== "https://slack.com/api/agents.sessions.setStatus")
+        return ordinaryFetch(input);
+      statusCalls += 1;
+      return Response.json({ ok: false, error: "thread_not_found" });
+    };
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture, { fetch });
+    const thread = makeThread({ channelId: "CSTUCK", id: "slack:CSTUCK:4060.1", name: "stuck-status" });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: thread.thread,
+      message: makeMessage({ id: "4060.1", text: "@maya stuck status", mentioned: true }),
+      trigger: "mention",
+    });
+    const conversation = await readChatConversationsByEndpointId(endpoint.id).then((rows) => rows[0]!);
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "slack",
+        providerMessageId: "4060.1",
+      }),
+    });
+    await db.insert(chatPublications).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      conversationId: conversation.id,
+      issueId: conversation.issueId,
+      idempotencyKey: `run:${runId}:working:${endpoint.id}`,
+      payload: { text: "Maya is working…", progressState: "working" },
+      state: "pending",
+    });
+    await service.processPendingPublications();
+    const action = await db
+      .select()
+      .from(chatActions)
+      .where(and(eq(chatActions.endpointId, endpoint.id), eq(chatActions.kind, "slack_session_sync")))
+      .then((rows) => rows[0]!);
+
+    // One failure below the cap stays retryable.
+    await service.processPendingSlackSessionSyncs(25, action.id);
+    expect(statusCalls).toBe(1);
+    expect(
+      await db.select({ status: chatActions.status }).from(chatActions).where(eq(chatActions.id, action.id)).then((rows) => rows[0]?.status),
+    ).toBe("received");
+
+    // At the cap the same failure is terminal and is not attempted again.
+    await db
+      .update(chatActions)
+      .set({ status: "received", result: { attempts: SLACK_SESSION_SYNC_MAX_ATTEMPTS - 1 }, updatedAt: new Date() })
+      .where(eq(chatActions.id, action.id));
+    await service.processPendingSlackSessionSyncs(25, action.id);
+    expect(statusCalls).toBe(2);
+    expect(
+      await db.select({ status: chatActions.status, result: chatActions.result }).from(chatActions).where(eq(chatActions.id, action.id)).then((rows) => rows[0]),
+    ).toMatchObject({ status: "failed", result: { code: "slack_session_sync_rejected" } });
+    await service.processPendingSlackSessionSyncs(25, action.id);
+    expect(statusCalls).toBe(2);
+    await service.shutdown();
   });
 
   it("reconciles Slack session status without replaying messages after rate limits or restart", async () => {
