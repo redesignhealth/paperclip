@@ -15,7 +15,7 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
@@ -72,6 +72,36 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("defers a new plugin agent's Copilot check until its saved-agent lifecycle can acquire the computer", async () => {
+    const { errorHandler } = await import("../middleware/index.js");
+    const owner = "copilot-plugin-bootstrap", pluginId = randomUUID();
+    const pluginKey = `test.bootstrap.${pluginId}`;
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: "@test/bootstrap", version: "1.0.0", apiVersion: 1,
+      categories: ["automation"], status: "ready", manifestJson: { id: pluginKey, apiVersion: 1, version: "1.0.0",
+        displayName: "Bootstrap", description: "Bootstrap fixture", author: "Test", categories: ["automation"],
+        capabilities: ["environment.drivers.register"], entrypoints: { worker: "worker.js" },
+        environmentDrivers: [{ driverKey: "tasks", displayName: "Tasks", supportsTasks: true, configSchema: { type: "object" } }] } });
+    const [environment] = await db.insert(environments).values({ companyId, name: "Agent computer", driver: "plugin",
+      config: { pluginKey, driverKey: "tasks", driverConfig: {} } }).returning();
+    const token = "github_pat_fixture_plugin_bootstrap";
+    const account = await service.save(companyId, owner, { provider: "github", method: "api_key", ownership: "personal", name: "Bootstrap", apiKey: token, agentIds: [], allAgents: false }, token);
+    await service.setDefault(companyId, owner, account.grantId);
+    const probe = vi.spyOn(copilotProbe, "probeCopilotExecutionTarget").mockRejectedValue(new Error("No computer exists before the agent is saved"));
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: owner, companyIds: [companyId], isInstanceAdmin: true }; next(); });
+    app.use("/api", agentRoutes(db)); app.use(errorHandler);
+    try {
+      const response = await request(app).post(`/api/companies/${companyId}/agents`).send({ name: "Plugin bootstrap", role: "general",
+        adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "copilot", model: "gpt-5.6-luna" },
+        defaultEnvironmentId: environment.id, runtimeConfig: { aiConnection: { provider: "github", method: "api_key", mode: "responsible_user" } } });
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      expect(response.body.defaultEnvironmentId).toBe(environment.id);
+      expect(response.body.lifecycleState).toBe("preparing");
+      expect(probe).not.toHaveBeenCalled();
+    } finally { probe.mockRestore(); }
+  });
+
   it.each(["create", "hire", "edit"])("refuses Copilot %s before probing or persisting when forced Kubernetes is missing", async action => {
     const { errorHandler } = await import("../middleware/index.js");
     const owner = `copilot-kubernetes-${action}`, id = randomUUID();
