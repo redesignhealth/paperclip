@@ -274,6 +274,16 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(r.state, "FAILURE")
         self.assertIn("concluded skipped", r.summary)
 
+    def test_skipped_vitest_selection_is_optional(self):
+        jobs = default_pr_jobs() + [job("ci / Select Vitest files", conclusion="skipped")]
+        r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})
+        self.assertEqual(r.state, "SUCCESS")
+
+    def test_failed_vitest_selection_still_fails(self):
+        jobs = default_pr_jobs() + [job("ci / Select Vitest files", conclusion="failure")]
+        r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})
+        self.assertEqual(r.state, "FAILURE")
+
     def test_negative_action_required_fails(self):
         r = evaluate({PR_WF}, [run(conclusion="action_required")])
         self.assertEqual(r.state, "FAILURE")

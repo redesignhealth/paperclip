@@ -56,6 +56,9 @@ PR_ANCHOR_JOBS = frozenset({
 
 OPTIONAL_SKIPPED_JOBS: dict[str, frozenset[str]] = {
     ".github/workflows/storybook-visual.yml": frozenset({"Deploy selected branch Storybook"}),
+    # pr-trusted.yml's Vitest selection is an optimization (continue-on-error). It is skipped
+    # whenever the plan forces a full run, and the full test matrix then runs instead.
+    ".github/workflows/pr.yml": frozenset({"ci / Select Vitest files"}),
 }
 
 WAITING_CONCLUSIONS = frozenset({"action_required"})
