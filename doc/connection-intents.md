@@ -15,7 +15,7 @@ When a task connection needs Paperclip Cloud enrollment, the shared dialog opens
 
 ## Agent tools
 
-Every active heartbeat with a responsible user receives two run-bound tools:
+Every active task-bound heartbeat with a responsible user receives two run-bound tools. Taskless runs, such as timer heartbeats, do not receive them, because both tools need a task:
 
 - `connections_search({ query })` searches catalog names and descriptions, plus authorized configured MCP connections and indexed tool descriptions and returns `ready`, `needs_user_action`, `available`, or `unavailable` from the requesting agent's perspective.
 - `connection_request({ service })` returns immediately when the service is already usable. Otherwise it creates or reuses a `connection_intent` and instructs the agent to finish independent work, then yield pending continuation.
