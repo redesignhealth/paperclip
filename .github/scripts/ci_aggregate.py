@@ -20,7 +20,7 @@ Jobs evaluation:
 - Anchors: `ci / gate / Select trusted runner`, `ci / policy`, `ci / verify`, `ci / e2e` are required success.
 - Missing anchors or incomplete jobs => PENDING (fail closed).
 - All present jobs in latest attempt must be `success`.
-- Allowed skips is empty for pr.yml (upstream full_ci=false is only for stacked PRs whose base is not master, which are ineligible).
+- The only allowed skip for pr.yml is the "ci / Select Vitest files" optimization (see OPTIONAL_SKIPPED_JOBS); upstream full_ci=false is only for stacked PRs whose base is not master, which are ineligible.
 - `action_required` is a FAILURE.
 - For .github/workflows/storybook-visual.yml, the workflow is only required when the PR holds the 'storybook-visual' label;
   when applicable, 'Storybook visual regression' must be success, and the dispatch-only preview job
@@ -56,8 +56,8 @@ PR_ANCHOR_JOBS = frozenset({
 
 OPTIONAL_SKIPPED_JOBS: dict[str, frozenset[str]] = {
     ".github/workflows/storybook-visual.yml": frozenset({"Deploy selected branch Storybook"}),
-    # pr-trusted.yml's Vitest selection is an optimization (continue-on-error). It is skipped
-    # whenever the plan forces a full run, and the full test matrix then runs instead.
+    # pr-trusted.yml's Vitest selection is an optimization. Its `if` skips it whenever the plan
+    # forces a full run, and the full test matrix then runs instead. A failure still fails.
     ".github/workflows/pr.yml": frozenset({"ci / Select Vitest files"}),
 }
 
