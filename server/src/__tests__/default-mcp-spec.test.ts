@@ -1163,6 +1163,8 @@ describe("RH Google MCP first-consent defaults", () => {
     expect(new Set(names).size).toBe(names.length);
     for (const name of names) expect(name, name).toMatch(READ_SHAPE);
     for (const name of KNOWN_MUTATORS) expect(names).not.toContain(name);
+    // May create an "anyone with the link" permission depending on the server, so it is not switched on by default.
+    expect(names).not.toContain("get_drive_shareable_link");
   });
 
   it("applies to a personal rh-google-mcp instance only, and installs existing agents only for that entry", () => {

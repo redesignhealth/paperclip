@@ -82,8 +82,8 @@ export interface DefaultMcpEntrySpec {
    */
   initialActiveTools?: readonly string[];
   /**
-   * When true, a brand-new personal instance is installed on the owner's existing agents as soon as the owner
-   * consents. Agents created later still start with the entry off.
+   * When true, a brand-new personal instance is installed on the agents the owner created (still live) as soon as
+   * the owner consents. Agents other people created, and agents created later, start with the entry off.
    */
   installOnExistingAgentsOnConnect?: boolean;
   /** Optional OAuth discovery-only seed configuration (TECH-7340). */
@@ -245,7 +245,6 @@ export function connectionHealthColumns<S extends string>(
  * `modify_gmail_message_labels`, `modify_sheet_values`, `manage_event`, `run_script_function`, `export_doc_to_pdf`,
  * `draft_gmail_message`). Anything not listed here stays quarantined until the owner reviews it.
  */
-export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS_VERSION = 1;
 export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.freeze([
   // Calendar
   "get_events",
@@ -268,7 +267,6 @@ export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.free
   "get_drive_file_content",
   "get_drive_file_download_url",
   "get_drive_file_permissions",
-  "get_drive_shareable_link",
   "check_drive_file_public_access",
   // Docs
   "get_doc_content",
@@ -493,7 +491,7 @@ export function initialActiveToolsForPersonalInstance(
   return names.length > 0 ? new Set(names) : null;
 }
 
-/** True when a brand-new personal instance of this entry should be installed on the owner's existing agents. */
+/** True when a brand-new personal instance of this entry should be installed on the agents its owner already created. */
 export function installsOnExistingAgentsOnConnect(
   connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
   spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
