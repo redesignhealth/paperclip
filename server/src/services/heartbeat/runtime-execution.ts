@@ -746,13 +746,20 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             }
           : {}),
       };
-      const runtimeTools = createAdapterRuntimeToolAccess({
-        agentId: agent.id,
-        companyId: agent.companyId,
-        runId: run.id,
-        responsibleUserId: run.responsibleUserId,
-      });
-      if (!runtimeTools) {
+      // Connection tools only serve task-bound runs (connection-intents
+      // rejects every request without one). A taskless run, such as a timer
+      // heartbeat, carries only the company-default responsible user, whom
+      // the connections endpoint can reject at the MCP handshake; Hermes
+      // preflight then aborts the whole run over tools it could never use.
+      const runtimeTools = issueId
+        ? createAdapterRuntimeToolAccess({
+            agentId: agent.id,
+            companyId: agent.companyId,
+            runId: run.id,
+            responsibleUserId: run.responsibleUserId,
+          })
+        : undefined;
+      if (!runtimeTools && issueId) {
         logger.warn(
           {
             companyId: agent.companyId,
