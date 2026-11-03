@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { mockOnboardingLocalAiConnection } from "./helpers/onboarding-ai-connection";
-import { CLAUDE_SOURCE, returnToSourceRow } from "./helpers/onboarding-source";
+import { CLAUDE_SOURCE, returnToSourceRow, selectSource } from "./helpers/onboarding-source";
 
 /**
  * E2E: Onboarding wizard flow (NUX Phase 2 expanded wizard).
@@ -324,7 +324,7 @@ test.describe("Onboarding wizard", () => {
     // step exists to enforce, since a hire here would file an agent with no
     // credential to run on. It is also the whole of the interaction: there is
     // no second press between choosing a source and being signed in.
-    await source.click();
+    await selectSource(source);
 
     await expect(cardInstruction).toBeVisible({ timeout: 30_000 });
     // One destination, two ways to it: the card's own link for anyone
@@ -536,7 +536,7 @@ test.describe("Onboarding wizard", () => {
 
     // Answering the row is what starts the sign-in now — there is no separate
     // Connect press between choosing a source and being signed in.
-    await source.click();
+    await selectSource(source);
 
     const cardInstruction = page.getByText("then come back and enter authorization code");
     const authorizationLink = page.getByRole("link", { name: /^Sign in to / });
@@ -667,7 +667,7 @@ test.describe("Onboarding wizard", () => {
 
     await returnToSourceRow(page);
     const source = page.getByRole("radio", { name: CLAUDE_SOURCE });
-    await source.click();
+    await selectSource(source);
 
     const connect = page.getByRole("button", { name: "Connect", exact: true });
     await expect(connect).toBeEnabled({ timeout: 30_000 });

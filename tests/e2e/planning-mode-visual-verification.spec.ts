@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { mockOnboardingLocalAiConnection } from "./helpers/onboarding-ai-connection";
-import { CLAUDE_SOURCE, returnToSourceRow } from "./helpers/onboarding-source";
+import { CLAUDE_SOURCE, returnToSourceRow, selectSource } from "./helpers/onboarding-source";
 import {
   expectLandsOnFirstTaskWithoutDashboardBounce,
   instrumentNavLog,
@@ -87,16 +87,15 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
 
   await page.getByRole("button", { name: /^Next$/ }).click();
 
-  // The connect step arrives with no source selected — the tile row is a
-  // question, not a confirmation — so its CTA stays disabled until one is
-  // pressed. It reads "Connect", not "Next": the button starts the sign-in
-  // where there is one to start. The test simulates successful local account
+  // The connect step arrives with Hermes selected, so this goes back to the
+  // row and picks Claude. The CTA reads "Connect", not "Next": the button
+  // starts the sign-in where there is one to start. The test simulates successful local account
   // connection, then exercises the real first-task creation flow.
   //
   // Waited on for enabled rather than visible: it is already on screen, and
   // clicking a disabled button raises nothing and does nothing.
   await returnToSourceRow(page);
-  await page.getByRole("radio", { name: CLAUDE_SOURCE }).click();
+  await selectSource(page.getByRole("radio", { name: CLAUDE_SOURCE }));
   const connectNext = page.getByRole("button", { name: /^Connect$/ });
   await expect(connectNext).toBeEnabled({ timeout: 30_000 });
   await connectNext.click();
