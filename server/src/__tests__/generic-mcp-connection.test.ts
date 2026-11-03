@@ -4245,9 +4245,10 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         .where(eq(toolProfileEntries.companyId, company.id));
       expect(profileEntriesAfterRefresh.map((entry) => entry.catalogEntryId)).toEqual([search.id]);
       expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(1); // the owner's agent binding only
-      expect(await installsOf(instanceId)).toHaveLength(0);
+      // The owner's finish installed exactly their chosen agent (no company-wide install, none for anyone else).
+      expect((await installsOf(instanceId)).map((install) => `${install.targetType}:${install.targetId}`)).toEqual([`agent:${agent!.id}`]);
       // No company install appears either.
-      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, company.id))).toHaveLength(0);
+      expect(await db.select().from(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.companyId, company.id), eq(toolConnectionInstalls.targetType, "company")))).toHaveLength(0);
     });
 
     it("a brand-new RH instance consent activates exactly the five Granola read tools; everything beyond the ceiling stays quarantined", async () => {
@@ -4606,7 +4607,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(profileEntriesAfter.map((entry) => entry.catalogEntryId)).not.toContain(deniedCeilingEntryId);
       const bindingsAfter = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id));
       expect(bindingsAfter).toEqual(bindingsBefore);
-      expect(await installsOf(instanceId)).toHaveLength(0);
+      // The owner's finish installed exactly their chosen agent (no company-wide install, none for anyone else).
+      expect((await installsOf(instanceId)).map((install) => `${install.targetType}:${install.targetId}`)).toEqual([`agent:${agent!.id}`]);
       // The re-consent kept exactly Alice's own user grant (refreshed, never duplicated).
       expect(await grantsOf(instanceId)).toEqual([
         expect.objectContaining({ kind: "user", subjectUserId: alice }),
@@ -4690,7 +4692,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(catalogAfter.map((entry) => [entry.toolName, entry.status, entry.reviewedAt === null])).toEqual(
         catalogBefore.map((entry) => [entry.toolName, entry.status, entry.reviewedAt === null]),
       );
-      expect(await installsOf(instanceId)).toHaveLength(0);
+      // The owner's finish installed exactly their chosen agent (no company-wide install, none for anyone else).
+      expect((await installsOf(instanceId)).map((install) => `${install.targetType}:${install.targetId}`)).toEqual([`agent:${agent!.id}`]);
       expect(await grantsOf(instanceId)).toEqual([
         expect.objectContaining({ kind: "user", subjectUserId: alice }),
       ]);

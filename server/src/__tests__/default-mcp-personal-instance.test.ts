@@ -756,6 +756,56 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect((await db.select().from(toolConnections).where(eq(toolConnections.id, bInstance.id)))[0]!.status).toBe("draft");
   });
 
+  it("finishing a personal instance never saves an access choice that reaches no agent: all-agents is refused loudly, chosen agents are installed and see the tools", async () => {
+    const { companyId, userA, userB } = await seededCompanyWithMembers({ roles: { a: "member", b: "member" } });
+    const service = svc();
+    const seed = (await googleSeed(companyId))!;
+    const aInstance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    const bInstance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userB);
+    const agent = await seedAgent(companyId, { state: agentState() });
+    const otherAgent = await seedAgent(companyId, { state: agentState() });
+    const [entry] = await db
+      .insert(toolCatalogEntries)
+      .values({ companyId, applicationId: aInstance.applicationId, connectionId: aInstance.id, entryKind: "tool", name: "calendar_list_events", toolName: "calendar_list_events", title: "List events", riskLevel: "read", isReadOnly: true, status: "active", versionHash: randomUUID(), schemaHash: randomUUID() })
+      .returning();
+    const finishInput = (access: "all_agents" | { agentIds: string[] }) => ({
+      enabledCatalogEntryIds: [entry!.id],
+      askFirstCatalogEntryIds: [],
+      access,
+    });
+
+    // "All agents" is refused with a clear code, and nothing is written (no profile, binding or install).
+    await expect(
+      service.finishGalleryAppConnection(companyId, aInstance.id, finishInput("all_agents"), userActor(userA)),
+    ).rejects.toMatchObject({ status: 422, details: { code: "company_install_not_permitted" } });
+    let rows = await toolRowsOf(companyId);
+    expect(rows.installs).toHaveLength(0);
+    expect(rows.bindings).toHaveLength(0);
+
+    // Choosing an agent installs it (install row + binding), and the agent now sees the connection and its tool.
+    await service.finishGalleryAppConnection(companyId, aInstance.id, finishInput({ agentIds: [agent.id] }), userActor(userA));
+    rows = await toolRowsOf(companyId);
+    expect(rows.installs.map((install) => `${install.targetType}:${install.targetId}:${install.connectionId}`)).toEqual([`agent:${agent.id}:${aInstance.id}`]);
+    expect(rows.bindings.map((binding) => `${binding.targetType}:${binding.targetId}`)).toEqual([`agent:${agent.id}`]);
+    const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
+    expect(effective.installedConnections.map((connection) => connection.id)).toContain(aInstance.id);
+    expect(effective.allowedToolNames).toContain("calendar_list_events");
+    // An agent that was not chosen sees neither.
+    const notChosen = await service.getEffectiveProfilesForAgent(companyId, otherAgent.id);
+    expect(notChosen.installedConnections.map((connection) => connection.id)).not.toContain(aInstance.id);
+
+    // Re-finishing with a different choice moves the install; it does not leave a stale one behind.
+    await service.finishGalleryAppConnection(companyId, aInstance.id, finishInput({ agentIds: [otherAgent.id] }), userActor(userA));
+    rows = await toolRowsOf(companyId);
+    expect(rows.installs.map((install) => install.targetId)).toEqual([otherAgent.id]);
+
+    // The one-owner-per-agent rule still holds on this path: B cannot take an agent A's same-entry instance holds.
+    await expect(
+      service.finishGalleryAppConnection(companyId, bInstance.id, finishInput({ agentIds: [otherAgent.id] }), userActor(userB)),
+    ).rejects.toMatchObject({ status: 409, details: { code: "personal_instance_conflict" } });
+    expect((await toolRowsOf(companyId)).installs.map((install) => install.connectionId)).toEqual([aInstance.id]);
+  });
+
   // ---- updateConnection (seed immutable; personal instance pinned) --------------------------
 
   it("a seed is server-owned: every public mutation except archiving is a 409, and archiving preserves it byte for byte", async () => {
