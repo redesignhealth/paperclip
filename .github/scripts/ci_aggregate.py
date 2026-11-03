@@ -15,9 +15,9 @@ Generic provenance for .github/workflows/pr.yml (TRUSTED_CI):
   and stays UNTRUSTED. Wrong local, extra/missing jobs, ci-routing replacement outer,
   arbitrary SHA refs, other repos, other ref forms => UNTRUSTED_CI_DEFINITION.
 - The API run.referenced_workflows must contain EXACTLY one approved pair -- both entries
-  from the SAME repository, pr-trusted.yml and ci-routing.yml, at ref refs/heads/master
-  (or master) -- recording their SHAs for audit. A mixed pair, a missing entry or an extra
-  entry => fail closed.
+  from the SAME repository, pr-trusted.yml and ci-routing.yml, with path ref @master and
+  ref refs/heads/master -- recording their SHAs for audit. A mixed pair, a SHA-pinned path ref,
+  a missing entry or an extra entry => fail closed.
 
 Jobs evaluation:
 - For .github/workflows/pr.yml, all jobs must carry the `ci / ` prefix.
@@ -62,7 +62,8 @@ APPROVED_REFERENCED_PATH_SETS = (
     frozenset({UPSTREAM_PR_TRUSTED_PATH, UPSTREAM_CI_ROUTING_PATH}),
 )
 ALL_APPROVED_REFERENCED_PATHS = frozenset().union(*APPROVED_REFERENCED_PATH_SETS)
-APPROVED_REFERENCED_REFS = frozenset({"master", "refs/heads/master"})
+APPROVED_REFERENCED_PATH_REF = "master"
+APPROVED_REFERENCED_REFS = frozenset({"refs/heads/master"})
 
 PR_ANCHOR_JOBS = frozenset({
     "ci / gate / Select trusted runner",
@@ -163,7 +164,7 @@ def validate_storybook_definition(content: str) -> None:
 
 def validate_run_referenced_workflows(run: dict[str, Any]) -> tuple[bool, str | None, dict[str, str]]:
     """Validate that run.referenced_workflows contains EXACTLY one approved pair:
-    pr-trusted.yml and ci-routing.yml from the same repository at refs/heads/master (or master),
+    pr-trusted.yml and ci-routing.yml from the same repository at refs/heads/master with path ref @master,
     recording their SHAs for audit.
     """
     ref_wfs = run.get("referenced_workflows")
@@ -180,18 +181,19 @@ def validate_run_referenced_workflows(run: dict[str, Any]) -> tuple[bool, str | 
         raw_path = entry.get("path")
         if not isinstance(raw_path, str) or not raw_path:
             return False, "missing path in referenced_workflow", {}
-        if "@" in raw_path:
-            path_part, at_ref = raw_path.split("@", 1)
-        else:
-            path_part = raw_path
-            at_ref = None
+        if "@" not in raw_path:
+            return False, "missing ref suffix in referenced_workflow path", {}
 
-        ref_part = entry.get("ref") or at_ref
-        if path_part not in ALL_APPROVED_REFERENCED_PATHS:
-            return False, f"untrusted referenced workflow path '{path_part}'", {}
+        path_part, at_ref = raw_path.rsplit("@", 1)
+        if at_ref != APPROVED_REFERENCED_PATH_REF:
+            return False, f"untrusted referenced workflow path ref '{at_ref}'", {}
 
+        ref_part = entry.get("ref")
         if ref_part not in APPROVED_REFERENCED_REFS:
             return False, f"untrusted referenced workflow ref '{ref_part}'", {}
+
+        if path_part not in ALL_APPROVED_REFERENCED_PATHS:
+            return False, f"untrusted referenced workflow path '{path_part}'", {}
 
         sha_part = entry.get("sha")
         if not gate_lib.is_full_sha(sha_part):
