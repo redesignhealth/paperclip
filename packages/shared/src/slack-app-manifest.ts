@@ -184,11 +184,15 @@ export const slackConfigurationCredentialSchema = z.object({
   slackUserId: z.string(),
   status: z.enum(["active", "reauthorize"]),
   lastRotatedAt: z.string().datetime().nullable(),
+  /** Saved once by an instance administrator and used by every company's Slack setup. */
+  shared: z.boolean().optional(),
 });
 export type SlackConfigurationCredential = z.infer<typeof slackConfigurationCredentialSchema>;
 /** Save a refresh token once; it is rotated immediately so the stored one is unique. */
 export const slackConfigurationCredentialSaveSchema = z.object({
   credentials: z.object({ refreshToken: z.string().trim().regex(/^xoxe-/).max(4096) }).strict(),
+  /** Instance administrators only: save this token once for every company in this instance. */
+  shared: z.boolean().optional(),
 }).strict();
 export type SlackConfigurationCredentialSaveInput = z.infer<typeof slackConfigurationCredentialSaveSchema>;
 export const slackSetupOptionsSchema = z.object({

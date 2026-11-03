@@ -12,7 +12,7 @@ import { SlackConfigurationTokenSource, type SlackConfigurationTokenMode } from 
 
 /** Uses ordinary request-local state: configuration tokens never enter a query/mutation cache. */
 export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSaved, onBusy,
-  onManual, onManaged, onContinue, onSaveExit, slackSetupOptions, refetchSlackSetupOptions }: {
+  onManual, onManaged, onContinue, onSaveExit, slackSetupOptions, refetchSlackSetupOptions, canShareConfigurationToken = false }: {
   endpoint: ChatEndpoint;
   stage: "app" | "credentials";
   disabled: boolean;
@@ -25,10 +25,14 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
   onSaveExit: () => void;
   /** Passed down from SlackSetup so there is only one setup-options fetch. */
   slackSetupOptions?: { configurationCredentials?: SlackConfigurationCredential[] };
+  /** Instance administrators can save one token for every company in this instance. */
+  canShareConfigurationToken?: boolean;
   refetchSlackSetupOptions?: () => Promise<unknown>;
 }) {
   const [configurationToken, setConfigurationToken] = useState("");
   const [refreshToken, setRefreshToken] = useState("");
+  const [shareWithCompany, setShareWithCompany] = useState(false);
+  const canShare = canShareConfigurationToken;
   const [selectedCredentialId, setSelectedCredentialId] = useState<string | null>(null);
   // The panel switches immediately after a save, before the parent refetch
   // lands. This optimistic entry is valid only against the options snapshot it
@@ -128,7 +132,11 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
           const replacing = selectedCredential;
           // Save (and thereby rotate) the pasted token first; only the summary id travels on.
           savedCredentialUsed.current = true;
-          const saved = await chatEndpointsApi.saveSlackConfigurationCredential(endpoint.companyId, pastedRefresh);
+          // Replacing the instance-wide token keeps it instance-wide, so no company is left without one.
+          const saveShared = canShare && (shareWithCompany || replacing?.shared === true);
+          const saved = saveShared
+            ? await chatEndpointsApi.saveSlackConfigurationCredential(endpoint.companyId, pastedRefresh, true)
+            : await chatEndpointsApi.saveSlackConfigurationCredential(endpoint.companyId, pastedRefresh);
           pastedRefresh = "";
           setRefreshToken("");
           setJustSaved({ credential: saved, basis: slackSetupOptions });
@@ -217,6 +225,9 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
         onSelectCredential={setSelectedCredentialId}
         onModeChange={setModeChoice}
         onRefreshTokenChange={setRefreshToken}
+        canShare={canShare}
+        shareWithCompany={shareWithCompany}
+        onShareChange={setShareWithCompany}
         onConfigurationTokenChange={setConfigurationToken}
         onForget={id => void run(async () => {
           await chatEndpointsApi.forgetSlackConfigurationCredential(endpoint.companyId, id);

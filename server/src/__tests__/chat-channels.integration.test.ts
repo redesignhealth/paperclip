@@ -6,7 +6,7 @@ import type { Db } from "@paperclipai/db";
 import * as activityLogModule from "../services/activity-log.js";
 import * as connectionCredentialBindings from "../services/connection-credential-bindings.js";
 import * as connectionCredentials from "../services/connection-credentials.js";
-import { chatSlackConfigurationCredentials, chatSlackManagerGrants, chatSlackRegistrations, toolOauthStates } from "@paperclipai/db";
+import { chatSlackConfigurationCredentials, chatSlackManagerGrants, chatSlackRegistrations, instanceSlackConfigurationCredentials, toolOauthStates } from "@paperclipai/db";
 import type { PaperclipCloudConnector, SealedConnectorCredentials } from "../services/paperclip-cloud-connector.js";
 import { buildSlackAppManifest, SLACK_MANAGER_SCOPES } from "@paperclipai/shared";
 import { registerChatActionWork, dueChatAction } from "../services/chat-action-work.js";
@@ -73,7 +73,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
@@ -8244,6 +8244,148 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .then(() => null, error => error as { status: number; details?: { code?: string } });
         expect(outcome).toMatchObject({ status: 403, details: { code: "slack_configuration_credential_forbidden" } });
         expect(f.state.rotateCount).toBe(1);
+      });
+
+      describe("instance-wide credential", () => {
+        const admin = { userId: "admin-user", sessionId: null, bypassPermissionCheck: true };
+        const adminTwo = { userId: "admin-two", sessionId: null, bypassPermissionCheck: true };
+        const userB = { userId: "user-b", sessionId: null, bypassPermissionCheck: false };
+        const credentials = (f: Awaited<ReturnType<typeof fixture>>) => f.service.slackRegistration.configurationCredentials;
+        const failure = (work: Promise<unknown>) => work.then(() => null, error => error as { status: number; details?: { code?: string } });
+        const instanceRow = async () => (await db.select().from(instanceSlackConfigurationCredentials))[0]!;
+        async function allowUserB(companyId: string) {
+          await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userB.userId, status: "active", membershipRole: "operator" });
+          await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userB.userId, permissionKey: "tools:manage_connections", scope: null, grantedByUserId: actor.userId });
+        }
+        // The credential is instance-wide, so it outlives a fixture's company.
+        beforeEach(async () => { await db.delete(instanceSlackConfigurationCredentials); });
+        afterEach(async () => { await db.delete(instanceSlackConfigurationCredentials); });
+
+        it("refuses a save from a non-administrator before spending the pasted token", async () => {
+          const f = await fixture();
+          const outcome = await failure(credentials(f).save(f.companyId, actor, pasted, { shared: true }));
+          expect(outcome).toMatchObject({ status: 403, details: { code: "slack_configuration_shared_forbidden" } });
+          expect(f.state.rotateCount).toBe(0);
+          expect(await db.select().from(instanceSlackConfigurationCredentials)).toEqual([]);
+        });
+
+        it("stores the token pair encrypted and never in a company's secrets", async () => {
+          const f = await fixture();
+          const saved = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          expect(saved).toEqual({ id: expect.any(String), workspaceId: "TAUTO", slackUserId: f.installerId, status: "active", lastRotatedAt: expect.any(String), shared: true });
+          const row = await instanceRow();
+          expect(row).toMatchObject({ status: "active", savedByUserId: admin.userId, revision: 0, chainGeneration: 0 });
+          const stored = JSON.stringify(row);
+          for (const secret of ["xoxe.xoxp-access-1", "xoxe-1-refresh-1", pasted]) expect(stored).not.toContain(secret);
+          expect(row.accessMaterial).toMatchObject({ scheme: "local_encrypted_v1" });
+          expect(row.refreshMaterial).toMatchObject({ scheme: "local_encrypted_v1" });
+          expect(await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, f.companyId), eq(companySecrets.scope, "user")))).toEqual([]);
+          const activities = (await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)))
+            .filter(entry => entry.action.startsWith("chat_slack.configuration"));
+          expect(activities).toEqual([expect.objectContaining({ action: "chat_slack.configuration_credential_saved", entityId: saved.id, details: { workspaceId: "TAUTO", instance: true } })]);
+          expect(JSON.stringify(activities)).not.toContain("xoxe");
+        });
+
+        it("serves another company's member, rotating the one chain for everyone", async () => {
+          const first = await fixture();
+          const second = await fixture();
+          const saved = await credentials(first).save(first.companyId, admin, pasted, { shared: true });
+          // A second company's member, who holds no Slack token, sees and uses it.
+          await allowUserB(second.companyId);
+          expect(await credentials(first).list(second.companyId, userB)).toEqual([saved]);
+          expect(await credentials(first).accessToken(saved.id, second.companyId, userB)).toBe("xoxe.xoxp-access-1");
+          expect(first.state.rotateCount).toBe(1);
+
+          // Near expiry, the next company's request rotates the single stored chain.
+          await db.update(instanceSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(instanceSlackConfigurationCredentials.id, saved.id));
+          expect(await credentials(first).accessToken(saved.id, second.companyId, userB)).toBe("xoxe.xoxp-access-2");
+          expect(first.state.rotateCount).toBe(2);
+          // The first company then reuses the rotated chain rather than a stale copy.
+          expect(await credentials(first).accessToken(saved.id, first.companyId, admin)).toBe("xoxe.xoxp-access-2");
+          expect(first.state.rotateCount).toBe(2);
+          // The rotation is recorded in the company whose request caused it.
+          const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, second.companyId));
+          expect(activities).toEqual(expect.arrayContaining([expect.objectContaining({ action: "chat_slack.configuration_token_rotated", details: expect.objectContaining({ instance: true }) })]));
+        });
+
+        it("rotates once when companies ask at the same time", async () => {
+          const first = await fixture();
+          const second = await fixture();
+          const saved = await credentials(first).save(first.companyId, admin, pasted, { shared: true });
+          await allowUserB(second.companyId);
+          await db.update(instanceSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(instanceSlackConfigurationCredentials.id, saved.id));
+          const tokens = await Promise.all([
+            credentials(first).accessToken(saved.id, first.companyId, admin),
+            credentials(first).accessToken(saved.id, second.companyId, userB),
+          ]);
+          expect(tokens).toEqual(["xoxe.xoxp-access-2", "xoxe.xoxp-access-2"]);
+          expect(first.state.rotateCount).toBe(2);
+        });
+
+        it("lets a company member create a Slack app with the shared credential and no token of their own", async () => {
+          const f = await fixture();
+          const saved = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          f.provider.mockClear();
+          await f.service.slackRegistration.create(f.endpoint.id, actor, { requestId: randomUUID(), credentials: { configurationCredentialId: saved.id } });
+          for (const suffix of ["apps.manifest.validate", "apps.manifest.create", "apps.manifest.update", "apps.icon.set"]) {
+            const calls = callsTo(f, suffix);
+            expect(calls, `${suffix} must be called once`).toHaveLength(1);
+            expect(bearer(calls[0]![1]), `${suffix} must use the shared access token`).toBe("Bearer xoxe.xoxp-access-1");
+          }
+          expect(await f.service.slackRegistration.registration(f.endpoint.id)).toMatchObject({ status: "install", errorCode: null });
+        });
+
+        it("still requires the company permission to use the shared credential", async () => {
+          const f = await fixture();
+          const saved = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          expect(await failure(credentials(f).accessToken(saved.id, f.companyId, userB))).toMatchObject({ status: 403 });
+          expect(await failure(credentials(f).list(f.companyId, userB))).toMatchObject({ status: 403 });
+          expect(f.state.rotateCount).toBe(1);
+        });
+
+        it("lets only an instance administrator forget it", async () => {
+          const f = await fixture();
+          const saved = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          await allowUserB(f.companyId);
+          expect(await failure(credentials(f).forget(saved.id, f.companyId, userB))).toMatchObject({ status: 403, details: { code: "slack_configuration_shared_forbidden" } });
+          expect(await instanceRow()).toMatchObject({ status: "active" });
+
+          await credentials(f).forget(saved.id, f.companyId, admin);
+          expect(await instanceRow()).toMatchObject({ status: "revoked", accessMaterial: null, refreshMaterial: null, revision: 1, chainGeneration: 1 });
+          expect(await credentials(f).list(f.companyId, userB)).toEqual([]);
+          expect(await failure(credentials(f).accessToken(saved.id, f.companyId, userB))).not.toBeNull();
+        });
+
+        it("replaces the chain in place when an administrator saves again", async () => {
+          const f = await fixture();
+          const first = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          f.state.validRefreshTokens.add("xoxe-1-admin-two");
+          const second = await credentials(f).save(f.companyId, adminTwo, "xoxe-1-admin-two", { shared: true });
+          expect(second.id).toBe(first.id);
+          expect(await db.select().from(instanceSlackConfigurationCredentials)).toHaveLength(1);
+          expect(await instanceRow()).toMatchObject({ status: "active", savedByUserId: adminTwo.userId, revision: 1, chainGeneration: 1 });
+        });
+
+        it("saves again over a forgotten credential", async () => {
+          const f = await fixture();
+          const first = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          await credentials(f).forget(first.id, f.companyId, admin);
+          f.state.validRefreshTokens.add("xoxe-1-after-forget");
+          const again = await credentials(f).save(f.companyId, admin, "xoxe-1-after-forget", { shared: true });
+          expect(again).toMatchObject({ id: first.id, status: "active" });
+          expect(await credentials(f).list(f.companyId, actor)).toEqual([again]);
+        });
+
+        it("marks the credential for a new token when Slack rejects the stored chain", async () => {
+          const f = await fixture();
+          const saved = await credentials(f).save(f.companyId, admin, pasted, { shared: true });
+          await db.update(instanceSlackConfigurationCredentials).set({ accessExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(instanceSlackConfigurationCredentials.id, saved.id));
+          f.state.validRefreshTokens.clear();
+          const outcome = await failure(credentials(f).accessToken(saved.id, f.companyId, actor));
+          expect(outcome).toMatchObject({ details: { code: "slack_configuration_refresh_invalid" } });
+          expect(await instanceRow()).toMatchObject({ status: "reauthorize" });
+          expect(await credentials(f).list(f.companyId, actor)).toEqual([expect.objectContaining({ id: saved.id, status: "reauthorize", shared: true })]);
+        });
       });
 
       it("rejects a rotation that returns a different workspace or Slack user", async () => {

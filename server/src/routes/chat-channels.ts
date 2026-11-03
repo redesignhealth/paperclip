@@ -202,7 +202,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     await assertConnectionManager(req, companyId);
     res.set("Cache-Control", "no-store");
     // Errors carry a safe `code`; the refresh token and provider echo never do.
-    res.json(await service.slackRegistration.configurationCredentials.save(companyId, slackActor(req), req.body.credentials.refreshToken));
+    res.json(await service.slackRegistration.configurationCredentials.save(companyId, slackActor(req), req.body.credentials.refreshToken, { shared: req.body.shared }));
   });
   router.delete("/companies/:companyId/chat-slack/configuration-credentials/:credentialId", async (req, res) => {
     const companyId = req.params.companyId as string;

@@ -201,12 +201,12 @@ describe("saved Slack configuration credentials", () => {
   afterEach(() => { flushSync(() => root.unmount()); container.remove(); vi.restoreAllMocks(); });
 
   const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
-  type Credential = typeof activeCredential | (Omit<typeof activeCredential, "status"> & { status: "reauthorize" });
-  function render(props: { slackSetupOptions?: { configurationCredentials?: Credential[] }; credentials?: Credential[] } = {}) {
+  type Credential = (typeof activeCredential | (Omit<typeof activeCredential, "status"> & { status: "reauthorize" })) & { shared?: boolean };
+  function render(props: { slackSetupOptions?: { configurationCredentials?: Credential[] }; credentials?: Credential[]; canShare?: boolean } = {}) {
     flushSync(() => root.render(<SlackAutomaticSetup endpoint={endpoint} stage="app" disabled={false} saveDetails={saveDetails}
       onSaved={onSaved} onContinue={onContinue} onManual={onManual} onBusy={onBusy} onSaveExit={() => {}}
       slackSetupOptions={props.slackSetupOptions ?? { configurationCredentials: props.credentials ?? [] }}
-      refetchSlackSetupOptions={refetchSlackSetupOptions} />));
+      refetchSlackSetupOptions={refetchSlackSetupOptions} canShareConfigurationToken={props.canShare} />));
   }
   /** Make the next refetch deliver a new authoritative snapshot, as react-query does. */
   function refetchReturns(credentials: Credential[]) {
@@ -251,6 +251,66 @@ describe("saved Slack configuration credentials", () => {
     expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: activeCredential.id } }));
     expect(api.saveSlackConfigurationCredential).not.toHaveBeenCalled();
     expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  describe("saved for every company", () => {
+    const shared = { ...activeCredential, id: "credential-shared", shared: true };
+
+    it("uses the instance-wide credential without any paste and hides forget from non-administrators", async () => {
+      render({ credentials: [shared] });
+      expect(container.textContent).toContain("Using the Slack configuration token your administrator saved for every company");
+      expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+      expect(findButton("Forget saved token")).toBeUndefined();
+      expect(createButton().disabled).toBe(false);
+      flushSync(() => createButton().click());
+      await settle();
+      expect(api.createSlackApp).toHaveBeenCalledWith(endpoint.id, expect.objectContaining({ credentials: { configurationCredentialId: shared.id } }));
+      expect(api.saveSlackConfigurationCredential).not.toHaveBeenCalled();
+    });
+
+    it("lets an instance administrator forget a shared credential", async () => {
+      render({ credentials: [shared], canShare: true });
+      flushSync(() => button("Forget saved token").click());
+      await settle();
+      expect(api.forgetSlackConfigurationCredential).toHaveBeenCalledWith(companyId, shared.id);
+    });
+
+    it("sends non-administrators to an administrator when the shared token needs replacing", () => {
+      render({ credentials: [{ ...shared, status: "reauthorize" }] });
+      expect(container.textContent).toContain("Ask an instance administrator to save a new one");
+      expect(container.querySelector("#slack-configuration-refresh-token")).toBeNull();
+      expect(createButton().disabled).toBe(true);
+    });
+
+    it("offers sharing only to instance administrators", () => {
+      render({ credentials: [] });
+      flushSync(() => button("Save refresh token instead").click());
+      expect(container.textContent).not.toContain("Save for every company in this instance");
+      render({ credentials: [], canShare: true });
+      expect(container.textContent).toContain("Save for every company in this instance");
+    });
+
+    it("saves the refresh token as shared when the administrator chooses to share it", async () => {
+      refetchReturns([{ ...activeCredential, shared: true }]);
+      api.saveSlackConfigurationCredential.mockResolvedValue({ ...activeCredential, shared: true });
+      render({ credentials: [], canShare: true });
+      flushSync(() => button("Save refresh token instead").click());
+      flushSync(() => container.querySelector<HTMLButtonElement>('[role="checkbox"]')!.click());
+      enter("xoxe-1-pasted-refresh");
+      flushSync(() => createButton().click());
+      await settle();
+      expect(api.saveSlackConfigurationCredential).toHaveBeenCalledWith(companyId, "xoxe-1-pasted-refresh", true);
+    });
+
+    it("keeps a replaced shared token shared", async () => {
+      refetchReturns([{ ...shared, status: "active" }]);
+      api.saveSlackConfigurationCredential.mockResolvedValue(shared);
+      render({ credentials: [{ ...shared, status: "reauthorize" }], canShare: true });
+      enter("xoxe-1-replacement");
+      flushSync(() => createButton().click());
+      await settle();
+      expect(api.saveSlackConfigurationCredential).toHaveBeenCalledWith(companyId, "xoxe-1-replacement", true);
+    });
   });
 
   it("lets the user choose among several saved workspaces", async () => {
