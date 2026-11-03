@@ -1,5 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 import { mockOnboardingLocalAiConnection } from "./helpers/onboarding-ai-connection";
+import { CLAUDE_SOURCE, returnToSourceRow } from "./helpers/onboarding-source";
 import {
   expectLandsOnFirstTaskWithoutDashboardBounce,
   instrumentNavLog,
@@ -90,9 +91,8 @@ async function runOnboardingWizard(page: Page, companyName: string) {
   // — the row is a question, not a confirmation — so the CTA is disabled until
   // a tile is pressed. By role rather than by label: which adapters the tiles
   // offer depends on the registry this environment reports.
-  const source = page.getByRole("radio").first();
-  await source.waitFor({ timeout: 30_000 });
-  await source.click();
+  await returnToSourceRow(page);
+  await page.getByRole("radio", { name: CLAUDE_SOURCE }).click();
 
   // "Connect", not "Next": this step's button starts the sign-in where there
   // is one to start, so it is named for what it does. This test simulates

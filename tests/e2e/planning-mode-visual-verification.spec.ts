@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { mockOnboardingLocalAiConnection } from "./helpers/onboarding-ai-connection";
+import { CLAUDE_SOURCE, returnToSourceRow } from "./helpers/onboarding-source";
 import {
   expectLandsOnFirstTaskWithoutDashboardBounce,
   instrumentNavLog,
@@ -94,9 +95,8 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   //
   // Waited on for enabled rather than visible: it is already on screen, and
   // clicking a disabled button raises nothing and does nothing.
-  const source = page.getByRole("radio").first();
-  await source.waitFor({ timeout: 30_000 });
-  await source.click();
+  await returnToSourceRow(page);
+  await page.getByRole("radio", { name: CLAUDE_SOURCE }).click();
   const connectNext = page.getByRole("button", { name: /^Connect$/ });
   await expect(connectNext).toBeEnabled({ timeout: 30_000 });
   await connectNext.click();

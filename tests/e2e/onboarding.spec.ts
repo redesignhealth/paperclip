@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { mockOnboardingLocalAiConnection } from "./helpers/onboarding-ai-connection";
+import { CLAUDE_SOURCE, returnToSourceRow } from "./helpers/onboarding-source";
 
 /**
  * E2E: Onboarding wizard flow (NUX Phase 2 expanded wizard).
@@ -121,8 +122,9 @@ test.describe("Onboarding wizard", () => {
     await page.getByRole("button", { name: "Next", exact: true }).click();
     const firstSetup = await (await firstSetupResponse).json();
     expect(firstSetup).toMatchObject({ name: "Ada", pauseReason: "setup", metadata: { setupAdapterPending: true } });
-    await expect(page.getByRole("radio").first()).toBeVisible();
-    await expect(page.locator('[role="radio"][aria-checked="true"]')).toHaveCount(0);
+    // Hermes answers the row on arrival; it is the only source selected.
+    await expect(page.getByRole("radio", { name: /^Hermes/ })).toBeChecked({ timeout: 30_000 });
+    await expect(page.locator('[role="radio"][aria-checked="true"]')).toHaveCount(1);
 
     // The roster path saves on Choose adapter, then configures that same row.
     await page.goto(`/${company.issuePrefix}/agents/all`);
@@ -309,8 +311,8 @@ test.describe("Onboarding wizard", () => {
 
     // Step 4 (Connect a model). By role rather than by label, because which
     // adapters the row offers depends on the registry this environment reports.
-    const source = page.getByRole("radio").first();
-    await source.waitFor({ timeout: 30_000 });
+    await returnToSourceRow(page);
+    const source = page.getByRole("radio", { name: CLAUDE_SOURCE });
 
     // Nothing before the row is answered: the card is the answer to the tile,
     // and the button has nothing to do until there is a source to do it with.
@@ -529,8 +531,8 @@ test.describe("Onboarding wizard", () => {
     await page.locator("#onboarding-agent-name").fill("Ada");
     await page.getByRole("button", { name: "Next" }).click();
 
-    const source = page.getByRole("radio").first();
-    await source.waitFor({ timeout: 30_000 });
+    await returnToSourceRow(page);
+    const source = page.getByRole("radio", { name: CLAUDE_SOURCE });
 
     // Answering the row is what starts the sign-in now — there is no separate
     // Connect press between choosing a source and being signed in.
@@ -663,8 +665,8 @@ test.describe("Onboarding wizard", () => {
     await page.locator("#onboarding-agent-name").fill("Ada");
     await page.getByRole("button", { name: "Next" }).click();
 
-    const source = page.getByRole("radio").first();
-    await source.waitFor({ timeout: 30_000 });
+    await returnToSourceRow(page);
+    const source = page.getByRole("radio", { name: CLAUDE_SOURCE });
     await source.click();
 
     const connect = page.getByRole("button", { name: "Connect", exact: true });
