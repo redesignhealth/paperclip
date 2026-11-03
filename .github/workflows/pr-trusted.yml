@@ -184,6 +184,11 @@ jobs:
           node ./scripts/check-docker-deps-stage.mjs
           node "$CI_NODE_TEST" ./scripts/docker-deps-postinstall.test.mjs
 
+      - name: Validate Hermes requirements closure offline
+        # Fork-specific (not present upstream). Preserved across upstream syncs because
+        # server/src/__tests__/docker-hermes-cli.test.ts enforces this step's presence.
+        run: python3 scripts/compile-hermes-requirements.py --check
+
       - name: Validate Node version policy
         run: pnpm check:node-version
 

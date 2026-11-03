@@ -12,7 +12,8 @@
       "upstream_sha256": "6a14f4a8e478f7152578723a8f45d42ab147e828a226b7b617440316fce585bf",
       "fork_edits": [
         "jobs.gate.uses -> redesignhealth/paperclip/.github/workflows/ci-routing.yml@master",
-        "jobs.test_selection.if -> require vars.CI_VITEST_SELECTION == 'enabled' (deliberately off on the fork)"
+        "jobs.test_selection.if -> require vars.CI_VITEST_SELECTION == 'enabled' (deliberately off on the fork)",
+        "jobs.policy.steps -> re-add Validate Hermes requirements closure offline (fork-specific check required by server/src/__tests__/docker-hermes-cli.test.ts)"
       ]
     }
   }
