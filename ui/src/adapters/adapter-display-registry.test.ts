@@ -46,6 +46,10 @@ describe("adapter display registry", () => {
     });
   });
 
+  it("recommends Hermes alongside Claude Code and Codex for onboarding", () => {
+    expect(getAdapterDisplay("hermes_local").recommended).toBe(true);
+  });
+
   it("drops local suffixes for unknown plugin adapter labels", () => {
     expect(getAdapterLabel("droid_local")).toBe("Droid");
     expect(getAdapterDisplay("droid_local")).toMatchObject({
