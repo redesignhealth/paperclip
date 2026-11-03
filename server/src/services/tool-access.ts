@@ -37,7 +37,8 @@ import {
   ARCANA_STATIC_TEMPLATE_UID,
   DEFAULT_MCP_TEMPLATE_CONFIG_KEY,
   agentMayUseConnectionTool,
-  agentReadCeilingForConnection,
+  initialActiveToolsForPersonalInstance,
+  installsOnExistingAgentsOnConnect,
   assertPersonalDefaultMcpTemplateUpdateValid,
   installAppliesToAgent,
   isDefaultMcpSeed,
@@ -15088,6 +15089,58 @@ export function toolAccessService(
     return results;
   }
 
+  /**
+   * First consent to a personal instance whose spec entry asks for it (RH Google MCP): install it on every live agent
+   * the owner's company already has, one agent at a time through the owner-only install path, so the one-owner-per-agent
+   * rule still applies. An agent that cannot take it (another owner's same-entry instance, say) is skipped and recorded;
+   * a failure here never fails the OAuth callback, and the audit event says what was and was not installed.
+   */
+  async function installPersonalInstanceOnExistingAgents(
+    connection: Pick<typeof toolConnections.$inferSelect, "id" | "companyId">,
+    ownerUserId: string,
+  ) {
+    const actor = { actorType: "user" as const, actorId: ownerUserId };
+    const liveAgents = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.companyId, connection.companyId), ne(agents.status, "terminated")));
+    const current = (await db
+      .select({ targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
+      .from(toolConnectionInstalls)
+      .where(and(eq(toolConnectionInstalls.companyId, connection.companyId), eq(toolConnectionInstalls.connectionId, connection.id))))
+      .map((install) => ({ targetType: install.targetType as "company" | "agent", targetId: install.targetId }));
+    const installed: string[] = [];
+    const skipped: Array<{ agentId: string; reason: string }> = [];
+    for (const agent of liveAgents) {
+      if (current.some((install) => install.targetType === "agent" && install.targetId === agent.id)) continue;
+      try {
+        await service.putConnectionInstalls(
+          connection.id,
+          { installs: [...current, { targetType: "agent", targetId: agent.id }] },
+          actor,
+        );
+        current.push({ targetType: "agent", targetId: agent.id });
+        installed.push(agent.id);
+      } catch (error) {
+        const code = (error as { details?: { code?: string } })?.details?.code;
+        skipped.push({ agentId: agent.id, reason: code ?? (error instanceof Error ? error.message : "install failed") });
+      }
+    }
+    await db.insert(toolAccessAuditEvents).values({
+      companyId: connection.companyId,
+      connectionId: connection.id,
+      actorType: "user",
+      actorId: ownerUserId,
+      action: "personal_instance.install_on_existing_agents",
+      outcome: skipped.length === 0 ? "success" : "partial",
+      reasonCode: skipped.length === 0 ? "installed_on_existing_agents" : "installed_on_some_agents",
+      details: { installedAgentIds: installed, skipped },
+    });
+    if (skipped.length > 0) {
+      logger.warn({ connectionId: connection.id, skipped }, "personal instance could not be installed on some existing agents");
+    }
+  }
+
   async function finishGalleryAppConnection(
     companyId: string,
     connectionId: string,
@@ -18084,10 +18137,11 @@ export function toolAccessService(
       // S5 + S6: Derive initial active tool IDs for brand-new personal profile without writing outside TX
       let activateOnNewProfileIds: string[] = [];
       if (isPersonalInstance) {
-        const ceiling = agentReadCeilingForConnection(connection);
-        if (ceiling && ceiling.size > 0) {
+        // RH MCP: its read ceiling. RH Google MCP: its reviewed read-only starting set. Nothing else is switched on.
+        const initiallyActive = initialActiveToolsForPersonalInstance(connection);
+        if (initiallyActive && initiallyActive.size > 0) {
           activateOnNewProfileIds = refresh.catalog
-            .filter((entry) => ceiling.has(entry.toolName))
+            .filter((entry) => initiallyActive.has(entry.toolName))
             .map((entry) => entry.id);
         }
       }
@@ -18128,6 +18182,9 @@ export function toolAccessService(
         for (const entry of refresh.catalog) {
           const row = rowById.get(entry.id);
           if (row) currentCatalog.push(toCatalogEntryForConnection(row, connection));
+        }
+        if (isPersonalInstance && !profileExisted && stateRow.subjectUserId && installsOnExistingAgentsOnConnect(connection)) {
+          await installPersonalInstanceOnExistingAgents(connection, stateRow.subjectUserId);
         }
       }
       return {
