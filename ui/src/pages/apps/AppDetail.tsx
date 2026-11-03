@@ -35,7 +35,7 @@ import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { accessApi } from "@/api/access";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
-import { installStateFrom, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
+import { installStateFrom, isPersonalDefaultMcpInstance, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
 import { Button } from "@/components/ui/button";
@@ -742,6 +742,9 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                 appName={baseAppName}
                 agents={agents}
                 access={access}
+                anyAgentUnavailableReason={isPersonalDefaultMcpInstance(connection.config)
+                  ? "This connection runs as one person's own sign-in, so it can't be shared with every agent."
+                  : undefined}
                 install={connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? installStateFrom([]) : install}
                 readOnly={readOnly}
                 canChange={canChange}
