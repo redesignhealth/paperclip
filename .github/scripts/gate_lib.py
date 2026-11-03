@@ -45,6 +45,11 @@ WORKFLOW_PATH_RE = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
 _PR_RE = re.compile(r"[1-9][0-9]{0,8}")
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _SAFE_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+# Job names legitimately carry spaces, slashes, parentheses and shard separators
+# ("ci / General tests (server (3/12))"). Keep the charset free of backticks, angle
+# brackets, newlines and link syntax so a PR-controlled name cannot alter the Markdown
+# of a check-run summary.
+_SAFE_JOB_NAME_RE = re.compile(r"[A-Za-z0-9 _.()/-]{1,120}")
 
 
 class GateError(Exception):
@@ -79,6 +84,13 @@ def require_full_sha(value: Any) -> str:
 def safe_token(value: Any, fallback: str = "(unrecognized)") -> str:
     """Emit a possibly PR-controlled name only if it is a short plain identifier."""
     if isinstance(value, str) and _SAFE_TOKEN_RE.fullmatch(value):
+        return value
+    return fallback
+
+
+def safe_job_name(value: Any, fallback: str = "(unrecognized)") -> str:
+    """Emit a possibly PR-controlled job name only if it is a short, plain, Markdown-inert label."""
+    if isinstance(value, str) and _SAFE_JOB_NAME_RE.fullmatch(value):
         return value
     return fallback
 
