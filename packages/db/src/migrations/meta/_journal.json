@@ -2668,6 +2668,13 @@
       "when": 1793235810488,
       "tag": "0382_upstream_sync_worker_state",
       "breakpoints": true
+    },
+    {
+      "idx": 383,
+      "version": "7",
+      "when": 1793717411351,
+      "tag": "0383_instance_slack_configuration_credentials",
+      "breakpoints": true
     }
   ]
 }

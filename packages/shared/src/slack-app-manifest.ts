@@ -133,6 +133,7 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_configuration_refresh_busy: "Paperclip is already refreshing this Slack configuration token. Try again in a moment.",
     slack_configuration_credential_mismatch: "Slack returned a token for a different workspace or account. Save the refresh token again from the intended workspace.",
     slack_configuration_credential_forbidden: "This saved Slack token belongs to another Paperclip account. Use your own token.",
+    slack_configuration_shared_forbidden: "Only an instance administrator can save or forget the Slack token shared by every company.",
     slack_manifest_invalid: "Slack rejected this app configuration. Check the app details or use manual setup.",
     slack_manifest_update_pending: "Your Slack app is saved, but its event settings still need to be applied. Enter an app configuration access token to retry configuring the same app.",
     slack_permissions_update_pending: "This agent's Slack permissions changed. Update the Slack app and re-authorize it to apply them. Until then the agent keeps its current permissions.",
@@ -184,11 +185,15 @@ export const slackConfigurationCredentialSchema = z.object({
   slackUserId: z.string(),
   status: z.enum(["active", "reauthorize"]),
   lastRotatedAt: z.string().datetime().nullable(),
+  /** Saved once by an instance administrator and used by every company's Slack setup. */
+  shared: z.boolean().optional(),
 });
 export type SlackConfigurationCredential = z.infer<typeof slackConfigurationCredentialSchema>;
 /** Save a refresh token once; it is rotated immediately so the stored one is unique. */
 export const slackConfigurationCredentialSaveSchema = z.object({
   credentials: z.object({ refreshToken: z.string().trim().regex(/^xoxe-/).max(4096) }).strict(),
+  /** Instance administrators only: save this token once for every company in this instance. */
+  shared: z.boolean().optional(),
 }).strict();
 export type SlackConfigurationCredentialSaveInput = z.infer<typeof slackConfigurationCredentialSaveSchema>;
 export const slackSetupOptionsSchema = z.object({
