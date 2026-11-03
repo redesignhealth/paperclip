@@ -33,8 +33,15 @@ network request or agent wake. Its server marker and deterministic UID are imple
 identifiers; the displayed application/connection name is not a canonical identity. The seed is
 immutable except for archive (`409 managed_seed_immutable`); its operation is idempotent under a
 company/entry advisory lock, and an archived seed is an organization opt-out that is not recreated.
-After the consenting owner creates a personal Google instance, that instance's newly discovered
-catalog entries remain quarantined until the owner reviews them.
+After the consenting owner first connects a personal Google instance, the tools named in
+`RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS` (`default-mcp-spec.ts`) are switched on and every other discovered
+catalog entry remains quarantined until the owner reviews it. That list is hand-built from tool names that only
+read; the Google server's own read-only flag is not used, because it marks tools that change data (for example
+`manage_drive_access`, `modify_sheet_values`, `run_script_function`) as read-only. The instance is also installed,
+through the owner-only per-agent install path, on the live agents that owner created (not terminated, not awaiting
+approval). Agents other people created and agents created later start with it off, and a reconnect changes
+neither the tool choices nor the installs. The result is recorded in a
+`personal_instance.install_on_existing_agents` audit event.
 
 RH MCP uses the same protected seed and personal-connect lifecycle, but its new personal instance
 auto-approves only the read tools listed below (see the current ceiling list for the exact count);

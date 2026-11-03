@@ -74,6 +74,18 @@ export interface DefaultMcpEntrySpec {
    * removes permissions (it never adds a tool to a profile) and never applies to user sessions.
    */
   readCeiling?: readonly string[];
+  /**
+   * Optional raw upstream tool names switched ON when the owner first consents (a brand-new personal profile), in
+   * addition to any `readCeiling` names. Unlike `readCeiling` this is only a starting point: it never limits what an
+   * agent may be granted later, and the owner can turn any of them off. Names must be tools that only read; do not
+   * trust a server's own read-only flag to build this list.
+   */
+  initialActiveTools?: readonly string[];
+  /**
+   * When true, a brand-new personal instance is installed on the agents the owner created (still live) as soon as
+   * the owner consents. Agents other people created, and agents created later, start with the entry off.
+   */
+  installOnExistingAgentsOnConnect?: boolean;
   /** Optional OAuth discovery-only seed configuration (TECH-7340). */
   oauthSeed?: {
     urlEnv: string;
@@ -227,6 +239,90 @@ export function connectionHealthColumns<S extends string>(
   return { healthStatus: status, healthMessage: message, lastError: status === "ok" ? null : message };
 }
 
+/**
+ * RH Google MCP tools switched on at first consent. Every name only reads. The server's own `isReadOnly` flag is NOT
+ * used: it marks 95 of 121 tools read-only, including ones that change data (`manage_drive_access`,
+ * `modify_gmail_message_labels`, `modify_sheet_values`, `manage_event`, `run_script_function`, `export_doc_to_pdf`,
+ * `draft_gmail_message`). Anything not listed here stays quarantined until the owner reviews it.
+ */
+export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.freeze([
+  // Calendar
+  "get_events",
+  "list_calendars",
+  "query_freebusy",
+  "list_pending_invitations",
+  // Gmail
+  "search_gmail_messages",
+  "get_gmail_message_content",
+  "get_gmail_messages_content_batch",
+  "get_gmail_thread_content",
+  "get_gmail_threads_content_batch",
+  "get_gmail_attachment_content",
+  "list_gmail_labels",
+  "list_gmail_filters",
+  // Drive
+  "search_drive_files",
+  "list_drive_items",
+  "svc_list_drive_folder",
+  "get_drive_file_content",
+  "get_drive_file_download_url",
+  "get_drive_file_permissions",
+  "check_drive_file_public_access",
+  // Docs
+  "get_doc_content",
+  "get_doc_as_markdown",
+  "svc_get_doc_markdown",
+  "search_docs",
+  "list_docs_in_folder",
+  "inspect_doc_structure",
+  "list_document_comments",
+  // Sheets
+  "read_sheet_values",
+  "svc_read_sheet_values",
+  "get_spreadsheet_info",
+  "list_spreadsheets",
+  "list_spreadsheet_comments",
+  // Slides
+  "get_presentation",
+  "get_page",
+  "get_page_thumbnail",
+  "search_presentations",
+  "list_presentation_comments",
+  // Forms
+  "get_form",
+  "get_form_response",
+  "list_form_responses",
+  // Tasks
+  "get_task",
+  "get_task_list",
+  "list_tasks",
+  "list_task_lists",
+  // Contacts and directory
+  "get_contact",
+  "get_contact_group",
+  "list_contacts",
+  "list_contact_groups",
+  "search_contacts",
+  "get_person",
+  "search_directory",
+  // Chat
+  "get_messages",
+  "list_spaces",
+  "search_messages",
+  // Search
+  "search_custom",
+  "get_search_engine_info",
+  // Apps Script (listing only)
+  "get_script_content",
+  "get_script_metrics",
+  "get_script_project",
+  "list_deployments",
+  "list_script_processes",
+  "list_script_projects",
+  "list_versions",
+  "get_version",
+]);
+
 export const DEFAULT_MCP_SPEC_ENABLED_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 
 export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
@@ -295,6 +391,8 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     connectionName: "rh-google-mcp",
     authKind: "oauth",
     defaultEnabled: false,
+    initialActiveTools: RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS,
+    installOnExistingAgentsOnConnect: true,
     oauthSeed: {
       urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL",
     },
@@ -365,6 +463,40 @@ export function isValidDefaultMcpTemplate(
     config.identityModel === requirements.identityModel &&
     config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
   );
+}
+
+function personalInstanceEntry(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[],
+): DefaultMcpEntrySpec | null {
+  if (!isPersonalDefaultMcpInstance(connection, spec)) return null;
+  const config =
+    connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+      ? (connection.config as Record<string, unknown>)
+      : {};
+  return spec.find((entry) => entry.key === config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY]) ?? null;
+}
+
+/**
+ * The raw tool names switched on when the owner first consents to a personal instance: the entry's read ceiling
+ * (RH MCP) plus its `initialActiveTools` (RH Google MCP). Null for anything that is not such an instance.
+ */
+export function initialActiveToolsForPersonalInstance(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): ReadonlySet<string> | null {
+  const entry = personalInstanceEntry(connection, spec);
+  if (!entry) return null;
+  const names = [...(entry.readCeiling ?? []), ...(entry.initialActiveTools ?? [])];
+  return names.length > 0 ? new Set(names) : null;
+}
+
+/** True when a brand-new personal instance of this entry should be installed on the agents its owner already created. */
+export function installsOnExistingAgentsOnConnect(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  return personalInstanceEntry(connection, spec)?.installOnExistingAgentsOnConnect === true;
 }
 
 /**

@@ -4251,6 +4251,62 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(await db.select().from(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.companyId, company.id), eq(toolConnectionInstalls.targetType, "company")))).toHaveLength(0);
     });
 
+    it("a brand-new Google instance consent switches on only the reviewed read-only tools, installs only the owner's own live agents, and leaves everything else quarantined", async () => {
+      // The server's own readOnlyHint is wrong for several of these: the mislabelled ones (flagged read-only) change data.
+      const REVIEWED_READS = ["get_events", "list_calendars", "search_gmail_messages", "read_sheet_values"];
+      const MISLABELLED_AS_READ = ["manage_drive_access", "modify_sheet_values", "manage_event", "run_script_function", "modify_gmail_message_labels"];
+      const WRITES = ["send_gmail_message", "create_doc"];
+      const tools = [
+        ...REVIEWED_READS.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),
+        ...MISLABELLED_AS_READ.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),
+        ...WRITES.map((name) => ({ name, description: name, annotations: { readOnlyHint: false } })),
+      ];
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const bob = await addHumanMember(company.id);
+      const mkAgent = async (name: string, status: string, createdByUserId: string | null) => (await db.insert(agents).values({
+        companyId: company.id, name, role: "engineer", status, adapterType: "process", adapterConfig: {}, runtimeConfig: {}, createdByUserId,
+      }).returning())[0]!;
+      const live1 = await mkAgent("Alice live one", "active", alice);
+      const live2 = await mkAgent("Alice live two", "idle", alice);
+      await mkAgent("Alice retired", "terminated", alice);
+      await mkAgent("Alice awaiting approval", "pending_approval", alice);
+      await mkAgent("Bob's agent", "active", bob);
+      await mkAgent("Nobody's agent", "active", null);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      expect(start.status).toBe(200);
+      const instanceId = start.body.connectionId as string;
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      const byName = new Map((await catalogOf(instanceId)).map((entry) => [entry.toolName, entry]));
+      for (const name of REVIEWED_READS) expect(byName.get(name)!.status).toBe("active");
+      // Mislabelled-as-read and real writes both stay quarantined until the owner reviews them.
+      for (const name of [...MISLABELLED_AS_READ, ...WRITES]) {
+        expect(byName.get(name)!.status).toBe("quarantined");
+        expect(byName.get(name)!.reviewedAt).toBeNull();
+      }
+      const profile = (await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`))))[0]!;
+      const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
+      expect(entries).toHaveLength(REVIEWED_READS.length);
+
+      // Only the owner's own live agents are installed (not terminated, not awaiting approval, not Bob's, not an agent
+      // with no recorded creator), per agent, and never company-wide.
+      const installs = await installsOf(instanceId);
+      expect(installs.map((install) => `${install.targetType}:${install.targetId}`).sort())
+        .toEqual([`agent:${live1.id}`, `agent:${live2.id}`].sort());
+      const audit = await db.select().from(toolAccessAuditEvents).where(and(
+        eq(toolAccessAuditEvents.connectionId, instanceId),
+        eq(toolAccessAuditEvents.action, "personal_instance.install_on_existing_agents"),
+      ));
+      expect(audit).toHaveLength(1);
+      expect(audit[0]!.outcome).toBe("success");
+    });
+
     it("a brand-new RH instance consent activates exactly the five Granola read tools; everything beyond the ceiling stays quarantined", async () => {
       const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_ALL_TOOLS });
       const company = await createCompany(db);
@@ -4397,13 +4453,15 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const seed = (await googleSeed(company.id))!;
       const alice = await addHumanMember(company.id);
       const bob = await addHumanMember(company.id);
-      const [agent] = await db.insert(agents).values({
-        companyId: company.id, name: "Install target", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
-      }).returning();
 
       const start = await startSeedConnect(company.id, seed.id, alice);
       const instanceId = start.body.connectionId as string;
       expect((await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture)).status).toBe(200);
+      // Created after consent on purpose: consent installs the owner's agents that already exist, and an agent
+      // created later starts with the connection off, which is the state these guards are about.
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id, name: "Install target", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {},
+      }).returning();
 
       // Bob (an active member, not the owner) cannot add the install — not even with
       // tools:manage_connections: the service-level owner gate refuses him.
