@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { connect, createServer as createNetServer, type AddressInfo, type Server as NetServer, type Socket } from "node:net";
 import type { Server } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { readRemoteConnectionFailure } from "../services/remote-connection-failure.js";
 import { readCommsBoardOwnership } from "../services/comms-board-provisioner-client.js";
@@ -42,10 +42,20 @@ async function startProxy(upstreamPort: number | null) {
   return { url: `http://127.0.0.1:${port}`, targets };
 }
 
+const savedTailnetEnv = { proxy: process.env.TAILNET_HTTP_PROXY, domain: process.env.TAILNET_DOMAIN };
+const restoreTailnetEnv = () => {
+  for (const [key, value] of [["TAILNET_HTTP_PROXY", savedTailnetEnv.proxy], ["TAILNET_DOMAIN", savedTailnetEnv.domain]] as const) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+};
+
 const trusted = { allowPrivateNetwork: true, tailnetDomain: "drum-mackarel.ts.net" };
 const privateLookup = async () => [{ address: "127.0.0.1", family: 4 }];
 
 describe("TAILNET_HTTP_PROXY", () => {
+  afterEach(restoreTailnetEnv);
+
   it("tunnels https *.ts.net on 443 through CONNECT without local DNS", async () => {
     const proxy = await startProxy(null);
     await expect(
@@ -60,7 +70,10 @@ describe("TAILNET_HTTP_PROXY", () => {
     const proxy = await startProxy(null);
     let lookups = 0;
     const lookup = async () => { lookups++; return [{ address: "127.0.0.1", family: 4 }]; };
-    for (const url of ["https://node.drum-mackarel.ts.net:5432/", "http://node.drum-mackarel.ts.net/"]) {
+    const closed = createNetServer();
+    const closedPort = await listen(closed);
+    await new Promise((resolve) => closed.close(resolve));
+    for (const url of [`https://node.drum-mackarel.ts.net:${closedPort}/`, `http://node.drum-mackarel.ts.net:${closedPort}/`]) {
       await expect(
         guardedRemoteHttpFetch(url, {}, { error, ...trusted, tailnetHttpProxy: proxy.url, lookup }),
       ).rejects.toMatchObject({ code: "ECONNREFUSED" });
@@ -78,7 +91,8 @@ describe("TAILNET_HTTP_PROXY", () => {
       expect(check(url), url).toBeNull();
     }
     expect(check("https://a.drum-mackarel.ts.net/", { allowPrivateNetwork: false })).toBeNull();
-    expect(check("https://a.drum-mackarel.ts.net/", { tailnetHttpProxy: "" })).toBeNull();
+    expect(() => check("https://a.drum-mackarel.ts.net/", { tailnetHttpProxy: "" })).toThrow(/TAILNET_HTTP_PROXY is required/);
+    expect(check("https://a.drum-mackarel.ts.net/", { tailnetHttpProxy: "", tailnetDomain: "" })).toBeNull();
   });
 
   it("classifies a proxy refusal", async () => {
@@ -170,6 +184,17 @@ describe("TAILNET_HTTP_PROXY", () => {
     ).rejects.toMatchObject({ code: "remote_http_tailnet_config_invalid", message: expect.stringMatching(/TAILNET_DOMAIN/) });
   });
 
+  it("rejects TAILNET_DOMAIN without a proxy only for names under that domain", async () => {
+    await expect(
+      guardedRemoteHttpFetch("https://a.drum-mackarel.ts.net/", {}, { error, allowPrivateNetwork: true, tailnetDomain: "drum-mackarel.ts.net" }),
+    ).rejects.toMatchObject({ code: "remote_http_tailnet_config_invalid", message: expect.stringMatching(/TAILNET_HTTP_PROXY/) });
+    expect(tailnetTunnelProxy(new URL("https://a.other.ts.net/"), { error, allowPrivateNetwork: true, tailnetDomain: "drum-mackarel.ts.net" })).toBeNull();
+  });
+
+  it("rejects userinfo in the proxy URL", () => {
+    expect(() => readTailnetHttpProxy("http://user:pw@127.0.0.1:1055")).toThrow(/TAILNET_HTTP_PROXY/);
+  });
+
   it("surfaces an invalid proxy through options.error", async () => {
     await expect(
       guardedRemoteHttpFetch("https://a.drum-mackarel.ts.net/", {}, { error, ...trusted, tailnetHttpProxy: "http://example.com:1" }),
@@ -199,13 +224,7 @@ describe("TAILNET_HTTP_PROXY", () => {
 });
 
 describe("default (unguarded-caller) fetch paths", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    for (const key of ["TAILNET_HTTP_PROXY", "TAILNET_DOMAIN"]) {
-      if (saved[key] === undefined) delete process.env[key];
-      else process.env[key] = saved[key];
-    }
-  });
+  afterEach(restoreTailnetEnv);
   const configure = (proxyUrl: string) => {
     process.env.TAILNET_HTTP_PROXY = proxyUrl;
     process.env.TAILNET_DOMAIN = "drum-mackarel.ts.net";
@@ -227,6 +246,24 @@ describe("default (unguarded-caller) fetch paths", () => {
     expect(proxy.targets).toEqual([]);
   });
 
+  it("tailnetAwareFetch checks URL credentials before tailnet config", async () => {
+    process.env.TAILNET_HTTP_PROXY = "http://example.com:1";
+    await expect(tailnetAwareFetch("https://user:pw@a.drum-mackarel.ts.net/")).rejects.toThrow(TypeError);
+  });
+
+  it("tailnetAwareFetch keeps the request body and values when init fields are undefined", async () => {
+    const proxy = await startProxy(null);
+    configure(proxy.url);
+    const request = new Request("https://a.drum-mackarel.ts.net/", { method: "POST", body: "hi" });
+    const spy = vi.spyOn(request, "arrayBuffer");
+    await expect(tailnetAwareFetch(request, { method: undefined, body: undefined })).rejects.toMatchObject({ code: "remote_http_connect_failed" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    const other = new Request("https://a.drum-mackarel.ts.net/", { method: "POST", body: "hi" });
+    const otherSpy = vi.spyOn(other, "arrayBuffer");
+    await expect(tailnetAwareFetch(other, { body: "override" })).rejects.toMatchObject({ code: "remote_http_connect_failed" });
+    expect(otherSpy).not.toHaveBeenCalled();
+  });
+
   it("tailnetAwareFetch rejects instead of throwing on bad config", async () => {
     process.env.TAILNET_HTTP_PROXY = "http://127.0.0.1:1055";
     delete process.env.TAILNET_DOMAIN;
@@ -242,7 +279,7 @@ describe("default (unguarded-caller) fetch paths", () => {
     await readCommsBoardOwnership(
       { boardMcpUrl: host, boardAdminToken: "t", ownershipApiUrl: host, ownershipApiToken: "t" } as never,
       { baseSub: "agent-1" },
-    ).catch(() => undefined);
+    ).catch((e) => e);
     await provisionArcanaBrain(
       { arcanaUrl: host, provisionKey: "k".repeat(32) },
       { agentPrincipalId: "p", companyId: "c", runtimeId: "r", exchangeKeyHash: "h" },

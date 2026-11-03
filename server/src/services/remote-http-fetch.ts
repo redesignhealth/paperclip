@@ -89,12 +89,24 @@ export function tailnetTunnelProxy(endpoint: URL, options: Pick<GuardedRemoteHtt
   if (options.allowPrivateNetwork !== true || endpoint.protocol !== "https:" || endpoint.port !== "" || !isTailnetSuffixHost(hostname)) return null;
   try {
     const proxy = readTailnetHttpProxy(options.tailnetHttpProxy ?? process.env.TAILNET_HTTP_PROXY);
-    if (!proxy) return null;
-    const domain = readTailnetDomain(options.tailnetDomain ?? process.env.TAILNET_DOMAIN);
+    const rawDomain = options.tailnetDomain ?? process.env.TAILNET_DOMAIN;
+    if (!proxy) {
+      // A domain without a proxy is a misconfiguration, but only for names under that domain.
+      const unproxied = rawDomain?.trim().toLowerCase();
+      if (unproxied && hostname.endsWith(`.${unproxied}`)) throw new Error("TAILNET_HTTP_PROXY is required with TAILNET_DOMAIN");
+      return null;
+    }
+    const domain = readTailnetDomain(rawDomain);
     return hostname.endsWith(`.${domain}`) ? proxy : null;
   } catch (error) {
     throw options.error(error instanceof Error ? error.message : "Invalid tailnet proxy configuration", "remote_http_tailnet_config_invalid");
   }
+}
+
+/** True for an https URL under our TAILNET_DOMAIN on a non-default port, which the 443-only tunnel cannot reach. */
+export function isUnreachableTailnetPort(url: URL): boolean {
+  const domain = process.env.TAILNET_DOMAIN?.trim().toLowerCase();
+  return url.protocol === "https:" && url.port !== "" && !!domain && url.hostname.endsWith(`.${domain}`);
 }
 
 /**
@@ -113,8 +125,8 @@ export function readTailnetHttpProxy(raw: string | undefined = process.env.TAILN
   }
   const host = proxy.hostname.replace(/^\[|\]$/g, "");
   const loopback = host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
-  if (proxy.protocol !== "http:" || !loopback || !proxy.port) {
-    throw new Error("TAILNET_HTTP_PROXY must be http://<loopback host>:<port>");
+  if (proxy.protocol !== "http:" || !loopback || !proxy.port || proxy.username || proxy.password) {
+    throw new Error("TAILNET_HTTP_PROXY must be http://<loopback host>:<port> without credentials");
   }
   return proxy;
 }
@@ -131,20 +143,21 @@ export const tailnetAwareFetch: typeof fetch = async (input, init) => {
     error: (message, code) => Object.assign(new Error(message), { code }),
   };
   const target = new URL(url);
-  if (!tailnetTunnelProxy(target, options)) return fetch(input, init);
   if (target.username || target.password) throw new TypeError("Request cannot be constructed from a URL that includes credentials");
+  if (!tailnetTunnelProxy(target, options)) return fetch(input, init);
   const merged: RequestInit = request
     ? {
         method: request.method,
         headers: request.headers,
         signal: request.signal,
         redirect: request.redirect,
-        ...(request.body ? { body: await request.arrayBuffer() } : {}),
-        ...init,
+        ...(request.body && init?.body === undefined ? { body: await request.arrayBuffer() } : {}),
+        ...Object.fromEntries(Object.entries(init ?? {}).filter(([, value]) => value !== undefined)),
       }
     : init ?? {};
   const response = await guardedRemoteHttpFetch(url, merged, options);
   if (merged.redirect !== "manual" && response.status >= 300 && response.status < 400 && response.headers.has("location")) {
+    await response.body?.cancel().catch(() => undefined);
     throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
   }
   return response;

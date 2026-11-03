@@ -22,7 +22,7 @@
  * "::"); fresh registration uses the bare base sub (`agentKey: null`), while legacy registered
  * agents preserve their existing keyed bindings.
  */
-import { tailnetAwareFetch } from "./remote-http-fetch.js";
+import { isUnreachableTailnetPort, tailnetAwareFetch } from "./remote-http-fetch.js";
 import { randomUUID } from "node:crypto";
 import {
   COMMS_BOARD_ADMIN_TOKEN_ENV,
@@ -112,7 +112,7 @@ function validEndpoint(raw: string): boolean {
     return false;
   }
   if (url.username || url.password || url.search || url.hash) return false;
-  if (url.protocol === "https:") return true;
+  if (url.protocol === "https:") return !isUnreachableTailnetPort(url);
   return url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname.toLowerCase());
 }
 
