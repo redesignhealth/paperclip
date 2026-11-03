@@ -1245,7 +1245,7 @@ function OnboardingWizardInner({
     adapterCaps.supportsSkills ||
     adapterCaps.supportsLocalAgentJwt;
   const isLocalAdapter =
-    isLocalAdapterCaps || isCopilot ||
+    isLocalAdapterCaps || isCopilot || isHermes ||
     adapterType === "claude_local" ||
     adapterType === "codex_local" ||
     adapterType === "gemini_local" ||
@@ -1734,7 +1734,8 @@ function OnboardingWizardInner({
   // the same sequence a tile press starts. Back unwinds it to the row, and the
   // ref stops it from answering again.
   useEffect(() => {
-    if (step !== 4 || defaultSourcePreselectedRef.current || !adapterRegistryLoaded
+    if (step !== 4) { defaultSourcePreselectedRef.current = false; return; }
+    if (defaultSourcePreselectedRef.current || !adapterRegistryLoaded
       || connectPhase !== "idle" || sourcePicked || adapterType !== DEFAULT_ONBOARDING_ADAPTER_TYPE
       || !recommendedAdapters.some((opt) => opt.type === DEFAULT_ONBOARDING_ADAPTER_TYPE)) return;
     defaultSourcePreselectedRef.current = true;
@@ -2476,7 +2477,7 @@ function OnboardingWizardInner({
         : baseAdapterConfig;
 
       let expectedCreateDefaults: AgentCreateDefaultsProjection | undefined;
-      if (isLocalAdapter || isHermes) {
+      if (isLocalAdapter) {
         // A cached result is reusable only when it tested the same
         // configuration the hire below sends, and only when it does not
         // block the hire — see blocksAgentCreate. With the "Test now" card
@@ -2484,8 +2485,11 @@ function OnboardingWizardInner({
         // blocking result, or a result from a config that did not carry the
         // stored login, would lock out a customer who has since fixed the
         // problem or signed in.
+        // Never for Hermes: its result carries the server defaults the hire
+        // echoes back, so a retry after a stale-defaults 409 or an unconfirmed
+        // Router check has to probe again rather than reread the failure.
         const cachedUsable =
-          !needsClaudeSetupQualification({ adapterType, runner, savedAgentId: createdAgentId, environment: resolvedLoginEnvironment }) && adapterEnvResult &&
+          !isHermes && !needsClaudeSetupQualification({ adapterType, runner, savedAgentId: createdAgentId, environment: resolvedLoginEnvironment }) && adapterEnvResult &&
           adapterEnvResultAppliedStoredLoginRef.current === shouldApplyStoredClaudeLogin &&
           !blocksAgentCreate(adapterEnvResult)
             ? adapterEnvResult
