@@ -1,5 +1,5 @@
 import { COPILOT_MODEL_DISCOVERY_QUERY_OPTIONS } from "@/lib/copilot-task-model-catalog";
-import type { AgentRunner, AgentRunnerChoice } from "@paperclipai/shared";
+import type { AgentRunner, AgentRunnerChoice, AgentCreateDefaultsProjection } from "@paperclipai/shared";
 import { needsClaudeSetupQualification, qualifyClaudeSetup } from "../lib/qualify-claude-setup";
 import { agentHarnessType } from "@paperclipai/shared";
 import { adaptersApi, type AdapterInfo } from "../api/adapters";
@@ -169,11 +169,15 @@ const copilotOnboardingQualified = PAPERCLIP_RUNNER_ACPX_PROFILES.some(
   (profile) => profile.value === "copilot" && profile.qualified,
 );
 
+// Hermes takes its provider keys from the platform when the agent is hired, so
+// the first agent needs no sign-in of its own.
+const DEFAULT_ONBOARDING_ADAPTER_TYPE = "hermes_local";
+
 function restoreOnboardingAdapterType(savedAdapterType: unknown, provider?: unknown, savedCopilot?: unknown): AdapterType {
   if (savedAdapterType === "paperclip_runner" && savedCopilot !== true && (provider === undefined || provider === "codex")) return "codex_local";
   return typeof savedAdapterType === "string" && (savedAdapterType !== "paperclip_runner" || (savedCopilot === true && copilotOnboardingQualified))
     ? savedAdapterType
-    : "claude_local";
+    : DEFAULT_ONBOARDING_ADAPTER_TYPE;
 }
 
 /**
@@ -642,6 +646,9 @@ function OnboardingWizardInner({
   const [sourcePicked, setSourcePicked] = useState(false);
   const [setupNameConflict, setSetupNameConflict] = useState<string | null>(null);
   const isCopilot = adapterType === "paperclip_runner";
+  const isHermes = adapterType === "hermes_local";
+  // The default source is lit on arrival at the connect step, once per visit.
+  const defaultSourcePreselectedRef = useRef(false);
   const [copilotConnection, setCopilotConnection] = useState<AiConnectionBinding>();
   const savedNativeRunnerDraft = saved?.adapterType === "paperclip_runner" && !(saved?.onboardingCopilot === true && copilotOnboardingQualified);
   const [cwd, setCwd] = useState((saved?.cwd as string) ?? "");
@@ -729,7 +736,7 @@ function OnboardingWizardInner({
     ? selectedSavedKey.id
     : savedKeys.options[0]?.id;
   const selectedApiKey = savedKeys.options.find((option) => option.id === selectedApiKeyId);
-  const credentialMode = isCopilot ? "api" : credentialModeChoice ?? (
+  const credentialMode = isCopilot ? "api" : isHermes ? "subscription" : credentialModeChoice ?? (
     (savedKeys.subscriptions.length > 0 || (adapterType === "claude_local" && savedKeys.storedLogin.data))
       ? "subscription" : savedKeys.options.length || adapterType === "opencode_local" ? "api" : "subscription"
   );
@@ -1262,7 +1269,11 @@ function OnboardingWizardInner({
       ? [{ ...getAdapterDisplay("copilot_runtime"), type: "paperclip_runner", label: "GitHub Copilot", recommended: true }]
       : [];
     return {
-      recommendedAdapters: [...all.filter((a) => a.recommended), ...copilot],
+      recommendedAdapters: [
+        ...all.filter((a) => a.recommended).sort((a, b) =>
+          Number(b.type === DEFAULT_ONBOARDING_ADAPTER_TYPE) - Number(a.type === DEFAULT_ONBOARDING_ADAPTER_TYPE)),
+        ...copilot,
+      ],
       moreAdapters: all.filter((a) => !a.recommended),
     };
   }, [disabledTypes, copilotOnboardingEnabled]);
@@ -1415,7 +1426,7 @@ function OnboardingWizardInner({
 
   /** Without browser login, show instructions for the selected execution environment. */
   const connectStepHasNoSandbox =
-    credentialMode !== "api" && !canShowAdapterLogin && !authSignalUndecided;
+    !isHermes && credentialMode !== "api" && !canShowAdapterLogin && !authSignalUndecided;
 
   /*
     The sequence's derived state. Space and visibility are separate throughout:
@@ -1689,7 +1700,7 @@ function OnboardingWizardInner({
       (a) => !a.comingSoon,
     );
     if (visible.length === 0) {
-      if (adapterType === "paperclip_runner" && !copilotOnboardingEnabled) { setAdapterType("claude_local"); setModel(""); setCopilotConnection(undefined); setSourcePicked(false); }
+      if (adapterType === "paperclip_runner" && !copilotOnboardingEnabled) { setAdapterType(DEFAULT_ONBOARDING_ADAPTER_TYPE); setModel(""); setCopilotConnection(undefined); setSourcePicked(false); }
       return;
     }
     if (visible.some((a) => a.type === adapterType)) return;
@@ -1718,6 +1729,19 @@ function OnboardingWizardInner({
     }
     setModel("");
   }, [adapterRegistryLoaded, recommendedAdapters, moreAdapters, adapterType, loginPolicyReady, copilotOnboardingEnabled]);
+
+  // Answers the source row with the default on the customer's behalf, through
+  // the same sequence a tile press starts. Back unwinds it to the row, and the
+  // ref stops it from answering again.
+  useEffect(() => {
+    if (step !== 4 || defaultSourcePreselectedRef.current || !adapterRegistryLoaded
+      || connectPhase !== "idle" || sourcePicked || adapterType !== DEFAULT_ONBOARDING_ADAPTER_TYPE
+      || !recommendedAdapters.some((opt) => opt.type === DEFAULT_ONBOARDING_ADAPTER_TYPE)) return;
+    defaultSourcePreselectedRef.current = true;
+    autoConnectStartedRef.current = false;
+    setSourcePicked(true);
+    setConnectPhase("collapsing");
+  }, [step, adapterRegistryLoaded, connectPhase, sourcePicked, adapterType, recommendedAdapters]);
 
   const COMMAND_PLACEHOLDERS: Record<string, string> = {
     claude_local: "claude",
@@ -1833,7 +1857,8 @@ function OnboardingWizardInner({
     setAgentName("");
     setAgentAppearance(randomAgentAppearance());
     setAgentRole(DEFAULT_AGENT_ROLE);
-    setAdapterType("claude_local");
+    setAdapterType(DEFAULT_ONBOARDING_ADAPTER_TYPE);
+    defaultSourcePreselectedRef.current = false;
     setRunner("auto");
     setModel("");
     setCommand("");
@@ -2268,6 +2293,8 @@ function OnboardingWizardInner({
           ...(restoredSetup?.companyId === createdCompanyId ? { agentId: restoredSetup.id } : {}),
           ...(["codex_local", "claude_local"].includes(adapterType) && runner !== "auto" ? { runner } : {}),
           ...(managedBindingForStep() ? { aiConnection: managedBindingForStep() } : {}),
+          // A Hermes agent's server-applied defaults are part of what the test must probe.
+          ...(adapterType === "hermes_local" ? { purpose: "create" as const } : {}),
           environmentId,
         }
       );
@@ -2448,7 +2475,8 @@ function OnboardingWizardInner({
           }
         : baseAdapterConfig;
 
-      if (isLocalAdapter) {
+      let expectedCreateDefaults: AgentCreateDefaultsProjection | undefined;
+      if (isLocalAdapter || isHermes) {
         // A cached result is reusable only when it tested the same
         // configuration the hire below sends, and only when it does not
         // block the hire — see blocksAgentCreate. With the "Test now" card
@@ -2479,6 +2507,18 @@ function OnboardingWizardInner({
               : "No working authentication was found. Fix the reported checks before you hire this agent."),
           );
           return;
+        }
+        if (isHermes) {
+          expectedCreateDefaults = result.createDefaults;
+          if (!expectedCreateDefaults) {
+            setError("Could not confirm this agent's server defaults. Retry the connection.");
+            return;
+          }
+          if (expectedCreateDefaults.requiresRouterReadiness
+            && !result.checks.some((check) => check.code === "hermes_router_supported")) {
+            setError("Ramp Router readiness was not confirmed for this agent. Fix the reported checks, then try again.");
+            return;
+          }
         }
       }
 
@@ -2532,6 +2572,8 @@ function OnboardingWizardInner({
         adapterConfig: hireAdapterConfig,
         ...(["codex_local", "claude_local"].includes(adapterType) && runner !== "auto" ? { runner } : {}),
         ...(shouldApplyStoredClaudeLogin ? { applyStoredClaudeLogin: true } : {}),
+        // Optional staleness check: the server refuses (409) if its defaults changed since the test.
+        ...(expectedCreateDefaults ? { expectedCreateDefaults } : {}),
         // The server owns what the first agent is told now: this marker seeds
         // the chief-of-staff persona over the agent's entry instruction file.
         // The wizard no longer composes or overwrites it.
@@ -3035,6 +3077,7 @@ function OnboardingWizardInner({
                         label: opt.type === "paperclip_runner" ? "GitHub Copilot" : CONNECT_SOURCE_NAMES[opt.type] ?? opt.label,
                         icon: <ModelSourceMark type={opt.type} Fallback={opt.icon} />,
                         ...(opt.type === "paperclip_runner" ? { credentialMode: "api" as const } : {}),
+                        ...(opt.type === "hermes_local" ? { credentialMode: null } : {}),
                       }))}
                       mode={credentialMode}
                       selectedId={
@@ -3082,7 +3125,7 @@ function OnboardingWizardInner({
                       transition={{ opacity: SOURCE_LINK_EXIT, height: MAKE_ROOM }}
                     >
                       <div className="-ml-3 mt-1">
-                        <CredentialModeLink mode={credentialMode} onChange={setCredentialMode} />
+                        {!isHermes && <CredentialModeLink mode={credentialMode} onChange={setCredentialMode} />}
                         {savedKeys.options.length > 0 && <p className="px-3 text-sm text-muted-foreground">{savedKeys.options.length} saved API {savedKeys.options.length === 1 ? "key available" : "keys available"}.</p>}
                         {credentialMode === "subscription" && authSignalStatus === "present" && <p className="px-3 text-sm text-muted-foreground">An existing provider connection is available.</p>}
                       </div>
