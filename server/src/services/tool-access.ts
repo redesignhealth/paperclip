@@ -281,6 +281,7 @@ import {
 } from "./remote-http-endpoint-guard.js";
 import {
   guardedRemoteHttpFetch,
+  tailnetTunnelProxy,
   type GuardedRemoteHttpFetchOptions,
 } from "./remote-http-fetch.js";
 import {
@@ -3612,14 +3613,18 @@ export function toolAccessService(
     const endpoint = parseRemoteHttpEndpoint(value, (message, code) =>
       badRequest(message, { code }),
     );
-    await assertPublicRemoteHttpEndpoint(
-      endpoint,
-      {
-        allowPrivateNetwork: allowPrivateRemoteEndpoints(),
-        lookup: options.remoteHttpEndpointLookup,
-      },
-      (message, code) => badRequest(message, { code }),
-    );
+    const guardOptions = remoteHttpFetchOptions();
+    // Tunnelled names only resolve inside the tailnet, so local DNS would fail.
+    if (!tailnetTunnelProxy(endpoint, guardOptions)) {
+      await assertPublicRemoteHttpEndpoint(
+        endpoint,
+        {
+          allowPrivateNetwork: allowPrivateRemoteEndpoints(),
+          lookup: options.remoteHttpEndpointLookup,
+        },
+        (message, code) => badRequest(message, { code }),
+      );
+    }
     return endpoint.toString();
   }
 
@@ -3756,11 +3761,13 @@ export function toolAccessService(
     const endpoint = parseRemoteHttpEndpoint(value, (message, code) =>
       badRequest(message, { code }),
     );
-    await assertPublicRemoteHttpEndpoint(
-      endpoint,
-      { allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint) },
-      (message, code) => badRequest(message, { code }),
-    );
+    if (!tailnetTunnelProxy(endpoint, tokenBrokerHttpFetchOptions(endpoint))) {
+      await assertPublicRemoteHttpEndpoint(
+        endpoint,
+        { allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint) },
+        (message, code) => badRequest(message, { code }),
+      );
+    }
     return endpoint.toString();
   }
 

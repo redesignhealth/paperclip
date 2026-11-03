@@ -79,11 +79,14 @@ export function readTailnetDomain(raw: string | undefined = process.env.TAILNET_
 }
 
 /**
- * The tunnel applies only to operator-trusted callers (`allowPrivateNetwork === true`) and only to names
- * inside our own tailnet. Misconfiguration surfaces through `options.error`.
+ * The tunnel applies only to `https://<name in our tailnet>` on port 443 when `allowPrivateNetwork === true`;
+ * anything else falls through to the normal guard. Misconfiguration surfaces through `options.error`.
+ * Residual risk: `allowPrivateNetwork` is per deployment, so in a private-network deployment anyone who can
+ * configure an MCP URL can reach every tailnet node the sidecar's ACL allows on 443.
  */
-function tailnetTunnelProxy(hostname: string, options: GuardedRemoteHttpFetchOptions): URL | null {
-  if (options.allowPrivateNetwork !== true || !isTailnetSuffixHost(hostname)) return null;
+export function tailnetTunnelProxy(endpoint: URL, options: Pick<GuardedRemoteHttpFetchOptions, "allowPrivateNetwork" | "error" | "tailnetHttpProxy" | "tailnetDomain">): URL | null {
+  const hostname = endpoint.hostname;
+  if (options.allowPrivateNetwork !== true || endpoint.protocol !== "https:" || endpoint.port !== "" || !isTailnetSuffixHost(hostname)) return null;
   try {
     const proxy = readTailnetHttpProxy(options.tailnetHttpProxy ?? process.env.TAILNET_HTTP_PROXY);
     if (!proxy) return null;
@@ -117,8 +120,8 @@ export function readTailnetHttpProxy(raw: string | undefined = process.env.TAILN
 }
 
 /**
- * Plain-`fetch` stand-in for operator-configured Arcana/board endpoints: only our tailnet's names go via the
- * proxy. The tunnel never follows redirects; `redirect: "error"` turns a 3xx into a rejection like platform `fetch`.
+ * Plain-`fetch` stand-in for operator-configured Arcana/board endpoints: only https tailnet names on 443 go via
+ * the proxy. The tunnel never follows redirects, so any redirect mode but "manual" rejects a 3xx instead of silently diverging.
  */
 export const tailnetAwareFetch: typeof fetch = async (input, init) => {
   const request = input instanceof Request ? input : null;
@@ -127,7 +130,9 @@ export const tailnetAwareFetch: typeof fetch = async (input, init) => {
     allowPrivateNetwork: true,
     error: (message, code) => Object.assign(new Error(message), { code }),
   };
-  if (!tailnetTunnelProxy(new URL(url).hostname, options)) return fetch(input, init);
+  const target = new URL(url);
+  if (!tailnetTunnelProxy(target, options)) return fetch(input, init);
+  if (target.username || target.password) throw new TypeError("Request cannot be constructed from a URL that includes credentials");
   const merged: RequestInit = request
     ? {
         method: request.method,
@@ -139,7 +144,7 @@ export const tailnetAwareFetch: typeof fetch = async (input, init) => {
       }
     : init ?? {};
   const response = await guardedRemoteHttpFetch(url, merged, options);
-  if (merged.redirect === "error" && response.status >= 300 && response.status < 400 && response.headers.has("location")) {
+  if (merged.redirect !== "manual" && response.status >= 300 && response.status < 400 && response.headers.has("location")) {
     throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
   }
   return response;
@@ -179,7 +184,7 @@ export async function guardedRemoteHttpFetch(
   options: GuardedRemoteHttpFetchOptions,
 ): Promise<Response> {
   const endpoint = url instanceof URL ? url : new URL(url);
-  const tailnetProxy = tailnetTunnelProxy(endpoint.hostname, options);
+  const tailnetProxy = tailnetTunnelProxy(endpoint, options);
   // MagicDNS names only resolve inside the tailnet, so the sidecar resolves them; no local DNS or private-address check applies.
   if (tailnetProxy) return tunneledRequest(endpoint, tailnetProxy, init, options);
   const approved = await resolveApprovedRemoteHttpAddresses(endpoint, options, options.error);
