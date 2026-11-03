@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentAccessSection } from "./PermissionsPanel";
 import { installStateFrom } from "@/lib/tool-installs";
+import { accessForConnection } from "./personal-access";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -72,5 +73,25 @@ describe("agent access choice", () => {
     expect(radio!.getAttribute("aria-checked")).not.toBe("true");
     expect(el.textContent).toContain(reason);
     expect(el.textContent).toContain("Choose agents");
+  });
+});
+
+describe("access draft for personal sign-in connections", () => {
+  const install = installStateFrom([{ targetType: "agent", targetId: "agent-1" }] as never);
+
+  it("never sends all agents for a personal connection, even with a stale company-wide binding", () => {
+    const next = accessForConnection({ mode: "all", agentIds: new Set() }, install, true);
+    expect(next.mode).toBe("specific");
+    expect([...next.agentIds]).toEqual(["agent-1"]);
+  });
+
+  it("leaves other connections alone", () => {
+    const draft = { mode: "all" as const, agentIds: new Set<string>() };
+    expect(accessForConnection(draft, install, false)).toBe(draft);
+  });
+
+  it("keeps an existing specific choice for a personal connection", () => {
+    const draft = { mode: "specific" as const, agentIds: new Set(["agent-2"]) };
+    expect(accessForConnection(draft, install, true)).toBe(draft);
   });
 });

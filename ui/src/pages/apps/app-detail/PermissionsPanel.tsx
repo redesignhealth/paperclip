@@ -189,7 +189,7 @@ export function AgentAccessSection({
             />
           ) : null}
         </div>
-      ) : access.mode === "all" ? (
+      ) : accessMode === "all" ? (
         <p className="text-sm text-muted-foreground">Any agent can use this connection.</p>
       ) : selectedAgents.length === 0 ? (
         <p className="text-sm text-muted-foreground">No agents can use this connection.</p>
