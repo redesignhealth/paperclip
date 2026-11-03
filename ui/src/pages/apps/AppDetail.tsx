@@ -35,7 +35,7 @@ import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { accessApi } from "@/api/access";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
-import { installStateFrom, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
+import { installStateFrom, isPersonalDefaultMcpInstance, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
 import { Button } from "@/components/ui/button";
@@ -58,6 +58,7 @@ import { appTabHref, appTabLabel, isAppTabKey, type AppTabKey } from "./app-tabs
 import { ConnectionProvenanceChip } from "./ConnectionProvenanceChip";
 import { IdentitiesSection } from "./app-detail/IdentitiesSection";
 import { PermissionsPanel } from "./app-detail/PermissionsPanel";
+import { accessForConnection } from "./app-detail/personal-access";
 import { AgentConnectionAccess } from "./app-detail/AgentConnectionAccess";
 import { ConnectedAggregatorApps } from "./app-detail/ConnectedAggregatorApps";
 import { isAppAggregator } from "@paperclipai/shared/aggregator-apps";
@@ -297,7 +298,14 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     () => installStateFrom(installsQuery.data?.installs ?? connection?.installs),
     [connection?.installs, installsQuery.data?.installs],
   );
-  const access = useMemo(() => accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install), [connection?.connectionPurpose, profile, install]);
+  const access = useMemo(
+    () => accessForConnection(
+      accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install),
+      install,
+      isPersonalDefaultMcpInstance(connection?.config),
+    ),
+    [connection?.connectionPurpose, connection?.config, profile, install],
+  );
   const managesRemoteMcpAccess = isRemoteMcpConnectorMethod(connection?.config?.sourceTemplateKey, connection?.config?.connectionMethodKey);
   const agents = agentsQuery.data ?? [];
   const disconnectRemote = useMutation({
@@ -742,6 +750,9 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                 appName={baseAppName}
                 agents={agents}
                 access={access}
+                anyAgentUnavailableReason={isPersonalDefaultMcpInstance(connection.config)
+                  ? "This connection runs as one person's own sign-in, so it can't be shared with every agent."
+                  : undefined}
                 install={connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? installStateFrom([]) : install}
                 readOnly={readOnly}
                 canChange={canChange}
