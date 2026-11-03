@@ -18,6 +18,7 @@
  *
  * Reports carry counts and agent ids only. No token, URL, secret id or response body is returned or logged.
  */
+import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { and, asc, eq, gt, sql, type SQL } from "drizzle-orm";
 import { agents, companies, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -161,7 +162,7 @@ async function discard(response: Response) {
 export async function putBrainBinding(
   config: BrainBindingConfig,
   request: BrainBindingRequest,
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = BRAIN_BINDING_REQUEST_TIMEOUT_MS,
 ): Promise<BrainBindingPutOutcome> {
   let response: Response;

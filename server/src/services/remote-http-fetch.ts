@@ -61,6 +61,44 @@ export type GuardedRemoteHttpFetchOptions = RemoteHttpEndpointGuardOptions & {
    * Platform `fetch`, used only for IP literals, which cannot be rebound.
    */
   unpinnedFetch?: typeof fetch;
+  /** Overrides env `TAILNET_HTTP_PROXY` (validated the same way). */
+  tailnetHttpProxy?: string;
+};
+
+const isTailnetHost = (hostname: string) => hostname.endsWith(".ts.net");
+
+/**
+ * Reads `TAILNET_HTTP_PROXY`: the Tailscale sidecar's HTTP CONNECT listener.
+ * Only `http://` on a loopback host is accepted, so the env cannot redirect
+ * traffic off the box. Throws on anything else.
+ */
+export function readTailnetHttpProxy(raw: string | undefined = process.env.TAILNET_HTTP_PROXY): URL | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  let proxy: URL;
+  try {
+    proxy = new URL(value);
+  } catch {
+    throw new Error("TAILNET_HTTP_PROXY is not a valid URL");
+  }
+  const host = proxy.hostname.replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+  if (proxy.protocol !== "http:" || !loopback || !proxy.port) {
+    throw new Error("TAILNET_HTTP_PROXY must be http://<loopback host>:<port>");
+  }
+  return proxy;
+}
+
+/** Plain-`fetch` stand-in for callers that are not SSRF-guarded: only `*.ts.net` goes via the proxy. */
+export const tailnetAwareFetch: typeof fetch = (input, init) => {
+  const url = typeof input === "string" ? input : input instanceof URL ? input : null;
+  if (url && isTailnetHost(new URL(url).hostname) && readTailnetHttpProxy()) {
+    return guardedRemoteHttpFetch(url, init ?? {}, {
+      allowPrivateNetwork: true,
+      error: (message, code) => Object.assign(new Error(message), { code }),
+    });
+  }
+  return fetch(input, init);
 };
 
 /**
@@ -97,6 +135,11 @@ export async function guardedRemoteHttpFetch(
   options: GuardedRemoteHttpFetchOptions,
 ): Promise<Response> {
   const endpoint = url instanceof URL ? url : new URL(url);
+  const tailnetProxy = isTailnetHost(endpoint.hostname)
+    ? readTailnetHttpProxy(options.tailnetHttpProxy ?? process.env.TAILNET_HTTP_PROXY)
+    : null;
+  // MagicDNS names only resolve inside the tailnet, so the sidecar resolves them; no local DNS or private-address check applies.
+  if (tailnetProxy) return tunneledRequest(endpoint, tailnetProxy, init, options);
   const approved = await resolveApprovedRemoteHttpAddresses(endpoint, options, options.error);
   const literalHost = isIP(endpoint.hostname.replace(/^\[|\]$/g, "")) !== 0;
   const platformFetch = options.unpinnedFetch ?? fetch;
@@ -148,6 +191,72 @@ async function pinnedRequest(
   const socket = await dialApprovedAddress({ approved, approvedSet, port, hostname, useTls, signal, options });
 
   try {
+    return await sendRequest({
+      endpoint,
+      hostname,
+      port,
+      useTls,
+      socket,
+      init,
+      signal,
+      responseTimeoutMs: options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
+      error: options.error,
+    });
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
+}
+
+async function tunneledRequest(
+  endpoint: URL,
+  proxy: URL,
+  init: RequestInit,
+  options: GuardedRemoteHttpFetchOptions,
+): Promise<Response> {
+  const useTls = endpoint.protocol === "https:";
+  const hostname = endpoint.hostname;
+  const port = endpoint.port ? Number(endpoint.port) : useTls ? 443 : 80;
+  const signal = init.signal ?? null;
+  const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+  signal?.throwIfAborted?.();
+
+  let socket: Socket = await new Promise<Socket>((resolve, reject) => {
+    const req = httpRequest({
+      host: proxy.hostname.replace(/^\[|\]$/g, ""),
+      port: Number(proxy.port),
+      method: "CONNECT",
+      path: `${hostname}:${port}`,
+      ...(signal ? { signal } : {}),
+    });
+    const timer = setTimeout(() => {
+      req.destroy(markRemoteConnectionFailure(new Error("Timed out trying to connect to the tailnet proxy"), "connection_timeout"));
+    }, connectTimeoutMs);
+    timer.unref?.();
+    req.once("connect", (res, tunnel) => {
+      clearTimeout(timer);
+      if (res.statusCode === 200) return resolve(tunnel);
+      tunnel.destroy();
+      reject(options.error(`Tailnet proxy refused the tunnel (HTTP ${res.statusCode})`, "remote_http_connect_failed"));
+    });
+    req.once("response", (res) => {
+      clearTimeout(timer);
+      res.resume();
+      reject(options.error(`Tailnet proxy refused the tunnel (HTTP ${res.statusCode})`, "remote_http_connect_failed"));
+    });
+    req.once("error", (error) => {
+      clearTimeout(timer);
+      reject(signal?.aborted ? error : options.error("Tailnet proxy could not be reached", "remote_http_connect_failed"));
+    });
+    req.end();
+  });
+
+  try {
+    if (useTls) {
+      const secure = tlsConnect({ socket, servername: isIP(hostname) === 0 ? hostname : undefined, host: hostname });
+      socket = secure;
+      await once(secure, "secureConnect", { signal, timeoutMs: connectTimeoutMs, what: "negotiate TLS with" });
+    }
     return await sendRequest({
       endpoint,
       hostname,
