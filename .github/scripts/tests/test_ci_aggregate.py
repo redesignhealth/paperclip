@@ -15,12 +15,27 @@ SB_WF = ".github/workflows/storybook-visual.yml"
 def default_referenced_workflows():
     return [
         {
-            "path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master",
+            "path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@master",
             "ref": "refs/heads/master",
             "sha": SHA,
         },
         {
-            "path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@refs/heads/master",
+            "path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master",
+            "ref": "refs/heads/master",
+            "sha": SHA,
+        },
+    ]
+
+
+def fork_referenced_workflows():
+    return [
+        {
+            "path": "redesignhealth/paperclip/.github/workflows/pr-trusted.yml@master",
+            "ref": "refs/heads/master",
+            "sha": SHA,
+        },
+        {
+            "path": "redesignhealth/paperclip/.github/workflows/ci-routing.yml@master",
             "ref": "refs/heads/master",
             "sha": SHA,
         },
@@ -112,6 +127,10 @@ DENIED_DEFINITIONS = {
     "short SHA ref": _definition("paperclipai/paperclip/.github/workflows/pr-trusted.yml@abcdef1"),
     "uppercase SHA ref": _definition(f"paperclipai/paperclip/.github/workflows/pr-trusted.yml@{SHA.upper()}"),
     "case-modified ref": _definition("paperclipai/paperclip/.github/workflows/pr-trusted.yml@Master"),
+    "fork pr-trusted with SHA ref": _definition(f"redesignhealth/paperclip/.github/workflows/pr-trusted.yml@{SHA}"),
+    "fork pr-trusted on non-master branch": _definition("redesignhealth/paperclip/.github/workflows/pr-trusted.yml@refs/heads/main"),
+    "fork ci-routing as outer workflow": _definition("redesignhealth/paperclip/.github/workflows/ci-routing.yml@master"),
+    "look-alike org name": _definition("redesign-health/paperclip/.github/workflows/pr-trusted.yml@master"),
     "unparseable yaml": "jobs: [unbalanced\n",
     "jobs is not a mapping": "name: PR\non: pull_request\njobs: []\n",
     "ci job is not a mapping": "name: PR\non: pull_request\njobs:\n  ci: echo\n",
@@ -123,6 +142,8 @@ class ProvenanceTests(unittest.TestCase):
         for uses in [
             "paperclipai/paperclip/.github/workflows/pr-trusted.yml@master",
             "paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master",
+            "redesignhealth/paperclip/.github/workflows/pr-trusted.yml@master",
+            "redesignhealth/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master",
         ]:
             with self.subTest(uses=uses):
                 ci.validate_ci_definition(_definition(uses))
@@ -160,7 +181,7 @@ class ReferencedWorkflowsTests(unittest.TestCase):
     def test_single_referenced_workflow_fails(self):
         # Missing ci-routing.yml
         r = run(PR_WF, 1, referenced_workflows=[
-            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master", "ref": "refs/heads/master", "sha": SHA}
+            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/master", "sha": SHA}
         ])
         valid, err, _ = ci.validate_run_referenced_workflows(r)
         self.assertFalse(valid)
@@ -168,7 +189,7 @@ class ReferencedWorkflowsTests(unittest.TestCase):
 
     def test_extra_referenced_workflow_fails(self):
         extra = default_referenced_workflows() + [
-            {"path": "attacker/paperclip/.github/workflows/evil.yml@refs/heads/master", "ref": "refs/heads/master", "sha": SHA}
+            {"path": "attacker/paperclip/.github/workflows/evil.yml@master", "ref": "refs/heads/master", "sha": SHA}
         ]
         r = run(PR_WF, 1, referenced_workflows=extra)
         valid, err, _ = ci.validate_run_referenced_workflows(r)
@@ -177,8 +198,8 @@ class ReferencedWorkflowsTests(unittest.TestCase):
 
     def test_wrong_ref_in_referenced_workflows_fails(self):
         bad_ref = [
-            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/feature", "ref": "refs/heads/feature", "sha": SHA},
-            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@refs/heads/master", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/feature", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
         ]
         r = run(PR_WF, 1, referenced_workflows=bad_ref)
         valid, err, _ = ci.validate_run_referenced_workflows(r)
@@ -187,13 +208,103 @@ class ReferencedWorkflowsTests(unittest.TestCase):
 
     def test_wrong_path_in_referenced_workflows_fails(self):
         bad_path = [
-            {"path": "attacker/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master", "ref": "refs/heads/master", "sha": SHA},
-            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@refs/heads/master", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "attacker/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
         ]
         r = run(PR_WF, 1, referenced_workflows=bad_path)
         valid, err, _ = ci.validate_run_referenced_workflows(r)
         self.assertFalse(valid)
         self.assertIn("untrusted referenced workflow path", err)
+
+    def test_valid_fork_referenced_workflows_pass(self):
+        r = run(PR_WF, 1, referenced_workflows=fork_referenced_workflows())
+        valid, err, shas = ci.validate_run_referenced_workflows(r)
+        self.assertTrue(valid)
+        self.assertIsNone(err)
+        self.assertEqual(len(shas), 2)
+        self.assertEqual(shas["redesignhealth/paperclip/.github/workflows/pr-trusted.yml"], SHA)
+        self.assertEqual(shas["redesignhealth/paperclip/.github/workflows/ci-routing.yml"], SHA)
+        self.assertEqual(frozenset(shas), ci.APPROVED_REFERENCED_PATH_SETS[0])
+
+    def test_mixed_fork_and_upstream_referenced_workflows_fails(self):
+        mixed = [
+            {"path": "redesignhealth/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=mixed)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("approved same-repository pair", err)
+
+    def test_two_pr_trusted_from_both_repos_fails(self):
+        both_pr_trusted = [
+            {"path": "redesignhealth/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=both_pr_trusted)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("approved same-repository pair", err)
+
+    def test_fork_referenced_workflow_wrong_ref_fails(self):
+        bad_ref = [
+            {"path": "redesignhealth/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "refs/heads/feature", "sha": SHA},
+            {"path": "redesignhealth/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=bad_ref)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("untrusted referenced workflow ref", err)
+
+    def test_sha_pinned_path_ref_in_referenced_workflows_fails(self):
+        sha_pinned = [
+            {"path": f"paperclipai/paperclip/.github/workflows/pr-trusted.yml@{SHA}", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=sha_pinned)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("untrusted referenced workflow path ref", err)
+
+    def test_fork_sha_pinned_path_ref_in_referenced_workflows_fails(self):
+        sha_pinned = [
+            {"path": f"redesignhealth/paperclip/.github/workflows/pr-trusted.yml@{SHA}", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "redesignhealth/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=sha_pinned)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("untrusted referenced workflow path ref", err)
+
+    def test_missing_ref_suffix_in_referenced_workflow_path_fails(self):
+        no_at = [
+            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=no_at)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("missing ref suffix", err)
+
+    def test_wrong_path_ref_in_referenced_workflows_fails(self):
+        wrong_path_ref = [
+            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master", "ref": "refs/heads/master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=wrong_path_ref)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("untrusted referenced workflow path ref", err)
+
+    def test_short_ref_master_in_referenced_workflows_fails(self):
+        short_ref = [
+            {"path": "paperclipai/paperclip/.github/workflows/pr-trusted.yml@master", "ref": "master", "sha": SHA},
+            {"path": "paperclipai/paperclip/.github/workflows/ci-routing.yml@master", "ref": "refs/heads/master", "sha": SHA},
+        ]
+        r = run(PR_WF, 1, referenced_workflows=short_ref)
+        valid, err, _ = ci.validate_run_referenced_workflows(r)
+        self.assertFalse(valid)
+        self.assertIn("untrusted referenced workflow ref", err)
 
 
 class LatestRunTests(unittest.TestCase):
@@ -273,6 +384,23 @@ class EvaluateTests(unittest.TestCase):
         r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: skipped_job})
         self.assertEqual(r.state, "FAILURE")
         self.assertIn("concluded skipped", r.summary)
+
+    def test_skipped_vitest_selection_is_optional(self):
+        jobs = default_pr_jobs() + [job("ci / Select Vitest files", conclusion="skipped")]
+        r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})
+        self.assertEqual(r.state, "SUCCESS")
+
+    def test_failed_vitest_selection_still_fails(self):
+        jobs = default_pr_jobs() + [job("ci / Select Vitest files", conclusion="failure")]
+        r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})
+        self.assertEqual(r.state, "FAILURE")
+
+    def test_failed_job_summary_retains_complex_safe_name(self):
+        jobs = default_pr_jobs() + [job("ci / General tests (server (3/12))", conclusion="failure")]
+        r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})
+        self.assertEqual(r.state, "FAILURE")
+        self.assertIn("ci / General tests (server (3/12))", r.summary)
+        self.assertNotIn("unnamed", r.summary)
 
     def test_negative_action_required_fails(self):
         r = evaluate({PR_WF}, [run(conclusion="action_required")])

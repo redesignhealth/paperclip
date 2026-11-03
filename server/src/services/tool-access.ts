@@ -19456,7 +19456,7 @@ export function toolAccessService(
     };
   }
 
-  return {
+  const service = {
     /** Identity-only verification: no bot installation/repository access required. */
     verifyPersonalGitHubIdentity: async (companyId: string, connectionId: string, userId: string) => {
       const [connection] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, connectionId), eq(toolConnections.enabled, true)));
@@ -19649,12 +19649,36 @@ export function toolAccessService(
 
     connectGalleryApp,
 
-    finishGalleryAppConnection: (
+    finishGalleryAppConnection: async (
       companyId: string,
       connectionId: string,
       input: FinishToolApp,
       actor?: ActorInfo,
-    ) => finishGalleryAppConnection(companyId, connectionId, input, actor),
+    ) => {
+      // A personal default-MCP instance (RH Google MCP, RH MCP) is installed per agent by its owner only. The
+      // setup screen's access choice must therefore either install the chosen agents through the same guarded
+      // path, or fail loudly. It must never save a permission list that reaches no agent.
+      // Only the owner reaches this branch; anyone else falls through to the owner check inside the finisher.
+      if (actor?.actorType === "user") {
+        const connection = await getConnectionRow(connectionId, companyId);
+        if (isPersonalDefaultMcpInstance(connection) && actor.actorId === connection.createdByUserId) {
+          if (input.access === "all_agents") {
+            throw unprocessable(
+              "This app runs as one person's own sign-in and cannot be shared with all agents. Choose specific agents instead.",
+              { code: "company_install_not_permitted" },
+            );
+          }
+          if (!input.preserveExistingAccess) {
+            await service.putConnectionInstalls(
+              connection.id,
+              { installs: [...new Set(input.access.agentIds)].map((targetId) => ({ targetType: "agent" as const, targetId })) },
+              actor,
+            );
+          }
+        }
+      }
+      return finishGalleryAppConnection(companyId, connectionId, input, actor);
+    },
 
     reconnectGalleryApp,
 
@@ -23762,4 +23786,5 @@ export function toolAccessService(
       throw error;
     },
   };
+  return service;
 }

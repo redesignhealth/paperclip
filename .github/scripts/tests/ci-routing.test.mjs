@@ -4,32 +4,149 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import vm from "node:vm";
 
 const workflow = readFileSync(new URL("../../workflows/ci-routing.yml", import.meta.url), "utf8");
 const jobs = workflow.split(/^jobs:\n/m)[1];
 
-test("routing uses reserved capacity and runs no PR code or actions", () => {
+test("routing runs on ubuntu-latest and runs no PR code or actions", () => {
   assert.deepEqual([...jobs.matchAll(/^ {2}([a-z_]+):$/gm)].map((match) => match[1]), ["gate"]);
   const placement = jobs.match(/^ {4}runs-on: (.+)$/m)?.[1];
-  assert.ok(placement, "routing placement must be defined");
-  assert.doesNotMatch(placement, /fromJSON/);
-  assert.ok(placement.includes("vars.AWS_CI_TRUSTED_USER_IDS == vars.AWS_CI_ROUTING_USER_IDS_SOURCE"));
-  assert.ok(placement.includes("github.event.pull_request.user.id"));
-  assert.ok(placement.includes("github.event.sender.id"));
-  assert.ok(placement.endsWith("&& 'runs-on/fleet=paperclip-ci-routing-x64/env=public-ci' || 'ubuntu-latest' }}"));
+  assert.equal(placement, "ubuntu-latest", "gate must run on ubuntu-latest until CODEOWNERS verified");
+  assert.match(jobs, /# No AWS capacity is allocated until current CI CODEOWNERS are verified\./);
+  assert.match(jobs, /# A cached numeric allowlist alone can outlive removal from CODEOWNERS\./);
   assert.doesNotMatch(jobs, /uses:|actions\/checkout|secrets\./);
   assert.doesNotMatch(workflow, /^ {2}(?:actions|contents|pull-requests): write$/m);
 });
 
-test("routing exports both placement and stack scope to callers", () => {
+test("routing exports placement, stack scope, and task plan to callers", () => {
   assert.match(workflow, /^ {6}runner:\n {8}value: \$\{\{ jobs\.gate\.outputs\.runner \}\}$/m);
   assert.match(workflow, /^ {6}full_ci:\n {8}value: \$\{\{ jobs\.gate\.outputs\.full_ci \}\}$/m);
+  assert.match(workflow, /^ {6}plan:\n {8}value: \$\{\{ jobs\.gate\.outputs\.plan \}\}$/m);
+  assert.match(workflow, /^ {6}profile_ci:\n {8}value: \$\{\{ jobs\.gate\.outputs\.profile_ci \}\}$/m);
+  assert.match(jobs, /^ {6}plan: \$\{\{ steps\.plan\.outputs\.plan \}\}$/m);
   assert.match(jobs, /^ {6}runner: \$\{\{ steps\.route\.outputs\.runner \}\}$/m);
   assert.match(jobs, /^ {6}full_ci: \$\{\{ steps\.scope\.outputs\.full_ci \}\}$/m);
+  assert.match(jobs, /^ {6}profile_ci: \$\{\{ steps\.profile\.outputs\.profile_ci \}\}$/m);
 });
 
-const githubStub = "#!/usr/bin/env bash\nset -Eeuo pipefail\n\nendpoint=\"${*: -1}\"\ncase \"$endpoint\" in\n  */pulls/*)\n    jq -cn \\\n      --argjson author_id \"${TEST_PR_AUTHOR_ID:-34892728}\" \\\n      --argjson repository_id \"${TEST_REPOSITORY_ID:-1170821064}\" \\\n      --arg base_ref \"${TEST_BASE_REF:-master}\" \\\n      --arg base_sha \"${TEST_PR_BASE_SHA:-$EVENT_BASE_SHA}\" \\\n      --arg head_sha \"${TEST_PR_HEAD_SHA:-1111111111111111111111111111111111111111}\" \\\n      --arg merge_sha \"${TEST_PR_MERGE_SHA:-4444444444444444444444444444444444444444}\" '{\n        state: \"open\",\n        user: {id: $author_id},\n        base: {repo: {id: $repository_id}, ref: $base_ref, sha: $base_sha},\n        head: {sha: $head_sha},\n        merge_commit_sha: $merge_sha\n      }'\n    ;;\n  */git/ref/heads/*)\n    jq -cn \\\n      --arg sha \"${TEST_LIVE_BASE_REF_SHA:-$EVENT_BASE_SHA}\" '{object: {sha: $sha}}'\n    ;;\n  */compare/*)\n    [[ -z \"${TEST_COMPARE_FAIL:-}\" ]] || exit 1\n    default_files='[{\"filename\":\"server/src/index.ts\"}]'\n    jq -cn \\\n      --arg merge_base_sha \"${TEST_BASE_COMPARISON_MERGE_BASE_SHA:-$EVENT_BASE_SHA}\" \\\n      --arg status \"${TEST_BASE_COMPARISON_STATUS:-ahead}\" \\\n      --argjson files \"${TEST_COMPARE_FILES:-$default_files}\" '{\n        merge_base_commit: {sha: $merge_base_sha},\n        status: $status,\n        files: $files\n      }'\n    ;;\n  */git/commits/*)\n    requested_sha=\"${endpoint##*/}\"\n    live_merge_sha=\"${TEST_PR_MERGE_SHA:-4444444444444444444444444444444444444444}\"\n    synthetic_base_merge_sha=\"${TEST_SYNTHETIC_BASE_MERGE_SHA:-}\"\n    if [[ \"$requested_sha\" == \"$EVENT_MERGE_SHA\" ]]; then\n      tree_sha=\"${TEST_EVENT_MERGE_TREE_SHA:-5555555555555555555555555555555555555555}\"\n      base_sha=\"${TEST_EVENT_MERGE_BASE_SHA:-$EVENT_BASE_SHA}\"\n      head_sha=\"${TEST_EVENT_MERGE_HEAD_SHA:-$EVENT_HEAD_SHA}\"\n    elif [[ \"$requested_sha\" == \"$live_merge_sha\" ]]; then\n      tree_sha=\"${TEST_LIVE_MERGE_TREE_SHA:-5555555555555555555555555555555555555555}\"\n      base_sha=\"${TEST_LIVE_MERGE_BASE_SHA:-$EVENT_BASE_SHA}\"\n      head_sha=\"${TEST_LIVE_MERGE_HEAD_SHA:-$EVENT_HEAD_SHA}\"\n    elif [[ -n \"$synthetic_base_merge_sha\" && \"$requested_sha\" == \"$synthetic_base_merge_sha\" ]]; then\n      tree_sha=\"${TEST_SYNTHETIC_BASE_MERGE_TREE_SHA:-8888888888888888888888888888888888888888}\"\n      base_sha=\"${TEST_SYNTHETIC_MASTER_PARENT_SHA:-9999999999999999999999999999999999999999}\"\n      head_sha=\"${TEST_SYNTHETIC_BASE_REF_PARENT_SHA:-${TEST_LIVE_BASE_REF_SHA:-$EVENT_BASE_SHA}}\"\n    else\n      echo \"unexpected merge commit: $requested_sha\" >&2\n      exit 1\n    fi\n    jq -cn \\\n      --arg sha \"$requested_sha\" \\\n      --arg tree_sha \"$tree_sha\" \\\n      --arg base_sha \"$base_sha\" \\\n      --arg head_sha \"$head_sha\" '{\n        sha: $sha,\n        tree: {sha: $tree_sha},\n        parents: [{sha: $base_sha}, {sha: $head_sha}]\n      }'\n    ;;\n  */actions/runs/*)\n    jq -cn \\\n      --argjson actor_id \"${TEST_TRIGGERING_ACTOR_ID:-34892728}\" \\\n      --argjson repository_id \"${TEST_REPOSITORY_ID:-1170821064}\" \\\n      --arg event_name \"${TEST_EVENT_NAME:-pull_request}\" '{\n        triggering_actor: {id: $actor_id},\n        repository: {id: $repository_id},\n        event: $event_name\n      }'\n    ;;\n  *)\n    echo \"unexpected gh endpoint: $endpoint\" >&2\n    exit 1\n    ;;\nesac";
+const githubStub = `#!/usr/bin/env bash
+set -Eeuo pipefail
+
+jq_filter=""
+endpoint=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --jq)
+      jq_filter="$2"
+      shift 2
+      ;;
+    -H|--header)
+      shift 2
+      ;;
+    /*)
+      endpoint="$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+filter_output() {
+  if [[ -n "$jq_filter" ]]; then
+    jq -r "$jq_filter"
+  else
+    cat
+  fi
+}
+
+case "$endpoint" in
+  */pulls/*)
+    jq -cn \\
+      --argjson author_id "\${TEST_PR_AUTHOR_ID:-34892728}" \\
+      --argjson repository_id "\${TEST_REPOSITORY_ID:-1170821064}" \\
+      --arg base_ref "\${TEST_BASE_REF:-master}" \\
+      --arg base_sha "\${TEST_PR_BASE_SHA:-$EVENT_BASE_SHA}" \\
+      --arg head_sha "\${TEST_PR_HEAD_SHA:-1111111111111111111111111111111111111111}" \\
+      --arg merge_sha "\${TEST_PR_MERGE_SHA:-4444444444444444444444444444444444444444}" '{
+        state: "open",
+        user: {id: $author_id},
+        base: {repo: {id: $repository_id}, ref: $base_ref, sha: $base_sha},
+        head: {sha: $head_sha},
+        merge_commit_sha: $merge_sha
+      }' | filter_output
+    ;;
+  */git/ref/heads/*)
+    jq -cn \\
+      --arg sha "\${TEST_LIVE_BASE_REF_SHA:-$EVENT_BASE_SHA}" '{object: {sha: $sha}}' | filter_output
+    ;;
+  */compare/*)
+    [[ -z "\${TEST_COMPARE_FAIL:-}" ]] || exit 1
+    default_files='[{"filename":"server/src/index.ts"}]'
+    jq -cn \\
+      --arg merge_base_sha "\${TEST_BASE_COMPARISON_MERGE_BASE_SHA:-$EVENT_BASE_SHA}" \\
+      --arg status "\${TEST_BASE_COMPARISON_STATUS:-ahead}" \\
+      --argjson files "\${TEST_COMPARE_FILES:-$default_files}" '{
+        merge_base_commit: {sha: $merge_base_sha},
+        status: $status,
+        files: $files
+      }' | filter_output
+    ;;
+  */contents/scripts/ci-profile/authorize.mjs*)
+    [[ -z "\${TEST_CONTENTS_FAIL:-}" ]] || exit 1
+    code="export function trustedOwnerIds() { return [\${TEST_TRUSTED_OWNER_ID:-34892728}]; }"
+    encoded="$(printf '%s' "$code" | base64)"
+    jq -cn --arg content "$encoded" '{content: $content}' | filter_output
+    ;;
+  */git/commits/*)
+    commit_endpoint="\${endpoint%\\?*}"
+    requested_sha="\${commit_endpoint##*/}"
+    live_merge_sha="\${TEST_PR_MERGE_SHA:-4444444444444444444444444444444444444444}"
+    synthetic_base_merge_sha="\${TEST_SYNTHETIC_BASE_MERGE_SHA:-}"
+    if [[ "$requested_sha" == "$EVENT_MERGE_SHA" ]]; then
+      tree_sha="\${TEST_EVENT_MERGE_TREE_SHA:-5555555555555555555555555555555555555555}"
+      base_sha="\${TEST_EVENT_MERGE_BASE_SHA:-$EVENT_BASE_SHA}"
+      head_sha="\${TEST_EVENT_MERGE_HEAD_SHA:-$EVENT_HEAD_SHA}"
+    elif [[ "$requested_sha" == "$live_merge_sha" ]]; then
+      tree_sha="\${TEST_LIVE_MERGE_TREE_SHA:-5555555555555555555555555555555555555555}"
+      base_sha="\${TEST_LIVE_MERGE_BASE_SHA:-$EVENT_BASE_SHA}"
+      head_sha="\${TEST_LIVE_MERGE_HEAD_SHA:-$EVENT_HEAD_SHA}"
+    elif [[ -n "$synthetic_base_merge_sha" && "$requested_sha" == "$synthetic_base_merge_sha" ]]; then
+      tree_sha="\${TEST_SYNTHETIC_BASE_MERGE_TREE_SHA:-8888888888888888888888888888888888888888}"
+      base_sha="\${TEST_SYNTHETIC_MASTER_PARENT_SHA:-9999999999999999999999999999999999999999}"
+      head_sha="\${TEST_SYNTHETIC_BASE_REF_PARENT_SHA:-\${TEST_LIVE_BASE_REF_SHA:-$EVENT_BASE_SHA}}"
+    else
+      echo "unexpected merge commit: $requested_sha" >&2
+      exit 1
+    fi
+    jq -cn \\
+      --arg sha "$requested_sha" \\
+      --arg tree_sha "$tree_sha" \\
+      --arg base_sha "$base_sha" \\
+      --arg head_sha "$head_sha" '{
+        sha: $sha,
+        tree: {sha: $tree_sha},
+        parents: [{sha: $base_sha}, {sha: $head_sha}]
+      }' | filter_output
+    ;;
+  */actions/runs/*)
+    jq -cn \\
+      --argjson actor_id "\${TEST_TRIGGERING_ACTOR_ID:-34892728}" \\
+      --argjson repository_id "\${TEST_REPOSITORY_ID:-1170821064}" \\
+      --argjson run_attempt "\${TEST_RUN_ATTEMPT:-\${RUN_ATTEMPT:-1}}" \\
+      --arg event_name "\${TEST_EVENT_NAME:-pull_request}" '{
+        triggering_actor: {id: $actor_id},
+        repository: {id: $repository_id},
+        run_attempt: $run_attempt,
+        event: $event_name
+      }' | filter_output
+    ;;
+  *)
+    echo "unexpected gh endpoint: $endpoint" >&2
+    exit 1
+    ;;
+esac`;
 
 function stepScript(name) {
   const start = workflow.indexOf(`      - name: ${name}\n`);
@@ -53,6 +170,8 @@ function executeStep(name, overrides = {}) {
       env: {
         ...process.env,
         PATH: `${directory}:${process.env.PATH}`,
+        RUNNER_TEMP: directory,
+        RUN_ATTEMPT: "1",
         GITHUB_OUTPUT: output,
         AWS_CI_ENABLED: "true",
         TRUSTED_USER_IDS: "[34892728]",
@@ -106,6 +225,8 @@ const routeCases = [
   ["unlisted author", { EVENT_PR_AUTHOR_ID: "99999999" }],
   ["unlisted sender", { EVENT_SENDER_ID: "99999999" }],
   ["unlisted rerun actor", { TEST_TRIGGERING_ACTOR_ID: "99999999" }],
+  ["author not in CI CODEOWNERS", { TEST_TRUSTED_OWNER_ID: "99999999" }],
+  ["missing CODEOWNERS resolver", { TEST_CONTENTS_FAIL: "1" }],
   ["missing base", { EVENT_BASE_REF: "" }],
   ["wrong base repository", { EVENT_BASE_REPOSITORY_ID: "999999999" }],
   ["replaced base ancestry", { TEST_BASE_COMPARISON_MERGE_BASE_SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }],
@@ -156,6 +277,7 @@ test("profile-ci overrides both middle-stack and release-notes-only skips", () =
     assert.equal(executeStep("Select PR CI scope", { ...overrides, PROFILE_CI: "true" }).full_ci, "true");
   }
 });
+
 const manyReleaseNotes = JSON.stringify(Array.from({ length: 300 }, (_, index) => ({
   filename: `releases/beta/v2026.1012.${index}-beta.0.md`,
 })));
@@ -225,52 +347,23 @@ test("path scope skips full CI for a single-PR stack that only touches release n
   }).full_ci, "false");
 });
 
+test("gate job unconditionally selects ubuntu-latest with CODEOWNERS comment", () => {
+  const placement = jobs.match(/^ {4}runs-on: (.+)$/m)?.[1];
+  assert.equal(placement, "ubuntu-latest", "gate runs-on must be static ubuntu-latest");
+  assert.doesNotMatch(placement, /\$\{\{/);
+  assert.match(jobs, /# No AWS capacity is allocated until current CI CODEOWNERS are verified\./);
+  assert.match(jobs, /# A cached numeric allowlist alone can outlive removal from CODEOWNERS\./);
+});
 
-function routingPlacement(vars = {}, github = {}) {
-  const source = "[34892728]";
-  const expression = jobs.match(/^ {4}runs-on: \$\{\{ (.+) \}\}$/m)?.[1];
-  assert.ok(expression, "routing expression is missing");
-  return vm.runInNewContext(expression, {
-    vars: {
-      AWS_CI_ENABLED: "true",
-      AWS_CI_TRUSTED_USER_IDS: source,
-      AWS_CI_ROUTING_USER_IDS_SOURCE: source,
-      AWS_CI_ROUTING_USER_IDS: "|34892728|",
-      ...vars,
-    },
-    github: {
-      repository: "paperclipai/paperclip",
-      repository_id: "1170821064",
-      event_name: "pull_request",
-      ref: "refs/heads/master",
-      actor_id: "34892728",
-      event: { pull_request: { user: { id: 34892728 } }, sender: { id: 34892728 } },
-      ...github,
-    },
-    contains: (search, item) => String(search).toLowerCase().includes(String(item).toLowerCase()),
-    format: (template, ...args) => template.replace(/\{(\d+)\}/g, (_, index) => String(args[Number(index)])),
-  }, { timeout: 1000 });
-}
+test("plan step falls back when full CI is not requested", () => {
+  assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+    FULL_CI: "false",
+  }), { plan: "" });
+});
 
-const placementCases = [
-  ["approved PR", {}, {}, "runs-on/fleet=paperclip-ci-routing-x64/env=public-ci"],
-  ["unapproved author", {}, { event: { pull_request: { user: { id: 999 } }, sender: { id: 34892728 } } }],
-  ["unapproved sender", {}, { event: { pull_request: { user: { id: 34892728 } }, sender: { id: 999 } } }],
-  ["partial ID cannot match", {}, { event: { pull_request: { user: { id: 4892728 } }, sender: { id: 34892728 } } }],
-  ["invalid JSON keeps hosted fallback", { AWS_CI_TRUSTED_USER_IDS: "[34892728,]" }, {}],
-  ["stale snapshot", { AWS_CI_TRUSTED_USER_IDS: "[34892728,999]" }, {}],
-  ["missing snapshot", { AWS_CI_ROUTING_USER_IDS_SOURCE: "" }, {}],
-  ["missing admission members", { AWS_CI_ROUTING_USER_IDS: "" }, {}],
-  ["disabled routing", { AWS_CI_ENABLED: "false" }, {}],
-  ["different repository", {}, { repository: "other/repo" }],
-  ["different repository ID", {}, { repository_id: "999" }],
-  ["approved manual master canary", {}, { event_name: "workflow_dispatch" }, "runs-on/fleet=paperclip-ci-routing-x64/env=public-ci"],
-  ["unapproved manual actor", {}, { event_name: "workflow_dispatch", actor_id: "999" }],
-  ["manual branch canary", {}, { event_name: "workflow_dispatch", ref: "refs/heads/other" }],
-];
-
-for (const [name, vars, github, expected = "ubuntu-latest"] of placementCases) {
-  test(`placement before allocation: ${name}`, () => {
-    assert.equal(routingPlacement(vars, github), expected);
-  });
-}
+test("plan step falls back when head SHA is invalid", () => {
+  assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+    FULL_CI: "true",
+    EVENT_HEAD_SHA: "not-a-sha",
+  }), { plan: "" });
+});

@@ -48,7 +48,8 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(len(cron.split()), 5)
 
     def test_workflow_run_list_matches_the_canonical_ci_workflows(self):
-        expected = {"PR", "Docker Runner check", "Gate Tests", "Storybook Visual"}
+        expected = {"PR", "Docker Runner check", "Gate Tests", "Storybook Visual",
+                    "CI work benchmark", "Sentry SDK contract"}
         self.assertEqual(set(self.wf["on"]["workflow_run"]["workflows"]), expected)
         self.assertNotIn(self.wf["name"], expected)
 

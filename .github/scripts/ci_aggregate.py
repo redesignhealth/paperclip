@@ -6,21 +6,27 @@ Evidence is the GitHub Actions run list of the exact head SHA H in the base repo
 - Run head_sha must match exactly H.
 
 Generic provenance for .github/workflows/pr.yml (TRUSTED_CI):
-- The workflow file definition at head_sha must call the outer upstream workflow:
-  paperclipai/paperclip/.github/workflows/pr-trusted.yml
-  at ref master or refs/heads/master.
-- Wrong local, extra/missing jobs, ci-routing replacement outer, or arbitrary SHA refs => UNTRUSTED_CI_DEFINITION.
-- The API run.referenced_workflows must contain EXACTLY the 2 upstream entries:
-  paperclipai/paperclip/.github/workflows/pr-trusted.yml
-  paperclipai/paperclip/.github/workflows/ci-routing.yml
-  at ref refs/heads/master (or master), recording their SHAs for audit. Missing or extra entries => fail closed.
+- The workflow file definition at head_sha must call an approved outer reusable workflow:
+    redesignhealth/paperclip/.github/workflows/pr-trusted.yml   (fork-owned, TECH-7907)
+    paperclipai/paperclip/.github/workflows/pr-trusted.yml      (upstream, transitional)
+  at ref master or refs/heads/master. Both forms resolve the definition from a protected
+  master branch, so a pull request never executes its own copy of the CI definition.
+- A root-local reference (./.github/workflows/pr-trusted.yml) resolves to the PR's merge ref
+  and stays UNTRUSTED. Wrong local, extra/missing jobs, ci-routing replacement outer,
+  arbitrary SHA refs, other repos, other ref forms => UNTRUSTED_CI_DEFINITION.
+- The API run.referenced_workflows must contain EXACTLY one approved pair -- both entries
+  from the SAME repository, pr-trusted.yml and ci-routing.yml, with path ref @master and
+  ref refs/heads/master -- recording their SHAs for audit. A mixed pair, a SHA-pinned path ref,
+  a missing entry or an extra entry => fail closed.
 
 Jobs evaluation:
 - For .github/workflows/pr.yml, all jobs must carry the `ci / ` prefix.
 - Anchors: `ci / gate / Select trusted runner`, `ci / policy`, `ci / verify`, `ci / e2e` are required success.
 - Missing anchors or incomplete jobs => PENDING (fail closed).
 - All present jobs in latest attempt must be `success`.
-- Allowed skips is empty for pr.yml (upstream full_ci=false is only for stacked PRs whose base is not master, which are ineligible).
+- The only allowed skip for pr.yml is the deliberately-disabled "ci / Select Vitest files" optimization
+  (see OPTIONAL_SKIPPED_JOBS); upstream full_ci=false is only for stacked PRs whose base is not master,
+  which are ineligible.
 - `action_required` is a FAILURE.
 - For .github/workflows/storybook-visual.yml, the workflow is only required when the PR holds the 'storybook-visual' label;
   when applicable, 'Storybook visual regression' must be success, and the dispatch-only preview job
@@ -38,14 +44,26 @@ import yaml
 import gate_lib
 from gate_lib import GateError
 
-OUTER_PR_TRUSTED_PATH = "paperclipai/paperclip/.github/workflows/pr-trusted.yml"
+# This fork owns reviewed copies of the reusable CI definitions on its own protected master
+# (TECH-7907), so upstream can no longer change this repository's CI without review. Upstream's
+# pair stays approved only until .github/workflows/pr.yml is cut over; remove it afterwards.
+FORK_PR_TRUSTED_PATH = "redesignhealth/paperclip/.github/workflows/pr-trusted.yml"
+FORK_CI_ROUTING_PATH = "redesignhealth/paperclip/.github/workflows/ci-routing.yml"
+UPSTREAM_PR_TRUSTED_PATH = "paperclipai/paperclip/.github/workflows/pr-trusted.yml"
+UPSTREAM_CI_ROUTING_PATH = "paperclipai/paperclip/.github/workflows/ci-routing.yml"
+
+OUTER_PR_TRUSTED_PATHS = frozenset({FORK_PR_TRUSTED_PATH, UPSTREAM_PR_TRUSTED_PATH})
 OUTER_ALLOWED_REFS = frozenset({"master", "refs/heads/master"})
 
-EXPECTED_REFERENCED_PATHS = frozenset({
-    "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
-    "paperclipai/paperclip/.github/workflows/ci-routing.yml",
-})
-APPROVED_REFERENCED_REFS = frozenset({"master", "refs/heads/master"})
+# A run must reference exactly ONE of these pairs, whole. A mixed pair (one repository's outer
+# workflow with another's router) is not an approved definition and fails closed.
+APPROVED_REFERENCED_PATH_SETS = (
+    frozenset({FORK_PR_TRUSTED_PATH, FORK_CI_ROUTING_PATH}),
+    frozenset({UPSTREAM_PR_TRUSTED_PATH, UPSTREAM_CI_ROUTING_PATH}),
+)
+ALL_APPROVED_REFERENCED_PATHS = frozenset().union(*APPROVED_REFERENCED_PATH_SETS)
+APPROVED_REFERENCED_PATH_REF = "master"
+APPROVED_REFERENCED_REFS = frozenset({"refs/heads/master"})
 
 PR_ANCHOR_JOBS = frozenset({
     "ci / gate / Select trusted runner",
@@ -56,6 +74,9 @@ PR_ANCHOR_JOBS = frozenset({
 
 OPTIONAL_SKIPPED_JOBS: dict[str, frozenset[str]] = {
     ".github/workflows/storybook-visual.yml": frozenset({"Deploy selected branch Storybook"}),
+    # pr-trusted.yml's Vitest selection is an optimization. Its `if` skips it whenever the plan
+    # forces a full run, and the full test matrix then runs instead. A failure still fails.
+    ".github/workflows/pr.yml": frozenset({"ci / Select Vitest files"}),
 }
 
 WAITING_CONCLUSIONS = frozenset({"action_required"})
@@ -71,7 +92,7 @@ class CiResult:
 def validate_ci_definition(content: str) -> None:
     """Validate that .github/workflows/pr.yml matches TRUSTED_CI generic provenance rules.
 
-    Outer call must be paperclipai/paperclip/.github/workflows/pr-trusted.yml at master or refs/heads/master.
+    Outer call must be an approved pr-trusted.yml at master or refs/heads/master.
     Raises GateError("UNTRUSTED_CI_DEFINITION") otherwise.
     """
     try:
@@ -92,7 +113,7 @@ def validate_ci_definition(content: str) -> None:
     if not isinstance(uses, str) or "@" not in uses:
         raise GateError("UNTRUSTED_CI_DEFINITION")
     path, ref = uses.split("@", 1)
-    if path != OUTER_PR_TRUSTED_PATH:
+    if path not in OUTER_PR_TRUSTED_PATHS:
         raise GateError("UNTRUSTED_CI_DEFINITION")
     if ref not in OUTER_ALLOWED_REFS:
         raise GateError("UNTRUSTED_CI_DEFINITION")
@@ -142,8 +163,9 @@ def validate_storybook_definition(content: str) -> None:
 
 
 def validate_run_referenced_workflows(run: dict[str, Any]) -> tuple[bool, str | None, dict[str, str]]:
-    """Validate that run.referenced_workflows contains EXACTLY the 2 upstream entries:
-    pr-trusted.yml and ci-routing.yml at refs/heads/master (or master), recording their SHAs for audit.
+    """Validate that run.referenced_workflows contains EXACTLY one approved pair:
+    pr-trusted.yml and ci-routing.yml from the same repository at refs/heads/master with path ref @master,
+    recording their SHAs for audit.
     """
     ref_wfs = run.get("referenced_workflows")
     if not isinstance(ref_wfs, list) or len(ref_wfs) == 0:
@@ -159,18 +181,19 @@ def validate_run_referenced_workflows(run: dict[str, Any]) -> tuple[bool, str | 
         raw_path = entry.get("path")
         if not isinstance(raw_path, str) or not raw_path:
             return False, "missing path in referenced_workflow", {}
-        if "@" in raw_path:
-            path_part, at_ref = raw_path.split("@", 1)
-        else:
-            path_part = raw_path
-            at_ref = None
+        if "@" not in raw_path:
+            return False, "missing ref suffix in referenced_workflow path", {}
 
-        ref_part = entry.get("ref") or at_ref
-        if path_part not in EXPECTED_REFERENCED_PATHS:
-            return False, f"untrusted referenced workflow path '{path_part}'", {}
+        path_part, at_ref = raw_path.rsplit("@", 1)
+        if at_ref != APPROVED_REFERENCED_PATH_REF:
+            return False, f"untrusted referenced workflow path ref '{at_ref}'", {}
 
+        ref_part = entry.get("ref")
         if ref_part not in APPROVED_REFERENCED_REFS:
             return False, f"untrusted referenced workflow ref '{ref_part}'", {}
+
+        if path_part not in ALL_APPROVED_REFERENCED_PATHS:
+            return False, f"untrusted referenced workflow path '{path_part}'", {}
 
         sha_part = entry.get("sha")
         if not gate_lib.is_full_sha(sha_part):
@@ -181,8 +204,8 @@ def validate_run_referenced_workflows(run: dict[str, Any]) -> tuple[bool, str | 
 
         sha_by_path[path_part] = sha_part
 
-    if set(sha_by_path.keys()) != EXPECTED_REFERENCED_PATHS:
-        return False, "referenced_workflows does not contain exact required set", {}
+    if frozenset(sha_by_path) not in APPROVED_REFERENCED_PATH_SETS:
+        return False, "referenced_workflows is not an approved same-repository pair", {}
 
     return True, None, sha_by_path
 
@@ -234,7 +257,7 @@ def _job_problems(path: str, run: dict[str, Any], jobs: list[Any]) -> tuple[list
         name = job.get("name")
         status = job.get("status")
         conclusion = job.get("conclusion")
-        label = f"{path}: job {gate_lib.safe_token(name, 'unnamed')}"
+        label = f"{path}: job {gate_lib.safe_job_name(name, 'unnamed')}"
         if isinstance(name, str):
             present_job_names.add(name)
 
