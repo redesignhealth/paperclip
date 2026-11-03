@@ -21,10 +21,23 @@ export const SLACK_CHAT_BOT_SCOPES = [
   "reactions:read", "reactions:write", "users:read",
 ] as const satisfies readonly (typeof SLACK_DEFAULT_BOT_SCOPES)[number][];
 
-export function defaultSlackAppConfiguration(agentName: string): SlackAppConfiguration {
-  const botName = agentName.normalize("NFKD").toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "paperclip-agent";
-  return { appName: `${botName}-paperclip`, botName, command: `/${botName.replace(/[._]+/g, "-")}` };
+function slackNameSlug(name: string): string {
+  return name.normalize("NFKD").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24);
+}
+
+/**
+ * The starting Slack app details. Without a company name the app is named after the agent, as before. With one, the
+ * app and its bot are named after the company (the app name as written, up to Slack's 35 characters; the bot display
+ * name as the lowercase slug Slack requires), while the slash command still comes from the agent so two agents in
+ * one company never claim the same command.
+ */
+export function defaultSlackAppConfiguration(agentName: string, companyName?: string): SlackAppConfiguration {
+  const agentSlug = slackNameSlug(agentName) || "paperclip-agent";
+  const command = `/${agentSlug.replace(/[._]+/g, "-")}`;
+  const company = companyName?.trim();
+  const companySlug = company ? slackNameSlug(company) : "";
+  if (!company || !companySlug) return { appName: `${agentSlug}-paperclip`, botName: agentSlug, command };
+  return { appName: company.slice(0, 35).trim(), botName: companySlug, command };
 }
 
 export function buildSlackAppManifest(input: {

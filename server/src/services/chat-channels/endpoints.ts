@@ -28,6 +28,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   chatEndpoints,
+  companies,
   toolApplications,
   toolConnections,
 } from "@paperclipai/db";
@@ -264,6 +265,9 @@ function providerSetupState(
       .then((rows) => rows[0] ?? null);
     if (!agent)
       throw unprocessable("The selected agent does not belong to this company");
+    const companyName = input.provider === "slack" && !input.slackApp
+      ? await db.select({ name: companies.name }).from(companies).where(eq(companies.id, companyId)).then((rows) => rows[0]?.name)
+      : undefined;
     if (!isAgentStatusInvokable(agent.status)) {
       throw unprocessable(
         "The selected agent must be active before it can be connected to chat",
@@ -363,8 +367,8 @@ function providerSetupState(
         setup: {
           step: "provider_setup",
           ...(input.provider === "slack"
-            ? { slackApp: input.slackApp ?? defaultSlackAppConfiguration(agent.name),
-                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod(),
+            ? { slackApp: input.slackApp ?? defaultSlackAppConfiguration(agent.name, companyName),
+                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name, companyName)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod(),
                 // Always explicit, on every create path: a new endpoint has
                 // requested and installed nothing, and no field means "legacy
                 // full grant" only when a prior install exists.

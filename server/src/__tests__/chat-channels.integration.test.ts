@@ -7308,7 +7308,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       assignedAgentName: "Maya",
       status: "draft",
       allowUnlinkedPeople: false,
-      setup: { command: "/maya", slackApp: { appName: "maya-paperclip", botName: "maya", command: "/maya" } },
+      // The app and bot are named after the company; the slash command still comes from the agent.
+      setup: { command: "/maya", slackApp: { appName: `Chat Test ${fixture.companyId.slice(0, 8)}`, botName: `chat-test-${fixture.companyId.slice(0, 8)}`, command: "/maya" } },
     });
     const createdCommand = createResponse.body.setup.command as string;
     const [connection] = await readToolConnectionsById(createResponse.body.connectionId);
