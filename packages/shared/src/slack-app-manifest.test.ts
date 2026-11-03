@@ -111,8 +111,18 @@ describe("Slack app manifest", () => {
     expect(save({ refreshToken: "xoxe-1-abc", extra: "untrusted" })).toBe(false);
     expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" }, extra: true }).success).toBe(false);
   });
+  it("accepts shared only as a boolean beside the credentials", () => {
+    const parse = (shared: unknown) => slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" }, shared }).success;
+    expect(parse(true)).toBe(true);
+    expect(parse(false)).toBe(true);
+    expect(parse("true")).toBe(false);
+    expect(parse(1)).toBe(false);
+    expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" } }).success).toBe(true);
+    // It travels beside the credentials, never inside them.
+    expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc", shared: true } }).success).toBe(false);
+  });
   it("returns specific messages for the saved-credential failure codes", () => {
-    for (const code of ["slack_configuration_refresh_invalid", "slack_configuration_refresh_required", "slack_configuration_refresh_uncertain", "slack_configuration_refresh_busy", "slack_configuration_credential_mismatch", "slack_configuration_credential_forbidden"]) {
+    for (const code of ["slack_configuration_refresh_invalid", "slack_configuration_refresh_required", "slack_configuration_refresh_uncertain", "slack_configuration_refresh_busy", "slack_configuration_shared_forbidden", "slack_configuration_credential_mismatch", "slack_configuration_credential_forbidden"]) {
       expect(slackRegistrationErrorMessage(code)).not.toBe(slackRegistrationErrorMessage("unknown-code"));
     }
     expect(slackRegistrationErrorMessage("slack_configuration_refresh_invalid")).toContain("refresh token");

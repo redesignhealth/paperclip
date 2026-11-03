@@ -37,7 +37,7 @@ export type InstanceCredentialDeps = {
   timeoutMs: number;
 };
 
-/** Records a use or rotation in the company whose setup caused it. */
+/** Records a rotation in the company whose request started it; concurrent callers share that one flight. */
 export type InstanceCredentialAudit = (action: string, workspaceId: string, details?: Record<string, unknown>) => Promise<void>;
 
 export const INSTANCE_CREDENTIAL_ADMIN_ONLY = "slack_configuration_shared_forbidden";
@@ -65,12 +65,14 @@ export function createInstanceSlackConfigurationCredentials(deps: InstanceCreden
     };
   }
 
-  function read(material: Row["accessMaterial"]): string {
+  function read(credentialId: string, material: Row["accessMaterial"]): string {
     if (!material) throw providerFailure("slack_configuration_refresh_required");
     try {
       return decryptInstanceSecretValue(material as Material);
     } catch {
       // Never include the material or the decrypt error: a bad key must not echo ciphertext.
+      // The log is what tells an operator this is the instance master key, not an expired Slack token.
+      logger.error({ credentialId }, "Slack instance configuration credential could not be decrypted; check PAPERCLIP_SECRETS_MASTER_KEY");
       throw providerFailure("slack_configuration_refresh_required");
     }
   }
@@ -122,11 +124,13 @@ export function createInstanceSlackConfigurationCredentials(deps: InstanceCreden
         }
         // A re-paste or a paste over a revoked row bumps the generation fence, so
         // a rotation already in flight discards its pair instead of overwriting this one.
+        // The counters are incremented in SQL: `existing` was read before the credential
+        // lock, and a rotation, a failed flight or a forget may have committed since.
         await tx.execute(credentialLock(existing.id));
         const [row] = await tx.update(table).set({
           ...values,
-          revision: existing.revision + 1,
-          chainGeneration: existing.chainGeneration + 1,
+          revision: sql`${table.revision} + 1`,
+          chainGeneration: sql`${table.chainGeneration} + 1`,
           updatedAt: new Date(),
         }).where(eq(table.id, existing.id)).returning();
         if (!row) throw new Error("Slack instance configuration credential was not saved");
@@ -146,7 +150,7 @@ export function createInstanceSlackConfigurationCredentials(deps: InstanceCreden
     return db.transaction(async tx => {
       await tx.execute(credentialLock(id));
       const [current] = await tx.select().from(table).where(eq(table.id, id));
-      if (!current) throw forbidden("This Slack token no longer exists.", { code: "slack_configuration_credential_forbidden" });
+      if (!current) throw providerFailure("slack_configuration_refresh_required");
       await tx.update(table).set({
         status: "revoked", accessMaterial: null, refreshMaterial: null,
         chainGeneration: current.chainGeneration + 1, revision: current.revision + 1, updatedAt: new Date(),
@@ -168,14 +172,14 @@ export function createInstanceSlackConfigurationCredentials(deps: InstanceCreden
       if (!row || row.status === "revoked") throw providerFailure("slack_configuration_refresh_required");
       if (row.status === "reauthorize") throw providerFailure("slack_configuration_refresh_invalid");
       if (row.status === "active" && row.accessExpiresAt && row.accessExpiresAt.getTime() > Date.now() + deps.accessMarginMs) {
-        return { kind: "cached", row, token: read(row.accessMaterial) };
+        return { kind: "cached", row, token: read(id, row.accessMaterial) };
       }
       if (row.status === "rotating" && !row.rotationStartedAt) throw providerFailure("slack_configuration_refresh_uncertain");
       if (row.status === "rotating" && row.rotationStartedAt!.getTime() > Date.now() - deps.rotatingStaleMs) return { kind: "busy" };
       // Stale `rotating` (crash or lost response): the stored refresh token was
       // never overwritten, so reclaiming is the only way the chain survives.
       const recovery = row.status === "rotating";
-      const refreshToken = read(row.refreshMaterial);
+      const refreshToken = read(id, row.refreshMaterial);
       const [claimed] = await tx.update(table).set({
         status: "rotating", rotationStartedAt: new Date(), revision: row.revision + 1, updatedAt: new Date(),
       }).where(eq(table.id, id)).returning();

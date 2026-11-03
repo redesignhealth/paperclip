@@ -139,6 +139,8 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
             : await chatEndpointsApi.saveSlackConfigurationCredential(endpoint.companyId, pastedRefresh);
           pastedRefresh = "";
           setRefreshToken("");
+          // One save per choice: a later paste in this flow must not stay instance-wide by accident.
+          setShareWithCompany(false);
           setJustSaved({ credential: saved, basis: slackSetupOptions });
           setSelectedCredentialId(saved.id);
           // Replacing a specific workspace's token with one from another
@@ -233,6 +235,7 @@ export function OwnSlackAppSetup({ endpoint, stage, disabled, saveDetails, onSav
           await chatEndpointsApi.forgetSlackConfigurationCredential(endpoint.companyId, id);
           setJustSaved(current => current?.credential.id === id ? null : current);
           setSelectedCredentialId(null);
+          setShareWithCompany(false);
           await reconcile();
         })}
       />}

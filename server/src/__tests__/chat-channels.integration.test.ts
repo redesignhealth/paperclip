@@ -1001,12 +1001,12 @@ function makeMessage(input: {
   } as unknown as Message;
 }
 
-function boardActor(companyId: string, userId = "owner-user") {
+function boardActor(companyId: string, userId = "owner-user", isInstanceAdmin = false) {
   return {
     type: "board" as const,
     source: "session" as const,
     userId,
-    isInstanceAdmin: false,
+    isInstanceAdmin,
     companyIds: [companyId],
     memberships: [{ companyId, status: "active", membershipRole: "operator" }],
   };
@@ -1017,11 +1017,12 @@ function routesApp(
   companyId: string,
   service: ChatChannelService,
   userId = "owner-user",
+  isInstanceAdmin = false,
 ) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    req.actor = boardActor(companyId, userId);
+    req.actor = boardActor(companyId, userId, isInstanceAdmin);
     next();
   });
   app.use(
@@ -8267,6 +8268,28 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect(outcome).toMatchObject({ status: 403, details: { code: "slack_configuration_shared_forbidden" } });
           expect(f.state.rotateCount).toBe(0);
           expect(await db.select().from(instanceSlackConfigurationCredentials)).toEqual([]);
+        });
+
+        it("saves and forgets through the routes only for an instance administrator", async () => {
+          const f = await fixture();
+          const asUser = () => routesApp(db, f.companyId, f.service);
+          const asAdmin = () => routesApp(db, f.companyId, f.service, "admin-user", true);
+
+          // A regular connection manager cannot share a token, and the pasted one is not spent.
+          await request(asUser()).post(credentialRoute(f.companyId)).send({ credentials: { refreshToken: pasted }, shared: true }).expect(403);
+          expect(f.state.rotateCount).toBe(0);
+
+          const saved = (await request(asAdmin()).post(credentialRoute(f.companyId)).send({ credentials: { refreshToken: pasted }, shared: true }).expect(200)).body;
+          expect(saved).toMatchObject({ workspaceId: "TAUTO", status: "active", shared: true });
+          // Every company manager sees it in setup options, with no secret material.
+          const options = (await request(asUser()).get(`/api/companies/${f.companyId}/chat-slack/setup-options`).expect(200)).body;
+          expect(options.configurationCredentials).toEqual([saved]);
+          expect(JSON.stringify(options)).not.toContain("xoxe");
+
+          await request(asUser()).delete(`${credentialRoute(f.companyId)}/${saved.id}`).expect(403);
+          expect(await instanceRow()).toMatchObject({ status: "active" });
+          await request(asAdmin()).delete(`${credentialRoute(f.companyId)}/${saved.id}`).expect(204);
+          expect(await instanceRow()).toMatchObject({ status: "revoked", accessMaterial: null, refreshMaterial: null });
         });
 
         it("stores the token pair encrypted and never in a company's secrets", async () => {
