@@ -22,6 +22,7 @@
  * "::"); fresh registration uses the bare base sub (`agentKey: null`), while legacy registered
  * agents preserve their existing keyed bindings.
  */
+import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { randomUUID } from "node:crypto";
 import {
   COMMS_BOARD_ADMIN_TOKEN_ENV,
@@ -232,7 +233,7 @@ export async function registerCommsBoardAgent(
   // agent inherits its company's classification, there is no per-agent override. Defaults
   // to false (private) so an unclassified/legacy company never gets upgraded to shared by omission.
   request: { boardSub: string; displayName: string; ownerEmail: string; isShared?: boolean },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   opts: RegisterCommsBoardAgentOptions = {},
 ): Promise<BoardRegisterOutcome> {
   const timeoutMs = opts.timeoutMs ?? COMMS_BOARD_REQUEST_TIMEOUT_MS;
@@ -453,7 +454,7 @@ export type BoardSetSharedOutcome =
 export async function setCommsBoardAgentShared(
   config: CommsBoardProvisionerConfig,
   request: { boardAgentId: string; isShared: boolean },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   opts: { timeoutMs?: number } = {},
 ): Promise<BoardSetSharedOutcome> {
   if (!UUID_PATTERN.test(request.boardAgentId)) return { ok: false, reason: "failed" };
@@ -621,7 +622,7 @@ async function mintCredentialForPurpose(
 export async function mintCommsBoardCredential(
   config: CommsBoardProvisionerConfig,
   request: { baseSub: string; ownerEmail: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<MintOutcome> {
   const outcome = await mintCredentialForPurpose(config, { ...request, purpose: "bot" }, fetchImpl, timeoutMs);
@@ -637,7 +638,7 @@ export async function mintCommsBoardCredential(
 export async function mintCommsBoardTemplateCredential(
   config: CommsBoardProvisionerConfig,
   request: { companyId: string; ownerEmail: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<PurposeMintOutcome> {
   const baseSub = composeTemplateSub(request.companyId);
@@ -654,7 +655,7 @@ export async function mintCommsBoardTemplateCredential(
 export async function mintRhMcpServiceCredential(
   config: CommsBoardProvisionerConfig,
   request: { companyId: string; ownerEmail: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<PurposeMintOutcome> {
   const baseSub = composeRhMcpServiceSub(request.companyId);
@@ -679,7 +680,7 @@ export type RotateOutcome =
 export async function rotateCommsBoardCredential(
   config: CommsBoardProvisionerConfig,
   request: { baseSub: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<RotateOutcome> {
   return rotateCredentialWithScopes(config, request.baseSub, COMMS_BOARD_TOKEN_SCOPES, fetchImpl, timeoutMs);
@@ -689,7 +690,7 @@ export async function rotateCommsBoardCredential(
 export async function rotateRhMcpServiceCredential(
   config: CommsBoardProvisionerConfig,
   request: { companyId: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<RotateOutcome> {
   const baseSub = composeRhMcpServiceSub(request.companyId);
@@ -758,7 +759,7 @@ export type ReadOwnershipOutcome =
 export async function readCommsBoardOwnership(
   config: CommsBoardProvisionerConfig,
   request: { baseSub: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
 ): Promise<ReadOwnershipOutcome> {
   if (!BASE_SUB_PATTERN.test(request.baseSub)) return { ok: false, reason: "invalid_subject" };

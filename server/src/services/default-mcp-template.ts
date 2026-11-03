@@ -35,6 +35,7 @@
  *
  * Scope is the boot-frozen `PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS` (unset = every company).
  */
+import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import {
@@ -806,7 +807,7 @@ async function provisionTemplate(
       const minted = await mintCommsBoardTemplateCredential(
         provisioner,
         { companyId, ownerEmail: claim.ownerEmailNorm },
-        ctx.fetchImpl ?? fetch,
+        ctx.fetchImpl ?? tailnetAwareFetch,
       );
       if (!minted.ok) {
         if (minted.noRowCreated) {
