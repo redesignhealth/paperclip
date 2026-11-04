@@ -30,6 +30,16 @@ describe("Slack app manifest", () => {
       expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", company)).success, company).toBe(true);
     }
     expect(defaultSlackAppConfiguration("Maya", "A".repeat(80)).appName).toHaveLength(35);
+    // A cut never splits an emoji into a lone surrogate, and the bot slug never ends on a separator.
+    const emoji = defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`).appName;
+    expect(emoji).toBe("a".repeat(34));
+    expect(emoji.isWellFormed()).toBe(true);
+    expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`)).success).toBe(true);
+    expect(defaultSlackAppConfiguration("Maya", `${"a".repeat(33)}😀tail`).appName).toBe(`${"a".repeat(33)}😀`);
+    expect(defaultSlackAppConfiguration("Maya", "chat adapters browser e2e 179374705").botName).toBe("chat-adapters-browser-e2");
+    expect(defaultSlackAppConfiguration("Maya", "abcdefghijklmnopqrstuvw xyz").botName).toBe("abcdefghijklmnopqrstuvw");
+    // Emoji-only company names have nothing usable for the slug, so the agent defaults apply.
+    expect(defaultSlackAppConfiguration("Maya", "😀😀")).toEqual({ appName: "maya-paperclip", botName: "maya", command: "/maya" });
     // Nothing usable in the company name (or no company): fall back to the agent defaults.
     for (const company of ["!!!", "", "   ", undefined]) {
       expect(defaultSlackAppConfiguration("Maya", company)).toEqual({ appName: "maya-paperclip", botName: "maya", command: "/maya" });

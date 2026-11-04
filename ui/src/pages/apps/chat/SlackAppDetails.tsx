@@ -24,6 +24,9 @@ export function SlackAppDetails({ value, readOnly, onChange, onBlur, fields }: {
   fields?: readonly SlackAppDetailKey[];
 }) {
   const validation = slackAppConfigurationSchema.safeParse(value);
+  // Only the first problem in a row this form shows, so a split form never reports another part's error.
+  const shownIssue = validation.success ? undefined
+    : validation.error.issues.find(issue => !fields || fields.includes(issue.path[0] as SlackAppDetailKey));
   return <div className="space-y-3 text-sm">
     {([
       ["appName", "Slack app name", 35, "The name of your app in Slack’s app directory and settings."],
@@ -40,6 +43,6 @@ export function SlackAppDetails({ value, readOnly, onChange, onBlur, fields }: {
         aria-invalid={!validation.success && validation.error.issues.some(issue => issue.path[0] === key)}
         onChange={event => onChange({ ...value, [key]: event.target.value })} onBlur={onBlur} />
     </div>)}
-    {!validation.success && <p role="alert" className="text-destructive">{validation.error.issues[0].message}</p>}
+    {shownIssue && <p role="alert" className="text-destructive">{shownIssue.message}</p>}
   </div>;
 }

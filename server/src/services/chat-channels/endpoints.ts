@@ -268,6 +268,7 @@ function providerSetupState(
     const companyName = input.provider === "slack" && !input.slackApp
       ? await db.select({ name: companies.name }).from(companies).where(eq(companies.id, companyId)).then((rows) => rows[0]?.name)
       : undefined;
+    const slackApp = input.slackApp ?? defaultSlackAppConfiguration(agent.name, companyName);
     if (!isAgentStatusInvokable(agent.status)) {
       throw unprocessable(
         "The selected agent must be active before it can be connected to chat",
@@ -367,8 +368,8 @@ function providerSetupState(
         setup: {
           step: "provider_setup",
           ...(input.provider === "slack"
-            ? { slackApp: input.slackApp ?? defaultSlackAppConfiguration(agent.name, companyName),
-                command: (input.slackApp ?? defaultSlackAppConfiguration(agent.name, companyName)).command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod(),
+            ? { slackApp: slackApp,
+                command: slackApp.command, slackSetupMethod: input.slackSetupMethod ?? options.slackRegistration.managerGrants.defaultMethod(),
                 // Always explicit, on every create path: a new endpoint has
                 // requested and installed nothing, and no field means "legacy
                 // full grant" only when a prior install exists.

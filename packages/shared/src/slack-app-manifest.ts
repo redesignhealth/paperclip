@@ -22,7 +22,8 @@ export const SLACK_CHAT_BOT_SCOPES = [
 ] as const satisfies readonly (typeof SLACK_DEFAULT_BOT_SCOPES)[number][];
 
 function slackNameSlug(name: string): string {
-  return name.normalize("NFKD").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24);
+  return name.normalize("NFKD").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24)
+    .replace(/^-+|-+$/g, "");
 }
 
 /**
@@ -37,7 +38,14 @@ export function defaultSlackAppConfiguration(agentName: string, companyName?: st
   const company = companyName?.trim();
   const companySlug = company ? slackNameSlug(company) : "";
   if (!company || !companySlug) return { appName: `${agentSlug}-paperclip`, botName: agentSlug, command };
-  return { appName: company.slice(0, 35).trim(), botName: companySlug, command };
+  // The schema counts UTF-16 units, so cut on whole characters until 35 units are used: an emoji at the boundary
+  // is dropped rather than split into a lone surrogate or pushed past the limit.
+  let appName = "";
+  for (const character of company) {
+    if (appName.length + character.length > 35) break;
+    appName += character;
+  }
+  return { appName: appName.trim(), botName: companySlug, command };
 }
 
 export function buildSlackAppManifest(input: {

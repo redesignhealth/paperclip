@@ -21,7 +21,7 @@ export function SlackSetupFixture({ scenario = "create", managed = false, manage
       id: "slack-story", companyId: "company-storybook", provider: "slack", status: "draft",
       assignedAgentId: agent.id, assignedAgentName: agent.name, allowUnlinkedPeople: false, trustUnlinkedPeople: false,
       setup: { step: "provider_setup", slackSetupMethod: scenario === "manual" ? "manual" : managed ? "managed" : "automatic",
-        slackApp: defaultSlackAppConfiguration(agent.name),
+        slackApp: defaultSlackAppConfiguration(agent.name, "Storybook Health"),
         webhookUrl: "https://ingress.example/api/chat-webhooks/slack-story/slack",
         slackOAuthCallbackUri: "https://board.example/api/chat-slack/oauth/callback",
       },
@@ -76,7 +76,7 @@ export function SlackSetupFixture({ scenario = "create", managed = false, manage
         agent = agents.find(value => value.id === input.assignedAgentId) ?? agent;
         endpoint.assignedAgentId = agent.id; endpoint.assignedAgentName = agent.name;
         endpoint.setup!.slackSetupMethod = input.slackSetupMethod ?? (managed ? "managed" : "automatic");
-        endpoint.setup!.slackApp = input.slackApp ?? defaultSlackAppConfiguration(agent.name);
+        endpoint.setup!.slackApp = input.slackApp ?? defaultSlackAppConfiguration(agent.name, "Storybook Health");
         return Response.json(endpoint);
       }
       if (path === "/api/chat-endpoints/slack-story") {

@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, within } from "storybook/test";
 import { SlackSetupFixture } from "../../fixtures/SlackSetupFixture";
+import { defaultSlackAppConfiguration } from "@paperclipai/shared";
 
 const start = "/PAP/apps/chat/connect?provider=slack&purpose=chat";
 const meta = {
@@ -37,12 +38,14 @@ export const Success: Story = { name: "04 · Success", args: { scenario: "succes
   await expect(await canvas.findByRole("heading", { name: "Success" })).toBeVisible();
 } };
 export const ChooseAgentSelected: Story = {
-  name: "Choose agent · Advanced defaults", args: { scenario: "choose" }, parameters: { initialEntries: [`${start}&agentId=agent-codex`] },
+  name: "Choose agent · Company-based defaults", args: { scenario: "choose" }, parameters: { initialEntries: [`${start}&agentId=agent-codex`] },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
+    // The app and bot names are on the step and default to the company; only the command is under Advanced.
+    const defaults = defaultSlackAppConfiguration("Maya", "Storybook Health");
+    await expect(await canvas.findByLabelText("Slack app name", { exact: true })).toHaveValue(defaults.appName);
+    await expect(canvas.getByLabelText("Bot display name", { exact: true })).toHaveValue(defaults.botName);
     await userEvent.click(await canvas.findByText("Advanced", { selector: "summary" }));
-    await expect(canvas.getByLabelText("Slack app name", { exact: true })).toHaveValue("maya-paperclip");
-    await expect(canvas.getByLabelText("Bot display name", { exact: true })).toHaveValue("maya");
     await expect(canvas.getByLabelText("Slash command", { exact: true })).toHaveValue("/maya");
   },
 };
