@@ -13,6 +13,7 @@
  * `paperclip:arcana-brain:<principal|runtime>:<companyId>:<agentId>` (first 16 bytes, version nibble 5,
  * RFC 4122 variant). The two domains never collide, as Arcana requires.
  */
+import { isUnreachableTailnetPort, tailnetAwareFetch } from "./remote-http-fetch.js";
 import { createHash, createHmac } from "node:crypto";
 import {
   ARCANA_MCP_URL_ENV,
@@ -44,7 +45,7 @@ function validEndpoint(raw: string): boolean {
     return false;
   }
   if (url.username || url.password || url.search || url.hash) return false;
-  if (url.protocol === "https:") return true;
+  if (url.protocol === "https:") return !isUnreachableTailnetPort(url);
   return url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname.toLowerCase());
 }
 
@@ -143,7 +144,7 @@ async function discard(response: Response) {
 export async function provisionArcanaBrain(
   config: ArcanaProvisionerConfig,
   request: { agentPrincipalId: string; companyId: string; runtimeId: string; exchangeKeyHash: string },
-  fetchImpl: FetchLike = fetch,
+  fetchImpl: FetchLike = tailnetAwareFetch,
   timeoutMs: number = ARCANA_REQUEST_TIMEOUT_MS,
   now: () => number = Date.now,
 ): Promise<ArcanaProvisionOutcome> {
