@@ -1207,6 +1207,7 @@ describe("agent skill routes", () => {
     const seededCalls = mockAgentInstructionsService.materializeManagedBundle.mock.calls;
     const entrySeed = seededCalls.at(-1)?.[1] as Record<string, string> | undefined;
     expect(entrySeed?.["AGENTS.md"]).toContain("chief of staff");
+    expect(entrySeed?.["AGENTS.md"]).toContain("use the RH Google MCP app");
     // The normal onboarding flow has beta skill version selection disabled.
     expect(mockAgentService.create.mock.calls[0][1].adapterConfig.paperclipSkillSync.desiredSkills)
       .toContain("paperclipai/paperclip/first-task");
