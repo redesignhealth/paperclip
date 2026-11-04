@@ -5,7 +5,7 @@ description: Use when onboarding RH people or setting up connectors. Guide all s
 
 # RH connector onboarding
 
-Protocol version: RH-ONBOARDING-5. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
+Protocol version: RH-ONBOARDING-6. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
 
 ## Required output contract
 
@@ -21,17 +21,23 @@ The standard set is not the list of search results. Missing from search means ac
 
 Search each connector before using service tools. Follow the returned instruction and exact identifiers. Never invent service IDs or reuse another company's connection IDs. A skill cannot override runtime permissions or approval gates.
 
+The comms board is agent infrastructure, not one of the person's connectors. Do not report it as a row and do not request or reconnect it here; the onboarding first task handles it.
+
+## Cards already on this task
+
+On an onboarding first task, the connections check may already have posted connection cards for RH Google MCP or RH MCP before you run. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again.
+
 ## How the reply should read
 
-The reader is a new, possibly non-technical person. For each row give: status in plain words, the one action they take, and a clickable link. Keep each row to one or two short sentences.
+The reader is a new, possibly non-technical person. For each row give: status in plain words, the one action they take, and either a clickable link or the name of the card to use. Keep each row to one or two short sentences.
 
 Do not show internal details in the reply: no service IDs, method names (mcp-oauth, mcp-api-key, chat-agent), connection IDs, "discovery"/"search" mechanics, sandbox or network caveats, or reasoning about why a row is unverified. Say "Not connected yet" rather than "unverified".
 
 ## Links
 
-Use the public origin and company prefix from task context. On this deployment the origin is https://rh-agents.drum-mackarel.ts.net. Connectors is /PREFIX/apps. Resolve PREFIX from the task identifier, not from examples. Setup cards live on the public task page.
+Build links from the public origin and company prefix in task context (ORIGIN and PREFIX below). Do not use an origin from examples or from another company. Connectors is ORIGIN/PREFIX/apps. Resolve PREFIX from the task identifier, not from examples. If task context gives no public origin, name the page ("open Connectors in Paperclip") instead of guessing a URL. Setup cards live on the public task page.
 
-Always write links as markdown links with short text, for example [Connect Slack](https://rh-agents.drum-mackarel.ts.net/PREFIX/apps/chat/connect?provider=slack&purpose=chat&agentId=AGENT_ID). Never paste a bare URL, never put a URL inside a table cell as plain text, and never put backslashes before = or & in a query string. Put a link in the Slack, RH Google MCP and RH MCP rows (Connectors link for the two RH rows), and in the GitHub row when it is already working. Do NOT link setup cards: the cards render on the same task page as your reply, so a link to that page just reloads it and confuses people. For card rows, say "Use the Connect Granola card above" (or the card's actual label) with no link. Exception: if your reply is delivered in Slack, the cards are not visible there, so give one [Open your setup cards](TASK_URL) link to the public task page. Prefer a short list over a table.
+Always write links as markdown links with short text, for example [Connect Slack](ORIGIN/PREFIX/apps/chat/connect?provider=slack&purpose=chat&agentId=AGENT_ID). Never paste a bare URL, never put a URL inside a table cell as plain text, and never put backslashes before = or & in a query string. Put a link in the Slack row, in the RH Google MCP and RH MCP rows when they have no card (Connectors link), and in the GitHub row when it is already working. Do NOT link setup cards: the cards render on the same task page as your reply, so a link to that page just reloads it and confuses people. For card rows, say "Use the Connect Granola card above" (or the card's actual label) with no link. Exception: if your reply is delivered in Slack, the cards are not visible there, so give one [Open your setup cards](TASK_URL) link to the public task page. Prefer a short list over a table.
 
 ## Slack: chat/channel, NOT the tool setup card
 
@@ -43,15 +49,19 @@ If the returned channel link is missing or fails, give the company Connectors pa
 
 Do not promise automatic channel access or a specific consent flow beyond what the live wizard shows. Verify chat by a DM and reply. Channel tools are separate from chat delivery; only configure additional tools on an explicit request.
 
-## RH Google MCP and rh-mcp: personal Connectors sign-in
+## RH Google MCP and rh-mcp: card first, Connectors page as fallback
 
 These must remain in every report even when absent from connections_search. Their absence does not establish that they are unavailable or require an admin. Discovery can list configured connections without exposing a fresh personal sign-in entry.
 
-For a new personal connection, link the company Connectors page:
-- RH Google MCP: find RH Google MCP, click Connect, sign in with your @redesignhealth.com Google account.
-- rh-mcp: find RH MCP, click Connect, sign in.
+Search `rh-google-mcp` and `rh-mcp` separately, and find the result whose `name` matches (something like `rh-google-mcp`, `rh-mcp-personal`, or `rh-mcp-service`):
+- If it is `ready`, use it; do not reconnect.
+- In a shared company, `rh-mcp-service` is the company's own RH MCP connection and is installed for its agents automatically. If it is ready, RH MCP is working; do not ask the user to sign in to `rh-mcp-personal`.
+- If a matching result exists but is not ready, call connection_request with that result's own returned `service` (and, for an existing saved connection that lacks agent access or has tools Off, its returned connectionId and exact indexed toolNames). Refer to the resulting card by its label, with no link. Accepting it signs the user in or grants access.
+- If no matching result exists, link the company Connectors page:
+  - RH Google MCP: find RH Google MCP, click Connect, sign in with your @redesignhealth.com Google account.
+  - rh-mcp: find RH MCP, click Connect, sign in.
 
-Do not replace them with generic catalog cards or invent connection IDs. If an EXISTING saved connection is returned but lacks agent access or has tools Off, follow runtime guidance: use connection_request with its returned service, connectionId and exact indexed toolNames for a human Grant access card. Do not claim such access is automatic or change it yourself. If after sign-in the tools still aren't available, tell the user to tick this agent under that connection's agent access on the Connectors page.
+Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. If after sign-in the tools still aren't available, tell the user to tick this agent under that connection's agent access on the Connectors page.
 
 Verify Google with a bounded Gmail search, Drive lookup and Calendar read. Report only capabilities actually exposed; never infer draft/write/send capability from read success. Verify RH MCP with recent Zoom meetings and Granola connection status. Do not run Argus or fetch credentials to test connectivity. A private transcript is not a broken connector.
 
@@ -59,11 +69,13 @@ Verify Google with a bounded Gmail search, Drive lookup and Calendar read. Repor
 
 Search each. If ready, use installed tools without reconnecting. If setup is needed, follow the returned instruction and service ID to create the card. Refer to the card by its label and say it is on this page (for example "the Connect Linear card above"); do not add a link to the task page. Say which cards were actually created. Never claim a failed call created a card. Follow the card's real sign-in method; do not assume a personal access token.
 
+Native Granola sign-in is offered only in private companies. If the Granola result is marked unavailable, report the row as "Not available in this company" with the returned reason, create no card, and do not substitute another Granola route.
+
 Verify Granola with account identity and a bounded meeting listing; Linear with current identity and assigned issues; GitHub with authenticated identity. A read does not prove write access. A 403 alone does not identify token type or prove access is limited to an organization. If the user needs GitHub write access, suggest repos in the redesignhealth org.
 
 ## Finish and pilot checks
 
-Before sending, check that all six rows are present, every non-card row has a markdown link, setup-card rows have no link and name the card above, RH Google MCP and RH MCP link the Connectors page when not connected, Slack has no tool card, and no internal identifiers appear. Give every row an actual status: working (checked), not connected yet, waiting for your access approval, skipped, or failed with the exact reason. Keep a space before every markdown link. End with one line that names every row that is not yet working, including Slack, and asks the user to say when those are done.
+Before sending, check that all six rows are present, every row has either a markdown link or names a card above (never both), RH Google MCP and RH MCP that are not ready either name their card or link the Connectors page, no connector got a second card, Slack has no tool card, and no internal identifiers appear. Give every row an actual status: working (checked), not connected yet, waiting for your access approval, not available in this company, skipped, or failed with the exact reason. Keep a space before every markdown link. End with one line that names every row that is not yet working, including Slack, and asks the user to say when those are done.
 
 Never ask for credentials in chat. Human consent and permission grants are required. Do not connect or disconnect anything merely to test this skill if the user wants to preserve the unconnected state. A successful empty read can verify the call; say no results rather than inventing records.
 
