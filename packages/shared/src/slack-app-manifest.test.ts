@@ -22,6 +22,29 @@ describe("Slack app manifest", () => {
     expect(createChatEndpointSchema.safeParse(request).success).toBe(true);
     expect(createChatEndpointSchema.safeParse({ ...request, provider: "discord" }).success).toBe(false);
   });
+  it("defaults the app and bot names from the company when one is given, and keeps the command per agent", () => {
+    expect(defaultSlackAppConfiguration("Maya", "Redesign Health")).toEqual({ appName: "Redesign Health", botName: "redesign-health", command: "/maya" });
+    // Two agents in one company share the names but never a slash command.
+    expect(defaultSlackAppConfiguration("Chief of Staff", "Redesign Health").command).toBe("/chief-of-staff");
+    for (const company of ["Redesign Health", "Café & Co.", "  Padded  ", "A".repeat(80), "x"]) {
+      expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", company)).success, company).toBe(true);
+    }
+    expect(defaultSlackAppConfiguration("Maya", "A".repeat(80)).appName).toHaveLength(35);
+    // A cut never splits an emoji into a lone surrogate, and the bot slug never ends on a separator.
+    const emoji = defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`).appName;
+    expect(emoji).toBe("a".repeat(34));
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji)).toBe(false); // no lone surrogate
+    expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`)).success).toBe(true);
+    expect(defaultSlackAppConfiguration("Maya", `${"a".repeat(33)}😀tail`).appName).toBe(`${"a".repeat(33)}😀`);
+    expect(defaultSlackAppConfiguration("Maya", "chat adapters browser e2e 179374705").botName).toBe("chat-adapters-browser-e2");
+    expect(defaultSlackAppConfiguration("Maya", "abcdefghijklmnopqrstuvw xyz").botName).toBe("abcdefghijklmnopqrstuvw");
+    // Emoji-only company names have nothing usable for the slug, so the agent defaults apply.
+    expect(defaultSlackAppConfiguration("Maya", "😀😀")).toEqual({ appName: "maya-paperclip", botName: "maya", command: "/maya" });
+    // Nothing usable in the company name (or no company): fall back to the agent defaults.
+    for (const company of ["!!!", "", "   ", undefined]) {
+      expect(defaultSlackAppConfiguration("Maya", company)).toEqual({ appName: "maya-paperclip", botName: "maya", command: "/maya" });
+    }
+  });
   const input = { app: { appName: 'Research "Ops"', botName: "research-ops", command: "/research" }, agentName: "Maya", webhookUrl: "https://ingress.example/api/chat-webhooks/public/slack" };
   it("uses identical manual and automatic configuration except the OAuth redirect", () => {
     const manual = buildSlackAppManifest(input);
