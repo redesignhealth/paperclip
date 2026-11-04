@@ -33,7 +33,7 @@ describe("Slack app manifest", () => {
     // A cut never splits an emoji into a lone surrogate, and the bot slug never ends on a separator.
     const emoji = defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`).appName;
     expect(emoji).toBe("a".repeat(34));
-    expect(emoji.isWellFormed()).toBe(true);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji)).toBe(false); // no lone surrogate
     expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`)).success).toBe(true);
     expect(defaultSlackAppConfiguration("Maya", `${"a".repeat(33)}😀tail`).appName).toBe(`${"a".repeat(33)}😀`);
     expect(defaultSlackAppConfiguration("Maya", "chat adapters browser e2e 179374705").botName).toBe("chat-adapters-browser-e2");
