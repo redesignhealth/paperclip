@@ -5,7 +5,7 @@ description: Use when onboarding RH people or setting up connectors. Guide all s
 
 # RH connector onboarding
 
-Protocol version: RH-ONBOARDING-4. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
+Protocol version: RH-ONBOARDING-5. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
 
 ## Required output contract
 
@@ -31,7 +31,7 @@ Do not show internal details in the reply: no service IDs, method names (mcp-oau
 
 Use the public origin and company prefix from task context. On this deployment the origin is https://rh-agents.drum-mackarel.ts.net. Connectors is /PREFIX/apps. Resolve PREFIX from the task identifier, not from examples. Setup cards live on the public task page.
 
-Always write links as markdown links with short text, for example [Connect Slack](https://rh-agents.drum-mackarel.ts.net/PREFIX/apps/chat/connect?provider=slack&purpose=chat&agentId=AGENT_ID). Never paste a bare URL, never put a URL inside a table cell as plain text, and never put backslashes before = or & in a query string. Put the relevant link in every row, including the Connectors link on the RH Google MCP and RH MCP rows. Prefer a short list over a table.
+Always write links as markdown links with short text, for example [Connect Slack](https://rh-agents.drum-mackarel.ts.net/PREFIX/apps/chat/connect?provider=slack&purpose=chat&agentId=AGENT_ID). Never paste a bare URL, never put a URL inside a table cell as plain text, and never put backslashes before = or & in a query string. Put a link in the Slack, RH Google MCP and RH MCP rows (Connectors link for the two RH rows), and in the GitHub row when it is already working. Do NOT link setup cards: the cards render on the same task page as your reply, so a link to that page just reloads it and confuses people. For card rows, say "Use the Connect Granola card above" (or the card's actual label) with no link. Exception: if your reply is delivered in Slack, the cards are not visible there, so give one [Open your setup cards](TASK_URL) link to the public task page. Prefer a short list over a table.
 
 ## Slack: chat/channel, NOT the tool setup card
 
@@ -57,13 +57,13 @@ Verify Google with a bounded Gmail search, Drive lookup and Calendar read. Repor
 
 ## Granola, Linear, GitHub: setup cards
 
-Search each. If ready, use installed tools without reconnecting. If setup is needed, follow the returned instruction and service ID to create the card. Link the task page and say which cards were actually created. Never claim a failed call created a card. Follow the card's real sign-in method; do not assume a personal access token.
+Search each. If ready, use installed tools without reconnecting. If setup is needed, follow the returned instruction and service ID to create the card. Refer to the card by its label and say it is on this page (for example "the Connect Linear card above"); do not add a link to the task page. Say which cards were actually created. Never claim a failed call created a card. Follow the card's real sign-in method; do not assume a personal access token.
 
 Verify Granola with account identity and a bounded meeting listing; Linear with current identity and assigned issues; GitHub with authenticated identity. A read does not prove write access. A 403 alone does not identify token type or prove access is limited to an organization. If the user needs GitHub write access, suggest repos in the redesignhealth org.
 
 ## Finish and pilot checks
 
-Before sending, check that all six rows are present, every row has a markdown link, RH Google MCP and RH MCP link the Connectors page when not connected, Slack has no tool card, and no internal identifiers appear. Give every row an actual status: working (checked), not connected yet, waiting for your access approval, skipped, or failed with the exact reason. Keep a space before every markdown link. End with one line that names every row that is not yet working, including Slack, and asks the user to say when those are done.
+Before sending, check that all six rows are present, every non-card row has a markdown link, setup-card rows have no link and name the card above, RH Google MCP and RH MCP link the Connectors page when not connected, Slack has no tool card, and no internal identifiers appear. Give every row an actual status: working (checked), not connected yet, waiting for your access approval, skipped, or failed with the exact reason. Keep a space before every markdown link. End with one line that names every row that is not yet working, including Slack, and asks the user to say when those are done.
 
 Never ask for credentials in chat. Human consent and permission grants are required. Do not connect or disconnect anything merely to test this skill if the user wants to preserve the unconnected state. A successful empty read can verify the call; say no results rather than inventing records.
 
