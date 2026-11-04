@@ -2,6 +2,7 @@ import { ExternalLink } from "lucide-react";
 import type { SlackConfigurationCredential } from "@paperclipai/shared";
 import { slackRegistrationErrorMessage } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
@@ -24,6 +25,9 @@ export function SlackConfigurationTokenSource({
   onSelectCredential,
   onModeChange,
   onRefreshTokenChange,
+  canShare,
+  shareWithCompany,
+  onShareChange,
   onConfigurationTokenChange,
   onForget,
 }: {
@@ -37,6 +41,10 @@ export function SlackConfigurationTokenSource({
   onSelectCredential: (id: string) => void;
   onModeChange: (mode: SlackConfigurationTokenMode) => void;
   onRefreshTokenChange: (value: string) => void;
+  /** An instance administrator may save one token for every company in this instance. */
+  canShare: boolean;
+  shareWithCompany: boolean;
+  onShareChange: (value: boolean) => void;
   onConfigurationTokenChange: (value: string) => void;
   onForget: (id: string) => void;
 }) {
@@ -51,18 +59,25 @@ export function SlackConfigurationTokenSource({
       {credentials.length > 1 && <Select value={selected?.id ?? ""} onValueChange={onSelectCredential} disabled={locked}>
         <SelectTrigger aria-label="Saved Slack configuration workspace"><SelectValue placeholder="Choose a workspace" /></SelectTrigger>
         <SelectContent>{credentials.map(credential => <SelectItem key={credential.id} value={credential.id}>
-          {credential.status === "reauthorize" ? `${credential.workspaceId} (needs a new token)` : credential.workspaceId}
+          {credential.workspaceId}{credential.shared ? " (shared)" : ""}{credential.status === "reauthorize" ? " (needs a new token)" : ""}
         </SelectItem>)}</SelectContent>
       </Select>}
       {selected?.status === "reauthorize" && mode !== "access" && <>
         <p role="alert" className="text-sm text-destructive">{slackRegistrationErrorMessage("slack_configuration_refresh_invalid")}</p>
-        <p className="text-sm">Save a new refresh token for workspace <code>{selected.workspaceId}</code></p>
-        <RefreshTokenField value={refreshToken} disabled={locked} onChange={onRefreshTokenChange} />
+        {selected.shared && !canShare
+          ? <p className="text-sm">This token is shared by every company. Ask an instance administrator to save a new one for workspace <code>{selected.workspaceId}</code>, or use a one-time access token.</p>
+          : <>
+            <p className="text-sm">Save a new refresh token for workspace <code>{selected.workspaceId}</code></p>
+            <RefreshTokenField value={refreshToken} disabled={locked} onChange={onRefreshTokenChange} />
+            {canShare && !selected.shared && <ShareWithCompany checked={shareWithCompany} disabled={locked} onChange={onShareChange} />}
+          </>}
       </>}
-      {selected?.status === "active" && <p className="text-sm">Using your saved Slack configuration token for workspace <code>{selected.workspaceId}</code></p>}
+      {selected?.status === "active" && (selected.shared
+        ? <p className="text-sm">Using the Slack configuration token your administrator saved for every company, for workspace <code>{selected.workspaceId}</code></p>
+        : <p className="text-sm">Using your saved Slack configuration token for workspace <code>{selected.workspaceId}</code></p>)}
       {selected && <div className="flex flex-wrap gap-4 text-sm">
         {mode !== "access" && <Button variant="link" className="h-auto p-0" disabled={locked} onClick={() => onModeChange("access")}>Use a one-time access token instead</Button>}
-        <Button variant="link" className="h-auto p-0" disabled={locked} onClick={() => onForget(selected.id)}>Forget saved token</Button>
+        {(!selected.shared || canShare) && <Button variant="link" className="h-auto p-0" disabled={locked} onClick={() => onForget(selected.id)}>Forget saved token</Button>}
       </div>}
       {selected && mode === "access" && <AccessTokenField value={configurationToken} disabled={locked} onChange={onConfigurationTokenChange} />}
     </div>;
@@ -81,6 +96,7 @@ export function SlackConfigurationTokenSource({
       <p className="text-muted-foreground">Save it once for all your agents. Paperclip refreshes the configuration token automatically.</p>
     </div>
     <RefreshTokenField value={refreshToken} disabled={locked} onChange={onRefreshTokenChange} helpId="slack-configuration-refresh-token-help" />
+    {canShare && <ShareWithCompany checked={shareWithCompany} disabled={locked} onChange={onShareChange} />}
     <Button variant="link" className="h-auto p-0" disabled={locked} onClick={() => onModeChange("access")}>Paste a one-time access token</Button>
   </div>;
 
@@ -88,6 +104,13 @@ export function SlackConfigurationTokenSource({
     <AccessTokenField value={configurationToken} disabled={locked} onChange={onConfigurationTokenChange} />
     <Button variant="link" className="h-auto p-0" disabled={locked} onClick={() => onModeChange("refresh")}>Save refresh token instead</Button>
   </div>;
+}
+
+function ShareWithCompany({ checked, disabled, onChange }: { checked: boolean; disabled: boolean; onChange: (value: boolean) => void }) {
+  return <label className="flex items-start gap-2 text-sm">
+    <Checkbox className="mt-0.5" checked={checked} disabled={disabled} onCheckedChange={value => onChange(value === true)} />
+    <span>Save for every company in this instance<span className="block text-muted-foreground">Everyone who manages connections can set up Slack apps without a Slack token of their own. Only an instance administrator can change or remove it.</span></span>
+  </label>;
 }
 
 function RefreshTokenField({ value, disabled, onChange, helpId }: { value: string; disabled: boolean; onChange: (value: string) => void; helpId?: string }) {

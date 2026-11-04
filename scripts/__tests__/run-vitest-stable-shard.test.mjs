@@ -111,8 +111,30 @@ test("workspace lanes cover every non-server project in the root Vitest configur
 // Collects every `- group:` matrix entry in a workflow with the keys it sets.
 // Comment and blank lines are dropped first, and an entry ends only when the
 // indentation returns to the item level, so a comment between two keys cannot
-// hide a shard setting from the assertions below.
+// hide a shard setting from the assertions below. Also parses embedded JSON
+// fallback matrices (e.g. fromJSON(...) || '{"include":[...]}').
 function matrixEntries(text) {
+  const jsonEntries = [];
+  for (const match of text.matchAll(/'(\{"include":\[.*?\]\})'/gs)) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (Array.isArray(parsed.include)) {
+        for (const item of parsed.include) {
+          if (item && item.group) {
+            jsonEntries.push({
+              group: item.group,
+              indent: 0,
+              keys: Object.keys(item),
+            });
+          }
+        }
+      }
+    } catch {}
+  }
+  if (jsonEntries.length > 0) {
+    return jsonEntries;
+  }
+
   const entries = [];
   let current = null;
   for (const line of text.split("\n")) {
@@ -496,7 +518,7 @@ test("the PR workflow wiring for the native-runner lane holds", () => {
     "renaming pr.yml silently moves the native-runner suite back into the uncached server shards");
 
   const trustedWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/pr-trusted.yml"), "utf8");
-  const lanes = [...trustedWorkflow.matchAll(/command: test:typescript:vitest --shard=(\d+)\/(\d+)/g)]
+  const lanes = [...trustedWorkflow.matchAll(/(?:command: |"command":")test:typescript:vitest --shard=(\d+)\/(\d+)/g)]
     .map((match) => [Number(match[1]), Number(match[2])]);
   assert.ok(lanes.length > 0, "expected sharded test:typescript:vitest lanes in pr-trusted.yml");
   assert.equal(new Set(lanes.map(([, count]) => count)).size, 1, "vitest lanes must agree on the shard count");

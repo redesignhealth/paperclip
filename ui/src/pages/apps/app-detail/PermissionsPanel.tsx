@@ -38,6 +38,7 @@ export function PermissionsPanel({
   refreshPending,
   capabilities,
   permissionChangeWarning,
+  anyAgentUnavailableReason,
   actions,
 }: Pick<
   AppDetailSectionProps,
@@ -60,6 +61,8 @@ export function PermissionsPanel({
   refreshPending: boolean;
   capabilities: ToolConnectionCapabilities | undefined;
   permissionChangeWarning?: string;
+  /** When set, "Any agent" is unavailable for this connection and the text says why (personal sign-in connections). */
+  anyAgentUnavailableReason?: string;
   /** A credential-only connection can supply its account controls instead of tool actions. */
   actions?: ReactNode;
   /** Supplemental agent settings share the existing connection configuration page. */
@@ -74,6 +77,7 @@ export function PermissionsPanel({
         install={install}
         capabilities={capabilities}
         disabled={pending}
+        anyAgentUnavailableReason={anyAgentUnavailableReason}
         onSave={onSaveAccess}
       />
       {afterAgentAccess}
@@ -99,12 +103,13 @@ export function PermissionsPanel({
   );
 }
 
-function AgentAccessSection({
+export function AgentAccessSection({
   agents,
   access,
   install,
   capabilities,
   disabled,
+  anyAgentUnavailableReason,
   onSave,
 }: {
   agents: Agent[];
@@ -112,6 +117,7 @@ function AgentAccessSection({
   install: InstallState;
   capabilities: ToolConnectionCapabilities | undefined;
   disabled: boolean;
+  anyAgentUnavailableReason?: string;
   onSave: (next: AccessDraft) => void;
 }) {
   const liveAgents = agents.filter((agent) => agent.status !== "terminated");
@@ -122,6 +128,9 @@ function AgentAccessSection({
     : liveAgents;
   const selectedAgents = liveAgents.filter((agent) => access.agentIds.has(agent.id));
   const requiredAgentIds = install.agentIds;
+  // A connection that can't go to every agent never shows "Any agent" as the current choice, whatever the draft says.
+  const anyAgentUnavailable = Boolean(anyAgentUnavailableReason);
+  const accessMode = anyAgentUnavailable ? "specific" : access.mode;
 
   return (
     <section className="space-y-4 border-t border-border pt-8">
@@ -134,7 +143,7 @@ function AgentAccessSection({
         <div className="space-y-3">
           <RadioCardGroup
             ariaLabel="Which agents can use this connection"
-            value={access.mode}
+            value={accessMode}
             disabled={disabled}
             className="sm:grid-cols-2"
             onValueChange={(next) => {
@@ -156,12 +165,13 @@ function AgentAccessSection({
               {
                 value: "all",
                 title: "Any agent",
-                description: "Available across your company.",
+                description: anyAgentUnavailableReason ?? "Available across your company.",
+                disabled: anyAgentUnavailable,
               },
             ]}
           />
 
-          {access.mode === "specific" ? (
+          {accessMode === "specific" ? (
             <AgentMultiSelect
               agents={selectableAgents}
               selectedAgentIds={access.agentIds}
@@ -179,7 +189,7 @@ function AgentAccessSection({
             />
           ) : null}
         </div>
-      ) : access.mode === "all" ? (
+      ) : accessMode === "all" ? (
         <p className="text-sm text-muted-foreground">Any agent can use this connection.</p>
       ) : selectedAgents.length === 0 ? (
         <p className="text-sm text-muted-foreground">No agents can use this connection.</p>

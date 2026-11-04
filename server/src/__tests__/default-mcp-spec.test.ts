@@ -45,6 +45,12 @@ import {
 } from "../services/default-mcp-spec.js";
 import { defaultMcpBackoffMs } from "../services/default-mcp-setup.js";
 import {
+  DEFAULT_MCP_SPEC as GOOGLE_DEFAULT_SPEC,
+  RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS,
+  initialActiveToolsForPersonalInstance,
+  installsOnExistingAgentsOnConnect,
+} from "../services/default-mcp-spec.js";
+import {
   BOARD_ADMIN_TOKEN,
   BOARD_AGENT_ID,
   BOARD_TOKEN,
@@ -546,7 +552,7 @@ describe("per-tool timeout (argus-review)", () => {
     expect(defaultToolTimeoutMs("rh-mcp-argus-review", "toString")).toBeUndefined();
     expect(defaultToolTimeoutMs("rh-mcp", "argus_start_review")).toBeUndefined();
     expect(defaultToolTimeoutMs("some-other-connection", "argus_start_review")).toBeUndefined();
-    for (const entry of DEFAULT_MCP_SPEC.filter((candidate) => candidate.key !== "argus-review")) {
+    for (const entry of DEFAULT_MCP_SPEC.filter((candidate) => candidate.key !== "argus-review" && candidate.key !== "rh-mcp-service")) {
       expect(entry.toolTimeoutMs).toBeUndefined();
     }
   });
@@ -567,7 +573,7 @@ describe("arcana-brain spec: default ON (TECH-7253)", () => {
     expect(arcana.setupHook).toBe("arcana_brain");
     expect(arcana.templateBootstrap).toBe("static");
     expect(arcana.reviewedTools?.allow).toEqual(["recall", "search_pages", "read_page", "coverage", "open_source"]);
-    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.defaultEnabled).map((entry) => entry.key)).toEqual(["arcana-brain"]);
+    expect(DEFAULT_MCP_SPEC.filter((entry) => entry.defaultEnabled).map((entry) => entry.key)).toEqual(["arcana-brain", "rh-mcp-service"]);
   });
 });
 
@@ -1137,5 +1143,45 @@ describe("installByDefault", () => {
     const flagged = DEFAULT_MCP_SPEC.filter((entry) => entry.installByDefault).map((entry) => entry.key);
     expect(flagged).toEqual(["comms-board"]);
     expect(DEFAULT_MCP_SPEC.every((entry) => !entry.installByDefault || entry.setupHook)).toBe(true);
+  });
+});
+
+describe("RH Google MCP first-consent defaults", () => {
+  // Only names that read. The server's readOnlyHint is wrong for many tools (manage_drive_access, modify_sheet_values,
+  // run_script_function ...), so this is a name-shape guard on the curated list, not a trust in that flag.
+  const READ_SHAPE = /^(get|list|search|read|query|check|inspect|svc_get|svc_list|svc_read)_/;
+  const KNOWN_MUTATORS = [
+    "manage_drive_access", "modify_sheet_values", "modify_gmail_message_labels", "manage_event", "respond_to_event",
+    "run_script_function", "copy_drive_file", "draft_gmail_message", "export_doc_to_pdf", "send_gmail_message",
+    "create_doc", "batch_update_doc", "set_drive_file_permissions", "delete_script_project", "find_and_replace_doc",
+    "format_sheet_range", "import_to_google_doc", "insert_doc_elements", "generate_trigger_code",
+  ];
+
+  it("lists only read-shaped tool names, none duplicated, and none of the known mutators", () => {
+    const names = [...RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS];
+    expect(names.length).toBeGreaterThan(40);
+    expect(new Set(names).size).toBe(names.length);
+    for (const name of names) expect(name, name).toMatch(READ_SHAPE);
+    for (const name of KNOWN_MUTATORS) expect(names).not.toContain(name);
+    // May create an "anyone with the link" permission depending on the server, so it is not switched on by default.
+    expect(names).not.toContain("get_drive_shareable_link");
+  });
+
+  it("applies to a personal rh-google-mcp instance only, and installs existing agents only for that entry", () => {
+    const personal = (entry: string) => ({
+      transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user",
+      config: { defaultMcpManaged: "personal", identityModel: "personal_only", paperclipDefaultMcpEntry: entry },
+    });
+    const google = initialActiveToolsForPersonalInstance(personal("rh-google-mcp"));
+    expect(google?.has("get_events")).toBe(true);
+    expect(google?.has("manage_drive_access")).toBe(false);
+    expect(installsOnExistingAgentsOnConnect(personal("rh-google-mcp"))).toBe(true);
+    // RH MCP keeps its own ceiling-based activation and does not auto-install.
+    expect(initialActiveToolsForPersonalInstance(personal("rh-mcp"))?.has("mdm_get_granola_note")).toBe(true);
+    expect(installsOnExistingAgentsOnConnect(personal("rh-mcp"))).toBe(false);
+    // An ordinary connection, or one that is not a strict personal instance, gets neither.
+    expect(initialActiveToolsForPersonalInstance({ transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user", config: { paperclipDefaultMcpEntry: "rh-google-mcp" } })).toBeNull();
+    expect(installsOnExistingAgentsOnConnect({ transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user", config: {} })).toBe(false);
+    expect(GOOGLE_DEFAULT_SPEC.find((entry) => entry.key === "rh-google-mcp")?.readCeiling).toBeUndefined();
   });
 });

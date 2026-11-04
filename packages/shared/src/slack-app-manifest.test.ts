@@ -22,6 +22,29 @@ describe("Slack app manifest", () => {
     expect(createChatEndpointSchema.safeParse(request).success).toBe(true);
     expect(createChatEndpointSchema.safeParse({ ...request, provider: "discord" }).success).toBe(false);
   });
+  it("defaults the app and bot names from the company when one is given, and keeps the command per agent", () => {
+    expect(defaultSlackAppConfiguration("Maya", "Redesign Health")).toEqual({ appName: "Redesign Health", botName: "redesign-health", command: "/maya" });
+    // Two agents in one company share the names but never a slash command.
+    expect(defaultSlackAppConfiguration("Chief of Staff", "Redesign Health").command).toBe("/chief-of-staff");
+    for (const company of ["Redesign Health", "Café & Co.", "  Padded  ", "A".repeat(80), "x"]) {
+      expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", company)).success, company).toBe(true);
+    }
+    expect(defaultSlackAppConfiguration("Maya", "A".repeat(80)).appName).toHaveLength(35);
+    // A cut never splits an emoji into a lone surrogate, and the bot slug never ends on a separator.
+    const emoji = defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`).appName;
+    expect(emoji).toBe("a".repeat(34));
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji)).toBe(false); // no lone surrogate
+    expect(slackAppConfigurationSchema.safeParse(defaultSlackAppConfiguration("Maya", `${"a".repeat(34)}😀tail`)).success).toBe(true);
+    expect(defaultSlackAppConfiguration("Maya", `${"a".repeat(33)}😀tail`).appName).toBe(`${"a".repeat(33)}😀`);
+    expect(defaultSlackAppConfiguration("Maya", "chat adapters browser e2e 179374705").botName).toBe("chat-adapters-browser-e2");
+    expect(defaultSlackAppConfiguration("Maya", "abcdefghijklmnopqrstuvw xyz").botName).toBe("abcdefghijklmnopqrstuvw");
+    // Emoji-only company names have nothing usable for the slug, so the agent defaults apply.
+    expect(defaultSlackAppConfiguration("Maya", "😀😀")).toEqual({ appName: "maya-paperclip", botName: "maya", command: "/maya" });
+    // Nothing usable in the company name (or no company): fall back to the agent defaults.
+    for (const company of ["!!!", "", "   ", undefined]) {
+      expect(defaultSlackAppConfiguration("Maya", company)).toEqual({ appName: "maya-paperclip", botName: "maya", command: "/maya" });
+    }
+  });
   const input = { app: { appName: 'Research "Ops"', botName: "research-ops", command: "/research" }, agentName: "Maya", webhookUrl: "https://ingress.example/api/chat-webhooks/public/slack" };
   it("uses identical manual and automatic configuration except the OAuth redirect", () => {
     const manual = buildSlackAppManifest(input);
@@ -111,8 +134,18 @@ describe("Slack app manifest", () => {
     expect(save({ refreshToken: "xoxe-1-abc", extra: "untrusted" })).toBe(false);
     expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" }, extra: true }).success).toBe(false);
   });
+  it("accepts shared only as a boolean beside the credentials", () => {
+    const parse = (shared: unknown) => slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" }, shared }).success;
+    expect(parse(true)).toBe(true);
+    expect(parse(false)).toBe(true);
+    expect(parse("true")).toBe(false);
+    expect(parse(1)).toBe(false);
+    expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc" } }).success).toBe(true);
+    // It travels beside the credentials, never inside them.
+    expect(slackConfigurationCredentialSaveSchema.safeParse({ credentials: { refreshToken: "xoxe-1-abc", shared: true } }).success).toBe(false);
+  });
   it("returns specific messages for the saved-credential failure codes", () => {
-    for (const code of ["slack_configuration_refresh_invalid", "slack_configuration_refresh_required", "slack_configuration_refresh_uncertain", "slack_configuration_refresh_busy", "slack_configuration_credential_mismatch", "slack_configuration_credential_forbidden"]) {
+    for (const code of ["slack_configuration_refresh_invalid", "slack_configuration_refresh_required", "slack_configuration_refresh_uncertain", "slack_configuration_refresh_busy", "slack_configuration_shared_forbidden", "slack_configuration_credential_mismatch", "slack_configuration_credential_forbidden"]) {
       expect(slackRegistrationErrorMessage(code)).not.toBe(slackRegistrationErrorMessage("unknown-code"));
     }
     expect(slackRegistrationErrorMessage("slack_configuration_refresh_invalid")).toContain("refresh token");

@@ -28,6 +28,21 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(gate_lib.safe_token("x\n::error::boom"), "(unrecognized)")
         self.assertEqual(gate_lib.safe_token("a" * 65, "z"), "z")
 
+    def test_safe_job_name(self):
+        self.assertEqual(gate_lib.safe_job_name("ci / Select Vitest files"), "ci / Select Vitest files")
+        self.assertEqual(gate_lib.safe_job_name("ci / General tests (server (3/12))"), "ci / General tests (server (3/12))")
+        for bad in [
+            None,
+            "",
+            "a" * 121,
+            "ci / job\nwith newline",
+            "ci / job `echo pwn`",
+            "ci / job <img src=x>",
+            "ci / job [link](http://x)",
+        ]:
+            with self.subTest(bad=bad):
+                self.assertEqual(gate_lib.safe_job_name(bad, "fallback"), "fallback")
+
     def test_workflow_path_strips_ref_and_rejects_non_files(self):
         self.assertEqual(gate_lib.workflow_path({"path": ".github/workflows/a.yml@refs/heads/x"}), ".github/workflows/a.yml")
         self.assertIsNone(gate_lib.workflow_path({"path": "dynamic/copilot"}))

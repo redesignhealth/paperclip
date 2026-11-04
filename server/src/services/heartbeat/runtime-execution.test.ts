@@ -24,7 +24,7 @@ import { buildNativeExecutionInput } from "../native-runtime/native-execution-in
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
-import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
+import { createAdapterRuntimeToolAccess, revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
 
 // Keep real accounting, workspace barriers, and task-session persistence. Providers
@@ -117,6 +117,19 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(revokeHeartbeatRunGatewayTokens).toHaveBeenCalledWith({ db, companyId: input.agent.companyId, runId: input.run.id });
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   }
+
+  it("delivers connection tools to task-bound runs", async () => {
+    const { input } = await fixture();
+    await executeHeartbeatRuntime(db, input);
+    expect(createAdapterRuntimeToolAccess).toHaveBeenCalledOnce();
+  });
+
+  it("withholds connection tools from taskless runs such as timer heartbeats", async () => {
+    const { input } = await fixture();
+    input.task = { ...input.task, issueRef: null, issueId: null, taskKey: null };
+    await executeHeartbeatRuntime(db, input);
+    expect(createAdapterRuntimeToolAccess).not.toHaveBeenCalled();
+  });
 
   it.each([false, true])("preserves the dispatch gate's early return and cleanup (native: %s)", async native => {
     const { input, adapter } = await fixture(native);

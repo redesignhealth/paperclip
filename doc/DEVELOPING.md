@@ -133,12 +133,11 @@ GitHub Actions owns `pnpm-lock.yaml`.
 
 ## Trusted PR Workflow
 
-The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
-The AWS runner group `paperclip-public-pr` must allow
-`paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master`.
-New workflow versions merged into master then receive runner access without a
-separate SHA allowlist update. Dependabot leaves this first-party reference on
-master.
+The PR caller uses the fork-owned
+`redesignhealth/paperclip/.github/workflows/pr-trusted.yml@master`, so upstream
+changes to the trusted workflow cannot alter fork CI without review. Resync it
+from upstream deliberately (see `.github/upstream-ci-sync.json`). Dependabot
+leaves this first-party reference on master.
 
 Runner selection calls `ci-routing.yml@master` on the dedicated
 `paperclip-ci-routing-x64` AWS Fleet. The `paperclip-ci-routing` runner group

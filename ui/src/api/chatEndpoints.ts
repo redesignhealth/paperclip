@@ -240,9 +240,10 @@ export const chatEndpointsApi = {
     api.post<import("@paperclipai/shared").SlackTestMessageResult>(`/chat-endpoints/${endpointId}/slack/test-message`, input),
   slackSetupOptions: (companyId: string) => api.get<SlackSetupOptions>(`/companies/${companyId}/chat-slack/setup-options`),
   /** Rotates immediately, so the pasted value is spent and the stored one is unique. */
-  saveSlackConfigurationCredential: (companyId: string, refreshToken: string) =>
+  saveSlackConfigurationCredential: (companyId: string, refreshToken: string, shared = false) =>
     api.post<import("@paperclipai/shared").SlackConfigurationCredential>(`/companies/${companyId}/chat-slack/configuration-credentials`, {
       credentials: { refreshToken },
+      ...(shared ? { shared: true } : {}),
     }),
   forgetSlackConfigurationCredential: (companyId: string, id: string) =>
     api.delete<void>(`/companies/${companyId}/chat-slack/configuration-credentials/${encodeURIComponent(id)}`),
