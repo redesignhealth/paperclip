@@ -68,9 +68,16 @@ export async function reconcilePiAgentsRouterKey(db: Db, deploymentKey: string |
         secretByCompany.set(row.companyId, secretId);
       }
       if (!secretId) continue;
-      // The agent lifecycle module owns adapterConfig writes: it locks the row, normalizes the config and syncs secret bindings.
+      // The agent lifecycle module owns adapterConfig writes and needs the root connection, so the row cannot be locked
+      // here. Re-read right before the write and re-check the predicate: the residual window is milliseconds at boot.
+      const [fresh] = await db
+        .select({ adapterConfig: agents.adapterConfig })
+        .from(agents)
+        .where(and(eq(agents.id, row.id), eq(agents.companyId, row.companyId)));
+      const config = isRecord(fresh?.adapterConfig) ? fresh.adapterConfig : null;
+      if (!config || !needsPlatformDefaultRouterKeyForPi(PI_LOCAL_ADAPTER_TYPE, config, true)) continue;
       const updated = await createAgentLifecycle(db).updateConfiguration(row.id, {
-        adapterConfig: applyPiRouterDefaults(isRecord(row.adapterConfig) ? row.adapterConfig : {}, secretId),
+        adapterConfig: applyPiRouterDefaults(config, secretId),
       });
       if (updated) summary.bound += 1;
     } catch (err) {
