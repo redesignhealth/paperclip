@@ -128,7 +128,18 @@ describeDb("pi_local platform default Ramp Router key", () => {
     expect((await configOf(explicit.id)).env).toBeUndefined();
     expect(JSON.stringify([cfg1, cfg2])).not.toContain(KEY);
 
+    const bindingsFor = (id: string) =>
+      db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, id));
+    for (const [id, cfg] of [[legacy1.id, cfg1], [legacy2.id, cfg2]] as const) {
+      const b = await bindingsFor(id);
+      expect(b).toHaveLength(1);
+      expect(b[0]).toMatchObject({ secretId: cfg.env.RAMP_ROUTER_API_KEY.secretId, configPath: "env.RAMP_ROUTER_API_KEY" });
+    }
+    expect(await bindingsFor(explicit.id)).toHaveLength(0);
+
     expect(await reconcilePiAgentsRouterKey(db, KEY)).toEqual({ scanned: 3, bound: 0, failed: 0 });
+    expect(await bindingsFor(legacy1.id)).toHaveLength(1);
+    expect(await bindingsFor(legacy2.id)).toHaveLength(1);
     expect(await reconcilePiAgentsRouterKey(db, null)).toEqual({ scanned: 0, bound: 0, failed: 0 });
   });
 });

@@ -40,7 +40,7 @@ type PlatformDefaultSecretOutcome = NonNullable<CreateAgentOptions["_platformDef
  * hire transaction: the advisory lock serializes concurrent hires for the company, and each attempt runs in a
  * savepoint so a unique-violation does not abort the surrounding transaction.
  */
-async function ensurePlatformDefaultSecret(
+export async function ensurePlatformDefaultSecret(
   txDb: Db,
   companyId: string,
   secret: { key: string; name: string; description: string },
