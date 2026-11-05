@@ -27,7 +27,7 @@ The comms board is agent infrastructure, not one of the person's connectors. Do 
 
 On an onboarding first task, do not run this skill while the opening-path question card is still waiting for an answer; the first-task flow controls what is posted before then. Once the user has answered that card or set it aside (for example by sending their own message instead), a connector request is handled normally.
 
-The onboarding first task's connections check may already have posted connection cards for RH Google MCP or RH MCP. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again. Accepting that card authorizes and installs the connection. If it was accepted and this agent still has no tools for that connector, search it again and, if the result is a saved connection that lacks agent access or has tools Off, request a Grant access card with its returned service, connectionId and exact indexed toolNames (see the next section).
+The onboarding first task's connections check may already have posted connection cards for RH Google MCP or RH MCP. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again. Accepting that card authorizes and installs the connection. If it was accepted and this agent still has no tools for that connector, do not post another card; tell the user to tick this agent under that connection's agent access on the Connectors page.
 
 ## How the reply should read
 
@@ -58,12 +58,12 @@ These must remain in every report even when absent from connections_search. Thei
 Search `rh-google-mcp` and `rh-mcp` separately, and find the result whose `name` matches (something like `rh-google-mcp`, `rh-mcp-personal`, or `rh-mcp-service`):
 - If it is `ready`, use it; do not reconnect.
 - In a shared company, `rh-mcp-service` is the company's own RH MCP connection and is installed for its agents automatically. If it is ready, RH MCP is working; do not ask the user to sign in to `rh-mcp-personal`.
-- If a matching result exists but is not ready, call connection_request with that result's own returned `service` (and, for an existing saved connection that lacks agent access or has tools Off, its returned connectionId and exact indexed toolNames). Refer to the resulting card by its label, with no link. Accepting it signs the user in or grants access.
+- If a matching result exists but is not ready, follow the instruction that result returns and call connection_request with that result's own returned `service`. Pass connectionId or toolNames only when the result itself supplies them; never guess or invent them. Refer to the resulting card by the label it shows, with no link. Accepting it signs the user in or grants access.
 - If no matching result exists, link the company Connectors page:
   - RH Google MCP: find RH Google MCP, click Connect, sign in with your @redesignhealth.com Google account.
   - rh-mcp: find RH MCP, click Connect, sign in.
 
-Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. Order of fallbacks after sign-in: first the Grant access card above (when search returns the saved connection); only if that card cannot be made, or the tools are still missing after it is accepted, tell the user to tick this agent under that connection's agent access on the Connectors page.
+Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. If after sign-in the tools still aren't available, tell the user to tick this agent under that connection's agent access on the Connectors page.
 
 Verify Google with a bounded Gmail search, Drive lookup and Calendar read. Report only capabilities actually exposed; never infer draft/write/send capability from read success. Verify RH MCP with recent Zoom meetings and Granola connection status. Do not run Argus or fetch credentials to test connectivity. A private transcript is not a broken connector.
 
