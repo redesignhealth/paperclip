@@ -1,6 +1,7 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createHash } from "node:crypto";
 import type { AdapterModel } from "@paperclipai/adapter-utils";
+import { parseProviderConfig } from "./runtime-config.js";
 import { asString, runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 const MODELS_CACHE_TTL_MS = 60_000;
@@ -197,12 +198,24 @@ export async function ensurePiModelConfiguredAndAvailable(input: {
   return models;
 }
 
-export async function listPiModels(): Promise<AdapterModel[]> {
-  try {
-    return await discoverPiModelsCached();
-  } catch {
-    return [];
+// provider/id entries from server-env PAPERCLIP_PI_PROVIDERS; needs no pi process, network, or key.
+function configuredProviderModels(): AdapterModel[] {
+  const { providers } = parseProviderConfig(process.env.PAPERCLIP_PI_PROVIDERS, () => undefined);
+  const out: AdapterModel[] = [];
+  for (const [provider, value] of Object.entries(providers ?? {})) {
+    const models = (value as { models?: unknown }).models;
+    if (!Array.isArray(models)) continue;
+    for (const model of models) {
+      const id = typeof model === "object" && model !== null ? (model as { id?: unknown }).id : undefined;
+      if (typeof id === "string" && id.trim()) out.push({ id: `${provider}/${id.trim()}`, label: `${provider}/${id.trim()}` });
+    }
   }
+  return out;
+}
+
+export async function listPiModels(): Promise<AdapterModel[]> {
+  const discovered = await discoverPiModelsCached().catch(() => []);
+  return sortModels(dedupeModels([...discovered, ...configuredProviderModels()]));
 }
 
 export function resetPiModelsCacheForTests() {

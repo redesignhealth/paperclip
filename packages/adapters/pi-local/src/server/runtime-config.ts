@@ -18,9 +18,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 // Recursively replace {env:VAR} placeholders with the resolved value. Used to bake
 // gateway provider secrets (e.g. an LLM-gateway virtual key) into models.json
 // SERVER-SIDE, where the value is reliably present. Pi resolves a provider apiKey
-// by trying it as an env var name first, then as a literal -- but the (possibly
-// sandboxed) run process env plumbing is not guaranteed to carry the key, so we
-// resolve it here. Unresolvable placeholders are left intact; an env var set to
+// by reading a bare NAME as an env var, falling back to the literal text (the
+// `${NAME}` form is NOT supported). The (possibly sandboxed) run process env
+// plumbing is not guaranteed to carry the key, so this baking is available, but
+// prefer a bare env var name so the secret is never written to models.json. Unresolvable placeholders are left intact; an env var set to
 // an empty string counts as unresolvable (the placeholder stays for Pi to try).
 function expandEnvPlaceholders<T>(value: T, resolve: (name: string) => string | undefined): T {
   if (typeof value === "string") {
@@ -47,7 +48,7 @@ type ParsedProviderConfig = {
   warning: string | null;
 };
 
-function parseProviderConfig(
+export function parseProviderConfig(
   raw: unknown,
   resolveEnv: (name: string) => string | undefined,
 ): ParsedProviderConfig {
@@ -88,6 +89,23 @@ function parseProviderConfig(
   }
 }
 
+// Names only, never values. A bare env-var-style apiKey must be present in the run env;
+// `${...}` is not interpolated by Pi and would be sent as a literal string.
+function apiKeyWarnings(providers: Record<string, unknown>, env: Record<string, string>): string[] {
+  const out: string[] = [];
+  for (const [name, provider] of Object.entries(providers)) {
+    const apiKey = isPlainObject(provider) ? provider.apiKey : undefined;
+    if (typeof apiKey !== "string") continue;
+    if (apiKey.includes("${")) {
+      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey uses "\${...}", which Pi does not expand; use the bare env var name (e.g. "RAMP_ROUTER_API_KEY").`);
+    } else if (/^[A-Z][A-Z0-9_]*$/.test(apiKey) && !env[apiKey]) {
+      // Never echo the value: a literal key can look like an env var name.
+      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey looks like an env var name that is missing or empty in the run env.`);
+    }
+  }
+  return out;
+}
+
 // Materialize custom Pi providers supplied via PAPERCLIP_PI_PROVIDERS (a JSON
 // object in Pi's models.json "providers" shape) into a managed agent-config dir.
 //
@@ -116,14 +134,16 @@ export async function preparePiRuntimeConfig(input: {
   const providersFromAdapterEnv = input.env.PAPERCLIP_PI_PROVIDERS !== undefined;
   const resolveEnv = (name: string): string | undefined =>
     input.env[name] ?? (providersFromAdapterEnv ? undefined : process.env[name]);
-  const { providers, warning } = parseProviderConfig(
+  const { providers, warning: parseWarning } = parseProviderConfig(
     input.env.PAPERCLIP_PI_PROVIDERS ?? process.env.PAPERCLIP_PI_PROVIDERS,
     resolveEnv,
   );
+  const keyWarnings = providers ? apiKeyWarnings(providers, input.env) : [];
+  const warnings = [...(parseWarning ? [parseWarning] : []), ...keyWarnings];
   if (!providers) {
     return {
       env: input.env,
-      notes: warning ? [warning] : [],
+      notes: warnings,
       agentConfigDir: null,
       cleanup: async () => {},
     };
@@ -162,7 +182,7 @@ export async function preparePiRuntimeConfig(input: {
       PI_CODING_AGENT_DIR: agentConfigDir,
     },
     notes: [
-      ...(warning ? [warning] : []),
+      ...warnings,
       `Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed models.json: ${Object.keys(providers).join(", ")}.`,
     ],
     agentConfigDir,
