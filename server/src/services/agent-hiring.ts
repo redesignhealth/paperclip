@@ -21,6 +21,7 @@ import {
   needsPlatformDefaultRouterKey,
   projectHermesCreateDefaults,
 } from "./hermes-create-defaults.js";
+import { applyPiRouterDefaults, needsPlatformDefaultRouterKeyForPi } from "./pi-create-defaults.js";
 import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent,
   deduplicateAgentName, type CreateAgentData, type CreateAgentOptions, type AgentConfigurationPatch, type AgentHireRecord } from "../lib/agent-records.js";
 import { normalizeAgentPermissions, permissionsImplyLowTrust, NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS,
@@ -39,7 +40,7 @@ type PlatformDefaultSecretOutcome = NonNullable<CreateAgentOptions["_platformDef
  * hire transaction: the advisory lock serializes concurrent hires for the company, and each attempt runs in a
  * savepoint so a unique-violation does not abort the surrounding transaction.
  */
-async function ensurePlatformDefaultSecret(
+export async function ensurePlatformDefaultSecret(
   txDb: Db,
   companyId: string,
   secret: { key: string; name: string; description: string },
@@ -134,6 +135,7 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   // TECH-7959: judged on the caller's raw (pre-binding) config, like the OpenAI predicate.
   const defaultRouterKey = readPlatformDefaultRouterKey();
   const needsDefaultRouterKey = needsPlatformDefaultRouterKey(adapterType, data.adapterConfig, Boolean(defaultRouterKey));
+  const needsPiRouterKey = needsPlatformDefaultRouterKeyForPi(adapterType, data.adapterConfig, Boolean(defaultRouterKey));
   const defaultOpenAiKey = readPlatformDefaultOpenAiKey();
   const needsDefaultOpenAiKey = needsPlatformDefaultOpenAiKey(adapterType, data.adapterConfig, Boolean(defaultOpenAiKey));
 
@@ -146,17 +148,21 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   // secret (inactive existing / name conflict) binds nothing, and the rest of this create then behaves
   // exactly as it did before TECH-7959.
   let platformDefaultRouterKeyBound = false;
-  if (needsDefaultRouterKey) {
+  if (needsDefaultRouterKey || needsPiRouterKey) {
     const outcome = await ensurePlatformDefaultSecret(
       db, companyId, PLATFORM_DEFAULT_ROUTER_SECRET, defaultRouterKey!,
       "The platform default Ramp Router key could not be stored; the agent was not created.", options,
     );
     if (options) options._platformDefaultRouterSecretOutcome = outcome;
     if (outcome.secretId) {
-      platformDefaultRouterKeyBound = true;
-      const existingEnv = isPlainRecord(adapterConfig.env) ? { ...adapterConfig.env } : {};
-      existingEnv.RAMP_ROUTER_API_KEY = { type: "secret_ref", secretId: outcome.secretId, version: "latest" };
-      adapterConfig = { ...adapterConfig, env: existingEnv };
+      if (needsPiRouterKey) {
+        adapterConfig = applyPiRouterDefaults(adapterConfig, outcome.secretId);
+      } else {
+        platformDefaultRouterKeyBound = true;
+        const existingEnv = isPlainRecord(adapterConfig.env) ? { ...adapterConfig.env } : {};
+        existingEnv.RAMP_ROUTER_API_KEY = { type: "secret_ref", secretId: outcome.secretId, version: "latest" };
+        adapterConfig = { ...adapterConfig, env: existingEnv };
+      }
     }
   }
   // Unchanged OpenAI attempt: kept even on a Router agent, because native mem0 memory needs it.
