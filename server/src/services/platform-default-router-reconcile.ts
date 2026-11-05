@@ -21,6 +21,8 @@ import {
   readPlatformDefaultRouterKey,
 } from "../secrets/platform-default-router-key.js";
 import { PLATFORM_DEFAULT_ROUTER_SECRET } from "./hermes-create-defaults.js";
+import { logger } from "../middleware/logger.js";
+import { reconcilePiAgentsRouterKey } from "./pi-create-defaults.js";
 import { secretService } from "./secrets.js";
 
 export interface PlatformRouterReconcileSummary {
@@ -50,6 +52,9 @@ export async function reconcilePlatformDefaultRouterSecretsOnStartup(
   const enabled = input.enabled ?? isPlatformRouterReconcileEnabled();
   const deploymentKey = input.deploymentKey === undefined ? readPlatformDefaultRouterKey() : input.deploymentKey;
   const summary: PlatformRouterReconcileSummary = { enabled: false, scanned: 0, unchanged: 0, rotated: 0, failed: 0 };
+  // Binding existing pi_local agents is not gated on the rotation flag. Counts only.
+  const pi = await reconcilePiAgentsRouterKey(db, deploymentKey);
+  if (pi.scanned > 0) logger.info(pi, "reconciled pi_local agents with the platform default Ramp Router key");
   if (!enabled || !deploymentKey) return summary;
   summary.enabled = true;
 
