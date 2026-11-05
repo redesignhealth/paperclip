@@ -5,7 +5,7 @@ description: Use only when the user explicitly asks to set up, connect, or check
 
 # RH connector onboarding
 
-Protocol version: RH-ONBOARDING-7. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
+Protocol version: RH-ONBOARDING-8. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
 
 ## Required output contract
 
@@ -27,7 +27,7 @@ The comms board is agent infrastructure, not one of the person's connectors. Do 
 
 On an onboarding first task, do not run this skill while the opening-path question card is still waiting for an answer; the first-task flow controls what is posted before then. Once the user has answered that card or set it aside (for example by sending their own message instead), a connector request is handled normally.
 
-The onboarding first task's connections check may already have posted connection cards for RH Google MCP or RH MCP. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again. Accepting that card authorizes and installs the connection. If it was accepted and this agent still has no tools for that connector, do not post another card; tell the user to tick this agent under that connection's agent access on the Connectors page.
+The onboarding first task's connections check may already have posted connection cards for RH Google MCP or RH MCP. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again. Accepting that card authorizes and installs the connection. If it was accepted and this agent still has no tools for that connector, do not post another sign-in card. Search it again: when the result shows the saved connection with tools Off or not enabled for this agent, call connection_request with the connectionId and required toolNames that result returns. That creates an access card only a human can approve; refer to it by the label it shows.
 
 ## How the reply should read
 
@@ -63,7 +63,7 @@ Search `rh-google-mcp` and `rh-mcp` separately, and find the result whose `name`
   - RH Google MCP: find RH Google MCP, click Connect, sign in with your @redesignhealth.com Google account.
   - rh-mcp: find RH MCP, click Connect, sign in.
 
-Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. If after sign-in the tools still aren't available, tell the user to tick this agent under that connection's agent access on the Connectors page.
+Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. If tools are Off or the connection is not enabled for this agent, request the access card with the result's connectionId and required toolNames, as above. Only if that card cannot be created, or the tools are still missing after it is approved, tell the user to tick this agent under that connection's agent access on the Connectors page.
 
 Verify Google with a bounded Gmail search, Drive lookup and Calendar read. Report only capabilities actually exposed; never infer draft/write/send capability from read success. Verify RH MCP with recent Zoom meetings and Granola connection status. Do not run Argus or fetch credentials to test connectivity. A private transcript is not a broken connector.
 
@@ -77,7 +77,7 @@ Verify Granola with account identity and a bounded meeting listing; Linear with 
 
 ## Finish and pilot checks
 
-Before sending, check that all six rows are present; every row that needs the user to act has exactly one of a markdown link (or the Connectors page name when no public origin is available) or the name of a card above, never both; rows that are working, not available in this company, or skipped have neither; in a reply delivered in Slack, card rows rely on the single [Open your setup cards](TASK_URL) link instead of "above"; RH Google MCP and RH MCP that are not ready either name their card or point to the Connectors page; no connector got a second card, Slack has no tool card, and no internal identifiers appear. Give every row an actual status: working (checked), not connected yet, waiting for your access approval, not available in this company, skipped, or failed with the exact reason. Keep a space before every markdown link. End with one line that names every row that is not yet working, including Slack, and asks the user to say when those are done.
+Before sending, check that all six rows are present; every row that needs the user to act has exactly one of a markdown link (or the Connectors page name when no public origin is available) or the name of a card above, never both; rows that are working, not available in this company, or skipped have neither; in a reply delivered in Slack, card rows rely on the single [Open your setup cards](TASK_URL) link instead of "above"; RH Google MCP and RH MCP that are not ready either name their card or point to the Connectors page; no connector got a second sign-in card, Slack has no tool card, and no internal identifiers appear. Give every row an actual status: working (checked), not connected yet, waiting for your access approval, not available in this company, skipped, or failed with the exact reason. Keep a space before every markdown link. End with one line that names every row that is not yet working, including Slack, and asks the user to say when those are done.
 
 Never ask for credentials in chat. Human consent and permission grants are required. Do not connect or disconnect anything merely to test this skill if the user wants to preserve the unconnected state. A successful empty read can verify the call; say no results rather than inventing records.
 
