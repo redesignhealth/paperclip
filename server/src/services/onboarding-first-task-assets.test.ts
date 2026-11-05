@@ -135,6 +135,12 @@ describe("first-task proposal mode policy", () => {
       expect(brief).toContain("rh-mcp");
       expect(brief).toContain("rh-comms-board");
       expect(brief).toContain("rh-mcp-personal");
+      // A shared company's bot-token RH MCP connection covers RH MCP on its own.
+      expect(brief).toContain("A ready `rh-mcp-service` covers RH MCP, so do not also request `rh-mcp-personal`");
+      // With no search result there is no card to post, so the note names the Connectors page.
+      expect(brief).toContain("connect it from the Connectors page in Paperclip");
+      // The full connector setup is delegated to the bundled skill, which reuses these cards.
+      expect(brief).toContain("use the `rh-connector-onboarding` skill if it is available");
       // The identifier must come from the search result, never a hardcoded value.
       expect(brief).toContain("never the search text, a hardcoded slug, or an invented value");
       expect(brief).toContain("connection:<uuid>");
