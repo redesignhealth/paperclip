@@ -51,10 +51,11 @@ describe("pi testEnvironment with PAPERCLIP_PI_PROVIDERS", () => {
     expect(JSON.stringify(result)).not.toContain("sk-test");
   });
 
-  it("warns about the missing key env var by name", async () => {
+  it("warns about the missing key env var by provider", async () => {
     const result = await run({ PAPERCLIP_PI_PROVIDERS: providers });
     const check = result.checks.find((c) => c.code === "pi_provider_config" && c.level === "warn");
-    expect(check?.message).toContain("RAMP_ROUTER_API_KEY");
+    expect(check?.message).toContain("ramp-router");
+    expect(check?.message).toContain("missing or empty");
     expect(codes(result)).toContain("pi_model_not_found");
   });
 });

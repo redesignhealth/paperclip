@@ -268,11 +268,18 @@ describe("preparePiRuntimeConfig", () => {
   const routerProviders = (apiKey: string) =>
     JSON.stringify({ "ramp-router": { baseUrl: "https://api.router.com/v1", api: "openai-responses", apiKey, models: [{ id: "gpt-6-luna" }] } });
 
-  it("warns by provider and env var name when a bare-name apiKey is missing or empty, and never writes the key value", async () => {
+  it("never echoes an apiKey value in a note, even when a literal key looks like an env var name", async () => {
+    const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: routerProviders("SKLITERALKEY123") } });
+    cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
+    expect(prepared.notes.join("\n")).not.toContain("SKLITERALKEY123");
+    await prepared.cleanup();
+  });
+
+  it("warns by provider name only when a bare-name apiKey is missing or empty, and never writes the key value", async () => {
     for (const env of [{} as Record<string, string>, { RAMP_ROUTER_API_KEY: "" }]) {
       const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: routerProviders("RAMP_ROUTER_API_KEY"), ...env } });
       cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
-      expect(prepared.notes.filter((n) => n.includes('"ramp-router"') && n.includes("RAMP_ROUTER_API_KEY") && n.includes("missing or empty"))).toHaveLength(1);
+      expect(prepared.notes.filter((n) => n.includes('"ramp-router"') && n.includes("missing or empty"))).toHaveLength(1);
       await prepared.cleanup();
     }
     const prepared = await preparePiRuntimeConfig({

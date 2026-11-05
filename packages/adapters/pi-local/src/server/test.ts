@@ -185,7 +185,7 @@ export async function testEnvironment(
   }
 
   const canRunProbe =
-    checks.every((check) => check.code !== "pi_cwd_invalid" && check.code !== "pi_command_unresolvable");
+    checks.every((check) => check.code !== "pi_cwd_invalid" && check.code !== "pi_command_unresolvable" && check.code !== "pi_provider_config_failed");
 
   // Pi model discovery shells out to `pi --list-models` locally; when probing a
   // remote target we skip discovery and let the remote hello probe surface

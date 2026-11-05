@@ -99,7 +99,8 @@ function apiKeyWarnings(providers: Record<string, unknown>, env: Record<string, 
     if (apiKey.includes("${")) {
       out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey uses "\${...}", which Pi does not expand; use the bare env var name (e.g. "RAMP_ROUTER_API_KEY").`);
     } else if (/^[A-Z][A-Z0-9_]*$/.test(apiKey) && !env[apiKey]) {
-      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey refers to env var ${apiKey}, which is missing or empty in the run env.`);
+      // Never echo the value: a literal key can look like an env var name.
+      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey looks like an env var name that is missing or empty in the run env.`);
     }
   }
   return out;
