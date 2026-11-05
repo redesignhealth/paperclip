@@ -5,8 +5,7 @@ import { agents } from "@paperclipai/db";
 
 import { RAMP_ROUTER_API_KEY_ENV, PLATFORM_DEFAULT_ROUTER_SECRET } from "./hermes-create-defaults.js";
 import { ensurePlatformDefaultSecret } from "./agent-hiring.js";
-import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
-import { secretService } from "./secrets.js";
+import { createAgentLifecycle } from "./agent-lifecycle.js";
 import { logger } from "../middleware/logger.js";
 
 export const PI_LOCAL_ADAPTER_TYPE = "pi_local";
@@ -58,37 +57,22 @@ export async function reconcilePiAgentsRouterKey(db: Db, deploymentKey: string |
   for (const row of rows) {
     summary.scanned += 1;
     if (!needsPlatformDefaultRouterKeyForPi(PI_LOCAL_ADAPTER_TYPE, row.adapterConfig, true)) continue;
-    let newSecretId: string | null = null;
     try {
-      await db.transaction(async (tx) => {
-        const [agent] = await tx
-          .select({ adapterConfig: agents.adapterConfig })
-          .from(agents)
-          .where(and(eq(agents.id, row.id), eq(agents.companyId, row.companyId)))
-          .for("update");
-        const config = isRecord(agent?.adapterConfig) ? agent.adapterConfig : {};
-        if (!needsPlatformDefaultRouterKeyForPi(PI_LOCAL_ADAPTER_TYPE, config, true)) return;
-        let secretId = secretByCompany.get(row.companyId);
-        if (secretId === undefined) {
-          const outcome = await ensurePlatformDefaultSecret(
-            tx as unknown as Db, row.companyId, PLATFORM_DEFAULT_ROUTER_SECRET, deploymentKey,
-            "The platform default Ramp Router key could not be stored.",
-          );
-          secretId = outcome.secretId;
-          newSecretId = secretId;
-        }
-        if (!secretId) return;
-        const adapterConfig = applyPiRouterDefaults(config, secretId);
-        await tx
-          .update(agents)
-          .set({ adapterConfig })
-          .where(and(eq(agents.id, row.id), eq(agents.companyId, row.companyId)));
-        await syncAgentAdapterEnvBindings({
-          secretsSvc: secretService(tx as unknown as Db), companyId: row.companyId, agentId: row.id, adapterConfig,
-        });
-        summary.bound += 1;
+      let secretId = secretByCompany.get(row.companyId);
+      if (secretId === undefined) {
+        const outcome = await ensurePlatformDefaultSecret(
+          db, row.companyId, PLATFORM_DEFAULT_ROUTER_SECRET, deploymentKey,
+          "The platform default Ramp Router key could not be stored.",
+        );
+        secretId = outcome.secretId;
+        secretByCompany.set(row.companyId, secretId);
+      }
+      if (!secretId) continue;
+      // The agent lifecycle module owns adapterConfig writes: it locks the row, normalizes the config and syncs secret bindings.
+      const updated = await createAgentLifecycle(db).updateConfiguration(row.id, {
+        adapterConfig: applyPiRouterDefaults(isRecord(row.adapterConfig) ? row.adapterConfig : {}, secretId),
       });
-      if (newSecretId) secretByCompany.set(row.companyId, newSecretId);
+      if (updated) summary.bound += 1;
     } catch (err) {
       summary.failed += 1;
       logger.error(
