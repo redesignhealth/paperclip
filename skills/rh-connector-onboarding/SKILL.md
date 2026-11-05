@@ -5,7 +5,7 @@ description: Use only when the user explicitly asks to set up, connect, or check
 
 # RH connector onboarding
 
-Protocol version: RH-ONBOARDING-6. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
+Protocol version: RH-ONBOARDING-7. Include this marker in the first onboarding reply so a pilot can confirm which instructions loaded.
 
 ## Required output contract
 
@@ -25,9 +25,9 @@ The comms board is agent infrastructure, not one of the person's connectors. Do 
 
 ## Cards already on this task
 
-On an onboarding first task, do not run this skill before the user has answered the opening-path question card; the first-task flow controls what is posted before then.
+On an onboarding first task, do not run this skill while the opening-path question card is still waiting for an answer; the first-task flow controls what is posted before then. Once the user has answered that card or set it aside (for example by sending their own message instead), a connector request is handled normally.
 
-The onboarding first task's connections check may already have posted connection cards for RH Google MCP or RH MCP. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again. Accepting that card authorizes and installs the connection. If it was accepted and this agent still has no tools for that connector, follow the existing saved connection rule in the RH Google MCP and rh-mcp section below.
+The onboarding first task's connections check may already have posted connection cards for RH Google MCP or RH MCP. Check this task's thread first. If a card for a connector is already there and still open, refer to it by its label and do not call connection_request for that connector again. Accepting that card authorizes and installs the connection. If it was accepted and this agent still has no tools for that connector, search it again and, if the result is a saved connection that lacks agent access or has tools Off, request a Grant access card with its returned service, connectionId and exact indexed toolNames (see the next section).
 
 ## How the reply should read
 
@@ -63,13 +63,13 @@ Search `rh-google-mcp` and `rh-mcp` separately, and find the result whose `name`
   - RH Google MCP: find RH Google MCP, click Connect, sign in with your @redesignhealth.com Google account.
   - rh-mcp: find RH MCP, click Connect, sign in.
 
-Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. If after sign-in the tools still aren't available, tell the user to tick this agent under that connection's agent access on the Connectors page.
+Do not replace them with generic catalog cards or invent connection IDs. Do not claim access is automatic unless a ready result shows it, and do not change access yourself. Order of fallbacks after sign-in: first the Grant access card above (when search returns the saved connection); only if that card cannot be made, or the tools are still missing after it is accepted, tell the user to tick this agent under that connection's agent access on the Connectors page.
 
 Verify Google with a bounded Gmail search, Drive lookup and Calendar read. Report only capabilities actually exposed; never infer draft/write/send capability from read success. Verify RH MCP with recent Zoom meetings and Granola connection status. Do not run Argus or fetch credentials to test connectivity. A private transcript is not a broken connector.
 
 ## Granola, Linear, GitHub: setup cards
 
-Search each. If ready, use installed tools without reconnecting. If setup is needed, follow the returned instruction and service ID to create the card. Refer to the card by its label and say it is on this page (for example "the Connect Linear card above"); do not add a link to the task page. Say which cards were actually created. Never claim a failed call created a card. Follow the card's real sign-in method; do not assume a personal access token.
+Search each. If ready, use installed tools without reconnecting. If setup is needed, follow the returned instruction and service ID to create the card. Refer to the card by its label and say it is on this page (for example "the Connect Linear card above"); do not add a link to the task page. In a reply delivered in Slack, name the card and rely on the single [Open your setup cards](TASK_URL) link instead of "above" (see Links). Say which cards were actually created. Never claim a failed call created a card. Follow the card's real sign-in method; do not assume a personal access token.
 
 Native Granola sign-in is offered only in private companies. If the Granola result is marked unavailable, report the row as "Not available in this company" with the returned reason, create no card, and do not substitute another Granola route.
 
