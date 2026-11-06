@@ -31,6 +31,7 @@ describe("computeMemoryAgentCapabilities", () => {
       agentMetadata: {},
       runtimeMemory: null,
       flags: { hermesMemoryConfig: false },
+      adapterType: "hermes_local",
     });
     expect(withoutMemory.mem0).toBe(false);
 
@@ -38,6 +39,7 @@ describe("computeMemoryAgentCapabilities", () => {
       agentMetadata: {},
       runtimeMemory: { provider: "mem0" },
       flags: { hermesMemoryConfig: false },
+      adapterType: "hermes_local",
     });
     expect(withMemory.mem0).toBe(true);
   });
@@ -47,6 +49,7 @@ describe("computeMemoryAgentCapabilities", () => {
       agentMetadata: makeMetadataWithArcanaState("ready"),
       runtimeMemory: null,
       flags: { hermesMemoryConfig: false },
+      adapterType: "hermes_local",
     });
     expect(readyCaps.arcana).toBe(true);
 
@@ -56,6 +59,7 @@ describe("computeMemoryAgentCapabilities", () => {
         agentMetadata: makeMetadataWithArcanaState(state),
         runtimeMemory: null,
         flags: { hermesMemoryConfig: false },
+        adapterType: "hermes_local",
       });
       expect(caps.arcana).toBe(false);
     }
@@ -66,26 +70,46 @@ describe("computeMemoryAgentCapabilities", () => {
         agentMetadata: null,
         runtimeMemory: null,
         flags: { hermesMemoryConfig: false },
+        adapterType: undefined,
       }).arcana,
     ).toBe(false);
   });
 
-  it("computes hermesBuiltInStores inverted from flags.hermesMemoryConfig for Hermes adapters", () => {
-    const withConfig = computeMemoryAgentCapabilities({
+  it("computes hermesBuiltInStores based on adapter, runtimeMemory, and flags.hermesMemoryConfig", () => {
+    // mem0 present + hermes-memory-config off => false (isolated home wipes stores)
+    const mem0WithConfigOff = computeMemoryAgentCapabilities({
       agentMetadata: {},
-      runtimeMemory: null,
-      flags: { hermesMemoryConfig: true },
+      runtimeMemory: { provider: "mem0" },
+      flags: { hermesMemoryConfig: false },
       adapterType: "hermes_local",
     });
-    expect(withConfig.hermesBuiltInStores).toBe(false);
+    expect(mem0WithConfigOff.hermesBuiltInStores).toBe(false);
 
-    const withoutConfig = computeMemoryAgentCapabilities({
+    // no mem0 + no flag => true
+    const noMem0NoFlag = computeMemoryAgentCapabilities({
       agentMetadata: {},
       runtimeMemory: null,
       flags: { hermesMemoryConfig: false },
       adapterType: "hermes_local",
     });
-    expect(withoutConfig.hermesBuiltInStores).toBe(true);
+    expect(noMem0NoFlag.hermesBuiltInStores).toBe(true);
+
+    // flag on => false
+    const flagOnNoMem0 = computeMemoryAgentCapabilities({
+      agentMetadata: {},
+      runtimeMemory: null,
+      flags: { hermesMemoryConfig: true },
+      adapterType: "hermes_local",
+    });
+    expect(flagOnNoMem0.hermesBuiltInStores).toBe(false);
+
+    const flagOnWithMem0 = computeMemoryAgentCapabilities({
+      agentMetadata: {},
+      runtimeMemory: { provider: "mem0" },
+      flags: { hermesMemoryConfig: true },
+      adapterType: "hermes_local",
+    });
+    expect(flagOnWithMem0.hermesBuiltInStores).toBe(false);
   });
 
   it("gates hermesBuiltInStores false for non-Hermes adapters regardless of flags", () => {
@@ -161,6 +185,30 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
     });
     const guidance = buildMemoryAgentGuidance(result!);
     expect(guidance).toContain("Hermes built-in stores handle session continuity.");
+  });
+
+  it("keeps hermesBuiltInStores false for Hermes when runtimeMemory is present even without hermesMemoryConfig", () => {
+    const result = buildHeartbeatMemoryGuidanceContext({
+      agentMetadata: {},
+      runtimeMemory: { provider: "mem0" },
+      flags: {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: true,
+      },
+      adapterType: "hermes_local",
+    });
+    expect(result).toEqual({
+      capabilities: {
+        mem0: true,
+        arcana: false,
+        hermesBuiltInStores: false,
+      },
+      variant: "write-rules",
+    });
+    const guidance = buildMemoryAgentGuidance(result!);
+    expect(guidance).not.toContain("Hermes built-in stores");
   });
 
   it("gates hermesBuiltInStores to false for non-Hermes adapters in guidance context", () => {

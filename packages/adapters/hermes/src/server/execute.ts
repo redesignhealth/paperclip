@@ -44,7 +44,6 @@ import {
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   buildPaperclipAgentPromptTemplate,
-  parseMemoryAgentGuidanceContext,
   parseMemoryAgentGuidanceContextResult,
   type MemoryAgentGuidanceContext,
   joinPromptSections,

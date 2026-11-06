@@ -266,14 +266,15 @@ export function selectMemoryAgentGuidance(
 
 export function buildPaperclipAgentPromptTemplate(
   context: MemoryAgentGuidanceContext,
+  template = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ): string {
-  if (!DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.includes(MEMORY_AGENT_GUIDANCE)) {
+  if (!template.includes(MEMORY_AGENT_GUIDANCE)) {
     throw new Error(
-      "buildPaperclipAgentPromptTemplate: DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE does not include MEMORY_AGENT_GUIDANCE",
+      "buildPaperclipAgentPromptTemplate: template does not include MEMORY_AGENT_GUIDANCE",
     );
   }
   const guidance = selectMemoryAgentGuidance(context);
-  return DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.replace(
+  return template.replace(
     MEMORY_AGENT_GUIDANCE,
     () => guidance,
   );

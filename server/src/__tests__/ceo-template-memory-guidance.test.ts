@@ -13,7 +13,9 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(agents).toContain("When Mem0 tools are available, Mem0 is your learned memory");
     expect(agents).toContain("Treat recalled memories as hints");
     expect(agents).toContain("When Arcana brain tools are available, Arcana is your knowledge layer");
-    expect(agents).toContain("When Hermes built-in stores are available, Hermes built-in stores handle session continuity");
+    expect(agents).toContain(
+      "Hermes built-in stores (MEMORY.md/USER.md) are wiped each run / not durable; use issue comments and Mem0 when available.",
+    );
     expect(agents).toContain("Task progress and handoffs go in issue comments, not memory.");
     expect(agents).toContain("When memory tools or stores are available, retain durable facts and preferences with the why");
     expect(agents).toContain("Never save secrets, credentials, personal data, PHI or PII.");
@@ -24,7 +26,8 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(agents).not.toContain("for all memory operations");
     expect(agents).not.toMatch(/personal files \(life, memory/);
     expect(agents).not.toContain("extraction checklist");
-    expect(agents).not.toContain("MEMORY.md/USER.md are wiped");
+    expect(agents).not.toContain("handle session continuity");
+    expect(agents).not.toContain("When Hermes built-in stores are available");
   });
 
   it("HEARTBEAT.md makes memory capture conditional on available tools while preserving always-on rules", () => {
@@ -35,12 +38,17 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(heartbeat).not.toMatch(/daily notes/i);
     expect(heartbeat).not.toContain("Local Planning");
     expect(heartbeat).toContain("## 7. Memory Capture");
+    expect(heartbeat).toContain("Task progress and handoffs go in issue comments, not memory.");
     expect(heartbeat).toContain("When memory tools or stores are available, retain durable facts and preferences with the why");
     expect(heartbeat).toContain("When Mem0 tools are available, save durable facts and preferences with the why");
     expect(heartbeat).toContain("Treat recalled memories as hints");
     expect(heartbeat).toContain("When Arcana brain tools are available, documents and source material go to Arcana");
-    expect(heartbeat).toContain("When Hermes built-in stores are available, Hermes built-in stores handle session continuity");
+    expect(heartbeat).toContain(
+      "Hermes built-in stores (MEMORY.md/USER.md) are wiped each run / not durable; use issue comments and Mem0 when available.",
+    );
     expect(heartbeat).toContain("Never save secrets, credentials, personal data, PHI or PII.");
     expect(heartbeat).toContain(REFERENCE);
+    expect(heartbeat).not.toContain("handle session continuity");
+    expect(heartbeat).not.toContain("When Hermes built-in stores are available");
   });
 });

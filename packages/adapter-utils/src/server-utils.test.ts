@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as shared from "@paperclipai/shared";
 import { CONNECTION_INTENT_AGENT_GUIDANCE, MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
@@ -154,23 +155,26 @@ describe("runtime connection tool delivery", () => {
       capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
       variant: "write-rules",
     };
-    const template = buildPaperclipAgentPromptTemplate(ctx);
-    expect(template).toContain("Memory:\n");
-    // Also verify replacer function preserves literal $
-    const withDollars = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.replace(
-      MEMORY_AGENT_GUIDANCE,
-      () => "Memory:\n- Spend $100 on $$ patterns and $'",
-    );
-    expect(withDollars).toContain("Spend $100 on $$ patterns and $'");
+    const dollarGuidance = "Memory:\n- Spend $100 on $$ patterns and $& and $' and $` and $1";
+    const spy = vi.spyOn(shared, "buildMemoryAgentGuidance").mockReturnValue(dollarGuidance);
+    try {
+      const template = buildPaperclipAgentPromptTemplate(ctx);
+      expect(template).toContain(dollarGuidance);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
-  it("buildPaperclipAgentPromptTemplate asserts DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE includes MEMORY_AGENT_GUIDANCE", () => {
+  it("buildPaperclipAgentPromptTemplate asserts template includes MEMORY_AGENT_GUIDANCE", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.includes(MEMORY_AGENT_GUIDANCE)).toBe(true);
     const ctx: MemoryAgentGuidanceContext = {
       capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
       variant: "legacy",
     };
     expect(() => buildPaperclipAgentPromptTemplate(ctx)).not.toThrow();
+    expect(() =>
+      buildPaperclipAgentPromptTemplate(ctx, "template without memory guidance marker"),
+    ).toThrow("buildPaperclipAgentPromptTemplate: template does not include MEMORY_AGENT_GUIDANCE");
   });
 
   describe("resolveEffectiveMemoryHardeningFlags", () => {

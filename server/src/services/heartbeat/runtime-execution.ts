@@ -843,6 +843,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             runId: run.id,
             companyId: agent.companyId,
             agentId: agent.id,
+            adapterType: agent.adapterType,
             mem0: memoryGuidanceContext?.capabilities.mem0,
             arcana: memoryGuidanceContext?.capabilities.arcana,
             hermesBuiltInStores: memoryGuidanceContext?.capabilities.hermesBuiltInStores,
