@@ -240,12 +240,38 @@ export function connectionHealthColumns<S extends string>(
 }
 
 /**
- * RH Google MCP tools switched on at first consent. Every name only reads. The server's own `isReadOnly` flag is NOT
- * used: it marks 95 of 121 tools read-only, including ones that change data (`manage_drive_access`,
- * `modify_gmail_message_labels`, `modify_sheet_values`, `manage_event`, `run_script_function`, `export_doc_to_pdf`,
- * `draft_gmail_message`). Anything not listed here stays quarantined until the owner reviews it.
+ * RH Google MCP tools switched on at first consent: every read tool, plus the reviewed low-risk writes in
+ * `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`. The server's own `isReadOnly` flag is NOT used: it marks 95 of 121 tools read-only,
+ * including ones that change data (`manage_drive_access`, `modify_gmail_message_labels`, `modify_sheet_values`,
+ * `manage_event`, `run_script_function`, `export_doc_to_pdf`, `draft_gmail_message`). Anything not listed here
+ * (send, sharing, filters, scripts, event invites, deletes, contact changes, Gmail label modify) stays quarantined
+ * until the owner enables it in Permissions. See doc/connections/TOOL-ENABLEMENT-RUNBOOK.md.
  */
+/** Low-risk writes: drafts (never sent), labels as objects, Docs/Sheets edits, Tasks. Reviewed 2026-11-06. */
+export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
+  "draft_gmail_message",
+  "manage_gmail_label",
+  "create_doc",
+  "modify_doc_text",
+  "find_and_replace_doc",
+  "insert_doc_elements",
+  "update_doc_headers_footers",
+  "batch_update_doc",
+  "create_table_with_data",
+  "update_paragraph_style",
+  "insert_doc_tab",
+  "update_doc_tab",
+  "create_spreadsheet",
+  "create_sheet",
+  "modify_sheet_values",
+  "format_sheet_range",
+  "manage_conditional_formatting",
+  "manage_task",
+  "manage_task_list",
+]);
+
 export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.freeze([
+  ...RH_GOOGLE_MCP_SAFE_WRITE_TOOLS,
   // Calendar
   "get_events",
   "list_calendars",
