@@ -74,6 +74,18 @@ export interface DefaultMcpEntrySpec {
    * removes permissions (it never adds a tool to a profile) and never applies to user sessions.
    */
   readCeiling?: readonly string[];
+  /**
+   * Optional raw upstream tool names switched ON when the owner first consents (a brand-new personal profile), in
+   * addition to any `readCeiling` names. Unlike `readCeiling` this is only a starting point: it never limits what an
+   * agent may be granted later, and the owner can turn any of them off. Names must be tools that only read; do not
+   * trust a server's own read-only flag to build this list.
+   */
+  initialActiveTools?: readonly string[];
+  /**
+   * When true, a brand-new personal instance is installed on the agents the owner created (still live) as soon as
+   * the owner consents. Agents other people created, and agents created later, start with the entry off.
+   */
+  installOnExistingAgentsOnConnect?: boolean;
   /** Optional OAuth discovery-only seed configuration (TECH-7340). */
   oauthSeed?: {
     urlEnv: string;
@@ -132,6 +144,74 @@ export const ARGUS_REVIEW_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "argus_cancel_review",
 ]);
 
+/**
+ * rh-mcp tools an agent of a SHARED org may use through the org's service token (TECH-8066), keyed by the rh-auth scope
+ * rh-mcp requires for each one. A mirror of `TOOL_SCOPES` in rh-data-platform `services/rh-mcp/scopes.py`, restricted
+ * to the scopes in `RH_MCP_SERVICE_TOKEN_SCOPES`: the token's scopes decide what rh-mcp will run, and this list makes
+ * the offered tools match, so agents are not shown tools that can only fail with `insufficient_scope`. The keys ARE the
+ * token's scope set. Never `supabase:read` (the supabase tools expose the Ashby ATS views with no identity gate;
+ * MDM keeps Ashby behind `mdm:ashby:read`), a `:write` scope, `argus:secrets` or `auth:impersonate`.
+ *
+ * Left out although a scope above covers them, because they read one person's data and fail for a service token that
+ * has no person: `mdm_get_user_annotations`, `mdm_granola_status`, `voice_get_style_guide`, `voice_list_voices` and
+ * `voice_list_source_docs`. Keep this in step with rh-mcp when a tool is added or re-scoped there.
+ */
+export const RH_MCP_SERVICE_TOOLS_BY_SCOPE = Object.freeze({
+  "argus:review": ["argus_start_review", "argus_get_review", "argus_cancel_review"],
+  "mdm:read": [
+    "mdm_get_person",
+    "mdm_get_persons",
+    "mdm_search_persons",
+    "mdm_get_org",
+    "mdm_get_orgs",
+    "mdm_search_orgs",
+    "mdm_get_concept",
+    "mdm_get_concepts",
+    "mdm_search_concepts",
+    "mdm_get_opportunity",
+    "mdm_search_opportunities",
+    "mdm_get_opportunity_lists",
+    "mdm_get_person_interactions",
+    "mdm_get_org_interactions",
+    "mdm_get_founder_engagement",
+    "mdm_get_duplicate_candidate",
+    "mdm_get_org_duplicate_candidate",
+    "mdm_get_unmerge_request",
+  ],
+  "opik:read": ["opik_get_prompt", "opik_list_prompts"],
+  "coresignal:read": [
+    "coresignal__resolve_company",
+    "coresignal__preview_company",
+    "coresignal__search_companies",
+    "coresignal__search_employees",
+    "coresignal__get_company_employees",
+    "coresignal__get_company",
+    "coresignal__get_employee",
+    "coresignal__get_credit_summary",
+  ],
+  "definitive_healthcare:read": [
+    "definitive_healthcare__search_hospitals",
+    "definitive_healthcare__get_hospital",
+    "definitive_healthcare__get_hospital_technologies",
+    "definitive_healthcare__get_hospital_executives",
+    "definitive_healthcare__get_hospital_quality",
+    "definitive_healthcare__search_physicians",
+    "definitive_healthcare__get_physician",
+    "definitive_healthcare__get_physician_affiliations",
+    "definitive_healthcare__resolve_hospital",
+    "definitive_healthcare__search_organizations",
+    "definitive_healthcare__search_executives",
+    "definitive_healthcare__get_organization",
+  ],
+  "voice:read": ["voice_get_humanizer_checklist"],
+} as const satisfies Record<string, readonly string[]>);
+
+/** Version of `RH_MCP_SERVICE_REVIEWED_TOOLS`. Bump it whenever the tool or scope set changes. */
+export const RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION = 1;
+export const RH_MCP_SERVICE_REVIEWED_TOOLS: readonly string[] = Object.freeze(
+  Object.values(RH_MCP_SERVICE_TOOLS_BY_SCOPE).flatMap((tools) => [...tools]),
+);
+
 /** Hard ceiling for any per-call or per-tool gateway timeout (matches the gateway's per-call clamp). */
 export const MAX_TOOL_TIMEOUT_MS = 60_000;
 /** api-main (Lambda) can take 8-15 s on a cold start, so the Argus verbs get 30 s instead of the 10 s default. */
@@ -158,6 +238,90 @@ export function connectionHealthColumns<S extends string>(
   if (isArcanaStaticTemplate(connection)) return { healthStatus: "ok", healthMessage: null, lastError: null };
   return { healthStatus: status, healthMessage: message, lastError: status === "ok" ? null : message };
 }
+
+/**
+ * RH Google MCP tools switched on at first consent. Every name only reads. The server's own `isReadOnly` flag is NOT
+ * used: it marks 95 of 121 tools read-only, including ones that change data (`manage_drive_access`,
+ * `modify_gmail_message_labels`, `modify_sheet_values`, `manage_event`, `run_script_function`, `export_doc_to_pdf`,
+ * `draft_gmail_message`). Anything not listed here stays quarantined until the owner reviews it.
+ */
+export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.freeze([
+  // Calendar
+  "get_events",
+  "list_calendars",
+  "query_freebusy",
+  "list_pending_invitations",
+  // Gmail
+  "search_gmail_messages",
+  "get_gmail_message_content",
+  "get_gmail_messages_content_batch",
+  "get_gmail_thread_content",
+  "get_gmail_threads_content_batch",
+  "get_gmail_attachment_content",
+  "list_gmail_labels",
+  "list_gmail_filters",
+  // Drive
+  "search_drive_files",
+  "list_drive_items",
+  "svc_list_drive_folder",
+  "get_drive_file_content",
+  "get_drive_file_download_url",
+  "get_drive_file_permissions",
+  "check_drive_file_public_access",
+  // Docs
+  "get_doc_content",
+  "get_doc_as_markdown",
+  "svc_get_doc_markdown",
+  "search_docs",
+  "list_docs_in_folder",
+  "inspect_doc_structure",
+  "list_document_comments",
+  // Sheets
+  "read_sheet_values",
+  "svc_read_sheet_values",
+  "get_spreadsheet_info",
+  "list_spreadsheets",
+  "list_spreadsheet_comments",
+  // Slides
+  "get_presentation",
+  "get_page",
+  "get_page_thumbnail",
+  "search_presentations",
+  "list_presentation_comments",
+  // Forms
+  "get_form",
+  "get_form_response",
+  "list_form_responses",
+  // Tasks
+  "get_task",
+  "get_task_list",
+  "list_tasks",
+  "list_task_lists",
+  // Contacts and directory
+  "get_contact",
+  "get_contact_group",
+  "list_contacts",
+  "list_contact_groups",
+  "search_contacts",
+  "get_person",
+  "search_directory",
+  // Chat
+  "get_messages",
+  "list_spaces",
+  "search_messages",
+  // Search
+  "search_custom",
+  "get_search_engine_info",
+  // Apps Script (listing only)
+  "get_script_content",
+  "get_script_metrics",
+  "get_script_project",
+  "list_deployments",
+  "list_script_processes",
+  "list_script_projects",
+  "list_versions",
+  "get_version",
+]);
 
 export const DEFAULT_MCP_SPEC_ENABLED_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 
@@ -207,12 +371,28 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     toolTimeoutMs: Object.fromEntries(ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS])),
   },
   {
+    // Per-org rh-mcp service token for SHARED orgs (TECH-8066). An ORDINARY (non-dedicated) entry: the org's
+    // `rh-mcp-service` connection is created by `shared-org-rh-mcp.ts` (one rh-auth service token per org, minted through
+    // the ownership API), never by an operator, and only for companies whose visibility is `shared`. Every other company
+    // has no such connection, so the entry is recorded with no template there and does nothing. ON for every new agent
+    // of an org that has the connection. `reviewedTools` is the agent ceiling: exactly the tools the token's scopes cover.
+    key: "rh-mcp-service",
+    displayName: "RH MCP (service token)",
+    connectionName: "rh-mcp-service",
+    authKind: "managed_token",
+    defaultEnabled: true,
+    reviewedTools: { version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION, allow: RH_MCP_SERVICE_REVIEWED_TOOLS },
+    toolTimeoutMs: Object.fromEntries(ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS])),
+  },
+  {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.
     key: "rh-google-mcp",
     displayName: "RH Google MCP",
     connectionName: "rh-google-mcp",
     authKind: "oauth",
     defaultEnabled: false,
+    initialActiveTools: RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS,
+    installOnExistingAgentsOnConnect: true,
     oauthSeed: {
       urlEnv: "PAPERCLIP_DEFAULT_MCP_RH_GOOGLE_MCP_URL",
     },
@@ -283,6 +463,40 @@ export function isValidDefaultMcpTemplate(
     config.identityModel === requirements.identityModel &&
     config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY] === entry.key
   );
+}
+
+function personalInstanceEntry(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[],
+): DefaultMcpEntrySpec | null {
+  if (!isPersonalDefaultMcpInstance(connection, spec)) return null;
+  const config =
+    connection.config && typeof connection.config === "object" && !Array.isArray(connection.config)
+      ? (connection.config as Record<string, unknown>)
+      : {};
+  return spec.find((entry) => entry.key === config[DEFAULT_MCP_ENTRY_TAG_CONFIG_KEY]) ?? null;
+}
+
+/**
+ * The raw tool names switched on when the owner first consents to a personal instance: the entry's read ceiling
+ * (RH MCP) plus its `initialActiveTools` (RH Google MCP). Null for anything that is not such an instance.
+ */
+export function initialActiveToolsForPersonalInstance(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): ReadonlySet<string> | null {
+  const entry = personalInstanceEntry(connection, spec);
+  if (!entry) return null;
+  const names = [...(entry.readCeiling ?? []), ...(entry.initialActiveTools ?? [])];
+  return names.length > 0 ? new Set(names) : null;
+}
+
+/** True when a brand-new personal instance of this entry should be installed on the agents its owner already created. */
+export function installsOnExistingAgentsOnConnect(
+  connection: TemplateFacts | { transport?: string; authKind?: string; credentialPolicy?: string; config?: unknown },
+  spec: readonly DefaultMcpEntrySpec[] = DEFAULT_MCP_SPEC,
+): boolean {
+  return personalInstanceEntry(connection, spec)?.installOnExistingAgentsOnConnect === true;
 }
 
 /**

@@ -1236,6 +1236,11 @@ export type {
   CostSummary,
   CostDataQualityItem,
   CostDataQualityReport,
+  UsageAvailability,
+  UsageBillingKind,
+  UsageAvailabilityTotals,
+  UsageAvailabilityByAdapter,
+  UsageAvailabilityReport,
   CostDataQualityReason,
   IssueCostSummary,
   CostByAgent,
@@ -2860,3 +2865,12 @@ export * from "./agent-observability.js";
 export * from "./prompt-injection-prevention.js";
 
 export * from "./workspace-provider.js";
+
+export {
+  resolveMemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+  mergeMemoryHardeningFlags,
+  MemoryHardeningConfigurationError,
+  type MemoryHardeningFlags,
+} from "./memory-hardening.js";
+

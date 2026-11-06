@@ -2665,15 +2665,15 @@ registry.registerPath({
 });
 registry.registerPath({
   method: "post", path: "/api/companies/{companyId}/chat-slack/configuration-credentials", tags: ["chat-channels"],
-  summary: "Save a personal Slack app-configuration refresh token",
-  description: "Requires a board connection manager and company membership. The pasted refresh token is rotated immediately, so it is spent on success and the stored token becomes the only valid one. Tokens are user-scoped vault values; the response is a secret-free summary and answers are never cached. Rotation failures return a safe `code` (`slack_configuration_refresh_invalid`, `slack_configuration_refresh_uncertain`, `..._busy`, `..._mismatch`).",
+  summary: "Save a Slack app-configuration refresh token, personal or shared by every company",
+  description: "Requires a board connection manager and company membership. The pasted refresh token is rotated immediately, so it is spent on success and the stored token becomes the only valid one. A personal token is a user-scoped vault value. With `shared: true`, only an instance administrator can save it: it is stored once per Slack workspace, encrypted with the instance master key, and offered to every company's Slack setup (a 403 with `slack_configuration_shared_forbidden` otherwise, before the token is spent); the response is a secret-free summary and answers are never cached. Rotation failures return a safe `code` (`slack_configuration_refresh_invalid`, `slack_configuration_refresh_uncertain`, `..._busy`, `..._mismatch`).",
   request: { params: z.object({ companyId: z.string().uuid() }), body: jsonBody(slackConfigurationCredentialSaveSchema) },
   responses: { 200: r.ok(slackConfigurationCredentialSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
 });
 registry.registerPath({
   method: "delete", path: "/api/companies/{companyId}/chat-slack/configuration-credentials/{credentialId}", tags: ["chat-channels"],
-  summary: "Forget the current user's saved Slack configuration token",
-  description: "Requires a board connection manager and company membership, and only ever forgets the caller's own credential. Marks it revoked, removes both vault values and fences any in-flight rotation. This does not revoke the token chain in Slack.",
+  summary: "Forget a saved Slack configuration token",
+  description: "Requires a board connection manager and company membership. A caller can forget their own personal credential; the credential shared by every company can only be forgotten by an instance administrator. Marks it revoked, removes both vault values and fences any in-flight rotation. This does not revoke the token chain in Slack.",
   request: { params: z.object({ companyId: z.string().uuid(), credentialId: z.string().uuid() }) },
   responses: { 204: { description: "Personal configuration credential forgotten" }, 401: r.unauthorized, 403: r.forbidden },
 });
@@ -6062,6 +6062,7 @@ const costSummaryPaths = [
   "quota-windows",
   "subscriptions",
   "data-quality",
+  "usage-availability",
 ] as const;
 
 for (const segment of costSummaryPaths) {

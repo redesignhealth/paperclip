@@ -35,6 +35,7 @@
  *
  * Scope is the boot-frozen `PAPERCLIP_DEFAULT_MCP_TEMPLATE_COMPANY_IDS` (unset = every company).
  */
+import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import {
@@ -288,7 +289,7 @@ async function claimTemplate(db: Pick<Db, "update">, connectionId: string, now: 
 // Owner, secrets, readiness
 // ---------------------------------------------------------------------------
 
-interface TemplateOwner {
+export interface TemplateOwner {
   userId: string;
   emailNorm: string;
 }
@@ -298,7 +299,7 @@ interface TemplateOwner {
  * whose user has a verified, non-empty email. The company's `defaultResponsibleUserId` wins when eligible,
  * otherwise the earliest owner (ties by principal id). Never invented, never an agent or built-in principal.
  */
-async function pickTemplateOwner(db: Pick<Db, "select">, companyId: string): Promise<TemplateOwner | null> {
+export async function pickTemplateOwner(db: Pick<Db, "select">, companyId: string): Promise<TemplateOwner | null> {
   const [company] = await db
     .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
     .from(companies)
@@ -806,7 +807,7 @@ async function provisionTemplate(
       const minted = await mintCommsBoardTemplateCredential(
         provisioner,
         { companyId, ownerEmail: claim.ownerEmailNorm },
-        ctx.fetchImpl ?? fetch,
+        ctx.fetchImpl ?? tailnetAwareFetch,
       );
       if (!minted.ok) {
         if (minted.noRowCreated) {

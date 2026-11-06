@@ -51,6 +51,7 @@
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:install-sh-docker": "./scripts/test-install-sh-docker.sh",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
+    "test:sample-mem0-memory-content": "node --import ./cli/node_modules/tsx/dist/loader.mjs --test scripts/__tests__/sample-mem0-memory-content.test.ts",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
     "smoke:hermes-gateway-e2e": "./scripts/smoke/hermes-gateway-e2e.sh",

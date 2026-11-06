@@ -9,6 +9,7 @@ import { instanceSettingsService } from "../../../instance-settings.js";
 import { secretService } from "../../../secrets.js";
 import * as connectionCredentials from "../../../connection-credentials.js";
 import { object, providerFailure, type SlackSetupActor, type SlackRegistrationStore } from "./registration.js";
+import { createInstanceSlackConfigurationCredentials } from "./instance-configuration-credentials.js";
 
 /**
  * TECH-7981 (RH-only): saved Slack app-configuration refresh tokens.
@@ -170,8 +171,14 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
     }
   }
 
-  async function save(companyId: string, actor: SlackSetupActor, refreshToken: string): Promise<SlackConfigurationCredential> {
+  async function save(companyId: string, actor: SlackSetupActor, refreshToken: string, options: { shared?: boolean } = {}): Promise<SlackConfigurationCredential> {
     await access(companyId, actor);
+    if (options.shared) {
+      // Instance-wide: saved once for every company, administrators only.
+      const savedForEveryCompany = await instance.save(actor, refreshToken);
+      await activity(companyId, actor.userId, savedForEveryCompany.id, savedForEveryCompany.workspaceId, "configuration_credential_saved", { instance: true });
+      return savedForEveryCompany;
+    }
     // Rotate on save: the pasted value is spent, so the stored token is the
     // only valid one and re-pasting the same value fails by design.
     let rotated: Rotated;
@@ -243,6 +250,11 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
 
   async function forget(id: string, companyId: string, actor: SlackSetupActor) {
     await access(companyId, actor);
+    if (await instance.has(id)) {
+      const removed = await instance.forget(id, actor);
+      await activity(companyId, actor.userId, id, removed.workspaceId, "configuration_credential_forgotten", { instance: true });
+      return;
+    }
     const row = await db.transaction(async tx => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`slack-config-credential:${id}`}, 0))`);
       const current = await readOwned(tx, id, companyId, actor);
@@ -272,7 +284,8 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
       eq(chatSlackConfigurationCredentials.userId, actor.userId),
       inArray(chatSlackConfigurationCredentials.status, ["active", "rotating", "reauthorize"]),
     )).orderBy(chatSlackConfigurationCredentials.workspaceId);
-    return rows.map(summary);
+    // The instance-wide credential is offered to every company's setup.
+    return [...rows.map(summary), ...await instance.list()];
   }
 
   type PhaseA =
@@ -390,6 +403,10 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
    */
   async function accessToken(credentialId: string, companyId: string, actor: SlackSetupActor): Promise<string> {
     await access(companyId, actor);
+    if (await instance.has(credentialId)) {
+      return instance.accessToken(credentialId, (action, workspaceId, details) =>
+        activity(companyId, actor.userId, credentialId, workspaceId, action, { instance: true, ...details }));
+    }
     const key = tokenKey(companyId, actor, credentialId);
     const running = tokenRequests.get(key);
     if (running) return running;
@@ -455,6 +472,11 @@ export function createSlackConfigurationCredentials(store: SlackRegistrationStor
     tokenRequests.set(key, operation);
     try { return await operation; } finally { if (tokenRequests.get(key) === operation) tokenRequests.delete(key); }
   }
+
+  const instance = createInstanceSlackConfigurationCredentials({
+    db, rotate, rethrowSaveFailure, withWriteRetry, sleep,
+    accessMarginMs: ACCESS_MARGIN_MS, rotatingStaleMs: ROTATING_STALE_MS, pollMs, timeoutMs,
+  });
 
   return { list, save, forget, accessToken };
 }

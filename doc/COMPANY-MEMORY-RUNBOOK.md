@@ -231,13 +231,13 @@ are source/test evidence—not a hosted production proof.
 
 ## 5. Operational Lifecycle & Maintenance
 
-### 1. Zero-Downtime Credential Rotation
+### 5.1. Zero-Downtime Credential Rotation
 ```typescript
 const result = await companyMemoryDatabaseService(db).rotateCredential(companyId);
 // Returns: { secretVersion: N+1, lastRotatedAt: Date }
 ```
 
-### 2. Company Offboarding & Deletion
+### 5.2. Company Offboarding & Deletion
 - **Archiving a Company**:
   Paperclip sets role `NOLOGIN`, alters database `ALLOW_CONNECTIONS false`, terminates active sessions via `pg_terminate_backend`, and transitions status to `archived`.
 - **Reactivating a Company**:
@@ -245,7 +245,7 @@ const result = await companyMemoryDatabaseService(db).rotateCredential(companyId
 - **Hard Deletion (`remove`)**:
   Paperclip terminates active sessions, executes `DROP DATABASE "pcmem_<hex32>" WITH (FORCE)`, `REVOKE ... FROM CURRENT_USER`, `DROP ROLE "pcmem_r_<hex32>"`, verifies absence in system catalogs, soft-deletes the secret, and retains the tombstone until the company hard-delete transaction completes. If `DROP DATABASE` completes but subsequent cleanup fails, the mapping is marked `failed` rather than `ready` to prevent resurrecting deleted state. If tenant isolation is disabled while a company memory row exists in a non-`deprovisioned` state, company deletion is rejected to prevent orphaning tenant infrastructure.
 
-### 3. Backup and Disaster Recovery
+### 5.3. Backup and Disaster Recovery
 - **Shared Instance Backup**: AWS RDS automated snapshots and point-in-time recovery (PITR) protect the shared instance.
 - **Per-Tenant Logical Dump**:
   *Note:* Because the provisioner role is explicitly revoked from having `CONNECT` privileges on tenant databases as part of security preflight invariants, dumping with the provisioner or non-superuser admin will fail with a permission error. Furthermore, granting CONNECT to the provisioner role causes `assertPreflightInvariants` to fail closed because the provisioner must not have persistent access.
@@ -269,6 +269,22 @@ const result = await companyMemoryDatabaseService(db).rotateCredential(companyId
      ```bash
      pg_restore --clean --if-exists --no-owner --no-privileges -h <rds_host> -U pcmem_r_<hex32> -d pcmem_<hex32> /backup/pcmem_<hex32>.dump
      ```
+
+### 5.4. Agent-Scoped Mem0 Scope Migration (TECH-8191)
+
+To isolate Mem0 memories per agent rather than sharing a global `"company"` scope, Mem0 uses `user_id = agent.id` instead of `"company"`.
+
+#### Operational Rules & Cutover Architecture
+
+- **Gated Runtime Scoping**: Runtime scoping is gated behind BOTH the `agent-scoped-mem0` hardening flag AND a per-company completion marker (`company_memory_databases.scope_migration_completed_at`). The flag alone has NO operational effect on any company without its completion marker: recall stays company-scoped (`user_id = 'company'`) and emits a warning naming the company ID only.
+- **No Cutover Tool Ships in this Change**: Copying a company onto agent scope is a planned per-company offline cutover. Because no offline cutover tool ships in this release, no company has its completion marker set, and enabling the flag has no operational cutover effect on any company.
+- **Why Online Copying is Rejected**: A safety review proved an online cutover cannot be made safe. The Mem0 write path bypasses the control plane: the tenant role credential is handed to the Hermes adapter, which connects and writes directly to tenant Postgres for the entire duration of a run. Consequently, concurrent writes escape any census/copy window, and no control-plane in-process lock can prevent concurrent mutations. Instead, the offline cutover will be enforced directly by the database (setting the tenant role to `NOLOGIN` with a bounded backend drain) rather than relying on operator assertion.
+- **Do Not Hand-Edit Completion Markers**: Operators must NEVER manually set or edit `scope_migration_completed_at` or `scope_migration_mode` in the database. Because no offline migration tool has shipped, manually setting the completion marker will cause agents to immediately start reading from an empty agent scope (`user_id = agent.id`), breaking data continuity with all existing company memories and creating empty-scope isolation failures. Markers must only be populated by the verified offline cutover tool once landed.
+- **Observation Evidence Column (`scope_migration_agent_scope_observed_at`)**:
+  - The runtime observation recorder writes to `company_memory_databases.scope_migration_agent_scope_observed_at` when runtime memory is resolved for a run under agent scope (`user_id = agent.id`) in a migrated company, before adapter dispatch. It is recorded at runtime memory resolution before dispatch (it does not check run outcome) and is not proof of run success.
+  - **Hourly Throttle**: To prevent database write amplification on every heartbeat run, updates to `scope_migration_agent_scope_observed_at` are throttled in the database query to at most once per hour (`lt(scopeMigrationAgentScopeObservedAt, cutoff)`).
+  - **Observation, Not Cutover Verification**: This column is runtime telemetry evidence that an agent-scoped run was observed in the wild. It is NOT proof that all historical memories were migrated, that cutover verification succeeded, or that the run executed successfully.
+  - **No Hand Edits**: Operators must not manually edit or clear `scope_migration_agent_scope_observed_at`.
 
 ---
 

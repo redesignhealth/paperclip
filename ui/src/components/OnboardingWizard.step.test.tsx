@@ -179,7 +179,7 @@ describe("OnboardingWizard — which step it lands on", () => {
     dialogState.onboardingOpen = false;
     dialogState.onboardingOptions = {};
     dialogState.onboardingRouteDismissed = false;
-    mockAdaptersApi.list.mockResolvedValue(["claude_local", "codex_local"].map(type => ({
+    mockAdaptersApi.list.mockResolvedValue(["claude_local", "codex_local", "hermes_local"].map(type => ({
       type, loaded: true, disabled: false, defaultRunner: "legacy", supportedRunners: ["legacy"],
     })));
     mockGoalsApi.list.mockResolvedValue([]);
@@ -198,6 +198,9 @@ describe("OnboardingWizard — which step it lands on", () => {
       adapterType: "claude_local",
       status: "pass",
       checks: [],
+      // Not what the server sends for a Claude test; it is here so the Hermes default path has
+      // a result. What the server reports for a create-purpose test of a Hermes agent.
+      createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: false, platformRouterKeyBound: true },
       testedAt: new Date("2026-03-02T00:00:00Z").toISOString(),
     });
     // Onboarding applies a stored Claude login automatically; this suite is
@@ -574,8 +577,9 @@ describe("OnboardingWizard — which step it lands on", () => {
     }
 
     /**
-     * Pick a model source. The connect step arrives with nothing chosen, so its
-     * CTA stays disabled until a tile is pressed — found by `aria-checked`
+     * Press the first model source. Hermes is preselected on arrival, so with
+     * the registry's default this press is a no-op; it only picks a source when a
+     * test has put another adapter first — found by `aria-checked`
      * rather than by label, because this suite mocks the display registry and
      * the tiles carry whatever it happens to return.
      */
@@ -602,6 +606,78 @@ describe("OnboardingWizard — which step it lands on", () => {
       expect(payload.role).toBe("general");
       expect(payload.name).toBe("Ada");
       expect(payload.setupAgentId).toBe(mockAgentsApi.create.mock.calls[0]?.[1].setupId);
+    });
+
+    it("hires the first agent on Hermes by default, confirming the server's defaults", async () => {
+      await openOnAgentStep();
+      await nameAgent("Ada");
+      await press(stepCta());
+      await settle();
+
+      // Preselected: the row is already answered, so Connect is live with no press.
+      await press(stepCta());
+
+      const [, , testBody] = mockAgentsApi.testEnvironment.mock.calls.at(-1)!;
+      expect(testBody.purpose).toBe("create");
+      const [, payload] = mockAgentsApi.hire.mock.calls.at(-1)!;
+      expect(payload.adapterType).toBe("hermes_local");
+      expect(payload.onboardingFirstAgent).toBe(true);
+      expect(payload.expectedCreateDefaults).toEqual(
+        expect.objectContaining({ source: "router_default" }),
+      );
+    });
+
+    it("does not hire a Hermes agent whose Router readiness was not confirmed", async () => {
+      mockAgentsApi.testEnvironment.mockResolvedValue({
+        adapterType: "hermes_local",
+        status: "pass",
+        checks: [],
+        createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: true },
+        testedAt: new Date("2026-03-02T00:00:00Z").toISOString(),
+      });
+      await openOnAgentStep();
+      await nameAgent("Ada");
+      await press(stepCta());
+      await settle();
+      await press(stepCta());
+
+      expect(mockAgentsApi.hire).not.toHaveBeenCalled();
+      expect(document.body.textContent).toContain("Ramp Router readiness was not confirmed");
+    });
+
+    it("probes again on retry after Router readiness was unconfirmed", async () => {
+      const unconfirmed = {
+        adapterType: "hermes_local", status: "pass", checks: [],
+        createDefaults: { provider: "router", model: "auto-jev-routing", source: "router_default", requiresRouterReadiness: true, platformRouterKeyBound: true },
+        testedAt: new Date("2026-03-02T00:00:00Z").toISOString(),
+      };
+      mockAgentsApi.testEnvironment.mockResolvedValueOnce(unconfirmed);
+      await openOnAgentStep();
+      await nameAgent("Ada");
+      await press(stepCta());
+      await settle();
+      await press(stepCta());
+      expect(mockAgentsApi.hire).not.toHaveBeenCalled();
+
+      // The default mock now reports no Router requirement; a cached result would repeat the failure.
+      await press(stepCta());
+      expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(2);
+      expect(mockAgentsApi.hire).toHaveBeenCalled();
+    });
+
+    it("does not hire a Hermes agent when the server defaults were not reported", async () => {
+      mockAgentsApi.testEnvironment.mockResolvedValue({
+        adapterType: "hermes_local", status: "pass", checks: [],
+        testedAt: new Date("2026-03-02T00:00:00Z").toISOString(),
+      });
+      await openOnAgentStep();
+      await nameAgent("Ada");
+      await press(stepCta());
+      await settle();
+      await press(stepCta());
+
+      expect(mockAgentsApi.hire).not.toHaveBeenCalled();
+      expect(document.body.textContent).toContain("Could not confirm this agent's server defaults");
     });
 
     it("does not offer a way back behind the step it entered on", async () => {

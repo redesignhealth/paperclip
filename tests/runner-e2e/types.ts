@@ -27,6 +27,7 @@ export type RunnerTaskFlow =
   | "public_mcp"
   | "everyday_workflow"
   | "context_integrity"
+  | "memory_recall"
 
   | "continuation_accounting"
   | "continuation"

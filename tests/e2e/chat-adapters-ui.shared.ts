@@ -162,6 +162,7 @@ export type Seed = {
   prefix: string;
   agentId: string;
   otherAgentId: string;
+  companyName: string;
 };
 
 export async function json<T>(
@@ -176,9 +177,10 @@ export async function json<T>(
 }
 
 export async function seedCompanyAndAgent(request: APIRequestContext): Promise<Seed> {
+  const companyName = `Chat adapters browser E2E ${Date.now()}`;
   const company = await json<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
-      data: { visibility: "shared", name: `Chat adapters browser E2E ${Date.now()}` },
+      data: { visibility: "shared", name: companyName },
     }),
     "create company",
   );
@@ -219,6 +221,7 @@ export async function seedCompanyAndAgent(request: APIRequestContext): Promise<S
     prefix: company.issuePrefix,
     agentId: agent.id,
     otherAgentId: otherAgent.id,
+    companyName,
   };
 }
 
@@ -1046,8 +1049,9 @@ export async function expectSetupRail(page: Page, newDraft = false) {
   }
 }
 
-export function expectedSlackManifest(webhookUrl: string) {
-  return JSON.stringify(buildSlackAppManifest({ app: { appName: "maya-paperclip", botName: "maya", command: "/maya" }, agentName: "Maya", webhookUrl }), null, 2);
+/** The manifest the builder produces for the app details on screen (by default the company-based defaults for Maya). */
+export function expectedSlackManifest(webhookUrl: string, app: { appName: string; botName: string; command: string }) {
+  return JSON.stringify(buildSlackAppManifest({ app, agentName: "Maya", webhookUrl }), null, 2);
 }
 
 export async function expectMinimumProviderSetup(page: Page, provider: ProviderCase) {
@@ -1055,14 +1059,20 @@ export async function expectMinimumProviderSetup(page: Page, provider: ProviderC
   if (provider.provider === "slack") {
     const steps = page.getByRole("navigation", { name: "Connection setup progress" });
     await steps.getByRole("button", { name: /Choose agent/ }).click();
-    await page.locator("summary:visible").filter({ hasText: "Advanced" }).click();
+    // The app and bot names are on the step itself; only the slash command is under Advanced.
     await expect(page.getByLabel("Slack app name", { exact: true })).toBeEditable();
     await expect(page.getByLabel("Bot display name", { exact: true })).toBeEditable();
+    await page.locator("summary:visible").filter({ hasText: "Advanced" }).click();
     await expect(page.getByLabel("Slash command", { exact: true })).toBeEditable();
+    const app = {
+      appName: await page.getByLabel("Slack app name", { exact: true }).inputValue(),
+      botName: await page.getByLabel("Bot display name", { exact: true }).inputValue(),
+      command: await page.getByLabel("Slash command", { exact: true }).inputValue(),
+    };
     await page.getByRole("button", { name: "Continue", exact: true }).click();
     await page.getByRole("button", { name: "View Slack App Manifest" }).click();
     const manifest = page.getByRole("textbox", { name: "Slack app manifest", exact: true });
-    await expect(manifest).toHaveValue(expectedSlackManifest(webhookUrl));
+    await expect(manifest).toHaveValue(expectedSlackManifest(webhookUrl, app));
     await expect(manifest).toHaveAttribute("readonly", "");
     await page.keyboard.press("Escape");
     await expect(page.getByRole("button", { name: "Create Slack app", exact: true })).toBeVisible();

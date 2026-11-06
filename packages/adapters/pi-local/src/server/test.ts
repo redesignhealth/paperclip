@@ -21,6 +21,7 @@ import {
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
 import { discoverPiModelsCached } from "./models.js";
+import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { parsePiJsonl } from "./parse.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -126,7 +127,27 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env }));
+  const baseRuntimeEnv = normalizeEnv(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env }));
+  // Remote targets get the managed config shipped by execute.ts; here we only validate locally.
+  const prepared = targetIsRemote
+    ? null
+    : await preparePiRuntimeConfig({ env: baseRuntimeEnv }).catch((err) => {
+        checks.push({
+          code: "pi_provider_config_failed",
+          level: "error",
+          message: err instanceof Error ? err.message : "Failed to prepare PAPERCLIP_PI_PROVIDERS config.",
+        });
+        return null;
+      });
+  const runtimeEnv = prepared?.env ?? baseRuntimeEnv;
+  for (const note of prepared?.notes ?? []) {
+    checks.push({
+      code: "pi_provider_config",
+      level: note.startsWith("Injected") ? "info" : "warn",
+      message: note,
+    });
+  }
+  try {
 
   const cwdInvalid = checks.some((check) => check.code === "pi_cwd_invalid");
   if (cwdInvalid) {
@@ -164,7 +185,7 @@ export async function testEnvironment(
   }
 
   const canRunProbe =
-    checks.every((check) => check.code !== "pi_cwd_invalid" && check.code !== "pi_command_unresolvable");
+    checks.every((check) => check.code !== "pi_cwd_invalid" && check.code !== "pi_command_unresolvable" && check.code !== "pi_provider_config_failed");
 
   // Pi model discovery shells out to `pi --list-models` locally; when probing a
   // remote target we skip discovery and let the remote hello probe surface
@@ -336,4 +357,7 @@ export async function testEnvironment(
     checks,
     testedAt: new Date().toISOString(),
   };
+  } finally {
+    await prepared?.cleanup();
+  }
 }

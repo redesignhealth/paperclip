@@ -657,6 +657,11 @@ export const PAPERCLIP_CORE_SKILL_KEYS = [
   "paperclipai/paperclip/paperclip-converting-plans-to-tasks",
   "paperclipai/paperclip/paperclip-create-agent",
   "paperclipai/paperclip/para-memory-files",
+  // Redesign Health: guides each new person through the standard six RH
+  // connectors on their first "set up my connectors" request. A skill in the
+  // company library is not active until it is in the agent's desired set, so
+  // lead agents get it by default; it stays removable afterwards.
+  "paperclipai/paperclip/rh-connector-onboarding",
 ] as const;
 
 export const ONBOARDING_FIRST_TASK_SKILL_KEY = "paperclipai/paperclip/first-task";

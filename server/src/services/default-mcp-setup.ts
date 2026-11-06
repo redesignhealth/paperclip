@@ -19,6 +19,7 @@
  * Effective install state is derived from install rows plus `installAppliesToAgent`
  * (default-mcp-spec.ts); a company-wide install never authorizes a managed connection.
  */
+import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNull, ne, notInArray, sql, type SQL } from "drizzle-orm";
 import type { CompanyVisibility } from "@paperclipai/shared";
@@ -569,7 +570,7 @@ export async function runDefaultMcpSetupForAgent(
   const spec = ctx.spec ?? DEFAULT_MCP_SPEC;
   const hooks = ctx.hooks ?? DEFAULT_MCP_SETUP_HOOKS;
   const env = ctx.env ?? process.env;
-  const fetchImpl = ctx.fetchImpl ?? fetch;
+  const fetchImpl = ctx.fetchImpl ?? tailnetAwareFetch;
   // Rollout scope (TECH-7271): the SAME trusted, boot-frozen predicate that bounds the company template
   // also bounds every per-agent claim, register and mint. A company outside the scope (including an empty or
   // malformed scope, which is none) is left completely untouched: no claim, no verify-ready write, no
