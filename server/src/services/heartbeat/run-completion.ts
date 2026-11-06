@@ -1521,7 +1521,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // Keep the failed run and its safe provider refusal authoritative,
         // but return the agent to idle so clients do not also announce a
         // misleading agent-wide error for the same rejected chat turn.
-        keepIdleOnFailure: Boolean(nonRetryablePreflightCode) || controllerLeaseLost,
+        keepIdleOnFailure:
+          Boolean(nonRetryablePreflightCode) ||
+          controllerLeaseLost ||
+          Boolean(memoryEmbeddingSetupFailure),
       }).catch(() => undefined);
     }
   }

@@ -1024,12 +1024,41 @@ export function createPostgresCompanyMemoryDatabaseService(
       .where(eq(companyMemoryDatabases.companyId, companyId))
       .then((rows) => rows[0] ?? null);
 
+    // Validate allowlist immediately after row is loaded, before any rotation
+    // convergence, credential rotation, or secret reads.
+    if (
+      row &&
+      !isSupportedCompanyMemoryEmbedding({
+        model: row.embeddingModel,
+        dimensions: row.embeddingDimensions,
+      })
+    ) {
+      throw new UnsupportedMemoryEmbeddingError(
+        companyId,
+        row.embeddingModel,
+        row.embeddingDimensions,
+      );
+    }
+
     if (!row || (row.status === "failed" && row.operation !== "rotate" && !row.pendingSecretVersion)) {
       try {
         row = await ensureProvisioned(companyId);
       } catch (err) {
         const reason = sanitizeDbError(err);
         throw new CompanyMemoryNotReadyError(`Failed to provision company memory database: ${reason}`);
+      }
+      if (
+        row &&
+        !isSupportedCompanyMemoryEmbedding({
+          model: row.embeddingModel,
+          dimensions: row.embeddingDimensions,
+        })
+      ) {
+        throw new UnsupportedMemoryEmbeddingError(
+          companyId,
+          row.embeddingModel,
+          row.embeddingDimensions,
+        );
       }
     }
 

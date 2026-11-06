@@ -327,7 +327,7 @@ describe("memory-config", () => {
       ).toThrow("embedder.config.model must be a non-empty string");
     });
 
-    it("validates structural embedding_dims check in embedder config (0, -1, 1.5, '1536' rejected; 1536 accepted)", () => {
+    it("validates structural embedding_dims check in embedder config (0, -1, 1.5, '1536', null, NaN, Infinity rejected; 1536 accepted)", () => {
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
@@ -367,6 +367,46 @@ describe("memory-config", () => {
           },
         }),
       ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: null as unknown as number },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: NaN },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a finite number");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: Infinity },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a finite number");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: -Infinity },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a finite number");
 
       const validated = validateHermesMemoryConfig({
         ...validMemoryInput,

@@ -396,6 +396,32 @@ describe("company-memory-databases", () => {
       }
     });
 
+    it("refuses to resolve runtime config and performs no credential rotation or secret writes for a rotating row when embedding is unsupported", async () => {
+      const service = createTestService();
+      await service.ensureProvisioned(companyA);
+
+      // Mutate row in db to have mid-rotation state AND unsupported embedding configuration
+      expect(memoryDbRows.length).toBe(1);
+      memoryDbRows[0].operation = "rotate";
+      memoryDbRows[0].pendingSecretVersion = 2;
+      memoryDbRows[0].embeddingModel = "text-embedding-3-large";
+      memoryDbRows[0].embeddingDimensions = 3072;
+
+      const initialSecretVersionCount = companySecretVersionRows.length;
+      const initialMaintenanceSqlCount = maintenanceSqlLog.length;
+      const rotateSpy = vi.spyOn(service, "rotateCredential");
+
+      try {
+        await expect(service.resolveRuntimeConfig(companyA)).rejects.toThrow(UnsupportedMemoryEmbeddingError);
+        expect(rotateSpy).not.toHaveBeenCalled();
+        expect(companySecretVersionRows.length).toBe(initialSecretVersionCount);
+        expect(maintenanceSqlLog.length).toBe(initialMaintenanceSqlCount);
+        expect(maintenanceSqlLog.some((sql) => sql.includes("ALTER ROLE") && sql.includes("PASSWORD"))).toBe(false);
+      } finally {
+        rotateSpy.mockRestore();
+      }
+    });
+
     it("rotates credentials, updates secret version and role password", async () => {
       const service = createTestService();
 
