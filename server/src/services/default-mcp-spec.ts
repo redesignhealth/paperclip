@@ -241,8 +241,9 @@ export function connectionHealthColumns<S extends string>(
 
 /**
  * Low-risk writes: drafts (never sent) and Docs/Sheets edits. Reviewed 2026-11-06. Tools that also delete through an
- * `action` argument (`manage_gmail_label`, `manage_task`, `manage_task_list`) are deliberately NOT here: activation is
- * per tool name, so enabling them would switch on the delete too.
+ * `action` argument and can destroy user data (`manage_gmail_label`, `manage_task`, `manage_task_list`) are deliberately
+ * NOT here: activation is per tool name, so enabling them would switch on the delete too. `manage_conditional_formatting`
+ * also accepts a delete action but only removes a formatting rule, never cell data, so it is kept.
  */
 export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
   "draft_gmail_message",

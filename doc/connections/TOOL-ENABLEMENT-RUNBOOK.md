@@ -134,7 +134,8 @@ Used when deciding what to enable broadly (implemented 2026-11-06 as the startin
 
 ## Verify
 
-- Unit tests: `pnpm --filter @paperclipai/server vitest run default-mcp gmail-tool-governance`
-  (adjust to the repo's test command).
+- Unit tests: `pnpm --filter @paperclipai/server vitest run default-mcp gmail-tool-governance generic-mcp-connection`
+  (adjust to the repo's test command). `generic-mcp-connection` holds the end-to-end first-consent test and needs
+  embedded Postgres.
 - In the UI, open the connection's Permissions page and confirm each tool shows the expected state: Active, Needs
   review (quarantined), or Disabled (hard-blocked, no toggle).
