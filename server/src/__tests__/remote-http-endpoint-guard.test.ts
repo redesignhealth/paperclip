@@ -105,6 +105,12 @@ describe("remote HTTP endpoint guard", () => {
     "http://1681915905/", // decimal 100.64.0.1
     "http://0x64400001/", // hex 100.64.0.1
     "http://0144.0100.0.1/", // octal 100.64.0.1
+    "http://[fd7a:115c:a1e0::1]:3000/",
+    "http://[fd7a:115c:a1e0:b1a:0:1:6440:1]/", // 4via6
+    "http://[64:ff9b::6440:1]/",
+    "http://[::6440:1]/",
+    "http://[::ffff:0:6440:1]/",
+    "http://[2002:6440:1::]/",
   ])("rejects tailnet CGNAT literal %s even when private networking is allowed", async (url) => {
     await expect(assertPublicRemoteHttpEndpoint(new URL(url), { allowPrivateNetwork: true }, guardError))
       .rejects.toMatchObject({ code: "remote_http_tailnet_address_denied" });
@@ -143,5 +149,18 @@ describe("remote HTTP endpoint guard", () => {
 
   it("keeps the private-endpoint code for CGNAT answers when private networking is off", async () => {
     await expect(hostCheck("https://svc.example:8443/", cgnat, false)).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
+  });
+
+  const tailnetV6 = [{ address: "fd7a:115c:a1e0::9", family: 6 }];
+  it("denies hostname with only an fd7a:115c:a1e0::/48 answer on http:3000", async () => {
+    await expect(hostCheck("http://svc.example:3000/", tailnetV6)).rejects.toMatchObject({ code: "remote_http_tailnet_address_denied" });
+    await expect(hostCheck("https://svc.example/", tailnetV6)).resolves.toBeUndefined();
+  });
+
+  it("allowTailnetAddress (operator allowlist) skips the tailnet deny only", async () => {
+    const allow = { allowPrivateNetwork: true, allowTailnetAddress: true };
+    await expect(assertPublicRemoteHttpEndpoint(new URL("http://100.64.0.5:8080/"), allow, guardError)).resolves.toBeUndefined();
+    await expect(assertPublicRemoteHttpEndpoint(new URL("http://[fd7a:115c:a1e0::1]/"), allow, guardError)).resolves.toBeUndefined();
+    await expect(assertPublicRemoteHttpEndpoint(new URL("http://169.254.169.254/"), allow, guardError)).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
   });
 });

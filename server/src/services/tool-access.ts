@@ -3751,6 +3751,7 @@ export function toolAccessService(
   ): GuardedRemoteHttpFetchOptions {
     return {
       allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint),
+      allowTailnetAddress: tokenBrokerAllowsPrivateNetwork(endpoint),
       error: (message, code) => badRequest(message, { code }),
     };
   }
@@ -3764,7 +3765,10 @@ export function toolAccessService(
     if (!tailnetTunnelProxy(endpoint, tokenBrokerHttpFetchOptions(endpoint))) {
       await assertPublicRemoteHttpEndpoint(
         endpoint,
-        { allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint) },
+        {
+          allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint),
+          allowTailnetAddress: tokenBrokerAllowsPrivateNetwork(endpoint),
+        },
         (message, code) => badRequest(message, { code }),
       );
     }
