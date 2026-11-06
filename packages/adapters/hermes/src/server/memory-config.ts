@@ -16,6 +16,8 @@
  * Exported via @paperclipai/adapter-utils/regex and root @paperclipai/adapter-utils.
  */
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
+import { resolveMemoryHardeningFlags, type MemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
+
 
 /**
  * Safe PostgreSQL identifier regex: 1-63 chars, letters/underscore start, letters/numbers/underscore rest.
@@ -91,8 +93,9 @@ export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze({
 export interface ValidatedHermesMemoryConfig {
   readonly provider: "mem0";
   readonly mode: "oss";
-  readonly userId: "company";
+  readonly userId: string;
   readonly agentId: string;
+  readonly syncMaxChars?: number;
   readonly llm: {
     readonly provider: "openai" | "ollama";
     readonly config: Readonly<Record<string, unknown>>;
@@ -144,8 +147,9 @@ export interface CanonicalMem0Json {
       };
     };
   };
-  readonly user_id: "company";
+  readonly user_id: string;
   readonly agent_id: string;
+  readonly sync_max_chars?: number;
 }
 
 function assertNoControlChars(val: string, fieldName: string): void {
@@ -435,7 +439,7 @@ function validateModelConfig(
  * Enforces:
  * - provider: "mem0"
  * - mode: "oss"
- * - userId / user_id: strictly "company", rejects conflicting camel/snake values
+ * - userId / user_id: safe identifier matching SAFE_AGENT_ID_REGEX and equal to either "company" or agentId, rejects conflicting camel/snake values
  * - agentId / agent_id: safe identifier without controls, rejects conflicting camel/snake values
  * - llm and embedder blocks: providers "openai" | "ollama", non-empty model, recursive plain-JSON safe
  * - vectorStore / vector_store: provider "pgvector", split fields only, rejects conflicting camel/snake values
@@ -457,6 +461,8 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
     "user_id",
     "agentId",
     "agent_id",
+    "syncMaxChars",
+    "sync_max_chars",
     "llm",
     "embedder",
     "vectorStore",
@@ -477,21 +483,42 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
     throw new Error('Invalid memory configuration: mode must be "oss"');
   }
 
-  // Detect conflicting camel/snake aliases
-  if (raw.userId !== undefined && raw.user_id !== undefined && raw.userId !== raw.user_id) {
-    throw new Error("Invalid memory configuration: conflicting userId and user_id values provided");
-  }
-  const userId = raw.userId ?? raw.user_id;
-  if (userId !== "company") {
-    throw new Error('Invalid memory configuration: userId must be "company"');
-  }
-
   if (raw.agentId !== undefined && raw.agent_id !== undefined && raw.agentId !== raw.agent_id) {
     throw new Error("Invalid memory configuration: conflicting agentId and agent_id values provided");
   }
   const agentId = raw.agentId ?? raw.agent_id;
   if (typeof agentId !== "string" || !SAFE_AGENT_ID_REGEX.test(agentId)) {
     throw new Error("Invalid memory configuration: agentId must be a non-empty safe identifier without control characters");
+  }
+
+  // Detect conflicting camel/snake aliases
+  if (raw.userId !== undefined && raw.user_id !== undefined && raw.userId !== raw.user_id) {
+    throw new Error("Invalid memory configuration: conflicting userId and user_id values provided");
+  }
+  const userId = raw.userId ?? raw.user_id;
+  if (
+    typeof userId !== "string" ||
+    !SAFE_AGENT_ID_REGEX.test(userId) ||
+    (userId !== "company" && userId !== agentId)
+  ) {
+    throw new Error('Invalid memory configuration: userId must be a safe identifier and equal either "company" or agentId');
+  }
+
+  if (raw.syncMaxChars !== undefined && raw.sync_max_chars !== undefined && raw.syncMaxChars !== raw.sync_max_chars) {
+    throw new Error("Invalid memory configuration: conflicting syncMaxChars and sync_max_chars values provided");
+  }
+  const rawSyncMaxChars = raw.syncMaxChars ?? raw.sync_max_chars;
+  let syncMaxChars: number | undefined;
+  if (rawSyncMaxChars !== undefined) {
+    if (
+      typeof rawSyncMaxChars !== "number" ||
+      !Number.isInteger(rawSyncMaxChars) ||
+      rawSyncMaxChars <= 0 ||
+      rawSyncMaxChars > 16000
+    ) {
+      throw new Error("Invalid memory configuration: syncMaxChars must be an integer between 1 and 16000");
+    }
+    syncMaxChars = rawSyncMaxChars;
   }
 
   // LLM block
@@ -545,11 +572,12 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   return {
     provider: "mem0",
     mode: "oss",
-    userId: "company",
+    userId,
     agentId,
     llm: validatedLlm,
     embedder: validatedEmbedder,
     vectorStore: validatedVectorStore,
+    ...(syncMaxChars !== undefined ? { syncMaxChars } : {}),
   };
 }
 
@@ -678,7 +706,11 @@ function validateVectorStoreBlock(
 /**
  * Builds the canonical mem0 JSON object with deterministic key ordering.
  */
-export function buildCanonicalMem0Object(config: ValidatedHermesMemoryConfig): CanonicalMem0Json {
+export function buildCanonicalMem0Object(
+  config: ValidatedHermesMemoryConfig,
+  flags?: MemoryHardeningFlags,
+): CanonicalMem0Json {
+  const hardening = flags ?? resolveMemoryHardeningFlags();
   const sortKeys = (obj: Record<string, unknown>): Record<string, unknown> => {
     const sorted: Record<string, unknown> = {};
     for (const key of Object.keys(obj).sort()) {
@@ -711,16 +743,22 @@ export function buildCanonicalMem0Object(config: ValidatedHermesMemoryConfig): C
         },
       },
     },
-    user_id: "company",
+    user_id: config.userId,
     agent_id: config.agentId,
+    ...(hardening.hermesMemoryConfig
+      ? { sync_max_chars: config.syncMaxChars ?? 6000 }
+      : {}),
   };
 }
 
 /**
  * Serializes the validated configuration deterministically to JSON format.
  */
-export function serializeMem0Json(config: ValidatedHermesMemoryConfig): string {
-  const canonical = buildCanonicalMem0Object(config);
+export function serializeMem0Json(
+  config: ValidatedHermesMemoryConfig,
+  flags?: MemoryHardeningFlags,
+): string {
+  const canonical = buildCanonicalMem0Object(config, flags);
   return JSON.stringify(canonical, null, 2) + "\n";
 }
 
@@ -728,7 +766,11 @@ export function serializeMem0Json(config: ValidatedHermesMemoryConfig): string {
  * Generates the separate Hermes config.yaml memory block.
  * Notice: host config inheritance must not widen ALLOWED_HOST_CONFIG_KEYS.
  */
-export function generateHermesMemoryYaml(): string {
+export function generateHermesMemoryYaml(flags?: MemoryHardeningFlags): string {
+  const hardening = flags ?? resolveMemoryHardeningFlags();
+  if (hardening.hermesMemoryConfig) {
+    return "memory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n";
+  }
   return "memory:\n  provider: mem0\n";
 }
 

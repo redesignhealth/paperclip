@@ -974,6 +974,25 @@ describe("runner E2E server isolation", () => {
     ).not.toThrow();
   });
 
+  it("preserves PAPERCLIP_MEMORY_HARDENING and PAPERCLIP_MEMORY_* in Paperclip server environment", () => {
+    const env = buildPaperclipServerEnvironment({
+      PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config,hermes-prompt-split",
+      PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED: "true",
+      PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: "postgresql://user:pass@localhost:5432/postgres?sslmode=require",
+      PAPERCLIP_MEMORY_COMPANY_SCOPE: "all",
+      DATABASE_URL: "postgres://strip-me",
+      OPENAI_API_KEY: "strip-me-too",
+    });
+    expect(env.PAPERCLIP_MEMORY_HARDENING).toBe("hermes-memory-config,hermes-prompt-split");
+    expect(env.PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED).toBe("true");
+    expect(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL).toBe(
+      "postgresql://user:pass@localhost:5432/postgres?sslmode=require",
+    );
+    expect(env.PAPERCLIP_MEMORY_COMPANY_SCOPE).toBe("all");
+    expect(env.DATABASE_URL).toBeUndefined();
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+  });
+
   it("uses absolute repository paths for the Playwright web server", () => {
     const command = runnerE2EWebServerCommand("/workspace/paperclip");
     expect(command).toContain(

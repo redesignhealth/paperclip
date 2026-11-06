@@ -33,8 +33,15 @@ network request or agent wake. Its server marker and deterministic UID are imple
 identifiers; the displayed application/connection name is not a canonical identity. The seed is
 immutable except for archive (`409 managed_seed_immutable`); its operation is idempotent under a
 company/entry advisory lock, and an archived seed is an organization opt-out that is not recreated.
-After the consenting owner creates a personal Google instance, that instance's newly discovered
-catalog entries remain quarantined until the owner reviews them.
+After the consenting owner first connects a personal Google instance, the tools named in
+`RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS` (`default-mcp-spec.ts`) are switched on and every other discovered
+catalog entry remains quarantined until the owner reviews it. That list is hand-built from tool names that only
+read; the Google server's own read-only flag is not used, because it marks tools that change data (for example
+`manage_drive_access`, `modify_sheet_values`, `run_script_function`) as read-only. The instance is also installed,
+through the owner-only per-agent install path, on the live agents that owner created (not terminated, not awaiting
+approval). Agents other people created and agents created later start with it off, and a reconnect changes
+neither the tool choices nor the installs. The result is recorded in a
+`personal_instance.install_on_existing_agents` audit event.
 
 RH MCP uses the same protected seed and personal-connect lifecycle, but its new personal instance
 auto-approves only the read tools listed below (see the current ceiling list for the exact count);
@@ -676,3 +683,20 @@ Behaviour of a run: no one-pager and no pending profile proposal: draft and prop
 brain has nothing to cite). One-pager exists, or a profile proposal is pending: do nothing. `arcana_source_revise` for the profile is
 NOT used: the Arcana pilot backend has no revise route (`apply_source_revise` is determinately unsupported, TECH-7161), so an
 approved revise would fail with `apply_failed`. Updating the reference doc is how revise gets enabled once Arcana supports it.
+
+## Shared-org rh-mcp service token (`rh-mcp-service`, TECH-8066)
+
+Personal orgs keep the OAuth `rh-mcp` seed. A company whose `visibility` is `shared` instead gets one bot-token
+connection to rh-mcp named `rh-mcp-service`, so no agent depends on one person's OAuth session.
+
+- **Off by default.** Set `PAPERCLIP_SHARED_ORG_RH_MCP_ENABLED=true` (also needs the default-MCP spec flag, the rh-mcp URL in
+  `PAPERCLIP_DEFAULT_MCP_RH_MCP_URL`, and the comms ownership API credentials). Rollout follows the company template scope.
+- **One token per org**, minted through the ownership API (`paperclip-rh-mcp-<companyId>`), never by Paperclip. Scopes are the
+  closed read set in `RH_MCP_SERVICE_TOOLS_BY_SCOPE`: Argus review, MDM read, Opik read, Coresignal, Definitive Healthcare and the
+  voice humanizer checklist. Never `supabase:*` (Ashby views are readable under `supabase:read`), writes, secrets or impersonation.
+- **Offered tools equal the scopes.** The spec entry's reviewed allowlist is derived from the same map; identity-keyed tools
+  (annotations, Granola status, voice guides) are left out because a service identity has no meaningful answer for them.
+- **Lifecycle.** A periodic sweep (startup, then every 5 minutes) mints, connects, enables exactly the reviewed tools and installs
+  live agents. New agents get it from `defaultEnabled`. The token is re-issued into a new vault version 60 days before expiry
+  (expiry kept in `config.rhMcpServiceTokenExpiresAt`).
+- **Opt-out:** archive the `rh-mcp-service` connection; it is not re-created.

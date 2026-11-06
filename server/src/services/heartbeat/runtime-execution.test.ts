@@ -24,8 +24,9 @@ import { buildNativeExecutionInput } from "../native-runtime/native-execution-in
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
-import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
+import { createAdapterRuntimeToolAccess, revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
+import { MemoryHardeningConfigurationError } from "@paperclipai/shared";
 
 // Keep real accounting, workspace barriers, and task-session persistence. Providers
 // and gateway delivery are external boundaries; browser acceptance covers their wiring.
@@ -117,6 +118,19 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(revokeHeartbeatRunGatewayTokens).toHaveBeenCalledWith({ db, companyId: input.agent.companyId, runId: input.run.id });
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   }
+
+  it("delivers connection tools to task-bound runs", async () => {
+    const { input } = await fixture();
+    await executeHeartbeatRuntime(db, input);
+    expect(createAdapterRuntimeToolAccess).toHaveBeenCalledOnce();
+  });
+
+  it("withholds connection tools from taskless runs such as timer heartbeats", async () => {
+    const { input } = await fixture();
+    input.task = { ...input.task, issueRef: null, issueId: null, taskKey: null };
+    await executeHeartbeatRuntime(db, input);
+    expect(createAdapterRuntimeToolAccess).not.toHaveBeenCalled();
+  });
 
   it.each([false, true])("preserves the dispatch gate's early return and cleanup (native: %s)", async native => {
     const { input, adapter } = await fixture(native);
@@ -390,5 +404,59 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     vi.mocked(revokeHeartbeatRunGatewayTokens).mockRejectedValueOnce(new Error("gateway unavailable"));
     expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true });
     expectCleanup(input);
+  });
+
+  it("does not throw or fail dispatch when non-Hermes agent has unknown PAPERCLIP_MEMORY_HARDENING tokens in agent or server env", async () => {
+    const { input, adapter } = await fixture(false, "codex");
+    expect(input.agent.adapterType).toBe("process");
+    input.config.runtimeConfig = { env: { PAPERCLIP_MEMORY_HARDENING: "unknown_token_agent_typo" } };
+
+    const prevServerEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+    try {
+      process.env.PAPERCLIP_MEMORY_HARDENING = "unknown_token_server_typo";
+      const result = await executeHeartbeatRuntime(db, input);
+      expect(result).toMatchObject({ dispatched: true });
+      expect(adapter.execute).toHaveBeenCalledOnce();
+    } finally {
+      if (prevServerEnv === undefined) {
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+      } else {
+        process.env.PAPERCLIP_MEMORY_HARDENING = prevServerEnv;
+      }
+    }
+    expectCleanup(input);
+  });
+
+  it("fails closed and does not dispatch when Hermes agent has unknown PAPERCLIP_MEMORY_HARDENING token in agent env", async () => {
+    const { input, adapter } = await fixture(false, "codex");
+    input.agent.adapterType = "hermes_local";
+    input.config.runtimeConfig = { env: { PAPERCLIP_MEMORY_HARDENING: "unknown_token_hermes_agent_typo" } };
+
+    await expect(executeHeartbeatRuntime(db, input)).rejects.toThrow(
+      MemoryHardeningConfigurationError,
+    );
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expectCleanup(input);
+  });
+
+  it("fails closed and does not dispatch when Hermes agent has unknown PAPERCLIP_MEMORY_HARDENING token in server env", async () => {
+    const { input, adapter } = await fixture(false, "codex");
+    input.agent.adapterType = "hermes_local";
+
+    const prevServerEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+    try {
+      process.env.PAPERCLIP_MEMORY_HARDENING = "unknown_token_hermes_server_typo";
+      await expect(executeHeartbeatRuntime(db, input)).rejects.toThrow(
+        MemoryHardeningConfigurationError,
+      );
+      expect(adapter.execute).not.toHaveBeenCalled();
+      expectCleanup(input);
+    } finally {
+      if (prevServerEnv === undefined) {
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+      } else {
+        process.env.PAPERCLIP_MEMORY_HARDENING = prevServerEnv;
+      }
+    }
   });
 });

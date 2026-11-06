@@ -24,6 +24,9 @@ export const companyMemoryDatabases = pgTable(
     lastProvisionedAt: timestamp("last_provisioned_at", { withTimezone: true }),
     lastRotatedAt: timestamp("last_rotated_at", { withTimezone: true }),
     lastError: text("last_error"),
+    scopeMigrationCompletedAt: timestamp("scope_migration_completed_at", { withTimezone: true }),
+    scopeMigrationMode: text("scope_migration_mode"),
+    scopeMigrationAgentScopeObservedAt: timestamp("scope_migration_agent_scope_observed_at", { withTimezone: true }),
 
     // Durable cross-process fenced lease and state machine
     operation: text("operation").notNull().default("idle"),

@@ -21,7 +21,7 @@ name: Auto Approve
 
 on:
   workflow_run:
-    workflows: ["PR", "Docker Runner check", "Gate Tests", "Storybook Visual"]
+    workflows: ["PR", "Docker Runner check", "Gate Tests", "Storybook Visual", "CI work benchmark", "Sentry SDK contract"]
     types: [completed]
   workflow_dispatch:
     inputs:

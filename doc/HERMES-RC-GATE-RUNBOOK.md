@@ -88,8 +88,11 @@ is `hermes` remains after exit. The scan matches the `hermes` program only; orph
 **Known Hermes 0.21.x behaviors to keep in mind**
 
 - *Tool deferral*: with the default `tools.tool_search.enabled`, MCP tools are not direct schema
-  entries. Paperclip's generated isolated profile sets `enabled: "off"` (PR #29); the YAML forms
-  `off`, `false` and `'off'` all behave identically.
+  entries. Paperclip's generated isolated profile sets `enabled: "off"` (PR #29) for allowlists of
+  up to `HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS` (40) tools, and `enabled: "auto"` above that (TECH-8184:
+  a large direct schema set can exceed the compaction threshold by itself, so Hermes recompacts
+  forever). With `auto`, calls arrive through the `tool_call` bridge rather than as direct
+  `mcp__<server>__<tool>` names. The YAML forms `off`, `false` and `'off'` all behave identically.
 - *Tool-name repair*: Hermes remaps an unknown/hallucinated tool name onto a registered tool
   (case/separator/`_tool`-suffix normalisation, then fuzzy match;
   `agent/agent_runtime_helpers.py` `repair_tool_call`). In the `forbidden` scenario the call to
@@ -228,7 +231,7 @@ These are facts about master `47568f409`, verified against the code, not assumpt
      proceeds without MCP instead of failing. Preflight failure paths are only reachable in tests
      (section 2). A fail-closed `adapterConfig.requiredMcpTools` check would make this canary-testable.
 4. **No server-side proof of the turn-1 tool schema.** Provider-trace capture exists only on the native
-   runner path. For Hermes the evidence is the preflight line plus `tools.tool_search.enabled: "off"`;
+   runner path. For Hermes the evidence is the preflight line plus `tools.tool_search.enabled` (`"off"` for allowlists of up to 40 tools, `"auto"` above that);
    section 1 proves the schema shape in an offline run of the same image, not in the hosted run.
 5. **No API for a name-only environment probe or for OS processes.** The probe must be performed by the
    operator on the task (outside this API), and orphan processes can only be inferred from

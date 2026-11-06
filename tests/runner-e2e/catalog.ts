@@ -28,6 +28,11 @@ import { publicMcpTasks, publicMcpExpandedDigest, publicMcpSetupDigest, publicMc
 import { graderVersion as publicMcpGraderVersion } from "./public-mcp-grading.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 import { CONNECTION_GUIDANCE_SUITE, CONNECTION_GUIDANCE_BUDGET_CENTS, connectionGuidanceTasks, connectionGuidanceDefinitionDigest } from "./connection-guidance-cases.js";
+import {
+  memoryRecallTasks,
+  memoryRecallDefinitionDigest,
+  MEMORY_RECALL_BUDGET_CENTS,
+} from "./memory-recall-cases.js";
 
 import { firstTaskTasks } from "./first-task-cases.js";
 import { chatTasks, chatHardeningTasks, chatStoryTasks, chatQualificationTasks, chatCompletionTasks } from "./chat-cases.js";
@@ -137,10 +142,11 @@ function commonAgent(
 function legacyProfile(input: {
   id: string;
   label: string;
-  adapterType: "codex_local" | "claude_local" | "opencode_local" | "kimi_local" | "grok_local";
+  adapterType: "codex_local" | "claude_local" | "opencode_local" | "kimi_local" | "grok_local" | "hermes_local";
   provider: string;
   model: string;
   credential: RunnerProfileFixture["credential"];
+  extraEnvCredentials?: readonly RunnerProfileFixture["credential"][];
   extraConfig?: Record<string, unknown>;
   instructions?: readonly string[];
   modelQualification?: RunnerProfileFixture["modelQualification"];
@@ -172,11 +178,80 @@ function legacyProfile(input: {
         ...input.extraConfig,
         env: {
           [input.credential]: requiredSecret(buildInput, input.credential),
+          ...(input.extraEnvCredentials ?? []).reduce<Record<string, SecretReference>>((acc, cred) => {
+            acc[cred] = requiredSecret(buildInput, cred);
+            return acc;
+          }, {}),
         },
       }, input.instructions);
     },
   };
 }
+
+export const hermesMemoryProfile: RunnerProfileFixture = {
+  ...legacyProfile({
+    id: "memory-hermes-local",
+    label: "Hermes Agent (Local Memory)",
+    adapterType: "hermes_local",
+    provider: "openrouter",
+    credential: "OPENROUTER_API_KEY",
+    extraEnvCredentials: ["OPENAI_API_KEY"],
+    model: "configured-in-memory-recall-env",
+    modelQualification: {
+      source: "candidate_runner_profile",
+      qualificationId: "operator-configured-model",
+    },
+    extraConfig: {
+      verbose: true,
+      persistSession: false,
+      timeoutSec: 360,
+      maxTurnsPerRun: 12,
+    },
+    instructions: [
+      "You are an operations agent with access to company memory tools. Follow user instructions, remember facts when asked, and recall durable information when relevant.",
+    ],
+  }),
+  supportedEnvironments: ["local"],
+  buildAgent(buildInput) {
+    const configuredModel = process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL?.trim();
+    if (!configuredModel) {
+      throw new Error(
+        "PAPERCLIP_E2E_MEMORY_HERMES_MODEL is required to build Hermes agent for memory recall",
+      );
+    }
+    const agent = commonAgent(
+      buildInput,
+      "memory-hermes-local",
+      "hermes_local",
+      {
+        ...(buildInput.environmentFixtureId === "local"
+          ? { cwd: buildInput.workspacePath }
+          : {}),
+        model: configuredModel,
+        timeoutSec: 360,
+        maxTurnsPerRun: 12,
+        verbose: true,
+        persistSession: false,
+        dangerouslySkipPermissions: true,
+        env: {
+          OPENROUTER_API_KEY: requiredSecret(buildInput, "OPENROUTER_API_KEY"),
+          OPENAI_API_KEY: requiredSecret(buildInput, "OPENAI_API_KEY"),
+        },
+      },
+      [
+        "You are an operations agent with access to company memory tools. Follow user instructions, remember facts when asked, and recall durable information when relevant.",
+      ],
+    );
+    return {
+      ...agent,
+      name: `Memory Analyst ${buildInput.executionId}`,
+      role: "general",
+      title: "Memory Analyst",
+      capabilities: "Evaluates memory persistence, recall, isolation boundaries, and noise filtering.",
+      budgetMonthlyCents: MEMORY_RECALL_BUDGET_CENTS,
+    };
+  },
+};
 
 const PI_QUALIFICATION_THINKING_LEVEL = "low" as const;
 
@@ -1715,6 +1790,25 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     environments: [localEnvironment, daytonaWarmEnvironment], tasks: [repositorySkillsTask], expectedMatrixSize: 2,
     definitionMetadata: { version: 1, scheduling: "explicit-only", maximumAttemptsPerCell: 1,
       source: "paperclipai/poteto-stack", skills: ["architect", "bro"], grading: "independent-git-blob-hashes-and-file-modes-from-owned-runtime", budgetMonthlyCents: 1000 },
+  },
+  {
+    id: "memory-recall",
+    label: "Memory Recall and Isolation",
+    description: "Mem0 memory recall, implicit guidance, cross-agent isolation, and heartbeat noise evaluation.",
+    groups: [],
+    manualOnly: true,
+    profiles: [hermesMemoryProfile],
+    environments: [localEnvironment],
+    tasks: memoryRecallTasks,
+    expectedMatrixSize: memoryRecallTasks.length,
+    definitionMetadata: {
+      version: 1,
+      definitionDigest: memoryRecallDefinitionDigest(),
+      scheduling: "explicit-only",
+      budgetMonthlyCents: MEMORY_RECALL_BUDGET_CENTS,
+      maximumAttemptsPerCell: 1,
+      grading: "live-mem0-tenant-database-rows-and-typed-hermes-tool-records",
+    },
   },
 ] as const;
 

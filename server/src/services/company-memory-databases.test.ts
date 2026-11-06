@@ -355,6 +355,23 @@ describe("company-memory-databases", () => {
       expect(runtimeConfig!.user).toMatch(/^pcmem_r_/);
       expect(runtimeConfig!.dbname).toMatch(/^pcmem_/);
       expect(runtimeConfig!.password).toBeTruthy();
+      expect(runtimeConfig!.scopeMigrationCompletedAt).toBeNull();
+      expect(runtimeConfig!.scopeMigrationMode).toBeNull();
+    });
+
+    it("maps scopeMigrationCompletedAt and scopeMigrationMode in resolveRuntimeConfig", async () => {
+      const service = createTestService();
+
+      await service.ensureProvisioned(companyA);
+      const completedAt = new Date("2026-11-05T12:00:00Z");
+      memoryDbRows[0].scopeMigrationCompletedAt = completedAt;
+      memoryDbRows[0].scopeMigrationMode = "copy";
+
+      const runtimeConfig = await service.resolveRuntimeConfig(companyA);
+
+      expect(runtimeConfig).not.toBeNull();
+      expect(runtimeConfig!.scopeMigrationCompletedAt).toEqual(completedAt);
+      expect(runtimeConfig!.scopeMigrationMode).toBe("copy");
     });
 
     it("rotates credentials, updates secret version and role password", async () => {

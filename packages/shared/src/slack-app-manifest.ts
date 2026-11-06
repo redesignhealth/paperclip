@@ -21,10 +21,31 @@ export const SLACK_CHAT_BOT_SCOPES = [
   "reactions:read", "reactions:write", "users:read",
 ] as const satisfies readonly (typeof SLACK_DEFAULT_BOT_SCOPES)[number][];
 
-export function defaultSlackAppConfiguration(agentName: string): SlackAppConfiguration {
-  const botName = agentName.normalize("NFKD").toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "paperclip-agent";
-  return { appName: `${botName}-paperclip`, botName, command: `/${botName.replace(/[._]+/g, "-")}` };
+function slackNameSlug(name: string): string {
+  return name.normalize("NFKD").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24)
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * The starting Slack app details. Without a company name the app is named after the agent, as before. With one, the
+ * app and its bot are named after the company (the app name as written, up to Slack's 35 characters; the bot display
+ * name as the lowercase slug Slack requires), while the slash command still comes from the agent so two agents in
+ * one company never claim the same command.
+ */
+export function defaultSlackAppConfiguration(agentName: string, companyName?: string): SlackAppConfiguration {
+  const agentSlug = slackNameSlug(agentName) || "paperclip-agent";
+  const command = `/${agentSlug.replace(/[._]+/g, "-")}`;
+  const company = companyName?.trim();
+  const companySlug = company ? slackNameSlug(company) : "";
+  if (!company || !companySlug) return { appName: `${agentSlug}-paperclip`, botName: agentSlug, command };
+  // The schema counts UTF-16 units, so cut on whole characters until 35 units are used: an emoji at the boundary
+  // is dropped rather than split into a lone surrogate or pushed past the limit.
+  let appName = "";
+  for (const character of company) {
+    if (appName.length + character.length > 35) break;
+    appName += character;
+  }
+  return { appName: appName.trim(), botName: companySlug, command };
 }
 
 export function buildSlackAppManifest(input: {
@@ -133,6 +154,7 @@ export function slackRegistrationErrorMessage(code: string): string {
     slack_configuration_refresh_busy: "Paperclip is already refreshing this Slack configuration token. Try again in a moment.",
     slack_configuration_credential_mismatch: "Slack returned a token for a different workspace or account. Save the refresh token again from the intended workspace.",
     slack_configuration_credential_forbidden: "This saved Slack token belongs to another Paperclip account. Use your own token.",
+    slack_configuration_shared_forbidden: "Only an instance administrator can save or forget the Slack token shared by every company.",
     slack_manifest_invalid: "Slack rejected this app configuration. Check the app details or use manual setup.",
     slack_manifest_update_pending: "Your Slack app is saved, but its event settings still need to be applied. Enter an app configuration access token to retry configuring the same app.",
     slack_permissions_update_pending: "This agent's Slack permissions changed. Update the Slack app and re-authorize it to apply them. Until then the agent keeps its current permissions.",
@@ -184,11 +206,15 @@ export const slackConfigurationCredentialSchema = z.object({
   slackUserId: z.string(),
   status: z.enum(["active", "reauthorize"]),
   lastRotatedAt: z.string().datetime().nullable(),
+  /** Saved once by an instance administrator and used by every company's Slack setup. */
+  shared: z.boolean().optional(),
 });
 export type SlackConfigurationCredential = z.infer<typeof slackConfigurationCredentialSchema>;
 /** Save a refresh token once; it is rotated immediately so the stored one is unique. */
 export const slackConfigurationCredentialSaveSchema = z.object({
   credentials: z.object({ refreshToken: z.string().trim().regex(/^xoxe-/).max(4096) }).strict(),
+  /** Instance administrators only: save this token once for every company in this instance. */
+  shared: z.boolean().optional(),
 }).strict();
 export type SlackConfigurationCredentialSaveInput = z.infer<typeof slackConfigurationCredentialSaveSchema>;
 export const slackSetupOptionsSchema = z.object({

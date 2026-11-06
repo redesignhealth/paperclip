@@ -1,3 +1,4 @@
+import { defaultSlackAppConfiguration } from "../../packages/shared/src/slack-app-manifest";
 import { oauthCallbackInterstitialHtml } from "../../server/src/lib/oauth-browser-return";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -322,9 +323,11 @@ test.describe.serial("native chat adapter UI", () => {
     await expect(page.getByRole("button", { name: /Set up with agent/i })).toHaveCount(0);
     await page.getByRole("button", { name: "Choose an active agent" }).click();
     await page.getByRole("button", { name: "Select Maya", exact: true }).click();
+    // The app and bot names default to the company and are on the step itself; only the command is under Advanced.
+    const defaults = defaultSlackAppConfiguration("Maya", seed.companyName);
+    await expect(page.getByLabel("Slack app name", { exact: true })).toHaveValue(defaults.appName);
+    await expect(page.getByLabel("Bot display name", { exact: true })).toHaveValue(defaults.botName);
     await page.locator("summary:visible").filter({ hasText: "Advanced" }).click();
-    await expect(page.getByLabel("Slack app name", { exact: true })).toHaveValue("maya-paperclip");
-    await expect(page.getByLabel("Bot display name", { exact: true })).toHaveValue("maya");
     await expect(page.getByLabel("Slash command", { exact: true })).toHaveValue("/maya");
     await page.getByRole("button", { name: "Continue", exact: true }).click();
     await expect(page.getByRole("heading", { name: "App configuration access token", exact: true })).toBeVisible();
@@ -392,7 +395,6 @@ test.describe.serial("native chat adapter UI", () => {
     await expect(page.getByRole("alert")).toContainText("Slack may have created the app");
     await page.getByRole("button", { name: "Open sidebar" }).click();
     await page.getByRole("navigation", { name: "Connection setup progress" }).getByRole("button", { name: /Choose agent/ }).click();
-    await page.locator("summary:visible").filter({ hasText: "Advanced" }).click();
     await expect(page.getByLabel("Slack app name", { exact: true })).toHaveAttribute("readonly", "");
     await page.getByRole("button", { name: "Continue", exact: true }).click();
     await page.locator("summary:visible").filter({ hasText: "Advanced" }).click();

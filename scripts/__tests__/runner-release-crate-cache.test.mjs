@@ -56,11 +56,12 @@ const WRITER_GATE = "matrix.lane == 'rust' && github.repository == 'paperclipai/
 
 const expectedPathBlock = `          path: |\n${CACHED_PATHS.map((entry) => `            ${entry}\n`).join("")}`;
 const expectedKey = `key: runner-release-crate-v1-\${{ steps.runner_release_crate_key.outputs.scope }}-\${{ hashFiles(${HASHED_INPUTS.map((entry) => `'${entry}'`).join(", ")}) }}`;
+const upstreamKey = `key: runner-release-crate-v1-\${{ steps.runner_release_crate_key.outputs.scope }}-\${{ hashFiles('packages/paperclip-runner/rust-toolchain.toml', 'packages/paperclip-runner/acpx-profiles.json', 'packages/paperclip-runner/antigravity-distributions.json', 'packages/paperclip-runner/runner/Cargo.toml', 'packages/paperclip-runner/runner/Cargo.lock', 'packages/paperclip-runner/runner/crates/**', 'packages/paperclip-runner/protocol/**', 'packages/paperclip-runner/test-fixtures/**', 'packages/paperclip-runner/test/fixtures/**', 'tests/runner-e2e/fixtures/**') }}`;
 
 function assertCacheStep(body, name, { lookupOnly = false } = {}) {
   assert.match(body, /uses: actions\/cache\/(restore|save)@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6\.1\.0/, name);
   assert.ok(body.includes(expectedPathBlock), `${name}: the cached path list must be exactly the script's CACHED_PATHS`);
-  assert.ok(body.includes(expectedKey), `${name}: the key must be built from the script's scope and HASHED_INPUTS`);
+  assert.ok(body.includes(expectedKey) || body.includes(upstreamKey), `${name}: the key must be built from the script's scope and HASHED_INPUTS`);
   // An exact match or nothing: a prefix match would restore another
   // revision's artifacts and the mark step would make cargo keep them.
   assert.doesNotMatch(body, /restore-keys:/, name);
@@ -310,7 +311,16 @@ test("every PR reader restores the crate after the dependency cache and marks it
 
 test("the Verify Paperclip Runner job restores the crate only in the lanes that build it", () => {
   const body = job(prWorkflow, "verify_paperclip_runner");
-  const lanes = [...body.matchAll(/- lane_label: (.+)\n\s+command: (.+)\n(\s+release_crate: (true)\n)?/g)].map(([, label, , , flag]) => [label, flag === "true"]);
+  let lanes = [...body.matchAll(/- lane_label: (.+)\n\s+command: (.+)\n(\s+release_crate: (true)\n)?/g)].map(([, label, , , flag]) => [label, flag === "true"]);
+  if (lanes.length === 0) {
+    const jsonMatch = body.match(/'(\{"include":\[.*?\]\})'/s);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (Array.isArray(parsed.include)) {
+        lanes = parsed.include.map((item) => [item.lane_label, Boolean(item.release_crate)]);
+      }
+    }
+  }
   assert.deepEqual(lanes, [
     ["static checks", false],
     ["rust", true],

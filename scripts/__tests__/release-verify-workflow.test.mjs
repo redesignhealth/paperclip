@@ -599,6 +599,23 @@ const EXPECTED_WORKSPACE_PROJECTS = [
 ];
 
 function workspaceMatrixRows(workflow) {
+  const jsonMatch = workflow.match(/'(\{"include":\[.*?\]\})'/s);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (Array.isArray(parsed.include)) {
+        const rows = parsed.include
+          .filter((item) => item && /^general-workspaces-[a-z]$/.test(item.group))
+          .map((item) => ({
+            group: item.group,
+            shardIndex: item.shard_index !== undefined ? Number(item.shard_index) : null,
+            shardCount: item.shard_count !== undefined ? Number(item.shard_count) : null,
+          }));
+        if (rows.length > 0) return rows;
+      }
+    } catch {}
+  }
+
   return [...workflow.matchAll(
     /- group: (general-workspaces-[a-z])\n\s+group_label: [^\n]+(?:\n\s+shard_index: (\d+)\n\s+shard_count: (\d+))?/g,
   )].map((row) => ({

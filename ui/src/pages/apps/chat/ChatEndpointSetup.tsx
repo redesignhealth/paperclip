@@ -181,7 +181,7 @@ function ChatSdkEndpointSetup() {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { selectedCompanyId } = useCompany();
+  const { selectedCompanyId, selectedCompany } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
   const provider = isProvider(params.get("provider"))
@@ -274,7 +274,7 @@ function ChatSdkEndpointSetup() {
   );
   const selectedAgent = agentsQuery.data?.find(agent => agent.id === agentId);
   const slackDetails = slackDraft?.agentId === agentId ? slackDraft.app
-    : endpoint?.setup?.slackApp ?? defaultSlackAppConfiguration(selectedAgent?.name ?? endpoint?.assignedAgentName ?? "");
+    : endpoint?.setup?.slackApp ?? defaultSlackAppConfiguration(selectedAgent?.name ?? endpoint?.assignedAgentName ?? "", selectedCompany?.name);
   const slackDetailsValidation = slackAppConfigurationSchema.safeParse(slackDetails);
   const slackDetailsEditable = !automaticBusy && (!endpoint || endpoint.status === "draft" && !endpoint.botExternalId
     && (!endpoint.setup?.slackRegistration || endpoint.setup.slackRegistration.status === "failed"));
@@ -606,8 +606,14 @@ function ChatSdkEndpointSetup() {
               placeholder="Choose an active agent"
               emptyMessage="No active agents are available."
             />}
+            {isSlack && (selectedAgent || endpoint) && <SlackAppDetails fields={["appName", "botName"]} value={slackDetails}
+              // Not editable until the company is known, so a name typed too early cannot lock in the agent-based default.
+              readOnly={!slackDetailsEditable || agentStepBusy || !endpoint && !selectedCompany}
+              onChange={app => setSlackDraft({ agentId, app })}
+              onBlur={() => void persistSlackDetails().catch(() => {})} />}
+            {isSlack && (selectedAgent || endpoint) && saveSlackDetails.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack app details. Try again before continuing.</p>}
             {isSlack && (selectedAgent || endpoint) && <SlackSetupAdvanced>
-              <SlackAppDetails value={slackDetails} readOnly={!slackDetailsEditable || agentStepBusy}
+              <SlackAppDetails fields={["command"]} value={slackDetails} readOnly={!slackDetailsEditable || agentStepBusy}
                 onChange={app => setSlackDraft({ agentId, app })}
                 onBlur={() => void persistSlackDetails().catch(() => {})} />
               <SlackScopeOptIns value={slackOptIns} disabled={!slackOptInsEditable}
@@ -623,7 +629,6 @@ function ChatSdkEndpointSetup() {
                   setParams(resumed, { replace: true });
                   setViewedStep(1);
                 } : undefined} />
-              {saveSlackDetails.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack app details. Try again before continuing.</p>}
               {saveSlackOptIns.isError && <p role="alert" className="text-sm text-destructive">Couldn&apos;t save the Slack permission groups. Your previous selection is still in effect; try again.</p>}
               {slackChoices.data?.defaultMethod === "managed" && (!endpoint || endpoint.setup?.slackSetupMethod === "managed") && !endpoint?.setup?.slackRegistration && <Button
                 variant="link" className="h-auto p-0 text-muted-foreground"

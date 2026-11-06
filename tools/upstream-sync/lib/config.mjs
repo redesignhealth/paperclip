@@ -65,6 +65,16 @@ export function loadConfig(env = process.env, warn = console.warn) {
       paperclipRunId: env.PAPERCLIP_RUN_ID || "",
       maxPerRun: count("UPSTREAM_SYNC_ALERT_MAX_PER_RUN", 10),
     },
+    // Worker (handle.mjs). The Argus round cap is a setting, not a constant: a row moves
+    // to needs_human only after this many non-approving rounds (default 10).
+    worker: {
+      repoDir: env.UPSTREAM_SYNC_REPO_DIR || process.cwd(),
+      integrationRef: env.UPSTREAM_SYNC_INTEGRATION_REF || "refs/remotes/origin/integration",
+      masterRef: env.UPSTREAM_SYNC_MASTER_REF || "refs/remotes/origin/master",
+      argusRoundCap: int("UPSTREAM_SYNC_ARGUS_ROUND_CAP", 10),
+      leaseMinutes: int("UPSTREAM_SYNC_LEASE_MINUTES", 15),
+      runId: env.PAPERCLIP_RUN_ID || "",
+    },
     ops: {
       queueDepthMax: count("UPSTREAM_SYNC_QUEUE_DEPTH_MAX", 40),
       oldestPendingHoursMax: count("UPSTREAM_SYNC_OLDEST_PENDING_HOURS_MAX", 48),

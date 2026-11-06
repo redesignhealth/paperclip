@@ -4,7 +4,7 @@ import { connect as netConnect, isIP, type Socket } from "node:net";
 import { Readable } from "node:stream";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
-import { classifyRemoteConnectionError, markRemoteConnectionFailure, recordRemoteConnectionAttempts } from "./remote-connection-failure.js";
+import { classifyRemoteConnectionError, markRemoteConnectionFailure, readRemoteConnectionFailure, recordRemoteConnectionAttempts } from "./remote-connection-failure.js";
 
 import {
   isAlwaysDeniedLinkLocalIp,
@@ -61,6 +61,106 @@ export type GuardedRemoteHttpFetchOptions = RemoteHttpEndpointGuardOptions & {
    * Platform `fetch`, used only for IP literals, which cannot be rebound.
    */
   unpinnedFetch?: typeof fetch;
+  /** Overrides env `TAILNET_HTTP_PROXY` (validated the same way). */
+  tailnetHttpProxy?: string;
+  /** Overrides env `TAILNET_DOMAIN`: our tailnet's MagicDNS suffix, e.g. `drum-mackarel.ts.net`. */
+  tailnetDomain?: string;
+};
+
+const isTailnetSuffixHost = (hostname: string) => hostname.endsWith(".ts.net");
+
+/** Reads `TAILNET_DOMAIN`: a bare DNS suffix ending in `.ts.net`. Throws on anything else, including unset. */
+export function readTailnetDomain(raw: string | undefined = process.env.TAILNET_DOMAIN): string {
+  const value = raw?.trim().toLowerCase() ?? "";
+  if (!/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net$/.test(value)) {
+    throw new Error("TAILNET_DOMAIN is required with TAILNET_HTTP_PROXY and must be a bare DNS suffix ending in .ts.net");
+  }
+  return value;
+}
+
+/**
+ * The tunnel applies only to `https://<name in our tailnet>` on port 443 when `allowPrivateNetwork === true`;
+ * anything else falls through to the normal guard. Misconfiguration surfaces through `options.error`.
+ * Residual risk: `allowPrivateNetwork` is per deployment, so in a private-network deployment anyone who can
+ * configure an MCP URL can reach every tailnet node the sidecar's ACL allows on 443.
+ */
+export function tailnetTunnelProxy(endpoint: URL, options: Pick<GuardedRemoteHttpFetchOptions, "allowPrivateNetwork" | "error" | "tailnetHttpProxy" | "tailnetDomain">): URL | null {
+  const hostname = endpoint.hostname;
+  if (options.allowPrivateNetwork !== true || endpoint.protocol !== "https:" || endpoint.port !== "" || !isTailnetSuffixHost(hostname)) return null;
+  try {
+    const proxy = readTailnetHttpProxy(options.tailnetHttpProxy ?? process.env.TAILNET_HTTP_PROXY);
+    const rawDomain = options.tailnetDomain ?? process.env.TAILNET_DOMAIN;
+    if (!proxy) {
+      // A domain without a proxy is a misconfiguration, but only for names under that domain.
+      const unproxied = rawDomain?.trim().toLowerCase();
+      if (unproxied && hostname.endsWith(`.${unproxied}`)) throw new Error("TAILNET_HTTP_PROXY is required with TAILNET_DOMAIN");
+      return null;
+    }
+    const domain = readTailnetDomain(rawDomain);
+    return hostname.endsWith(`.${domain}`) ? proxy : null;
+  } catch (error) {
+    throw options.error(error instanceof Error ? error.message : "Invalid tailnet proxy configuration", "remote_http_tailnet_config_invalid");
+  }
+}
+
+/** True for an https URL under our TAILNET_DOMAIN on a non-default port, which the 443-only tunnel cannot reach. */
+export function isUnreachableTailnetPort(url: URL): boolean {
+  const domain = process.env.TAILNET_DOMAIN?.trim().toLowerCase();
+  return url.protocol === "https:" && url.port !== "" && !!domain && url.hostname.endsWith(`.${domain}`);
+}
+
+/**
+ * Reads `TAILNET_HTTP_PROXY`: the Tailscale sidecar's HTTP CONNECT listener.
+ * Only `http://` on a loopback host is accepted, so the env cannot redirect
+ * traffic off the box. Throws on anything else.
+ */
+export function readTailnetHttpProxy(raw: string | undefined = process.env.TAILNET_HTTP_PROXY): URL | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  let proxy: URL;
+  try {
+    proxy = new URL(value);
+  } catch {
+    throw new Error("TAILNET_HTTP_PROXY is not a valid URL");
+  }
+  const host = proxy.hostname.replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+  if (proxy.protocol !== "http:" || !loopback || !proxy.port || proxy.username || proxy.password) {
+    throw new Error("TAILNET_HTTP_PROXY must be http://<loopback host>:<port> without credentials");
+  }
+  return proxy;
+}
+
+/**
+ * Plain-`fetch` stand-in for operator-configured Arcana/board endpoints: only https tailnet names on 443 go via
+ * the proxy. The tunnel never follows redirects, so any redirect mode but "manual" rejects a 3xx instead of silently diverging.
+ */
+export const tailnetAwareFetch: typeof fetch = async (input, init) => {
+  const request = input instanceof Request ? input : null;
+  const url = request ? request.url : input.toString();
+  const options: GuardedRemoteHttpFetchOptions = {
+    allowPrivateNetwork: true,
+    error: (message, code) => Object.assign(new Error(message), { code }),
+  };
+  const target = new URL(url);
+  if (target.username || target.password) throw new TypeError("Request cannot be constructed from a URL that includes credentials");
+  if (!tailnetTunnelProxy(target, options)) return fetch(input, init);
+  const merged: RequestInit = request
+    ? {
+        method: request.method,
+        headers: request.headers,
+        signal: request.signal,
+        redirect: request.redirect,
+        ...(request.body && init?.body === undefined ? { body: await request.arrayBuffer() } : {}),
+        ...Object.fromEntries(Object.entries(init ?? {}).filter(([, value]) => value !== undefined)),
+      }
+    : init ?? {};
+  const response = await guardedRemoteHttpFetch(url, merged, options);
+  if (merged.redirect !== "manual" && response.status >= 300 && response.status < 400 && response.headers.has("location")) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
+  }
+  return response;
 };
 
 /**
@@ -97,6 +197,9 @@ export async function guardedRemoteHttpFetch(
   options: GuardedRemoteHttpFetchOptions,
 ): Promise<Response> {
   const endpoint = url instanceof URL ? url : new URL(url);
+  const tailnetProxy = tailnetTunnelProxy(endpoint, options);
+  // MagicDNS names only resolve inside the tailnet, so the sidecar resolves them; no local DNS or private-address check applies.
+  if (tailnetProxy) return tunneledRequest(endpoint, tailnetProxy, init, options);
   const approved = await resolveApprovedRemoteHttpAddresses(endpoint, options, options.error);
   const literalHost = isIP(endpoint.hostname.replace(/^\[|\]$/g, "")) !== 0;
   const platformFetch = options.unpinnedFetch ?? fetch;
@@ -148,6 +251,83 @@ async function pinnedRequest(
   const socket = await dialApprovedAddress({ approved, approvedSet, port, hostname, useTls, signal, options });
 
   try {
+    return await sendRequest({
+      endpoint,
+      hostname,
+      port,
+      useTls,
+      socket,
+      init,
+      signal,
+      responseTimeoutMs: options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
+      error: options.error,
+    });
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
+}
+
+async function tunneledRequest(
+  endpoint: URL,
+  proxy: URL,
+  init: RequestInit,
+  options: GuardedRemoteHttpFetchOptions,
+): Promise<Response> {
+  const useTls = endpoint.protocol === "https:";
+  const hostname = endpoint.hostname;
+  const port = endpoint.port ? Number(endpoint.port) : useTls ? 443 : 80;
+  const signal = init.signal ?? null;
+  const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+  signal?.throwIfAborted?.();
+
+  let socket: Socket = await new Promise<Socket>((resolve, reject) => {
+    const req = httpRequest({
+      host: proxy.hostname.replace(/^\[|\]$/g, ""),
+      port: Number(proxy.port),
+      method: "CONNECT",
+      path: `${hostname}:${port}`,
+      ...(signal ? { signal } : {}),
+    });
+    const timer = setTimeout(() => {
+      req.destroy(markRemoteConnectionFailure(new Error("Timed out trying to connect to the tailnet proxy"), "connection_timeout"));
+    }, connectTimeoutMs);
+    timer.unref?.();
+    const refused = (status: number | undefined) => {
+      const failure = options.error(`Tailnet proxy refused the tunnel (HTTP ${status})`, "remote_http_connect_failed");
+      // The sidecar answers 502/504 when it cannot reach the node.
+      return status === 502 || status === 504 ? markRemoteConnectionFailure(failure, status === 504 ? "connection_timeout" : "network_unreachable") : failure;
+    };
+    req.once("connect", (res, tunnel, head) => {
+      clearTimeout(timer);
+      if (res.statusCode === 200) {
+        if (head.length > 0) tunnel.unshift(head);
+        return resolve(tunnel);
+      }
+      tunnel.destroy();
+      reject(refused(res.statusCode));
+    });
+    req.once("response", (res) => {
+      clearTimeout(timer);
+      res.resume();
+      reject(refused(res.statusCode));
+    });
+    req.once("error", (error) => {
+      clearTimeout(timer);
+      if (signal?.aborted) return reject(error);
+      const failure = options.error("Tailnet proxy could not be reached", "remote_http_connect_failed");
+      const reason = readRemoteConnectionFailure(error) ?? classifyRemoteConnectionError(error);
+      reject(reason ? markRemoteConnectionFailure(failure, reason) : failure);
+    });
+    req.end();
+  });
+
+  try {
+    if (useTls) {
+      const secure = tlsConnect({ socket, servername: isIP(hostname) === 0 ? hostname : undefined, host: hostname });
+      socket = secure;
+      await once(secure, "secureConnect", { signal, timeoutMs: connectTimeoutMs, what: "negotiate TLS with" });
+    }
     return await sendRequest({
       endpoint,
       hostname,
