@@ -41,11 +41,29 @@ export const memoryAgentGuidanceContextSchema = z.object({
   variant: memoryAgentGuidanceVariantSchema,
 });
 
+export type ParseMemoryAgentGuidanceContextResult =
+  | { status: "absent" }
+  | { status: "valid"; data: MemoryAgentGuidanceContext }
+  | { status: "malformed"; error: z.ZodError };
+
+export function parseMemoryAgentGuidanceContextResult(
+  value: unknown,
+): ParseMemoryAgentGuidanceContextResult {
+  if (value === undefined) {
+    return { status: "absent" };
+  }
+  const result = memoryAgentGuidanceContextSchema.safeParse(value);
+  if (result.success) {
+    return { status: "valid", data: result.data };
+  }
+  return { status: "malformed", error: result.error };
+}
+
 export function parseMemoryAgentGuidanceContext(
   value: unknown,
 ): MemoryAgentGuidanceContext | undefined {
-  const result = memoryAgentGuidanceContextSchema.safeParse(value);
-  return result.success ? result.data : undefined;
+  const result = parseMemoryAgentGuidanceContextResult(value);
+  return result.status === "valid" ? result.data : undefined;
 }
 
 export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): string {
@@ -54,6 +72,7 @@ export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): strin
   }
 
   const lines: string[] = [
+    "Memory:",
     "- Task progress belongs in issue comments, not memory.",
   ];
 
@@ -85,5 +104,5 @@ export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): strin
     "- Never save secrets, credentials, personal data, PHI, or patient/customer identifiers.",
   );
 
-  return `${lines.join("\n")}\n`;
+  return lines.join("\n");
 }

@@ -502,8 +502,35 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     await execute(ctx);
     const [invocation] = await invocations();
     expect(invocation.systemPrompt).toContain("Hermes built-in stores handle session continuity; do not duplicate that in Mem0.");
-    expect(invocation.systemPrompt).toContain("Task progress belongs in issue comments, not memory.");
-    expect(invocation.systemPrompt).not.toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+    expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
+  });
+
+  it("uses buildPaperclipAgentPromptTemplate and strips default identity when hermesPromptSplit is true and paperclipMemoryGuidance is present", async () => {
+    const baseCtx = context();
+    const ctx: AdapterExecutionContext = {
+      ...baseCtx,
+      paperclipMemoryGuidance: {
+        capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+        variant: "write-rules",
+      },
+      config: {
+        ...baseCtx.config,
+        env: {
+          ...(baseCtx.config.env as Record<string, string>),
+          PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split",
+        },
+      },
+    };
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Default identity line is stripped from system prompt
+    expect(invocation.systemPrompt).not.toContain("You are agent agent-synthetic (Hermes fixture).");
+    // Guidance from write-rules is present in system prompt
+    expect(invocation.systemPrompt).toContain("Hermes built-in stores handle session continuity; do not duplicate that in Mem0.");
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+    // Legacy guidance is absent
+    expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
   });
 
   it("gives typed paperclipMemoryGuidance precedence over stale nested context", async () => {
@@ -557,8 +584,12 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
   });
 
-  it("does not crash prompt build when typed paperclipMemoryGuidance is malformed", async () => {
+  it("does not crash prompt build when typed paperclipMemoryGuidance is malformed and logs to stderr", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
     const ctx = context({
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
       paperclipMemoryGuidance: {
         capabilities: null,
         variant: "invalid-variant",
@@ -568,6 +599,26 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     const [invocation] = await invocations();
     // Falls back cleanly to default prompt template without throwing
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    const stderrLog = logs.find(
+      (l) => l.stream === "stderr" && l.chunk.includes("Malformed paperclipMemoryGuidance"),
+    );
+    expect(stderrLog).toBeDefined();
+  });
+
+  it("does not log to stderr when paperclipMemoryGuidance is absent", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = context({
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    const stderrLog = logs.find(
+      (l) => l.stream === "stderr" && l.chunk.includes("paperclipMemoryGuidance"),
+    );
+    expect(stderrLog).toBeUndefined();
   });
 
   it("removes an obsolete instruction overlay when the bundle is removed", async () => {

@@ -3,6 +3,7 @@ import {
   MEMORY_AGENT_GUIDANCE,
   buildMemoryAgentGuidance,
   parseMemoryAgentGuidanceContext,
+  parseMemoryAgentGuidanceContextResult,
   type MemoryAgentCapabilities,
   type MemoryAgentGuidanceContext,
 } from "./memory-agent-guidance.js";
@@ -89,16 +90,18 @@ describe("buildMemoryAgentGuidance", () => {
       },
     ];
 
-    it("empty capabilities yields exactly the two always-on lines plus nothing else", () => {
+    it("empty capabilities yields exactly the Memory header and two always-on lines plus nothing else", () => {
       const output = buildMemoryAgentGuidance({
         capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
         variant: "write-rules",
       });
 
       expect(output).toBe(
-        `- ${ALWAYS_ON_PROGRESS}\n- ${ALWAYS_ON_SAFETY}\n`,
+        `Memory:\n- ${ALWAYS_ON_PROGRESS}\n- ${ALWAYS_ON_SAFETY}`,
       );
-      expect(output.trim().split("\n")).toHaveLength(2);
+      expect(output.split("\n")).toHaveLength(3);
+      expect(output.startsWith("Memory:\n")).toBe(true);
+      expect(output.endsWith("\n")).toBe(false);
       expect(output).not.toContain("Mem0");
       expect(output).not.toContain("Arcana");
       expect(output).not.toContain("Hermes");
@@ -110,7 +113,8 @@ describe("buildMemoryAgentGuidance", () => {
         variant: "write-rules",
       });
 
-      expect(output).toContain("- Hermes built-in stores handle session continuity.\n");
+      expect(output).toContain("- Hermes built-in stores handle session continuity.");
+      expect(output.endsWith("\n")).toBe(false);
       expect(output).not.toContain("Mem0");
       expect(output).not.toContain("Arcana");
       expect(output).not.toContain("duplicate");
@@ -123,6 +127,7 @@ describe("buildMemoryAgentGuidance", () => {
       });
 
       expect(output).toContain(MEM0_SNIPPET);
+      expect(output.endsWith("\n")).toBe(false);
       expect(output).not.toContain("Hermes");
       expect(output).not.toContain("Arcana");
     });
@@ -137,6 +142,7 @@ describe("buildMemoryAgentGuidance", () => {
         "- Hermes built-in stores handle session continuity; do not duplicate that in Mem0.",
       );
       expect(output).toContain(MEM0_SNIPPET);
+      expect(output.endsWith("\n")).toBe(false);
     });
 
     it.each(testCases)(
@@ -146,6 +152,9 @@ describe("buildMemoryAgentGuidance", () => {
           capabilities,
           variant: "write-rules",
         });
+
+        // Starts with Memory: header
+        expect(output.startsWith("Memory:\n")).toBe(true);
 
         // Always-on rules appear in every output
         expect(output).toContain(ALWAYS_ON_PROGRESS);
@@ -170,11 +179,9 @@ describe("buildMemoryAgentGuidance", () => {
           expect(output).toContain(HERMES_SNIPPET);
         }
 
-        // Single trailing newline, no double blank lines, no empty headers
-        expect(output.endsWith("\n")).toBe(true);
-        expect(output.endsWith("\n\n")).toBe(false);
+        // No trailing newline, no double blank lines
+        expect(output.endsWith("\n")).toBe(false);
         expect(output).not.toContain("\n\n");
-        expect(output).not.toMatch(/^[#\w\s]+:\s*$/m);
       },
     );
   });
@@ -219,5 +226,50 @@ describe("parseMemoryAgentGuidanceContext", () => {
         variant: "write-rules",
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("parseMemoryAgentGuidanceContextResult", () => {
+  it("returns { status: 'absent' } when input is undefined", () => {
+    expect(parseMemoryAgentGuidanceContextResult(undefined)).toEqual({ status: "absent" });
+  });
+
+  it("returns { status: 'valid', data } for valid guidance contexts", () => {
+    const validLegacy = {
+      capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+      variant: "legacy" as const,
+    };
+    expect(parseMemoryAgentGuidanceContextResult(validLegacy)).toEqual({
+      status: "valid",
+      data: validLegacy,
+    });
+
+    const validWriteRules = {
+      capabilities: { mem0: false, arcana: true, hermesBuiltInStores: false },
+      variant: "write-rules" as const,
+    };
+    expect(parseMemoryAgentGuidanceContextResult(validWriteRules)).toEqual({
+      status: "valid",
+      data: validWriteRules,
+    });
+  });
+
+  it("returns { status: 'malformed', error } for non-undefined invalid input", () => {
+    const malformedCases = [
+      null,
+      "string",
+      42,
+      {},
+      { capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true }, variant: "unknown-variant" },
+      { capabilities: { mem0: "true", arcana: false, hermesBuiltInStores: true }, variant: "write-rules" },
+      { capabilities: null, variant: "write-rules" },
+    ];
+    for (const val of malformedCases) {
+      const res = parseMemoryAgentGuidanceContextResult(val);
+      expect(res.status).toBe("malformed");
+      if (res.status === "malformed") {
+        expect(res.error).toBeDefined();
+      }
+    }
   });
 });

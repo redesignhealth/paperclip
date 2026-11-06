@@ -36,9 +36,11 @@ export {
   memoryAgentGuidanceVariantSchema,
   memoryAgentGuidanceContextSchema,
   parseMemoryAgentGuidanceContext,
+  parseMemoryAgentGuidanceContextResult,
   type MemoryAgentCapabilities,
   type MemoryAgentGuidanceVariant,
   type MemoryAgentGuidanceContext,
+  type ParseMemoryAgentGuidanceContextResult,
 } from "./memory-agent-guidance.js";
 export {
   nativeFinalizationResultSchema,

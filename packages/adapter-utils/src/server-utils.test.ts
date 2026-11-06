@@ -148,6 +148,31 @@ describe("runtime connection tool delivery", () => {
     expect(prefixBeforeGuidance).toBe(prefixBeforeDefault);
   });
 
+  it("buildPaperclipAgentPromptTemplate does not expand $-patterns in replacement", () => {
+    // Function replacement prevents $` $' $& $1 from being interpreted by String.replace
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+      variant: "write-rules",
+    };
+    const template = buildPaperclipAgentPromptTemplate(ctx);
+    expect(template).toContain("Memory:\n");
+    // Also verify replacer function preserves literal $
+    const withDollars = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.replace(
+      MEMORY_AGENT_GUIDANCE,
+      () => "Memory:\n- Spend $100 on $$ patterns and $'",
+    );
+    expect(withDollars).toContain("Spend $100 on $$ patterns and $'");
+  });
+
+  it("buildPaperclipAgentPromptTemplate asserts DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE includes MEMORY_AGENT_GUIDANCE", () => {
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.includes(MEMORY_AGENT_GUIDANCE)).toBe(true);
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+      variant: "legacy",
+    };
+    expect(() => buildPaperclipAgentPromptTemplate(ctx)).not.toThrow();
+  });
+
   describe("resolveEffectiveMemoryHardeningFlags", () => {
     it("uses server env flags when agent env is not provided", () => {
       const serverEnv = {

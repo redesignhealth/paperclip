@@ -45,6 +45,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   buildPaperclipAgentPromptTemplate,
   parseMemoryAgentGuidanceContext,
+  parseMemoryAgentGuidanceContextResult,
   type MemoryAgentGuidanceContext,
   joinPromptSections,
   selectPaperclipPromptSections,
@@ -1134,11 +1135,18 @@ export function renderHermesSystemPrompt(
   return renderTemplate(promptTemplate, { agent });
 }
 
-function resolveMemoryGuidance(
+async function resolveMemoryGuidance(
   ctx: AdapterExecutionContext,
-): MemoryAgentGuidanceContext | undefined {
-  if (ctx.paperclipMemoryGuidance !== undefined) {
-    return parseMemoryAgentGuidanceContext(ctx.paperclipMemoryGuidance);
+): Promise<MemoryAgentGuidanceContext | undefined> {
+  const result = parseMemoryAgentGuidanceContextResult(ctx.paperclipMemoryGuidance);
+  if (result.status === "valid") {
+    return result.data;
+  }
+  if (result.status === "malformed") {
+    await ctx.onLog(
+      "stderr",
+      `[hermes] Malformed paperclipMemoryGuidance context received; falling back to legacy memory guidance: ${result.error.message}\n`,
+    );
   }
   return undefined;
 }
@@ -1664,7 +1672,7 @@ export async function execute(
   let prompt = builtPrompt.query;
   let finalSystemPrompt: string;
 
-  const memoryGuidance = resolveMemoryGuidance(ctx);
+  const memoryGuidance = await resolveMemoryGuidance(ctx);
   const agentPromptTemplate = memoryGuidance
     ? buildPaperclipAgentPromptTemplate(memoryGuidance)
     : undefined;

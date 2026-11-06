@@ -1,46 +1,22 @@
-import {
-  type MemoryAgentCapabilities,
-  type MemoryAgentGuidanceContext,
-  type MemoryHardeningFlags,
-  resolveEffectiveMemoryHardeningFlags,
+import type {
+  MemoryAgentCapabilities,
+  MemoryAgentGuidanceContext,
+  MemoryHardeningFlags,
 } from "@paperclipai/adapter-utils/server-utils";
 import { readDefaultMcpState } from "../default-mcp-spec.js";
 import { BRAIN_BINDING_ARCANA_ENTRY_KEY } from "../arcana-brain-binding.js";
-
-export function resolveHeartbeatEffectiveEnv(
-  processEnv: NodeJS.ProcessEnv = process.env,
-  adapterConfigEnv?: unknown,
-): NodeJS.ProcessEnv {
-  const userEnv =
-    adapterConfigEnv && typeof adapterConfigEnv === "object"
-      ? (adapterConfigEnv as Record<string, string | undefined>)
-      : undefined;
-  return {
-    ...processEnv,
-    ...(userEnv ? userEnv : {}),
-  };
-}
-
-export function resolveHeartbeatMemoryHardeningFlags(input: {
-  processEnv?: NodeJS.ProcessEnv;
-  runtimeConfig?: Record<string, unknown> | null;
-  agentAdapterConfig?: unknown;
-}): MemoryHardeningFlags {
-  const adapterEnv =
-    (input.runtimeConfig?.env ??
-    (input.agentAdapterConfig && typeof input.agentAdapterConfig === "object"
-      ? (input.agentAdapterConfig as Record<string, unknown>).env
-      : undefined)) as Record<string, string | undefined> | undefined;
-  return resolveEffectiveMemoryHardeningFlags(
-    input.processEnv ?? process.env,
-    adapterEnv ?? (input.runtimeConfig as Record<string, string | undefined> | undefined),
-  );
-}
+import { HERMES_ADAPTER_TYPE } from "./run-state.js";
 
 export interface ComputeMemoryAgentCapabilitiesInput {
   agentMetadata: unknown;
   runtimeMemory: unknown;
   flags: Pick<MemoryHardeningFlags, "hermesMemoryConfig">;
+  /**
+   * Adapter type for the executing agent. When specified, hermesBuiltInStores
+   * is only enabled for Hermes adapters (HERMES_ADAPTER_TYPE / "hermes_local").
+   * Non-Hermes adapters must not emit Hermes-specific store guidance.
+   */
+  adapterType?: string | null;
 }
 
 export function computeMemoryAgentCapabilities(
@@ -49,11 +25,12 @@ export function computeMemoryAgentCapabilities(
   const mcpState = readDefaultMcpState(input.agentMetadata);
   const arcanaReady =
     mcpState?.entries[BRAIN_BINDING_ARCANA_ENTRY_KEY]?.setup?.state === "ready";
+  const isHermes = input.adapterType === HERMES_ADAPTER_TYPE;
 
   return {
     mem0: Boolean(input.runtimeMemory),
     arcana: arcanaReady,
-    hermesBuiltInStores: !input.flags.hermesMemoryConfig,
+    hermesBuiltInStores: Boolean(isHermes && !input.flags.hermesMemoryConfig),
   };
 }
 
@@ -61,6 +38,7 @@ export function buildHeartbeatMemoryGuidanceContext(input: {
   agentMetadata: unknown;
   runtimeMemory: unknown;
   flags: MemoryHardeningFlags;
+  adapterType?: string | null;
 }): MemoryAgentGuidanceContext | undefined {
   if (!input.flags.capabilityMemoryGuidance) {
     return undefined;

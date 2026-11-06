@@ -831,20 +831,24 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       });
       let memoryGuidanceContext: ReturnType<typeof buildHeartbeatMemoryGuidanceContext> = undefined;
       if (hardeningFlags?.capabilityMemoryGuidance) {
-        logger.debug(
-          {
-            companyId: agent.companyId,
-            agentId: agent.id,
-          },
-          "capability memory guidance enabled",
-        );
         memoryGuidanceContext =
           buildHeartbeatMemoryGuidanceContext({
             agentMetadata: agent.metadata,
             runtimeMemory,
             flags: hardeningFlags,
+            adapterType: agent.adapterType,
           });
-        adapterContext.paperclipMemoryGuidance = memoryGuidanceContext;
+        logger.debug(
+          {
+            runId: run.id,
+            companyId: agent.companyId,
+            agentId: agent.id,
+            mem0: memoryGuidanceContext?.capabilities.mem0,
+            arcana: memoryGuidanceContext?.capabilities.arcana,
+            hermesBuiltInStores: memoryGuidanceContext?.capabilities.hermesBuiltInStores,
+          },
+          "capability memory guidance enabled",
+        );
       }
       const guardedDispatch =
         await dispatchWithTiming(

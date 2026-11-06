@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   computeMemoryAgentCapabilities,
   buildHeartbeatMemoryGuidanceContext,
-  resolveHeartbeatEffectiveEnv,
-  resolveHeartbeatMemoryHardeningFlags,
 } from "./memory-guidance-context.js";
 import { buildMemoryAgentGuidance } from "@paperclipai/adapter-utils/server-utils";
 import { BRAIN_BINDING_ARCANA_ENTRY_KEY } from "../arcana-brain-binding.js";
@@ -72,11 +70,12 @@ describe("computeMemoryAgentCapabilities", () => {
     ).toBe(false);
   });
 
-  it("computes hermesBuiltInStores inverted from flags.hermesMemoryConfig", () => {
+  it("computes hermesBuiltInStores inverted from flags.hermesMemoryConfig for Hermes adapters", () => {
     const withConfig = computeMemoryAgentCapabilities({
       agentMetadata: {},
       runtimeMemory: null,
       flags: { hermesMemoryConfig: true },
+      adapterType: "hermes_local",
     });
     expect(withConfig.hermesBuiltInStores).toBe(false);
 
@@ -84,8 +83,21 @@ describe("computeMemoryAgentCapabilities", () => {
       agentMetadata: {},
       runtimeMemory: null,
       flags: { hermesMemoryConfig: false },
+      adapterType: "hermes_local",
     });
     expect(withoutConfig.hermesBuiltInStores).toBe(true);
+  });
+
+  it("gates hermesBuiltInStores false for non-Hermes adapters regardless of flags", () => {
+    for (const adapterType of ["claude_local", "codex_local", "process", undefined, null]) {
+      const caps = computeMemoryAgentCapabilities({
+        agentMetadata: {},
+        runtimeMemory: null,
+        flags: { hermesMemoryConfig: false },
+        adapterType,
+      });
+      expect(caps.hermesBuiltInStores).toBe(false);
+    }
   });
 });
 
@@ -100,6 +112,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
       },
+      adapterType: "hermes_local",
     });
     expect(result).toBeUndefined();
   });
@@ -114,6 +127,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         agentScopedMem0: false,
         capabilityMemoryGuidance: true,
       },
+      adapterType: "hermes_local",
     });
     expect(result).toEqual({
       capabilities: {
@@ -124,95 +138,52 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
       variant: "write-rules",
     });
   });
-});
 
-describe("effective environment resolution and guidance regression", () => {
-  it("enables capability-memory-guidance from config.env with empty processEnv", () => {
-    const flags = resolveHeartbeatMemoryHardeningFlags({
-      processEnv: {},
-      runtimeConfig: { env: { PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance" } },
-    });
-    expect(flags.capabilityMemoryGuidance).toBe(true);
-    expect(flags.hermesMemoryConfig).toBe(false);
-
-    const guidanceCtx = buildHeartbeatMemoryGuidanceContext({
+  it("correctly enables hermesBuiltInStores for Hermes without hermesMemoryConfig", () => {
+    const result = buildHeartbeatMemoryGuidanceContext({
       agentMetadata: {},
       runtimeMemory: null,
-      flags,
+      flags: {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: true,
+      },
+      adapterType: "hermes_local",
     });
-    expect(guidanceCtx).toBeDefined();
-    expect(guidanceCtx?.capabilities.hermesBuiltInStores).toBe(true);
-    const guidance = buildMemoryAgentGuidance(guidanceCtx!);
+    expect(result).toEqual({
+      capabilities: {
+        mem0: false,
+        arcana: false,
+        hermesBuiltInStores: true,
+      },
+      variant: "write-rules",
+    });
+    const guidance = buildMemoryAgentGuidance(result!);
     expect(guidance).toContain("Hermes built-in stores handle session continuity.");
   });
 
-  it("does not allow config.env to disable capability-memory-guidance when processEnv has it enabled (additive OR)", () => {
-    const flags = resolveHeartbeatMemoryHardeningFlags({
-      processEnv: { PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance" },
-      runtimeConfig: { env: { PAPERCLIP_MEMORY_HARDENING: "" } },
-    });
-    expect(flags.capabilityMemoryGuidance).toBe(true);
-
-    const guidanceCtx = buildHeartbeatMemoryGuidanceContext({
+  it("gates hermesBuiltInStores to false for non-Hermes adapters in guidance context", () => {
+    const result = buildHeartbeatMemoryGuidanceContext({
       agentMetadata: {},
       runtimeMemory: null,
-      flags,
-    });
-    expect(guidanceCtx).toBeDefined();
-  });
-
-  it("falls back to processEnv when config.env does not specify PAPERCLIP_MEMORY_HARDENING", () => {
-    const flags = resolveHeartbeatMemoryHardeningFlags({
-      processEnv: { PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance" },
-      runtimeConfig: { env: { OTHER_VAR: "value" } },
-    });
-    expect(flags.capabilityMemoryGuidance).toBe(true);
-  });
-
-  it("hermes-memory-config in config.env turns off built-in store guidance", () => {
-    const flags = resolveHeartbeatMemoryHardeningFlags({
-      processEnv: {},
-      runtimeConfig: {
-        env: {
-          PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance,hermes-memory-config",
-        },
+      flags: {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: true,
       },
+      adapterType: "claude_local",
     });
-    expect(flags.capabilityMemoryGuidance).toBe(true);
-    expect(flags.hermesMemoryConfig).toBe(true);
-
-    const guidanceCtx = buildHeartbeatMemoryGuidanceContext({
-      agentMetadata: {},
-      runtimeMemory: null,
-      flags,
+    expect(result).toEqual({
+      capabilities: {
+        mem0: false,
+        arcana: false,
+        hermesBuiltInStores: false,
+      },
+      variant: "write-rules",
     });
-    expect(guidanceCtx).toBeDefined();
-    expect(guidanceCtx?.capabilities.hermesBuiltInStores).toBe(false);
-    const guidance = buildMemoryAgentGuidance(guidanceCtx!);
+    const guidance = buildMemoryAgentGuidance(result!);
     expect(guidance).not.toContain("Hermes built-in stores");
-  });
-
-  it("resolves from agent.adapterConfig.env fallback when runtimeConfig has no env", () => {
-    const flags = resolveHeartbeatMemoryHardeningFlags({
-      processEnv: {},
-      runtimeConfig: {},
-      agentAdapterConfig: {
-        env: {
-          PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance",
-        },
-      },
-    });
-    expect(flags.capabilityMemoryGuidance).toBe(true);
-  });
-
-  it("resolves flags additively with logical OR between processEnv and adapter config.env", () => {
-    const flags = resolveHeartbeatMemoryHardeningFlags({
-      processEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" },
-      runtimeConfig: { env: { PAPERCLIP_MEMORY_HARDENING: "agent-scoped-mem0,capability-memory-guidance" } },
-    });
-    // Verifies additive semantics: server flags and adapter flags are merged via logical OR
-    expect(flags.hermesMemoryConfig).toBe(true);
-    expect(flags.agentScopedMem0).toBe(true);
-    expect(flags.capabilityMemoryGuidance).toBe(true);
   });
 });
