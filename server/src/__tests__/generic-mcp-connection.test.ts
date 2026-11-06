@@ -4251,13 +4251,16 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(await db.select().from(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.companyId, company.id), eq(toolConnectionInstalls.targetType, "company")))).toHaveLength(0);
     });
 
-    it("a brand-new Google instance consent switches on only the reviewed read-only tools, installs only the owner's own live agents, and leaves everything else quarantined", async () => {
+    it("a brand-new Google instance consent switches on only the reviewed reads and safe writes, installs only the owner's own live agents, and leaves everything else quarantined", async () => {
       // The server's own readOnlyHint is wrong for several of these: the mislabelled ones (flagged read-only) change data.
       const REVIEWED_READS = ["get_events", "list_calendars", "search_gmail_messages", "read_sheet_values"];
-      const MISLABELLED_AS_READ = ["manage_drive_access", "modify_sheet_values", "manage_event", "run_script_function", "modify_gmail_message_labels"];
-      const WRITES = ["send_gmail_message", "create_doc"];
+      // Reviewed low-risk writes (RH_GOOGLE_MCP_SAFE_WRITE_TOOLS); `modify_sheet_values` is also flagged read-only upstream.
+      const REVIEWED_WRITES = ["create_doc", "modify_sheet_values"];
+      const MISLABELLED_AS_READ = ["manage_drive_access", "manage_event", "run_script_function", "modify_gmail_message_labels"];
+      const WRITES = ["send_gmail_message", "manage_task"];
       const tools = [
         ...REVIEWED_READS.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),
+        ...REVIEWED_WRITES.map((name) => ({ name, description: name, annotations: { readOnlyHint: name === "modify_sheet_values" } })),
         ...MISLABELLED_AS_READ.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),
         ...WRITES.map((name) => ({ name, description: name, annotations: { readOnlyHint: false } })),
       ];
@@ -4284,15 +4287,15 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(callback.status).toBe(200);
 
       const byName = new Map((await catalogOf(instanceId)).map((entry) => [entry.toolName, entry]));
-      for (const name of REVIEWED_READS) expect(byName.get(name)!.status).toBe("active");
-      // Mislabelled-as-read and real writes both stay quarantined until the owner reviews them.
+      for (const name of [...REVIEWED_READS, ...REVIEWED_WRITES]) expect(byName.get(name)!.status).toBe("active");
+      // Mislabelled-as-read and dangerous writes both stay quarantined until the owner reviews them.
       for (const name of [...MISLABELLED_AS_READ, ...WRITES]) {
         expect(byName.get(name)!.status).toBe("quarantined");
         expect(byName.get(name)!.reviewedAt).toBeNull();
       }
       const profile = (await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`))))[0]!;
       const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
-      expect(entries).toHaveLength(REVIEWED_READS.length);
+      expect(entries).toHaveLength(REVIEWED_READS.length + REVIEWED_WRITES.length);
 
       // Only the owner's own live agents are installed (not terminated, not awaiting approval, not Bob's, not an agent
       // with no recorded creator), per agent, and never company-wide.
