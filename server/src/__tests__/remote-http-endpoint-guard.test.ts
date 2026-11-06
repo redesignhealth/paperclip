@@ -95,4 +95,36 @@ describe("remote HTTP endpoint guard", () => {
       guardError,
     )).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
   });
+
+  it.each([
+    "http://100.64.0.1/mcp",
+    "http://100.127.255.254:3000/mcp",
+    "http://100.100.100.100/mcp",
+    "https://[::ffff:100.64.0.1]:3000/",
+    "https://[::ffff:6440:1]/",
+    "http://1681915905/", // decimal 100.64.0.1
+    "http://0x64400001/", // hex 100.64.0.1
+    "http://0144.0100.0.1/", // octal 100.64.0.1
+  ])("rejects tailnet CGNAT literal %s even when private networking is allowed", async (url) => {
+    await expect(assertPublicRemoteHttpEndpoint(new URL(url), { allowPrivateNetwork: true }, guardError))
+      .rejects.toMatchObject({ code: "remote_http_tailnet_address_denied" });
+  });
+
+  it("rejects CGNAT literals without private networking via the existing private-address rule", async () => {
+    await expect(assertPublicRemoteHttpEndpoint(new URL("http://100.64.0.1/"), {}, guardError))
+      .rejects.toMatchObject({ code: "remote_http_private_endpoint" });
+  });
+
+  it.each(["http://100.63.255.255/", "http://100.128.0.1/"])("keeps %s outside the CGNAT rule (public address, allowed in both modes)", async (url) => {
+    await expect(assertPublicRemoteHttpEndpoint(new URL(url), { allowPrivateNetwork: true }, guardError)).resolves.toBeUndefined();
+    await expect(assertPublicRemoteHttpEndpoint(new URL(url), {}, guardError)).resolves.toBeUndefined();
+  });
+
+  it("does not block a hostname whose DNS answer is in the CGNAT range", async () => {
+    await expect(assertPublicRemoteHttpEndpoint(
+      new URL("https://svc.internal.example/"),
+      { allowPrivateNetwork: true, lookup: async () => [{ address: "100.64.0.9", family: 4 }] },
+      guardError,
+    )).resolves.toBeUndefined();
+  });
 });

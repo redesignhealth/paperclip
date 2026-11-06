@@ -74,6 +74,12 @@ export async function resolveApprovedRemoteHttpAddresses(
     if (isAlwaysDeniedLinkLocalIp(hostname) || (!options.allowPrivateNetwork && isPrivateOrReservedIp(hostname))) {
       throw error("Remote MCP connection URL cannot target private or reserved network addresses", "remote_http_private_endpoint");
     }
+    if (isTailnetCgnatIp(hostname)) {
+      throw error(
+        "Remote MCP connection URL cannot target tailnet (100.64.0.0/10) IP addresses; use the tailnet host name instead",
+        "remote_http_tailnet_address_denied",
+      );
+    }
     return [hostname];
   }
 
@@ -156,6 +162,12 @@ export function isAlwaysDeniedLinkLocalIp(address: string): boolean {
     return octets !== null && octets[0] === 169 && octets[1] === 254;
   }
   return isIP(normalized) === 6 && /^fe[89ab]/.test(normalized);
+}
+
+/** Tailscale CGNAT range: IP literals here bypass the tailnet host-name port limit, so deny them in every mode. */
+function isTailnetCgnatIp(address: string): boolean {
+  const octets = parseIpv4Address(normalizeIpAddress(address));
+  return octets !== null && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
 }
 
 function isPrivateOrReservedIpv4(address: string): boolean {
