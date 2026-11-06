@@ -14,8 +14,14 @@ const SECRET_SHAPES = [
 const SENSITIVE_JSON_KEY =
   /^(?:api[-_]?key|access[-_]?token|refresh[-_]?token|auth(?:orization)?|bearer|client[-_]?secret|cookie|password|secret|token)$/i;
 
-const SAFE_SECRET_SOURCES = new Set<string>([...CREDENTIAL_NAMES, "PAPERCLIP_AGENT_JWT_SECRET",
-  "PAPERCLIP_DECISION_SIGNING_SECRET", "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "BETTER_AUTH_SECRET"]);
+const SAFE_SECRET_SOURCES = new Set<string>([
+  ...CREDENTIAL_NAMES,
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
+  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL",
+]);
 // Credential dictionaries can have account identities as keys. Only known
 // schema fields, never arbitrary JSON keys, may become diagnostic labels.
 const SAFE_SECRET_FIELDS = new Set(["tokens", "account_id", "access_token", "refresh_token", "id_token", "token",

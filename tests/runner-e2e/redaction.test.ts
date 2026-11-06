@@ -12,6 +12,13 @@ import {
   sanitizeJson,
   secretScanFailureEvidence,
 } from "./redaction.js";
+import {
+  attemptSecretValues,
+  campaignSecretValues,
+  hasMemoryRecallExecution,
+  prepareAttemptChildEnvironment,
+} from "./launch.js";
+import type { MatrixExecution } from "./types.js";
 
 const tokens = {
   account_id: "identity-canary-private-90123",
@@ -35,6 +42,14 @@ it("attributes plain environment credentials and keeps unknown source names priv
   const value = "environment-canary-private-12345";
   expect(findSecretLeakMatch(value, [value], { sources: { OPENAI_API_KEY: value } })).toEqual({
     reason: "exact secret value", matchCategory: "OPENAI_API_KEY",
+  });
+  expect(
+    findSecretLeakMatch(value, [value], {
+      sources: { PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: value },
+    }),
+  ).toEqual({
+    reason: "exact secret value",
+    matchCategory: "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL",
   });
   const match = findSecretLeakMatch(value, [value], { sources: { [value]: value } });
   expect(match).toEqual({ reason: "exact secret value", matchCategory: "other credential" });
@@ -106,19 +121,87 @@ describe("extractDsnSecrets", () => {
     expect(extractDsnSecrets("postgres://user:12@localhost:5432/test_db")).toEqual([]); // < 4 chars
   });
 
-  it("covers DSN secrets in campaign redaction so assertSecretFree protects campaign outputs", () => {
+  it("extracts DSN secrets and normalizes password variants", () => {
     const dsn = "postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres?sslmode=require";
     const dsnSecrets = extractDsnSecrets(dsn);
-    const campaignSecrets = normalizedSecrets([
-      "some_other_secret_value",
-      ...dsnSecrets,
-    ]);
+    expect(dsnSecrets).toContain("superSecretDsnPass987");
+  });
+});
+
+describe("campaignSecretValues and attemptSecretValues", () => {
+  const dsn =
+    "postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres?sslmode=require";
+  const envWithDsn: NodeJS.ProcessEnv = {
+    PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: dsn,
+    OPENAI_API_KEY: "sk-test-canary-private-12345",
+  };
+
+  const nonMemoryExecutions = [
+    {
+      id: "stock-harness.legacy-codex.local.ordered-comment-continuation",
+      suite: { id: "stock-harness", manualOnly: false },
+      task: { id: "ordered-comment-continuation", flow: "context_integrity" },
+    },
+  ] as unknown as MatrixExecution[];
+
+  const memoryExecutions = [
+    {
+      id: "memory-recall.memory-hermes-local.local.save-then-fresh-recall-rep-1",
+      suite: { id: "memory-recall", manualOnly: true },
+      task: { id: "save-then-fresh-recall-rep-1", flow: "memory_recall" },
+    },
+  ] as unknown as MatrixExecution[];
+
+  it("(a) a batch with no memory-recall suite redacts the full DSN and password at attempt scope", () => {
+    const secrets = attemptSecretValues(envWithDsn, nonMemoryExecutions);
+    expect(secrets).toContain(dsn);
+    expect(secrets).toContain("superSecretDsnPass987");
+
+    const raw = `State dump error connecting to ${dsn} for non-memory task`;
+    expect(() => assertSecretFree(raw, secrets, "attempt-error.log")).toThrow(
+      /Secret leak in attempt-error\.log/,
+    );
+
+    const sanitized = sanitizeJson({ error: raw }, secrets) as { error: string };
+    expect(sanitized.error).not.toContain(dsn);
+    expect(sanitized.error).not.toContain("superSecretDsnPass987");
+    expect(sanitized.error).not.toContain("eval_admin");
+    expect(sanitized.error).not.toContain("db.internal");
+    expect(sanitized.error).toContain("[REDACTED]");
+    expect(() =>
+      assertSecretFree(JSON.stringify(sanitized), secrets, "attempt.json"),
+    ).not.toThrow();
+  });
+
+  it("(b) a memory-recall batch redacts the full DSN and password at attempt scope", () => {
+    const secrets = attemptSecretValues(envWithDsn, memoryExecutions);
+    expect(secrets).toContain(dsn);
+    expect(secrets).toContain("superSecretDsnPass987");
+
+    const raw = `Memory connection string: ${dsn}`;
+    expect(() => assertSecretFree(raw, secrets, "attempt-memory.log")).toThrow(
+      /Secret leak in attempt-memory\.log/,
+    );
+
+    const sanitized = sanitizeJson({ log: raw }, secrets) as { log: string };
+    expect(sanitized.log).not.toContain(dsn);
+    expect(sanitized.log).not.toContain("superSecretDsnPass987");
+    expect(sanitized.log).toContain("[REDACTED]");
+    expect(() =>
+      assertSecretFree(JSON.stringify(sanitized), secrets, "attempt.json"),
+    ).not.toThrow();
+  });
+
+  it("(c) asserts the full DSN string (not just the password) is redacted from campaign outputs", () => {
+    const campaignSecrets = campaignSecretValues(envWithDsn);
+    expect(campaignSecrets).toContain(dsn);
+    expect(campaignSecrets).toContain("superSecretDsnPass987");
 
     const campaignData = {
       campaignId: "campaign-test-123",
       results: [
         {
-          error: "Connection failed to postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres",
+          error: `Connection failed to ${dsn}`,
         },
       ],
     };
@@ -131,7 +214,52 @@ describe("extractDsnSecrets", () => {
     const safeCampaign = sanitizeJson(campaignData, campaignSecrets);
     const safeJson = JSON.stringify(safeCampaign, null, 2);
     expect(() => assertSecretFree(safeJson, campaignSecrets, "campaign.json")).not.toThrow();
+    // Full DSN is completely redacted, including username, password, host, and database
+    expect(safeJson).not.toContain(dsn);
     expect(safeJson).not.toContain("superSecretDsnPass987");
+    expect(safeJson).not.toContain("eval_admin");
+    expect(safeJson).not.toContain("db.internal");
     expect(safeJson).toContain("[REDACTED]");
+  });
+
+  it("gating rule: strips admin DSN from childEnv when !hasMemoryRecall, retains when hasMemoryRecall", () => {
+    const nonMemoryEnv: NodeJS.ProcessEnv = {
+      DATABASE_URL: "postgres://strip-me",
+      DATABASE_MIGRATION_URL: "postgres://strip-me-too",
+      PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: dsn,
+      SOME_OTHER_VAR: "keep-me",
+    };
+    prepareAttemptChildEnvironment(nonMemoryEnv, false);
+    expect(nonMemoryEnv.DATABASE_URL).toBeUndefined();
+    expect(nonMemoryEnv.DATABASE_MIGRATION_URL).toBeUndefined();
+    expect(nonMemoryEnv.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL).toBeUndefined();
+    expect(nonMemoryEnv.SOME_OTHER_VAR).toBe("keep-me");
+
+    const memoryEnv: NodeJS.ProcessEnv = {
+      DATABASE_URL: "postgres://strip-me",
+      DATABASE_MIGRATION_URL: "postgres://strip-me-too",
+      PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: dsn,
+      SOME_OTHER_VAR: "keep-me",
+    };
+    prepareAttemptChildEnvironment(memoryEnv, true);
+    expect(memoryEnv.DATABASE_URL).toBeUndefined();
+    expect(memoryEnv.DATABASE_MIGRATION_URL).toBeUndefined();
+    expect(memoryEnv.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL).toBe(dsn);
+    expect(memoryEnv.SOME_OTHER_VAR).toBe("keep-me");
+  });
+
+  it("identifies memory-recall executions accurately", () => {
+    expect(hasMemoryRecallExecution([])).toBe(false);
+    expect(hasMemoryRecallExecution(nonMemoryExecutions)).toBe(false);
+    expect(hasMemoryRecallExecution(memoryExecutions)).toBe(true);
+    expect(
+      hasMemoryRecallExecution([
+        {
+          id: "test",
+          suite: { id: "other-suite" },
+          task: { flow: "memory_recall" },
+        } as any,
+      ]),
+    ).toBe(true);
   });
 });

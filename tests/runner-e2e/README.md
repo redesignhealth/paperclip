@@ -360,12 +360,16 @@ inputs, or a tracked env file.
 
 The `memory-recall` suite evaluates Mem0 persistent memory, prompt guidance, cross-agent isolation boundaries, and heartbeat noise suppression on the Hermes agent adapter (`hermes_local`). Select `--suite memory-recall`; it is manual-only and excluded from `--all`.
 
+> **WARNING: THROWAWAY DATABASE INSTANCE ONLY**
+> `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` must point to a dedicated throwaway PostgreSQL instance (such as a local disposable Docker container), **never** a shared or production database.
+> The test harness provisions temporary tenant databases and drops them during teardown (`DROP DATABASE ...`, `DROP ROLE ...`). The drop guards only verify tenant naming regex format and exact equality with fixture-derived company names, which do not isolate a run from production by themselves. Real isolation strictly requires the operator to supply an isolated throwaway database instance.
+
 ### Preconditions and Environment
 
 Executing this suite requires:
 - `PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED=true`
 - `PAPERCLIP_MEMORY_COMPANY_SCOPE=all`
-- `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` pointing to an external PostgreSQL instance with `sslmode=require` query parameter and the `vector` extension preinstalled in `template1`.
+- `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` pointing to an external throwaway PostgreSQL instance (never shared or production) with `sslmode=require` query parameter and the `vector` extension preinstalled in `template1`.
 - `PAPERCLIP_E2E_MEMORY_HERMES_MODEL` naming the model ID passed to Hermes via OpenRouter (e.g. `anthropic/claude-3.5-sonnet`).
 - `OPENROUTER_API_KEY` for Hermes LLM inference.
 - `OPENAI_API_KEY` for Mem0 vector embedding generation (`text-embedding-3-small`).

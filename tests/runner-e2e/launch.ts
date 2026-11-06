@@ -10,6 +10,7 @@ import { createWriteStream } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   access,
   chmod,
@@ -470,6 +471,77 @@ async function copySharedEvidence(privateRoot: string, casePrivateDir: string) {
   }
 }
 
+export function hasMemoryRecallExecution(
+  executions: readonly MatrixExecution[],
+): boolean {
+  return executions.some(
+    (candidate) =>
+      candidate.suite.id === "memory-recall" || candidate.task.flow === "memory_recall",
+  );
+}
+
+export function prepareAttemptChildEnvironment(
+  childEnv: NodeJS.ProcessEnv,
+  hasMemoryRecall: boolean,
+): NodeJS.ProcessEnv {
+  delete childEnv.DATABASE_URL;
+  delete childEnv.DATABASE_MIGRATION_URL;
+  if (!hasMemoryRecall) {
+    delete childEnv.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL;
+  }
+  return childEnv;
+}
+
+export function attemptSecretSources(
+  env: NodeJS.ProcessEnv = process.env,
+  generatedSecrets:
+    | {
+        agentJwtSecret?: string;
+        decisionSigningSecret?: string;
+        toolActionSigningSecret?: string;
+        betterAuthSecret?: string;
+      }
+    | Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  return {
+    ...Object.fromEntries(CREDENTIAL_NAMES.map((name) => [name, env[name]])),
+    ...generatedSecrets,
+    ...(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL
+      ? { PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL }
+      : {}),
+  };
+}
+
+export function attemptSecretValues(
+  env: NodeJS.ProcessEnv = process.env,
+  executions: readonly MatrixExecution[] = [],
+  generatedSecrets:
+    | readonly (string | undefined | null)[]
+    | Record<string, string | undefined | null> = [],
+): string[] {
+  const extra = Array.isArray(generatedSecrets)
+    ? generatedSecrets
+    : Object.values(generatedSecrets);
+  const dsnSecrets = extractDsnSecrets(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
+  return normalizedSecrets([
+    ...CREDENTIAL_NAMES.map((name) => env[name]),
+    env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
+    ...dsnSecrets,
+    ...extra,
+  ]);
+}
+
+export function campaignSecretValues(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const dsnSecrets = extractDsnSecrets(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
+  return normalizedSecrets([
+    ...CREDENTIAL_NAMES.map((name) => env[name]),
+    env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
+    ...dsnSecrets,
+  ]);
+}
+
 async function runAttempt(input: {
   executions: readonly MatrixExecution[];
   attempt: number;
@@ -531,27 +603,18 @@ async function runAttempt(input: {
     const decisionSigningSecret = secret(48);
     const toolActionSigningSecret = secret(48);
     const betterAuthSecret = secret(48);
-    const hasMemoryRecall = executions.some(
-      (candidate) =>
-        candidate.suite.id === "memory-recall" || candidate.task.flow === "memory_recall",
-    );
-    const dsnSecrets = hasMemoryRecall
-      ? extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL)
-      : [];
-    const credentialSources = {
-      ...Object.fromEntries(CREDENTIAL_NAMES.map((name) => [name, process.env[name]])),
+    const hasMemoryRecall = hasMemoryRecallExecution(executions);
+    const credentialSources = attemptSecretSources(process.env, {
       PAPERCLIP_AGENT_JWT_SECRET: agentJwtSecret,
       PAPERCLIP_DECISION_SIGNING_SECRET: decisionSigningSecret,
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
       BETTER_AUTH_SECRET: betterAuthSecret,
-      ...(hasMemoryRecall && process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL
-        ? { PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL }
-        : {}),
-    };
-    const credentials = normalizedSecrets([
-      ...Object.values(credentialSources),
-      ...dsnSecrets,
-    ]);
+    });
+    const credentials = attemptSecretValues(
+      process.env,
+      executions,
+      credentialSources,
+    );
     attemptSecrets = credentials;
     if (installedCli) await writeFile(path.join(privateDir, "installed-cli-admission.json"), `${JSON.stringify(installedCli, null, 2)}\n`, { mode: 0o600 });
     if (installedPlugin) await writeFile(path.join(privateDir, "installed-daytona-plugin-admission.json"), `${JSON.stringify(installedPlugin, null, 2)}\n`, { mode: 0o600 });
@@ -598,8 +661,8 @@ async function runAttempt(input: {
     };
     // The database URLs are stripped here and again at the Playwright web-server
     // boundary so a developer's shell can never redirect this paid test.
-    delete childEnv.DATABASE_URL;
-    delete childEnv.DATABASE_MIGRATION_URL;
+    // Privileged admin DSN is deleted unless memory-recall is actively selected.
+    prepareAttemptChildEnvironment(childEnv, hasMemoryRecall);
 
     const playwrightArgs = [
       "test",
@@ -1114,11 +1177,7 @@ async function main() {
     expected: executions.map((execution) => execution.id),
     results: finalResults,
   });
-  const dsnSecrets = extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
-  const campaignSecrets = normalizedSecrets([
-    ...CREDENTIAL_NAMES.map((name) => process.env[name]),
-    ...dsnSecrets,
-  ]);
+  const campaignSecrets = campaignSecretValues(process.env);
   const safeCampaign = sanitizeJson(
     campaign,
     campaignSecrets,
@@ -1160,7 +1219,24 @@ async function main() {
   if (safeCampaign.failed > 0) process.exitCode = 1;
 }
 
-await main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+function isMainScript(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    const scriptPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (scriptPath === modulePath) return true;
+    return (
+      scriptPath.endsWith("tests/runner-e2e/launch.ts") ||
+      scriptPath.endsWith("tests/runner-e2e/launch.js")
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isMainScript()) {
+  await main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
