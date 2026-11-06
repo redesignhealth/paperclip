@@ -69,11 +69,11 @@ describe("buildMemoryAgentGuidance", () => {
         capabilities: { mem0: true, arcana: true, hermesBuiltInStores: false },
       },
       {
-        name: "mem0 + hermesBuiltInStores",
+        name: "mem0 + hermesBuiltInStores (unreachable in runtime; fallback test)",
         capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
       },
       {
-        name: "all 3 capabilities",
+        name: "all 3 capabilities (unreachable in runtime; fallback test)",
         capabilities: { mem0: true, arcana: true, hermesBuiltInStores: true },
       },
       {
@@ -107,18 +107,18 @@ describe("buildMemoryAgentGuidance", () => {
       expect(output).not.toContain("Hermes");
     });
 
-    it("hermes-only guidance does not mention Mem0 or Arcana tools", () => {
+    it("hermes-only guidance does not mention Mem0 or Arcana", () => {
       const output = buildMemoryAgentGuidance({
         capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
         variant: "write-rules",
       });
 
       expect(output).toContain(
-        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+        "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
       );
       expect(output.endsWith("\n")).toBe(false);
-      expect(output).not.toContain(MEM0_SNIPPET);
-      expect(output).not.toContain(ARCANA_SNIPPET);
+      expect(output).not.toContain("Mem0");
+      expect(output).not.toContain("Arcana");
       expect(output).not.toContain("handle session continuity");
       expect(output).not.toContain("duplicate");
     });
@@ -135,16 +135,32 @@ describe("buildMemoryAgentGuidance", () => {
       expect(output).not.toContain("Arcana");
     });
 
-    it("both hermes and mem0 enabled includes scratch store guidance and mem0 snippet without continuity promise", () => {
+    it("both hermes and mem0 enabled (unreachable in runtime) includes scratch store guidance and mem0 snippet without continuity promise", () => {
       const output = buildMemoryAgentGuidance({
         capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
         variant: "write-rules",
       });
 
       expect(output).toContain(
-        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0 and progress to issue comments.",
       );
       expect(output).toContain(MEM0_SNIPPET);
+      expect(output).not.toContain("Arcana");
+      expect(output).not.toContain("handle session continuity");
+      expect(output.endsWith("\n")).toBe(false);
+    });
+
+    it("hermes and arcana enabled includes scratch store guidance naming Arcana and not Mem0", () => {
+      const output = buildMemoryAgentGuidance({
+        capabilities: { mem0: false, arcana: true, hermesBuiltInStores: true },
+        variant: "write-rules",
+      });
+
+      expect(output).toContain(
+        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Arcana and progress to issue comments.",
+      );
+      expect(output).toContain(ARCANA_SNIPPET);
+      expect(output).not.toContain("Mem0");
       expect(output).not.toContain("handle session continuity");
       expect(output.endsWith("\n")).toBe(false);
     });
@@ -164,21 +180,15 @@ describe("buildMemoryAgentGuidance", () => {
         expect(output).toContain(ALWAYS_ON_PROGRESS);
         expect(output).toContain(ALWAYS_ON_SAFETY);
 
-        // Unavailable tools must not have tool guidance sections
+        // Unavailable tools must not be mentioned anywhere
         if (!capabilities.arcana) {
-          expect(output).not.toContain(ARCANA_SNIPPET);
-          if (!capabilities.hermesBuiltInStores) {
-            expect(output).not.toContain("Arcana");
-          }
+          expect(output).not.toContain("Arcana");
         } else {
           expect(output).toContain(ARCANA_SNIPPET);
         }
 
         if (!capabilities.mem0) {
-          expect(output).not.toContain(MEM0_SNIPPET);
-          if (!capabilities.hermesBuiltInStores) {
-            expect(output).not.toContain("Mem0");
-          }
+          expect(output).not.toContain("Mem0");
         } else {
           expect(output).toContain(MEM0_SNIPPET);
         }

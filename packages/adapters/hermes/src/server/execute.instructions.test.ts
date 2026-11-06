@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
-import { buildPrompt, execute, renderHermesSystemPrompt } from "./execute.js";
+import { buildPrompt, execute, renderHermesSystemPrompt, resolveMemoryGuidance } from "./execute.js";
 import { sessionCodec } from "./index.js";
 
 vi.mock("./mcp-preflight.js", () => ({
@@ -31,9 +31,15 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
   let instructionsFilePath: string;
   let capturePath: string;
   let origHardeningEnv: string | undefined;
+  let origHostIsoEnv: string | undefined;
+  let origDeploymentModeEnv: string | undefined;
 
   beforeEach(async () => {
     origHardeningEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+    origHostIsoEnv = process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    origDeploymentModeEnv = process.env.DEPLOYMENT_MODE;
+    delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    delete process.env.DEPLOYMENT_MODE;
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-instructions-"));
     command = path.join(dir, "hermes.cjs");
     instructionsFilePath = path.join(dir, "instructions.md");
@@ -77,6 +83,16 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       process.env.PAPERCLIP_MEMORY_HARDENING = origHardeningEnv;
     } else {
       delete process.env.PAPERCLIP_MEMORY_HARDENING;
+    }
+    if (origHostIsoEnv !== undefined) {
+      process.env.PAPERCLIP_HERMES_HOST_ISOLATION = origHostIsoEnv;
+    } else {
+      delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    }
+    if (origDeploymentModeEnv !== undefined) {
+      process.env.DEPLOYMENT_MODE = origDeploymentModeEnv;
+    } else {
+      delete process.env.DEPLOYMENT_MODE;
     }
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -503,18 +519,20 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   it("uses buildPaperclipAgentPromptTemplate when paperclipMemoryGuidance is present in context", async () => {
     const ctx = context({
       paperclipMemoryGuidance: {
-        capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
         variant: "write-rules",
       },
     });
     await execute(ctx);
     const [invocation] = await invocations();
     expect(invocation.systemPrompt).toContain(
-      "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+      "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
     );
     expect(invocation.systemPrompt).not.toContain("handle session continuity");
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
     expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).not.toContain("Mem0");
+    expect(invocation.systemPrompt).not.toContain("Arcana");
   });
 
   it("uses buildPaperclipAgentPromptTemplate and strips default identity when hermesPromptSplit is true and paperclipMemoryGuidance is present", async () => {
@@ -522,7 +540,7 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     const ctx: AdapterExecutionContext = {
       ...baseCtx,
       paperclipMemoryGuidance: {
-        capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
         variant: "write-rules",
       },
       config: {
@@ -539,12 +557,14 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(invocation.systemPrompt).not.toContain("You are agent agent-synthetic (Hermes fixture).");
     // Guidance from write-rules is present in system prompt
     expect(invocation.systemPrompt).toContain(
-      "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+      "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
     );
     expect(invocation.systemPrompt).not.toContain("handle session continuity");
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
     // Legacy guidance is absent
     expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).not.toContain("Mem0");
+    expect(invocation.systemPrompt).not.toContain("Arcana");
   });
 
   it("gives typed paperclipMemoryGuidance precedence over stale nested context", async () => {
@@ -660,6 +680,8 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
       expect(invocation.systemPrompt).not.toContain("session continuity");
       expect(invocation.systemPrompt).not.toContain("not a durable store");
+      expect(invocation.systemPrompt).not.toContain("mock-bearer-token");
+      expect(query(invocation)).not.toContain("mock-bearer-token");
     });
 
     it("forces hermesBuiltInStores false when host isolation is enabled", async () => {
@@ -686,6 +708,8 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
         expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
         expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
         expect(invocation.systemPrompt).not.toContain("session continuity");
+        expect(invocation.systemPrompt).not.toContain("sk-or-test-key");
+        expect(query(invocation)).not.toContain("sk-or-test-key");
       } finally {
         if (origHostIso !== undefined) {
           process.env.PAPERCLIP_HERMES_HOST_ISOLATION = origHostIso;
@@ -696,7 +720,12 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     });
 
     it("forces hermesBuiltInStores false on real execute path with Mem0", async () => {
-      const baseCtx = context();
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const baseCtx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+      });
       const ctx: AdapterExecutionContext = {
         ...baseCtx,
         runtimeMemory: {
@@ -708,7 +737,7 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
             llm: {
               provider: "openai",
               config: {
-                model: "gpt-4o-mini",
+                model: "gpt-5.4-mini",
                 api_key: "sk-openai-key-secret-9999",
               },
             },
@@ -749,6 +778,17 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       expect(invocation.systemPrompt).toContain("Mem0: save short, self-contained facts");
       expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
       expect(invocation.systemPrompt).not.toContain("session continuity");
+      expect(invocation.systemPrompt).not.toContain("sk-openai-key-secret-9999");
+      expect(invocation.systemPrompt).not.toContain("Tenant_Password_123!");
+      expect(query(invocation)).not.toContain("sk-openai-key-secret-9999");
+      expect(query(invocation)).not.toContain("Tenant_Password_123!");
+      expect(invocation.args.join(" ")).not.toContain("sk-openai-key-secret-9999");
+      expect(invocation.args.join(" ")).not.toContain("Tenant_Password_123!");
+      expect(
+        logs.some(
+          (l) => l.stream === "stdout" && l.chunk.includes("Isolation override: disabling Hermes built-in stores guidance"),
+        ),
+      ).toBe(true);
     });
 
     it("retains conservative hermesBuiltInStores guidance without continuity promise on non-isolated runs without Mem0", async () => {
@@ -761,9 +801,11 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       await execute(ctx);
       const [invocation] = await invocations();
       expect(invocation.systemPrompt).toContain(
-        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+        "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
       );
       expect(invocation.systemPrompt).not.toContain("handle session continuity");
+      expect(invocation.systemPrompt).not.toContain("Mem0");
+      expect(invocation.systemPrompt).not.toContain("Arcana");
     });
 
     it("preserves legacy prompt byte-identical when paperclipMemoryGuidance is absent", async () => {
@@ -776,6 +818,102 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       expect(invocation.systemPrompt).not.toContain(
         "- Task progress belongs in issue comments, not memory.",
       );
+    });
+  });
+
+  describe("resolveMemoryGuidance unit tests (TECH-8192)", () => {
+    it("forces hermesBuiltInStores false and logs concise notice when usingIsolatedHome is true and hermesBuiltInStores is true", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+      expect(resolved).toEqual({
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+        variant: "write-rules",
+      });
+      expect(logs).toEqual([
+        {
+          stream: "stdout",
+          chunk: "[hermes] Isolation override: disabling Hermes built-in stores guidance\n",
+        },
+      ]);
+    });
+
+    it("returns capabilities unchanged and does not log override when usingIsolatedHome is true but hermesBuiltInStores is already false", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: true, arcana: false, hermesBuiltInStores: false },
+          variant: "write-rules",
+        },
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+      expect(resolved).toEqual({
+        capabilities: { mem0: true, arcana: false, hermesBuiltInStores: false },
+        variant: "write-rules",
+      });
+      expect(logs).toHaveLength(0);
+    });
+
+    it("preserves hermesBuiltInStores true when usingIsolatedHome is false", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: false });
+      expect(resolved).toEqual({
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+        variant: "write-rules",
+      });
+      expect(logs).toHaveLength(0);
+    });
+
+    it("logs malformed error to stderr and returns undefined when paperclipMemoryGuidance is malformed", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: "not-a-bool" },
+          variant: "invalid-variant",
+        } as any,
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: false });
+      expect(resolved).toBeUndefined();
+      expect(logs).toHaveLength(1);
+      expect(logs[0].stream).toBe("stderr");
+      expect(logs[0].chunk).toContain("[hermes] Malformed paperclipMemoryGuidance context received");
+      expect(logs[0].chunk).not.toContain("password");
+    });
+
+    it("returns undefined without logging when paperclipMemoryGuidance is absent", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: undefined,
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+      expect(resolved).toBeUndefined();
+      expect(logs).toHaveLength(0);
     });
   });
 

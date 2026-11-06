@@ -61,7 +61,7 @@ Status quick guide:
 3. When memory tools or stores are available, retain durable facts and preferences with the why (decisions with date, lessons, procedures that worked).
 4. When Mem0 tools are available, save durable facts and preferences with the why (decisions with date, lessons, procedures that worked) to Mem0; mark inferences "(inferred)". Search before asking again. Treat recalled memories as hints: Arcana, the issue, or an issue comment wins.
 5. When Arcana brain tools are available, documents and source material go to Arcana: propose them after reading `skills/paperclip/references/arcana-brain-proposals.md`.
-6. When running on Hermes, Hermes built-in stores (MEMORY.md/USER.md) are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.
+6. When running on Hermes, Hermes built-in stores (MEMORY.md/USER.md) are scratch/local session context, not a durable store; use issue comments, and Mem0/Arcana when their tools are available.
 7. Never save secrets, credentials, personal data, PHI or PII.
 
 ## 8. Exit

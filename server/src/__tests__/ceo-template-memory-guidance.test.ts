@@ -14,14 +14,14 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(agents).toContain("Treat recalled memories as hints");
     expect(agents).toContain("When Arcana brain tools are available, Arcana is your knowledge layer");
     expect(agents).toContain(
-      "- When running on Hermes, Hermes built-in stores (MEMORY.md/USER.md) are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+      "- When running on Hermes, Hermes built-in stores (MEMORY.md/USER.md) are scratch/local session context, not a durable store; use issue comments, and Mem0/Arcana when their tools are available.",
     );
     expect(agents).toContain("Task progress and handoffs go in issue comments, not memory.");
     expect(agents).toContain("When memory tools or stores are available, retain durable facts and preferences with the why");
     expect(agents).toContain("Never save secrets, credentials, personal data, PHI or PII.");
     expect(agents).toContain(REFERENCE);
     expect(agents).toContain("## Planning");
-    expect(agents).toContain("When memory tools are available, memory goes to Mem0 and Arcana");
+    expect(agents).toContain("Use issue comments for progress and durable outcomes, and Mem0/Arcana when their tools are available");
     expect(agents).not.toContain("para-memory-files");
     expect(agents).not.toContain("for all memory operations");
     expect(agents).not.toMatch(/personal files \(life, memory/);
@@ -44,7 +44,7 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(heartbeat).toContain("Treat recalled memories as hints");
     expect(heartbeat).toContain("When Arcana brain tools are available, documents and source material go to Arcana");
     expect(heartbeat).toContain(
-      "6. When running on Hermes, Hermes built-in stores (MEMORY.md/USER.md) are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+      "6. When running on Hermes, Hermes built-in stores (MEMORY.md/USER.md) are scratch/local session context, not a durable store; use issue comments, and Mem0/Arcana when their tools are available.",
     );
     expect(heartbeat).toContain("Never save secrets, credentials, personal data, PHI or PII.");
     expect(heartbeat).toContain(REFERENCE);

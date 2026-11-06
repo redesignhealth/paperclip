@@ -1136,11 +1136,15 @@ export function renderHermesSystemPrompt(
 
 export async function resolveMemoryGuidance(
   ctx: AdapterExecutionContext,
-  options?: { usingIsolatedHome?: boolean },
+  options: { usingIsolatedHome: boolean },
 ): Promise<MemoryAgentGuidanceContext | undefined> {
   const result = parseMemoryAgentGuidanceContextResult(ctx.paperclipMemoryGuidance);
   if (result.status === "valid") {
-    if (options?.usingIsolatedHome) {
+    if (options.usingIsolatedHome && result.data.capabilities.hermesBuiltInStores) {
+      await ctx.onLog(
+        "stdout",
+        "[hermes] Isolation override: disabling Hermes built-in stores guidance\n",
+      );
       return {
         ...result.data,
         capabilities: {
