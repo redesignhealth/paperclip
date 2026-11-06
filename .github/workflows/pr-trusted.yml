@@ -440,6 +440,9 @@ jobs:
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
+      - name: Verify Mem0 memory content sampler test coverage
+        run: pnpm run test:sample-mem0-memory-content
+
       - name: Upload CI profile timings
         continue-on-error: true
         if: always() && env.PAPERCLIP_CI_PROFILE == 'true'
