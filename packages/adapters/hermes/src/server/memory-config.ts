@@ -425,6 +425,16 @@ function validateModelConfig(
     throw new Error(`Invalid memory configuration: ${blockName}.config.model must be a non-empty string`);
   }
 
+  if (blockName === "embedder" && sanitized.embedding_dims !== undefined) {
+    if (
+      typeof sanitized.embedding_dims !== "number" ||
+      !Number.isInteger(sanitized.embedding_dims) ||
+      sanitized.embedding_dims <= 0
+    ) {
+      throw new Error("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+    }
+  }
+
   validateCredentialFields(sanitized, `${blockName}.config`);
 
   return {

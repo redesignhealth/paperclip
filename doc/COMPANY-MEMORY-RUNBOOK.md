@@ -286,6 +286,25 @@ To isolate Mem0 memories per agent rather than sharing a global `"company"` scop
   - **Observation, Not Cutover Verification**: This column is runtime telemetry evidence that an agent-scoped run was observed in the wild. It is NOT proof that all historical memories were migrated, that cutover verification succeeded, or that the run executed successfully.
   - **No Hand Edits**: Operators must not manually edit or clear `scope_migration_agent_scope_observed_at`.
 
+### 5. Changing the Embedding Model (TECH-8193)
+
+The external Hermes Mem0 OSS backend inspects the vector column dimension on start and, if it differs from the configured embedding dims, executes `DROP TABLE IF EXISTS <collection>` inside `suppress(Exception)`. A configuration change of embedding model or dimensions without a coordinated data migration will silently delete a company's memories.
+
+To guard against silent data loss, Paperclip enforces a fail-closed allowlist check (`SUPPORTED_COMPANY_MEMORY_EMBEDDINGS`) before any credentials leave the heartbeat service.
+
+#### Invariants & Operational Rules
+- **Never just edit configuration**: Changing the embedding model or dimensions in configuration alone is strictly prohibited.
+- **Default change alone fails every run by design**: Shipping a provisioner default change without updating the allowlist constant will fail every memory run immediately with `UnsupportedMemoryEmbeddingError`.
+- **Coordinated PR requirement**: The allowlist constant (`SUPPORTED_COMPANY_MEMORY_EMBEDDINGS`) and the provisioner default (`PROVISIONER_DEFAULT_EMBEDDING`) must change in the **same PR** as a migration that re-embeds existing memory collections.
+- **pgvector dimension limits**: Note that `text-embedding-3-large` at 3072 dimensions exceeds `pgvector`'s 2000-dimension HNSW indexing limit for `vector` columns (PostgreSQL `pgvector` limits HNSW indexes to 2000 dimensions).
+
+#### Re-Embedding Migration Procedure
+When transitioning to a new embedding model or dimension:
+1. **Logical backup first**: Take a full per-tenant logical dump (`pg_dump -Fc`) of the affected memory database before touching any tables.
+2. **Re-embed into a new collection**: Create a new collection table with the new vector dimensions. Read existing memories and re-embed each memory text from `payload->>'data'` using the new model into the new collection table.
+3. **Atomic collection swap**: Update the `collection_name` column on the `company_memory_databases` row to point to the new collection table.
+4. **Retain old table until verified**: Keep the legacy collection table intact in the tenant database until the migration is fully verified and soaked. Do not drop the old table immediately.
+
 ---
 
 ## 6. Capacity Planning & Production Placement

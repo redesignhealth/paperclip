@@ -327,6 +327,57 @@ describe("memory-config", () => {
       ).toThrow("embedder.config.model must be a non-empty string");
     });
 
+    it("validates structural embedding_dims check in embedder config (0, -1, 1.5, '1536' rejected; 1536 accepted)", () => {
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: 0 },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: -1 },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: 1.5 },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          embedder: {
+            provider: "openai",
+            config: { model: "text-embedding-3-small", embedding_dims: "1536" as unknown as number },
+          },
+        }),
+      ).toThrow("Invalid memory configuration: embedder.config.embedding_dims must be a positive integer");
+
+      const validated = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        embedder: {
+          provider: "openai",
+          config: { model: "text-embedding-3-small", embedding_dims: 1536 },
+        },
+      });
+      expect(validated.embedder.config.embedding_dims).toBe(1536);
+    });
+
     it("rejects control characters or CRLF in model config strings", () => {
       expect(() =>
         validateHermesMemoryConfig({

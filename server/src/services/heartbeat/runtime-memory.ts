@@ -1,10 +1,22 @@
 import type { AdapterRuntimeMemoryAccess } from "@paperclipai/adapter-utils";
 import { resolveMemoryHardeningFlags, type MemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
 import { companyMemoryDatabaseService } from "../company-memory-databases.js";
+import {
+  isSupportedCompanyMemoryEmbedding,
+  UnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+  isUnsupportedMemoryEmbeddingError,
+} from "../company-memory-constants.js";
 import { recordAgentScopedMemoryUse } from "../memory-scope-observations.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { HERMES_ADAPTER_TYPE } from "./run-state.js";
 import { logger } from "../../middleware/logger.js";
+
+export {
+  UnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+  isUnsupportedMemoryEmbeddingError,
+};
 
 /**
  * Only the local Hermes adapter consumes the per-company Mem0/pgvector
@@ -43,6 +55,18 @@ export async function resolveHeartbeatRuntimeMemory(input: {
   const descriptor = await memorySvc.resolveRuntimeConfig(agent.companyId, runId);
   if (!descriptor) {
     return undefined;
+  }
+  if (
+    !isSupportedCompanyMemoryEmbedding({
+      model: descriptor.embeddingModel,
+      dimensions: descriptor.embeddingDimensions,
+    })
+  ) {
+    throw new UnsupportedMemoryEmbeddingError(
+      agent.companyId,
+      descriptor.embeddingModel,
+      descriptor.embeddingDimensions,
+    );
   }
   await createRunSecretRedactionRegistry(db).register(agent.companyId, runId, descriptor.password);
 

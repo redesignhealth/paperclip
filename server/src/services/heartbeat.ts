@@ -225,6 +225,7 @@ export { HERMES_ADAPTER_TYPE } from "./heartbeat/run-state.js";
 export {
   adapterSupportsRuntimeMemory,
   resolveHeartbeatRuntimeMemory,
+  UnsupportedMemoryEmbeddingError,
 } from "./heartbeat/runtime-memory.js";
 
 import { decisionModelService } from "./decision-models.js";

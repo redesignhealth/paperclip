@@ -11,6 +11,10 @@ import { LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import { requestedRunCancellation } from "../run-cancellation.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
 import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from "./run-preparation.js";
+import {
+  UnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+} from "../company-memory-constants.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
@@ -312,6 +316,39 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect(run.error).not.toContain("private-identity-material");
     expect((await f.deps.getTaskSession(f.agent.companyId, f.agent.id, f.agent.adapterType, "completion-task"))?.sessionDisplayId).toBe("checkpoint");
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
+  });
+
+  it("maps UnsupportedMemoryEmbeddingError to dedicated non-retryable error code with safe diagnostics and keeps agent idle", async () => {
+    const f = await fixture();
+    const failure = f.failure(new UnsupportedMemoryEmbeddingError(f.agent.companyId, "text-embedding-3-large", 3072));
+    await f.completion.failRun(failure);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "failed", errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE });
+    expect(run.error).toContain(f.agent.companyId);
+    expect(run.error).toContain("text-embedding-3-large");
+    expect(run.error).toContain("3072");
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
+      f.agent.id,
+      "failed",
+      run.error,
+      expect.objectContaining({ keepIdleOnFailure: true }),
+    );
+  });
+
+  it("maps name-only deserialized UnsupportedMemoryEmbeddingError without code to dedicated non-retryable error code", async () => {
+    const f = await fixture();
+    const nameOnlyErr = new Error("Unsupported company memory embedding configuration");
+    nameOnlyErr.name = "UnsupportedMemoryEmbeddingError";
+    const failure = f.failure(nameOnlyErr);
+    await f.completion.failRun(failure);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "failed", errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE });
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
+      f.agent.id,
+      "failed",
+      run.error,
+      expect.objectContaining({ keepIdleOnFailure: true }),
+    );
   });
 
   it("still records failure and releases issue ownership when log finalization and progress flushing fail", async () => {

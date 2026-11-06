@@ -5,6 +5,10 @@ import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspaceGitScanCode } from "./retries.js";
 import { type RunSessionOutcome, resolveNextSessionState, normalizeUsageTotals, resolveCacheAdjustedCostUsd, resolveLedgerBiller, resolveLedgerCostStatus, normalizeLedgerBillingType } from "./run-state.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
+import {
+  isUnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+} from "../company-memory-constants.js";
 import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
@@ -292,7 +296,8 @@ export function isConfigurationIncompleteFailedRun(
 ) {
   return (
     run?.errorCode === CONFIGURATION_INCOMPLETE_FAILURE_CODE ||
-    run?.errorCode === "model_not_found"
+    run?.errorCode === "model_not_found" ||
+    run?.errorCode === UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE
   );
 }
 
@@ -1063,6 +1068,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     )
       ? err
       : null;
+    const memoryEmbeddingFailure = isUnsupportedMemoryEmbeddingError(err)
+      ? err
+      : null;
     const recordedResponsibleUserDenialCode =
       normalizeResponsibleUserDenialCode(
         (await getRun(run.id).catch(() => null))?.errorCode,
@@ -1091,6 +1099,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const failureErrorCode =
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
+      (memoryEmbeddingFailure ? UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE : null) ??
       nonRetryablePreflightFailureCode(err) ??
       recordedResponsibleUserDenialCode ??
       nativeTerminalFailureCode ??
@@ -1178,7 +1187,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       keepIdleOnFailure:
         Boolean(nonRetryablePreflightFailureCode(err)) ||
-        isWorkspaceSyncConflictFailure(message),
+        isWorkspaceSyncConflictFailure(message) ||
+        Boolean(memoryEmbeddingFailure),
     });
     await setWakeupStatus(run.wakeupRequestId, "failed", {
       finishedAt: new Date(),
@@ -1304,6 +1314,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       : null;
     const configurationIncompleteSetupFailure =
       isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
+    const memoryEmbeddingSetupFailure = isUnsupportedMemoryEmbeddingError(
+      outerErr,
+    )
+      ? outerErr
+      : null;
     const unresolvedBaseRefSetupFailure = isUnresolvedWorkspaceBaseRefError(
       outerErr,
     )
@@ -1328,6 +1343,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       workspaceGitScanFailure?.code ??
       workspaceValidationSetupFailure?.code ??
       configurationIncompleteSetupFailure?.code ??
+      (memoryEmbeddingSetupFailure ? UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE : null) ??
       (unresolvedBaseRefSetupFailure ||
       sandboxProviderPluginNotReadySetupFailure
         ? CONFIGURATION_INCOMPLETE_FAILURE_CODE
