@@ -37,9 +37,9 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
   beforeEach(async () => {
     origHardeningEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
     origHostIsoEnv = process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
-    origDeploymentModeEnv = process.env.DEPLOYMENT_MODE;
+    origDeploymentModeEnv = process.env.PAPERCLIP_DEPLOYMENT_MODE;
     delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
-    delete process.env.DEPLOYMENT_MODE;
+    delete process.env.PAPERCLIP_DEPLOYMENT_MODE;
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-instructions-"));
     command = path.join(dir, "hermes.cjs");
     instructionsFilePath = path.join(dir, "instructions.md");
@@ -90,9 +90,9 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
     }
     if (origDeploymentModeEnv !== undefined) {
-      process.env.DEPLOYMENT_MODE = origDeploymentModeEnv;
+      process.env.PAPERCLIP_DEPLOYMENT_MODE = origDeploymentModeEnv;
     } else {
-      delete process.env.DEPLOYMENT_MODE;
+      delete process.env.PAPERCLIP_DEPLOYMENT_MODE;
     }
     await fs.rm(dir, { recursive: true, force: true });
   });
