@@ -3202,7 +3202,13 @@ export function agentRoutes(
     if (test || binding.provider === "github") {
       const testEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId, binding.provider === "github");
       if (testEnvironmentId) await assertAdapterTestEnvironmentForCompany(companyId, testEnvironmentId, adapterType);
-      const target = await resolveAdapterTestExecutionContext({ companyId, adapterType, agentId: newAgent ? undefined : agentId, environmentId: testEnvironmentId });
+      const hasSavedAgent = !newAgent || (isUuidLike(agentId) && Boolean(await svc.getById(agentId)));
+      if (!hasSavedAgent && !test && testEnvironmentId && (await environmentsSvc.getById(testEnvironmentId))?.driver === "plugin") {
+        // The lifecycle verifies the saved agent after its plugin can create the agent-owned computer.
+        return { connectionId: selection.connection.id };
+      }
+      const target = await resolveAdapterTestExecutionContext({ companyId, adapterType,
+        agentId: hasSavedAgent ? agentId : undefined, environmentId: testEnvironmentId });
       try {
         if (!target.executionTarget && target.fallbackChecks.length > 0) throw unprocessable("The agent environment is not available for adoption");
         await withManagedAiProbe(db, { companyId, agentId, responsibleUserId: userId, adapterType, binding, config, allowUninstalledPersonal: newAgent, allowUninstalledShared, allowLegacyValidation: true }, async managed => {
