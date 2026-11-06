@@ -950,6 +950,19 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(childEnv.PGHOST).toBeUndefined();
   });
 
+  it("uses promptViaFile with --query-file when oversized task body pushes shrunk prompt >=128 KiB under hermes-prompt-split", async () => {
+    const ctx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+    });
+    (ctx as any).context.paperclipTaskMarkdownAssignment = "x".repeat(150_000);
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    expect(interceptedOpts.args).toContain("--query-file");
+    expect(interceptedOpts.args).not.toContain("-q");
+  });
+
   describe("benign stderr reclassification and logging notices", () => {
     it("reclassifies benign INFO, DEBUG, MCP server, and timestamped lines to stdout while keeping errors on stderr", async () => {
       mockChildProcessBehavior = "emit_secrets";

@@ -44,6 +44,8 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
   selectPaperclipPromptSections,
+  selectInitialCommunicationGuidance,
+  resolveMemoryHardeningFlags,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -1031,9 +1033,7 @@ const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
   "- API base: {{paperclipApiUrl}}",
 ].join("\n");
 
-// Hermes applies this overlay at each API call, including after compaction,
-// without storing it in conversation history. Keep run/task deltas in -q.
-const HERMES_SYSTEM_PROMPT_TEMPLATE = [
+const HERMES_SYSTEM_PROMPT_API_GUIDANCE = [
   "Paperclip API guidance:",
   "- Use `curl` from the terminal for Paperclip API calls; browser/web extraction tools may not reach localhost.",
   "- Use `$PAPERCLIP_API_URL`, `$PAPERCLIP_API_KEY`, and `$PAPERCLIP_RUN_ID`; do not hard-code local ports or copy secrets into comments.",
@@ -1061,9 +1061,35 @@ const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "    -H \"Content-Type: application/json\" \\",
   "    --data-binary @-",
   "```",
+].join("\n");
+
+// Hermes applies this overlay at each API call, including after compaction,
+// without storing it in conversation history. Keep run/task deltas in -q.
+const HERMES_SYSTEM_PROMPT_TEMPLATE = [
+  HERMES_SYSTEM_PROMPT_API_GUIDANCE,
   "",
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ].join("\n");
+
+function renderHermesSystemPrompt(
+  agent: unknown,
+  options: { includeDefaultIdentity?: boolean } = {},
+): string {
+  const includeDefaultIdentity = options.includeDefaultIdentity ?? true;
+  if (includeDefaultIdentity) {
+    return renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, { agent });
+  }
+  const agentTemplate = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.replace(
+    /^You are agent \{\{agent\.id\}\} \(\{\{agent\.name\}\}\)\.\n\n?/,
+    "",
+  );
+  const promptTemplate = [
+    HERMES_SYSTEM_PROMPT_API_GUIDANCE,
+    "",
+    agentTemplate,
+  ].join("\n");
+  return renderTemplate(promptTemplate, { agent });
+}
 
 function renderConditionalSections(template: string, vars: Record<string, unknown>): string {
   const isTruthy = (key: string) => {
@@ -1078,11 +1104,26 @@ function renderConditionalSections(template: string, vars: Record<string, unknow
   );
 }
 
+export interface HermesBuiltPrompt {
+  query: string;
+  systemSections: string[];
+}
+
 export function buildPrompt(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
-  options: { resumedSession?: boolean } = {},
-): string {
+  options: { resumedSession?: boolean; returnSections: true },
+): HermesBuiltPrompt;
+export function buildPrompt(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+  options?: { resumedSession?: boolean; returnSections?: false },
+): string;
+export function buildPrompt(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+  options?: { resumedSession?: boolean; returnSections?: boolean },
+): string | HermesBuiltPrompt {
   const context = (ctx as any).context || {};
   const template = cfgString(config.promptTemplate);
   const taskId = cfgString(context.taskId) || cfgString(context.issueId) || cfgString(ctx.config?.taskId);
@@ -1104,9 +1145,16 @@ export function buildPrompt(
     paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
   }
 
+  const userEnvForHardening = (config.env ?? ctx.config?.env) as Record<string, string> | undefined;
+  const envForHardening = {
+    ...process.env,
+    ...(userEnvForHardening && typeof userEnvForHardening === "object" ? userEnvForHardening : {}),
+  };
+  const { hermesPromptSplit } = resolveMemoryHardeningFlags(envForHardening);
+
   const { taskContextNote: taskContextMarkdown, wakePrompt } = selectPaperclipPromptSections(context, {
-    resumedSession: options.resumedSession === true,
-    includeCommunicationGuidance: true,
+    resumedSession: options?.resumedSession === true,
+    includeCommunicationGuidance: !hermesPromptSplit,
   });
   // Keep the historical variable available to custom templates. Automatic
   // assembly uses the ownership-aware assignment variant below.
@@ -1146,14 +1194,49 @@ export function buildPrompt(
   const rendered = template && !isPaperclipRecoveryWakePayload(context.paperclipWake)
     ? renderTemplate(renderConditionalSections(template, vars), vars)
     : "";
-  return joinPromptSections([
-    renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
-    wakePrompt,
-    sessionHandoffMarkdown,
-    runtimeGuidance,
-    taskContextMarkdown,
-    rendered,
-  ]);
+
+  let query: string;
+  let systemSections: string[];
+
+  if (hermesPromptSplit) {
+    const initialCommunicationGuidance = selectInitialCommunicationGuidance(context, {
+      resumedSession: options?.resumedSession === true,
+    });
+    query = joinPromptSections([
+      taskContextMarkdown,
+      wakePrompt,
+      sessionHandoffMarkdown,
+      rendered,
+    ]);
+    systemSections = [
+      renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
+      initialCommunicationGuidance,
+      runtimeGuidance,
+    ].filter(Boolean);
+  } else {
+    query = joinPromptSections([
+      renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
+      wakePrompt,
+      sessionHandoffMarkdown,
+      runtimeGuidance,
+      taskContextMarkdown,
+      rendered,
+    ]);
+    systemSections = [];
+  }
+
+  if (options?.returnSections === true) {
+    return { query, systemSections };
+  }
+  return query;
+}
+
+export function buildPromptSections(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+  options: { resumedSession?: boolean } = {},
+): HermesBuiltPrompt {
+  return buildPrompt(ctx, config, { ...options, returnSections: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,7 +1569,11 @@ export async function execute(
   // Isolated per-run HERMES_HOME runs (runtime MCP, memory, host isolation) have ephemeral
   // native session state, so they never resume a prior Hermes session.
   const sessionId = persistSession && !usingIsolatedHome ? prevSessionId : undefined;
-  const prompt = buildPrompt(ctx, promptConfig, { resumedSession: Boolean(sessionId) });
+  const builtPrompt = buildPrompt(ctx, promptConfig, {
+    resumedSession: Boolean(sessionId),
+    returnSections: true,
+  });
+  const prompt = builtPrompt.query;
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
@@ -1553,14 +1640,22 @@ export async function execute(
     ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
   };
 
+  const userEnvForHardening = (config.env ?? ctx.config?.env) as Record<string, string> | undefined;
+  const envForHardening = {
+    ...process.env,
+    ...(userEnvForHardening && typeof userEnvForHardening === "object" ? userEnvForHardening : {}),
+  };
+  const { hermesPromptSplit } = resolveMemoryHardeningFlags(envForHardening);
+
   // Scope the overlay to this child process. Read the current bundle on every
   // invocation; never infer its availability from a persisted session ID.
   // Preserve an operator's explicit overlay before Paperclip's instructions.
   env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
     env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
     agentInstructions,
-    renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
-      agent: ctx.agent,
+    ...builtPrompt.systemSections,
+    renderHermesSystemPrompt(ctx.agent, {
+      includeDefaultIdentity: !hermesPromptSplit,
     }),
   ]);
 

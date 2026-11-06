@@ -366,6 +366,17 @@ content, and the rendered custom `promptTemplate`, if configured. Custom templat
 run on every normal wake. `quiet` changes CLI display only. Disabling persistence
 uses full fresh-session context even if old session parameters are supplied.
 
+When memory hardening `hermes-prompt-split` is enabled (via `PAPERCLIP_MEMORY_HARDENING`),
+the runtime identity block, initial communication guidance, and runtime tools guidance
+move from the `-q` query to `HERMES_EPHEMERAL_SYSTEM_PROMPT`. The `-q` query is reorganized
+with task-specific brief context first (task context markdown, wake payload, session handoff,
+and custom `promptTemplate`) so task-relevant tokens dominate Mem0 semantic recall queries.
+Custom `promptTemplate` remains in `-q` in both flag states: operators author it as per-heartbeat
+content, so it continues to evaluate per turn rather than being relocated into the system
+prompt. In addition, `HERMES_EPHEMERAL_SYSTEM_PROMPT` suppresses the default template's
+identity line when the prompt split is active, ensuring the richer Hermes identity block
+renders exactly once without duplicate identity declarations.
+
 An explicit `HERMES_EPHEMERAL_SYSTEM_PROMPT` in `env` is preserved before the
 Paperclip overlay. Hermes gives this environment hook precedence over its profile's
 configured personality/system prompt. Put required additional profile guidance in
