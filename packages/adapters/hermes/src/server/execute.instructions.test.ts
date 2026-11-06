@@ -247,11 +247,15 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(result.sessionParams).toBeUndefined();
   });
 
-  it("keeps custom templates and quiet mode dynamic while preserving a configured system overlay", async () => {
+  it.each([false, true])("keeps custom templates and quiet mode dynamic while preserving a configured system overlay (hermesPromptSplit=%s)", async (splitEnabled) => {
     const ctx = context();
     await execute({ ...ctx, config: {
       ...ctx.config, quiet: true, promptTemplate: "Current custom direction for {{runId}}.",
-      env: { CAPTURE_PATH: capturePath, HERMES_EPHEMERAL_SYSTEM_PROMPT: "User configured system guidance." },
+      env: {
+        CAPTURE_PATH: capturePath,
+        HERMES_EPHEMERAL_SYSTEM_PROMPT: "User configured system guidance.",
+        PAPERCLIP_MEMORY_HARDENING: splitEnabled ? "hermes-prompt-split" : "",
+      },
     }, runtime: { ...ctx.runtime, sessionParams: { sessionId: SESSION_ID } } });
     const [invocation] = await invocations();
     expect(invocation.args).toContain("-Q");
@@ -259,6 +263,85 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(query(invocation)).not.toContain(INSTRUCTIONS);
     expect(invocation.systemPrompt).toContain("User configured system guidance.");
     expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
+  });
+
+  it("splits runtime identity, connection guidance, and runtime tools guidance into system prompt under hermes-prompt-split", async () => {
+    const ctx = context({
+      runtimeTools: { guidance: "Synthetic runtime tools guidance." } as any,
+      context: {
+        issueId: "task-synthetic",
+        paperclipTaskCommunicationGuidance: "Synthetic Slack connection guidance preference.",
+        paperclipTaskMarkdownAssignment: "Complete current synthetic task assignment.",
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "task-synthetic", title: "Synthetic task", status: "in_progress" },
+          comments: [],
+          commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+          fallbackFetchNeeded: false,
+        },
+      },
+    });
+
+    // 1. Flag ON:
+    await execute({
+      ...ctx,
+      runId: "run-split-on",
+      config: {
+        ...ctx.config,
+        env: {
+          CAPTURE_PATH: capturePath,
+          PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split",
+        },
+      },
+    });
+
+    // 2. Flag OFF:
+    await execute({
+      ...ctx,
+      runId: "run-split-off",
+      config: {
+        ...ctx.config,
+        env: {
+          CAPTURE_PATH: capturePath,
+          PAPERCLIP_MEMORY_HARDENING: "",
+        },
+      },
+    });
+
+    const [splitOn, splitOff] = await invocations();
+
+    // Flag ON assertions
+    const onQuery = query(splitOn);
+    expect(onQuery).not.toContain("You are agent");
+    expect(onQuery).not.toContain("Paperclip runtime identity:");
+    expect(onQuery).not.toContain("Synthetic Slack connection guidance preference.");
+    expect(onQuery).not.toContain("Synthetic runtime tools guidance.");
+    expect(onQuery).not.toContain("Connection tools:");
+    expect(onQuery).toContain("Complete current synthetic task assignment.");
+    expect(onQuery).toContain("## Paperclip Wake Payload");
+
+    const onSystem = splitOn.systemPrompt!;
+    expect(onSystem).not.toContain("You are agent");
+    expect(onSystem.split("Paperclip runtime identity:")).toHaveLength(2);
+    expect(onSystem.split("Synthetic Slack connection guidance preference.")).toHaveLength(2);
+    expect(onSystem.split("Synthetic runtime tools guidance.")).toHaveLength(2);
+    expect(onSystem.split("Connection tools:")).toHaveLength(2);
+    expect(onSystem.split("Memory:")).toHaveLength(2);
+    expect(onSystem).toContain(INSTRUCTIONS);
+
+    // Flag OFF assertions (byte-identical to today)
+    const offQuery = query(splitOff);
+    expect(offQuery).toBe(buildPrompt({ ...ctx, runId: "run-split-off" }, ctx.config));
+    expect(offQuery).toContain("Paperclip runtime identity:");
+    expect(offQuery).toContain("Synthetic Slack connection guidance preference.");
+    expect(offQuery).toContain("Synthetic runtime tools guidance.");
+
+    const offSystem = splitOff.systemPrompt!;
+    expect(offSystem).toContain("You are agent agent-synthetic (Hermes fixture).");
+    expect(offSystem.split("You are agent agent-synthetic (Hermes fixture).")).toHaveLength(2);
+    expect(offSystem).not.toContain("Paperclip runtime identity:");
+    expect(offSystem).not.toContain("Synthetic Slack connection guidance preference.");
+    expect(offSystem).not.toContain("Synthetic runtime tools guidance.");
   });
 
   it.each([false, true])("keeps an empty wake runnable with current identity (conversation=%s)", async (conversationMode) => {
