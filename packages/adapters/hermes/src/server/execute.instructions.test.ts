@@ -583,6 +583,8 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     await execute(ctx);
     const [invocation] = await invocations();
     expect(invocation.systemPrompt).toContain("Arcana brain tools exist; prefer them for durable cross-run knowledge.");
+    expect(invocation.systemPrompt).not.toContain("save durable facts only to available Arcana");
+    expect(invocation.systemPrompt).not.toContain("save durable facts to Arcana");
     expect(invocation.systemPrompt).not.toContain("Mem0");
     expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
   });
@@ -806,6 +808,8 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       expect(invocation.systemPrompt).not.toContain("handle session continuity");
       expect(invocation.systemPrompt).not.toContain("Mem0");
       expect(invocation.systemPrompt).not.toContain("Arcana");
+      expect(invocation.systemPrompt).not.toContain("save durable facts only to available Arcana");
+      expect(invocation.systemPrompt).not.toContain("save durable facts to Arcana");
     });
 
     it("preserves legacy prompt byte-identical when paperclipMemoryGuidance is absent", async () => {

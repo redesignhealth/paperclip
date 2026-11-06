@@ -85,7 +85,7 @@ describe("buildMemoryAgentGuidance", () => {
         capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
       },
       {
-        name: "arcana + hermesBuiltInStores",
+        name: "arcana + hermesBuiltInStores (synthetic/not normally runtime-reachable; actual attached runtime MCP causes isolation)",
         capabilities: { mem0: false, arcana: true, hermesBuiltInStores: true },
       },
     ];
@@ -150,18 +150,39 @@ describe("buildMemoryAgentGuidance", () => {
       expect(output.endsWith("\n")).toBe(false);
     });
 
-    it("hermes and arcana enabled includes scratch store guidance naming Arcana and not Mem0", () => {
+    it("hermes and arcana enabled (synthetic/not normally runtime-reachable; actual attached runtime MCP causes isolation) includes scratch store guidance naming Arcana and not Mem0", () => {
       const output = buildMemoryAgentGuidance({
         capabilities: { mem0: false, arcana: true, hermesBuiltInStores: true },
         variant: "write-rules",
       });
 
       expect(output).toContain(
-        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Arcana and progress to issue comments.",
+        "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments, and propose source documents to Arcana when its tools are available.",
       );
       expect(output).toContain(ARCANA_SNIPPET);
       expect(output).not.toContain("Mem0");
       expect(output).not.toContain("handle session continuity");
+      expect(output).not.toContain("save durable facts only to available Arcana");
+      expect(output).not.toContain("save durable facts to Arcana");
+      expect(output).not.toContain("save durable facts");
+      expect(output.endsWith("\n")).toBe(false);
+    });
+
+    it("all 3 capabilities enabled (synthetic/not normally runtime-reachable; fallback test) routes Mem0 to durable facts and Arcana to document proposals without direct-save-to-Arcana language", () => {
+      const output = buildMemoryAgentGuidance({
+        capabilities: { mem0: true, arcana: true, hermesBuiltInStores: true },
+        variant: "write-rules",
+      });
+
+      expect(output).toContain(
+        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0, record progress and durable outcomes in issue comments, and propose source documents to Arcana when its tools are available.",
+      );
+      expect(output).toContain(MEM0_SNIPPET);
+      expect(output).toContain(ARCANA_SNIPPET);
+      expect(output).not.toContain("handle session continuity");
+      expect(output).not.toContain("save durable facts only to available Arcana");
+      expect(output).not.toContain("save durable facts only to available Mem0/Arcana");
+      expect(output).not.toContain("save durable facts to Arcana");
       expect(output.endsWith("\n")).toBe(false);
     });
 
@@ -198,6 +219,11 @@ describe("buildMemoryAgentGuidance", () => {
         } else {
           expect(output).toContain(HERMES_SNIPPET);
         }
+
+        // Direct-save-to-Arcana wording must never be emitted
+        expect(output).not.toContain("save durable facts only to available Arcana");
+        expect(output).not.toContain("save durable facts only to available Mem0/Arcana");
+        expect(output).not.toContain("save durable facts to Arcana");
 
         // No trailing newline, no double blank lines
         expect(output.endsWith("\n")).toBe(false);

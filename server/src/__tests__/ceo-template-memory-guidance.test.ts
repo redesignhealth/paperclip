@@ -28,6 +28,8 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(agents).not.toContain("extraction checklist");
     expect(agents).not.toContain("handle session continuity");
     expect(agents).not.toContain("When Hermes built-in stores are available");
+    expect(agents).not.toContain("save durable facts only to available Arcana");
+    expect(agents).not.toContain("save durable facts to Arcana");
   });
 
   it("HEARTBEAT.md makes memory capture conditional on available tools while preserving always-on rules", () => {
@@ -50,5 +52,7 @@ describe("CEO onboarding templates route memory to Mem0 and Arcana", () => {
     expect(heartbeat).toContain(REFERENCE);
     expect(heartbeat).not.toContain("handle session continuity");
     expect(heartbeat).not.toContain("When Hermes built-in stores are available");
+    expect(heartbeat).not.toContain("save durable facts only to available Arcana");
+    expect(heartbeat).not.toContain("save durable facts to Arcana");
   });
 });

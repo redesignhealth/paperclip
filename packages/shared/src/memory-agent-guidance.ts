@@ -91,7 +91,7 @@ export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): strin
   if (ctx.capabilities.hermesBuiltInStores) {
     if (ctx.capabilities.mem0 && ctx.capabilities.arcana) {
       lines.push(
-        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0, record progress and durable outcomes in issue comments, and propose source documents to Arcana when its tools are available.",
       );
     } else if (ctx.capabilities.mem0) {
       lines.push(
@@ -99,7 +99,7 @@ export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): strin
       );
     } else if (ctx.capabilities.arcana) {
       lines.push(
-        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Arcana and progress to issue comments.",
+        "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments, and propose source documents to Arcana when its tools are available.",
       );
     } else {
       lines.push(
