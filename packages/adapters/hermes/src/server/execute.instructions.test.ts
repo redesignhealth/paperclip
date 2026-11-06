@@ -263,6 +263,18 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(query(invocation)).not.toContain(INSTRUCTIONS);
     expect(invocation.systemPrompt).toContain("User configured system guidance.");
     expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
+
+    if (splitEnabled) {
+      expect(query(invocation)).not.toContain("Paperclip runtime identity:");
+      expect(query(invocation)).toContain("Paperclip invocation:\n- Run ID: run-fresh");
+      expect(invocation.systemPrompt).toContain("Paperclip runtime identity:");
+      expect(invocation.systemPrompt).not.toContain("You are agent agent-synthetic (Hermes fixture).");
+    } else {
+      expect(query(invocation)).toContain("Paperclip runtime identity:");
+      expect(query(invocation)).not.toContain("Paperclip invocation:");
+      expect(invocation.systemPrompt).not.toContain("Paperclip runtime identity:");
+      expect(invocation.systemPrompt).toContain("You are agent agent-synthetic (Hermes fixture).");
+    }
   });
 
   it("splits runtime identity, connection guidance, and runtime tools guidance into system prompt under hermes-prompt-split", async () => {
@@ -317,11 +329,15 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(onQuery).not.toContain("Synthetic Slack connection guidance preference.");
     expect(onQuery).not.toContain("Synthetic runtime tools guidance.");
     expect(onQuery).not.toContain("Connection tools:");
+    expect(onQuery).not.toContain("Memory:");
     expect(onQuery).toContain("Complete current synthetic task assignment.");
     expect(onQuery).toContain("## Paperclip Wake Payload");
+    expect(onQuery).toContain("Paperclip invocation:\n- Run ID: run-split-on");
 
     const onSystem = splitOn.systemPrompt!;
     expect(onSystem).not.toContain("You are agent");
+    expect(onSystem).not.toContain("Run ID:");
+    expect(onSystem).not.toContain("run-split-on");
     expect(onSystem.split("Paperclip runtime identity:")).toHaveLength(2);
     expect(onSystem.split("Synthetic Slack connection guidance preference.")).toHaveLength(2);
     expect(onSystem.split("Synthetic runtime tools guidance.")).toHaveLength(2);
@@ -329,12 +345,53 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(onSystem.split("Memory:")).toHaveLength(2);
     expect(onSystem).toContain(INSTRUCTIONS);
 
+    // Verify overlay ordering: instructions -> identity -> initial communication -> runtime tools -> API guidance -> connection tools
+    const instructionsIdx = onSystem.indexOf(INSTRUCTIONS);
+    const identityIdx = onSystem.indexOf("Paperclip runtime identity:");
+    const commGuidanceIdx = onSystem.indexOf("Synthetic Slack connection guidance preference.");
+    const toolsGuidanceIdx = onSystem.indexOf("Synthetic runtime tools guidance.");
+    const apiGuidanceIdx = onSystem.indexOf("Paperclip API guidance:");
+    const connectionToolsIdx = onSystem.indexOf("Connection tools:");
+    expect(instructionsIdx).toBeGreaterThanOrEqual(0);
+    expect(identityIdx).toBeGreaterThan(instructionsIdx);
+    expect(commGuidanceIdx).toBeGreaterThan(identityIdx);
+    expect(toolsGuidanceIdx).toBeGreaterThan(commGuidanceIdx);
+    expect(apiGuidanceIdx).toBeGreaterThan(toolsGuidanceIdx);
+    expect(connectionToolsIdx).toBeGreaterThan(apiGuidanceIdx);
+
     // Flag OFF assertions (byte-identical to today)
     const offQuery = query(splitOff);
-    expect(offQuery).toBe(buildPrompt({ ...ctx, runId: "run-split-off" }, ctx.config));
+    const expectedGoldenQuery = [
+      'You are "Hermes fixture", an AI agent employee in a Paperclip-managed company.',
+      "",
+      "Paperclip runtime identity:",
+      "- Agent ID: agent-synthetic",
+      "- Company ID: company-synthetic",
+      "- Run ID: run-split-off",
+      "- API base: http://127.0.0.1:3100/api",
+      "",
+      "## Paperclip Wake Payload",
+      "",
+      "Use this wake to continue the task, applying new user direction and preserving its approval gates.",
+      "This heartbeat is scoped to the issue below. Do not switch to another issue until you have handled this wake.",
+      "Use this inline wake data first before refetching the issue thread.",
+      "",
+      "- reason: issue_assigned",
+      "- issue: task-synthetic Synthetic task",
+      "- fallback fetch needed: no",
+      "- issue status: in_progress",
+      "",
+      "Synthetic runtime tools guidance.",
+      "",
+      "Synthetic Slack connection guidance preference.",
+      "",
+      "Complete current synthetic task assignment.",
+    ].join("\n");
+    expect(offQuery).toBe(expectedGoldenQuery);
     expect(offQuery).toContain("Paperclip runtime identity:");
     expect(offQuery).toContain("Synthetic Slack connection guidance preference.");
     expect(offQuery).toContain("Synthetic runtime tools guidance.");
+    expect(offQuery).not.toContain("Paperclip invocation:");
 
     const offSystem = splitOff.systemPrompt!;
     expect(offSystem).toContain("You are agent agent-synthetic (Hermes fixture).");
@@ -394,5 +451,50 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(resumed.systemPrompt).not.toContain(INSTRUCTIONS);
     expect(resumed.systemPrompt).toContain("Paperclip API guidance:");
     expect(query(resumed)).toContain("Fresh human direction.");
+  });
+
+  it("fails early and logs to stderr when PAPERCLIP_MEMORY_HARDENING contains an unknown token", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = context({
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+      config: {
+        ...context().config,
+        env: {
+          CAPTURE_PATH: capturePath,
+          PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split,unknown-typo-flag",
+        },
+      },
+    });
+
+    await expect(execute(ctx)).rejects.toThrow("Unknown PAPERCLIP_MEMORY_HARDENING token \"unknown-typo-flag\"");
+    const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+    expect(stderrLogs).toContain("[hermes] Invalid PAPERCLIP_MEMORY_HARDENING configuration:");
+    expect(stderrLogs).toContain("unknown-typo-flag");
+  });
+
+  it("enables prompt split when PAPERCLIP_MEMORY_HARDENING is set in ambient process.env", async () => {
+    const origEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+    process.env.PAPERCLIP_MEMORY_HARDENING = "hermes-prompt-split";
+    try {
+      const ctx = context({
+        config: {
+          ...context().config,
+          env: { CAPTURE_PATH: capturePath },
+        },
+      });
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(query(invocation)).not.toContain("Paperclip runtime identity:");
+      expect(query(invocation)).toContain("Paperclip invocation:\n- Run ID: run-fresh");
+      expect(invocation.systemPrompt).toContain("Paperclip runtime identity:");
+    } finally {
+      if (origEnv !== undefined) {
+        process.env.PAPERCLIP_MEMORY_HARDENING = origEnv;
+      } else {
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+      }
+    }
   });
 });

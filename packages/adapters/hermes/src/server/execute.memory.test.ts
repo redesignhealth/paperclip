@@ -19,6 +19,7 @@ let interceptedOpts: {
   tempHomeAtExecution?: string | null;
   tempHomeExistsAtExecution?: boolean;
   mem0JsonExistedAtExecution?: boolean;
+  promptFileContent?: string | null;
 } = {};
 
 let mockChildProcessBehavior: "success" | "failure" | "timeout" | "throw" | "emit_secrets" | "emit_chunks" | "real_spawn" = "success";
@@ -82,6 +83,16 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
         }
       }
 
+      let promptFileContent: string | null = null;
+      const queryFileIdx = args.indexOf("--query-file");
+      if (queryFileIdx !== -1 && args[queryFileIdx + 1] && args[queryFileIdx + 1] !== "-") {
+        try {
+          promptFileContent = await fs.readFile(args[queryFileIdx + 1], "utf8");
+        } catch {
+          // ignore
+        }
+      }
+
       interceptedOpts = {
         command: cmd,
         args,
@@ -89,6 +100,7 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
         tempHomeAtExecution: tempHome,
         tempHomeExistsAtExecution: tempHomeExists,
         mem0JsonExistedAtExecution: mem0JsonExists,
+        promptFileContent,
       };
 
       if (mockChildProcessBehavior === "throw") {
@@ -961,6 +973,45 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
 
     expect(interceptedOpts.args).toContain("--query-file");
     expect(interceptedOpts.args).not.toContain("-q");
+    expect(interceptedOpts.promptFileContent).toBeTruthy();
+    expect(interceptedOpts.promptFileContent?.startsWith("x".repeat(100))).toBe(true);
+    expect(interceptedOpts.promptFileContent).not.toContain("Paperclip runtime identity:");
+    expect(interceptedOpts.promptFileContent).not.toContain("Initial communication guidance:");
+    expect(interceptedOpts.promptFileContent).not.toContain("You are agent");
+    expect(interceptedOpts.promptFileContent).toContain("Paperclip invocation:");
+    expect(interceptedOpts.promptFileContent).toContain("- Run ID:");
+  });
+
+  it("falls back to keeping relocated content in query when large fresh-session handoff makes candidate system overlay >=128 KiB", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+      onLogCollector: logs,
+    });
+    // Supply task markdown and large fresh-session handoff markdown (which selectInitialCommunicationGuidance includes)
+    const largeHandoff = "Oversized handoff markdown content: ".repeat(5000); // ~180 KiB
+    (ctx as any).context.paperclipTaskMarkdown = "Paperclip task context: brief work description.";
+    (ctx as any).context.paperclipFreshSessionHandoffMarkdown = largeHandoff;
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    // Verify stdout notice was emitted
+    const stdoutLogs = logs.filter((l) => l.stream === "stdout").map((l) => l.chunk).join("");
+    expect(stdoutLogs).toContain("[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.");
+
+    // Because prompt became >= 128 KiB with the relocated content kept in query, it uses --query-file
+    expect(interceptedOpts.args).toContain("--query-file");
+    expect(interceptedOpts.promptFileContent).toBeTruthy();
+    expect(interceptedOpts.promptFileContent).toContain(largeHandoff.trim());
+    // In fallback, query keeps relocated sections
+    expect(interceptedOpts.promptFileContent).toContain("Paperclip runtime identity:");
+
+    // And system prompt stays bounded (<128 KiB)
+    const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+    const systemPrompt = childEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT;
+    expect(Buffer.byteLength(systemPrompt, "utf8")).toBeLessThan(128 * 1024);
+    expect(systemPrompt).not.toContain(largeHandoff);
   });
 
   describe("benign stderr reclassification and logging notices", () => {

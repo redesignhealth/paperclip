@@ -46,6 +46,7 @@ import {
   selectPaperclipPromptSections,
   selectInitialCommunicationGuidance,
   resolveMemoryHardeningFlags,
+  type MemoryHardeningFlags,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -1023,6 +1024,22 @@ export function buildRouterProbeLaunchEnv(finalEnv: Record<string, string | unde
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
 
+export const HERMES_MAX_SYSTEM_PROMPT_BYTES = 128 * 1024;
+
+const HERMES_STATIC_RUNTIME_IDENTITY_TEMPLATE = [
+  'You are "{{agent.name}}", an AI agent employee in a Paperclip-managed company.',
+  "",
+  "Paperclip runtime identity:",
+  "- Agent ID: {{agent.id}}",
+  "- Company ID: {{agent.companyId}}",
+  "- API base: {{paperclipApiUrl}}",
+].join("\n");
+
+const HERMES_RUN_CONTEXT_TEMPLATE = [
+  "Paperclip invocation:",
+  "- Run ID: {{run.id}}",
+].join("\n");
+
 const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
   'You are "{{agent.name}}", an AI agent employee in a Paperclip-managed company.',
   "",
@@ -1064,14 +1081,15 @@ const HERMES_SYSTEM_PROMPT_API_GUIDANCE = [
 ].join("\n");
 
 // Hermes applies this overlay at each API call, including after compaction,
-// without storing it in conversation history. Keep run/task deltas in -q.
+// without storing it in conversation history. Keep run/task deltas (such as Run ID
+// and task briefs) in -q to preserve provider prompt-cache prefix reuse across runs.
 const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   HERMES_SYSTEM_PROMPT_API_GUIDANCE,
   "",
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ].join("\n");
 
-function renderHermesSystemPrompt(
+export function renderHermesSystemPrompt(
   agent: unknown,
   options: { includeDefaultIdentity?: boolean } = {},
 ): string {
@@ -1079,8 +1097,14 @@ function renderHermesSystemPrompt(
   if (includeDefaultIdentity) {
     return renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, { agent });
   }
+  const identityRegex = /^You are agent \{\{agent\.id\}\} \(\{\{agent\.name\}\}\)\.\r?\n\r?\n?/;
+  if (!identityRegex.test(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE)) {
+    throw new Error(
+      "renderHermesSystemPrompt: failed to strip default identity line from DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE; template format may have changed",
+    );
+  }
   const agentTemplate = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.replace(
-    /^You are agent \{\{agent\.id\}\} \(\{\{agent\.name\}\}\)\.\n\n?/,
+    identityRegex,
     "",
   );
   const promptTemplate = [
@@ -1107,22 +1131,23 @@ function renderConditionalSections(template: string, vars: Record<string, unknow
 export interface HermesBuiltPrompt {
   query: string;
   systemSections: string[];
+  hermesPromptSplit: boolean;
 }
 
 export function buildPrompt(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
-  options: { resumedSession?: boolean; returnSections: true },
+  options: { resumedSession?: boolean; returnSections: true; hardeningFlags?: MemoryHardeningFlags },
 ): HermesBuiltPrompt;
 export function buildPrompt(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
-  options?: { resumedSession?: boolean; returnSections?: false },
+  options?: { resumedSession?: boolean; returnSections?: false; hardeningFlags?: MemoryHardeningFlags },
 ): string;
 export function buildPrompt(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
-  options?: { resumedSession?: boolean; returnSections?: boolean },
+  options?: { resumedSession?: boolean; returnSections?: boolean; hardeningFlags?: MemoryHardeningFlags },
 ): string | HermesBuiltPrompt {
   const context = (ctx as any).context || {};
   const template = cfgString(config.promptTemplate);
@@ -1150,7 +1175,8 @@ export function buildPrompt(
     ...process.env,
     ...(userEnvForHardening && typeof userEnvForHardening === "object" ? userEnvForHardening : {}),
   };
-  const { hermesPromptSplit } = resolveMemoryHardeningFlags(envForHardening);
+  const resolvedHardeningFlags = options?.hardeningFlags ?? resolveMemoryHardeningFlags(envForHardening);
+  const hermesPromptSplit = resolvedHardeningFlags.hermesPromptSplit;
 
   const { taskContextNote: taskContextMarkdown, wakePrompt } = selectPaperclipPromptSections(context, {
     resumedSession: options?.resumedSession === true,
@@ -1207,9 +1233,10 @@ export function buildPrompt(
       wakePrompt,
       sessionHandoffMarkdown,
       rendered,
+      renderTemplate(HERMES_RUN_CONTEXT_TEMPLATE, vars),
     ]);
     systemSections = [
-      renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
+      renderTemplate(HERMES_STATIC_RUNTIME_IDENTITY_TEMPLATE, vars),
       initialCommunicationGuidance,
       runtimeGuidance,
     ].filter(Boolean);
@@ -1226,17 +1253,9 @@ export function buildPrompt(
   }
 
   if (options?.returnSections === true) {
-    return { query, systemSections };
+    return { query, systemSections, hermesPromptSplit };
   }
   return query;
-}
-
-export function buildPromptSections(
-  ctx: AdapterExecutionContext,
-  config: Record<string, unknown>,
-  options: { resumedSession?: boolean } = {},
-): HermesBuiltPrompt {
-  return buildPrompt(ctx, config, { ...options, returnSections: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,6 +1433,21 @@ export async function execute(
 
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
+  // Resolve memory hardening flags once early from agreed merged env source
+  const userEnvForHardening = (config.env ?? ctx.config?.env) as Record<string, string> | undefined;
+  const envForHardening = {
+    ...process.env,
+    ...(userEnvForHardening && typeof userEnvForHardening === "object" ? userEnvForHardening : {}),
+  };
+  let hardeningFlags: MemoryHardeningFlags;
+  try {
+    hardeningFlags = resolveMemoryHardeningFlags(envForHardening);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await ctx.onLog("stderr", `[hermes] Invalid PAPERCLIP_MEMORY_HARDENING configuration: ${reason}\n`);
+    throw err;
+  }
+
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
   const configuredModel = normalizeConfiguredModel(cfgString(config.model));
@@ -1556,7 +1590,7 @@ export async function execute(
     }
   }
 
-  // ── Build prompt ───────────────────────────────────────────────────────
+  // ── Build prompt and environment ───────────────────────────────────────
   const userEnvForPrompt = config.env as Record<string, unknown> | undefined;
   const promptConfig: Record<string, unknown> = { ...config };
   if (!cfgString(promptConfig.paperclipApiUrl) && userEnvForPrompt && typeof userEnvForPrompt === "object") {
@@ -1572,8 +1606,72 @@ export async function execute(
   const builtPrompt = buildPrompt(ctx, promptConfig, {
     resumedSession: Boolean(sessionId),
     returnSections: true,
+    hardeningFlags,
   });
-  const prompt = builtPrompt.query;
+
+  const userEnv = config.env as Record<string, string> | undefined;
+  // TECH-7076: never spread the whole server process.env into the agent. It carries
+  // server-only secrets (SSO provider definitions, Better Auth secret, secrets master
+  // key, database URLs, cloud credentials, the server's own provider keys) that the
+  // agent's terminal tool could print before log redaction. Start from the strict
+  // allowlisted base; credentials come only from explicit config/managed AI connection.
+  const env: Record<string, string> = {
+    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
+    ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
+    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
+  };
+
+  let prompt = builtPrompt.query;
+  let systemSectionsToApply = builtPrompt.systemSections;
+  let useSplitDefaultIdentity = builtPrompt.hermesPromptSplit;
+
+  if (builtPrompt.hermesPromptSplit) {
+    const candidateOverlay = joinPromptSections([
+      env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+      agentInstructions,
+      ...systemSectionsToApply,
+      renderHermesSystemPrompt(ctx.agent, {
+        includeDefaultIdentity: false,
+      }),
+    ]);
+    if (Buffer.byteLength(candidateOverlay, "utf8") >= HERMES_MAX_SYSTEM_PROMPT_BYTES) {
+      // Ephemeral system prompt would exceed Linux MAX_ARG_STRLEN (128 KiB).
+      // Fall back: keep relocated sections in the query (-q / --query-file) instead of the system prompt.
+      await ctx.onLog(
+        "stdout",
+        "[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.\n",
+      );
+      const fallbackPrompt = buildPrompt(ctx, promptConfig, {
+        resumedSession: Boolean(sessionId),
+        returnSections: true,
+        hardeningFlags: { ...hardeningFlags, hermesPromptSplit: false },
+      });
+      prompt = fallbackPrompt.query;
+      systemSectionsToApply = [];
+      useSplitDefaultIdentity = false;
+    }
+  }
+
+  // Scope the overlay to this child process. Read the current bundle on every
+  // invocation; never infer its availability from a persisted session ID.
+  // Preserve an operator's explicit overlay before Paperclip's instructions.
+  const finalSystemPrompt = joinPromptSections([
+    env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+    agentInstructions,
+    ...systemSectionsToApply,
+    renderHermesSystemPrompt(ctx.agent, {
+      includeDefaultIdentity: !useSplitDefaultIdentity,
+    }),
+  ]);
+
+  const finalSystemPromptBytes = Buffer.byteLength(finalSystemPrompt, "utf8");
+  if (finalSystemPromptBytes >= HERMES_MAX_SYSTEM_PROMPT_BYTES) {
+    const errorMsg = `[hermes] HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds maximum argument size (${finalSystemPromptBytes} bytes >= ${HERMES_MAX_SYSTEM_PROMPT_BYTES} bytes limit)`;
+    await ctx.onLog("stderr", `${errorMsg}\n`);
+    throw new Error(errorMsg);
+  }
+
+  env.HERMES_EPHEMERAL_SYSTEM_PROMPT = finalSystemPrompt;
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
@@ -1626,38 +1724,6 @@ export async function execute(
   // Failed resumes remain failures. Do not infer a safe restart from CLI text.
   if (sessionId) args.push("--resume", sessionId);
   if (extraArgs?.length) args.push(...extraArgs);
-
-  // ── Build environment ──────────────────────────────────────────────────
-  const userEnv = config.env as Record<string, string> | undefined;
-  // TECH-7076: never spread the whole server process.env into the agent. It carries
-  // server-only secrets (SSO provider definitions, Better Auth secret, secrets master
-  // key, database URLs, cloud credentials, the server's own provider keys) that the
-  // agent's terminal tool could print before log redaction. Start from the strict
-  // allowlisted base; credentials come only from explicit config/managed AI connection.
-  const env: Record<string, string> = {
-    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
-    ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
-  };
-
-  const userEnvForHardening = (config.env ?? ctx.config?.env) as Record<string, string> | undefined;
-  const envForHardening = {
-    ...process.env,
-    ...(userEnvForHardening && typeof userEnvForHardening === "object" ? userEnvForHardening : {}),
-  };
-  const { hermesPromptSplit } = resolveMemoryHardeningFlags(envForHardening);
-
-  // Scope the overlay to this child process. Read the current bundle on every
-  // invocation; never infer its availability from a persisted session ID.
-  // Preserve an operator's explicit overlay before Paperclip's instructions.
-  env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
-    env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-    agentInstructions,
-    ...builtPrompt.systemSections,
-    renderHermesSystemPrompt(ctx.agent, {
-      includeDefaultIdentity: !hermesPromptSplit,
-    }),
-  ]);
 
   // TECH-7895: a Router run needs the canonical RAMP_ROUTER_API_KEY itself; another provider's key
   // never satisfies it, and the provider is never switched. Key precedence:
@@ -1971,6 +2037,7 @@ export async function execute(
         servers: runtimeMcpServers,
         memory: memoryConfig ?? undefined,
         config,
+        flags: hardeningFlags,
         onWarning: onCleanupWarning,
         canonicalRouterEndpoint: isRouterRun,
         isolatedFromHost: hostIsolated,
