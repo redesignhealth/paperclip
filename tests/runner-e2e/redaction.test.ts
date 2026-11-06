@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assertSecretFree,
+  childSecretValues,
   extractDsnSecrets,
   findSecretLeak,
   findSecretLeakInDirectory,
@@ -128,6 +129,68 @@ describe("extractDsnSecrets", () => {
   });
 });
 
+describe("childSecretValues", () => {
+  const dsn =
+    "postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres?sslmode=require";
+  const credentials = {
+    OPENAI_API_KEY: "sk-test-canary-private-12345",
+  };
+
+  it("builds secret set with credentials, exact full DSN, and extracted password", () => {
+    const secrets = childSecretValues(credentials, dsn);
+    expect(secrets).toContain(credentials.OPENAI_API_KEY);
+    expect(secrets).toContain(dsn);
+    expect(secrets).toContain("superSecretDsnPass987");
+    // Does NOT broaden username or host independently into secrets
+    expect(secrets).not.toContain("eval_admin");
+    expect(secrets).not.toContain("db.internal");
+  });
+
+  it("redacts exact full DSN and partial DSN password, but not isolated username or host", () => {
+    const secrets = childSecretValues(credentials, dsn);
+
+    // 1. Exact full DSN is redacted
+    const fullDsnLeak = `Error connecting to database: ${dsn}`;
+    expect(() => assertSecretFree(fullDsnLeak, secrets, "full-dsn.log")).toThrow(
+      /Secret leak in full-dsn\.log/,
+    );
+    const sanitizedFull = sanitizeJson({ err: fullDsnLeak }, secrets) as { err: string };
+    expect(sanitizedFull.err).not.toContain(dsn);
+    expect(sanitizedFull.err).toContain("[REDACTED]");
+
+    // 2. Partial DSN password is independently redacted
+    const partialPasswordLeak = "Auth failure: password=superSecretDsnPass987 expired";
+    expect(() => assertSecretFree(partialPasswordLeak, secrets, "partial.log")).toThrow(
+      /Secret leak in partial\.log/,
+    );
+    const sanitizedPartial = sanitizeJson({ err: partialPasswordLeak }, secrets) as { err: string };
+    expect(sanitizedPartial.err).not.toContain("superSecretDsnPass987");
+    expect(sanitizedPartial.err).toContain("[REDACTED]");
+
+    // 3. Isolated username or host fragments are NOT treated as independent secrets
+    const unredactedFragments = "Connection error for user eval_admin on host db.internal";
+    expect(() => assertSecretFree(unredactedFragments, secrets, "clean.log")).not.toThrow();
+    const sanitizedClean = sanitizeJson({ info: unredactedFragments }, secrets) as { info: string };
+    expect(sanitizedClean.info).toContain("eval_admin");
+    expect(sanitizedClean.info).toContain("db.internal");
+    expect(sanitizedClean.info).not.toContain("[REDACTED]");
+  });
+
+  it("handles undefined, empty, or passwordless admin DSN cleanly", () => {
+    const secretsUndefined = childSecretValues(credentials, undefined);
+    expect(secretsUndefined).toContain(credentials.OPENAI_API_KEY);
+    expect(secretsUndefined).not.toContain(undefined);
+
+    const secretsEmpty = childSecretValues(credentials, "   ");
+    expect(secretsEmpty).toContain(credentials.OPENAI_API_KEY);
+
+    const noPassDsn = "postgresql://eval_admin@db.internal:5432/postgres";
+    const secretsNoPass = childSecretValues(credentials, noPassDsn);
+    expect(secretsNoPass).toContain(noPassDsn);
+    expect(secretsNoPass).not.toContain("eval_admin");
+  });
+});
+
 describe("campaignSecretValues and attemptSecretValues", () => {
   const dsn =
     "postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres?sslmode=require";
@@ -165,6 +228,7 @@ describe("campaignSecretValues and attemptSecretValues", () => {
     const sanitized = sanitizeJson({ error: raw }, secrets) as { error: string };
     expect(sanitized.error).not.toContain(dsn);
     expect(sanitized.error).not.toContain("superSecretDsnPass987");
+    // Username and host inside the full DSN were redacted along with the full DSN string
     expect(sanitized.error).not.toContain("eval_admin");
     expect(sanitized.error).not.toContain("db.internal");
     expect(sanitized.error).toContain("[REDACTED]");
@@ -214,12 +278,19 @@ describe("campaignSecretValues and attemptSecretValues", () => {
     const safeCampaign = sanitizeJson(campaignData, campaignSecrets);
     const safeJson = JSON.stringify(safeCampaign, null, 2);
     expect(() => assertSecretFree(safeJson, campaignSecrets, "campaign.json")).not.toThrow();
-    // Full DSN is completely redacted, including username, password, host, and database
+    // The exact full DSN string is redacted as a whole (removing the entire DSN which contained
+    // username, password, host, and database), and the password is independently redacted.
+    // Isolated username or host fragments appearing on their own are not independent secrets.
     expect(safeJson).not.toContain(dsn);
     expect(safeJson).not.toContain("superSecretDsnPass987");
     expect(safeJson).not.toContain("eval_admin");
     expect(safeJson).not.toContain("db.internal");
     expect(safeJson).toContain("[REDACTED]");
+
+    // Verify isolated username or host fragments are NOT redacted when appearing on their own
+    const isolatedMsg = { error: "Connected as user eval_admin to host db.internal" };
+    const safeIsolated = sanitizeJson(isolatedMsg, campaignSecrets) as { error: string };
+    expect(safeIsolated.error).toBe("Connected as user eval_admin to host db.internal");
   });
 
   it("gating rule: strips admin DSN from childEnv when !hasMemoryRecall, retains when hasMemoryRecall", () => {

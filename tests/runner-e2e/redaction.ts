@@ -99,9 +99,28 @@ export function extractDsnSecrets(dsn: string | undefined): string[] {
   return [...secrets].filter((s) => s.length >= 4);
 }
 
-export function normalizedSecrets(values: readonly (string | undefined)[]) {
-  return [...new Set(values.flatMap(value => secretEntries(value).map(entry => entry.value)))].sort((left, right) => right.length - left.length);
+export function normalizedSecrets(values: readonly (string | undefined | null)[]) {
+  return [...new Set(values.flatMap(value => secretEntries(value ?? undefined).map(entry => entry.value)))].sort((left, right) => right.length - left.length);
 }
+
+export function childSecretValues(
+  credentials:
+    | readonly (string | undefined | null)[]
+    | Record<string, string | undefined | null>,
+  adminDsn?: string | null,
+  extra: readonly (string | undefined | null)[] = [],
+): string[] {
+  const creds = Array.isArray(credentials) ? credentials : Object.values(credentials);
+  const rawDsn = adminDsn?.trim() || undefined;
+  const dsnSecrets = extractDsnSecrets(rawDsn);
+  return normalizedSecrets([
+    ...creds,
+    rawDsn,
+    ...dsnSecrets,
+    ...extra,
+  ]);
+}
+export const buildChildSecrets = childSecretValues;
 
 export interface SecretScanOptions {
   includeShapes?: boolean;

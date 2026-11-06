@@ -82,10 +82,9 @@ import {
 import {
   assertSecretFree,
   findSecretLeakInJsonValues,
-  normalizedSecrets,
   sanitizeJson,
   browserDiagnosticUrl,
-  extractDsnSecrets,
+  childSecretValues,
 } from "./redaction.js";
 import {
   CREDENTIAL_NAMES,
@@ -603,8 +602,10 @@ for (const execution of executions) {
       verifyNativeInstructionPreflight(process.env[NATIVE_INSTRUCTION_PREFLIGHT_ENV]);
     }
     const credentials = credentialValues();
-    const dsnSecrets = extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
-    const secrets = normalizedSecrets([...Object.values(credentials), ...dsnSecrets]);
+    const secrets = childSecretValues(
+      credentials,
+      process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
+    );
     const api = new RunnerApi(request);
     const companyRunFlow = execution.suite.id === "task-titles" || ["plan_task_guidance", "blocker_guidance", "continuation_accounting", "continuation", "context_integrity", "repository_skills", "agent_chat", "everyday_workflow", "first_task", "instruction_persistence", "pi_native", "pi_controls", "copilot_protection", "cursor_native", "native_active_stop", "native_provider_loss", "public_mcp", "case_handoff", "memory_recall"].includes(execution.task.flow);
     const publicMcpUsage = execution.task.flow === "public_mcp" ? assistantUsage(execution.profile.provider === "claude" ? "anthropic" : "openai", execution.profile.model) : undefined;

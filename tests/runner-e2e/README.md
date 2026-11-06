@@ -379,6 +379,7 @@ Executing this suite requires:
 
 - **Database**: Embedded PostgreSQL used by other local tests lacks TLS and pgvector, so an external pgvector PostgreSQL server is required.
 - **Tenant Isolation**: Each execution cell creates an isolated company, which lazily provisions a tenant database named `pcmem_<sha256(companyId)[0:32]>` with its own dedicated unprivileged role. During flow teardown, this tenant database is dropped cleanly.
+- **Admin DSN Forwarding & Redaction**: `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` is forwarded to child test runner processes only for batches executing the `memory-recall` suite; it is stripped from child environments for all other suites. Redaction covers the exact full DSN string as well as partial DSN secrets (the extracted password); arbitrary username and host fragments are not treated as independent secrets.
 - **Provider Spend**: Cells incur real external API billing on OpenRouter and OpenAI.
 
 ### Hardening Flags and Blocked Lanes

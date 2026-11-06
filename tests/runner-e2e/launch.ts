@@ -39,7 +39,7 @@ import {
 import { assertEmbeddedDatabaseIsolation } from "./instance-isolation.js";
 import {
   assertSecretFree,
-  extractDsnSecrets,
+  childSecretValues,
   findSecretLeakInDirectory,
   isEphemeralCodexRuntimeAuthFile,
   isEphemeralPostgresScanFile,
@@ -522,24 +522,20 @@ export function attemptSecretValues(
   const extra = Array.isArray(generatedSecrets)
     ? generatedSecrets
     : Object.values(generatedSecrets);
-  const dsnSecrets = extractDsnSecrets(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
-  return normalizedSecrets([
-    ...CREDENTIAL_NAMES.map((name) => env[name]),
+  return childSecretValues(
+    CREDENTIAL_NAMES.map((name) => env[name]),
     env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
-    ...dsnSecrets,
-    ...extra,
-  ]);
+    extra,
+  );
 }
 
 export function campaignSecretValues(
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
-  const dsnSecrets = extractDsnSecrets(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
-  return normalizedSecrets([
-    ...CREDENTIAL_NAMES.map((name) => env[name]),
+  return childSecretValues(
+    CREDENTIAL_NAMES.map((name) => env[name]),
     env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
-    ...dsnSecrets,
-  ]);
+  );
 }
 
 async function runAttempt(input: {
