@@ -179,7 +179,7 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
       handleEmbeddedPostgresUnsupported(
         { supported: false, reason: "local missing binary" },
         mockT,
-        undefined,
+        "",
       );
     });
     assert.equal(skippedReason, "local missing binary");
