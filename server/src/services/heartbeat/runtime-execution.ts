@@ -21,7 +21,7 @@ import {
   attachPaperclipSessionMetadataToSessionParams,
 } from "./workspaces.js";
 import { recordLegacyWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
-import { resolveHeartbeatRuntimeMemory } from "./runtime-memory.js";
+import { adapterSupportsRuntimeMemory, resolveHeartbeatRuntimeMemory } from "./runtime-memory.js";
 import { projectToolDefinitions } from "../project-tools.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildAgentIdentityEnv, resolveEffectiveMemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
@@ -816,10 +816,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
       const agentEnv = (runtimeConfig?.env ?? (agent.adapterConfig as Record<string, unknown> | null)?.env) as Record<string, string | undefined> | undefined;
-      const hardeningFlags = resolveEffectiveMemoryHardeningFlags(
-        process.env,
-        agentEnv,
-      );
+      const hardeningFlags = adapterSupportsRuntimeMemory(agent.adapterType)
+        ? resolveEffectiveMemoryHardeningFlags(
+            process.env,
+            agentEnv,
+          )
+        : undefined;
       const runtimeMemory = await resolveHeartbeatRuntimeMemory({
         db,
         agent,

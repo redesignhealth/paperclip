@@ -65,6 +65,25 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
     expect(adapterSupportsRuntimeMemory(undefined)).toBe(false);
   });
 
+  it("resolveHeartbeatRuntimeMemory returns undefined and does not throw for non-Hermes adapters even if process.env contains unknown hardening tokens", async () => {
+    const prevEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+    try {
+      process.env.PAPERCLIP_MEMORY_HARDENING = "completely_unknown_token";
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "claude_local", companyId },
+        runId,
+      });
+      expect(runtimeMemory).toBeUndefined();
+    } finally {
+      if (prevEnv === undefined) {
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+      } else {
+        process.env.PAPERCLIP_MEMORY_HARDENING = prevEnv;
+      }
+    }
+  });
+
   it("eligible hermes_local builds runtimeMemory with approved model (gpt-5.4-mini), embedding_dims, and registers secret", async () => {
     vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
       companyScope: "allowlist",
