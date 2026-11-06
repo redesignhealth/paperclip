@@ -6,7 +6,12 @@ import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
-import { type ValidatedHermesMemoryConfig, serializeMem0Json, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
+import {
+  type ValidatedHermesMemoryConfig,
+  serializeMem0Json,
+  generateHermesMemoryYaml,
+  MAX_CONFIG_STRING_LENGTH,
+} from "./memory-config.js";
 
 export interface HermesMcpServerConfig {
   url: string;
@@ -427,8 +432,7 @@ export function serializeHermesMcpYaml(
   }
 
   if (hasMemory) {
-    lines.push("memory:");
-    lines.push("  provider: mem0");
+    lines.push(generateHermesMemoryYaml().trimEnd());
     lines.push("");
   }
 

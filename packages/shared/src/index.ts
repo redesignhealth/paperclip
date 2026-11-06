@@ -2860,3 +2860,10 @@ export * from "./agent-observability.js";
 export * from "./prompt-injection-prevention.js";
 
 export * from "./workspace-provider.js";
+
+export {
+  resolveMemoryHardeningFlags,
+  MemoryHardeningConfigurationError,
+  type MemoryHardeningFlags,
+} from "./memory-hardening.js";
+
