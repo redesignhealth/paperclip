@@ -602,7 +602,37 @@ for (const execution of executions) {
       verifyNativeInstructionPreflight(process.env[NATIVE_INSTRUCTION_PREFLIGHT_ENV]);
     }
     const credentials = credentialValues();
-    const secrets = normalizedSecrets(Object.values(credentials));
+    const dsnSecrets: string[] = [];
+    const memoryAdminDsn = process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL;
+    if (memoryAdminDsn) {
+      try {
+        const parsedUrl = new URL(memoryAdminDsn);
+        if (parsedUrl.password) {
+          // Add raw password before decoding so URIError from decodeURIComponent never leaves raw password unredacted
+          dsnSecrets.push(parsedUrl.password);
+          try {
+            const decoded = decodeURIComponent(parsedUrl.password);
+            if (decoded && decoded !== parsedUrl.password) {
+              dsnSecrets.push(decoded);
+            }
+          } catch {
+            // raw password already added
+          }
+        }
+      } catch {
+        const match = memoryAdminDsn.match(/:\/\/[^:]+:([^@]+)@/);
+        if (match?.[1]) {
+          dsnSecrets.push(match[1]);
+          try {
+            const decoded = decodeURIComponent(match[1]);
+            if (decoded && decoded !== match[1]) {
+              dsnSecrets.push(decoded);
+            }
+          } catch {}
+        }
+      }
+    }
+    const secrets = normalizedSecrets([...Object.values(credentials), ...dsnSecrets]);
     const api = new RunnerApi(request);
     const companyRunFlow = execution.suite.id === "task-titles" || ["plan_task_guidance", "blocker_guidance", "continuation_accounting", "continuation", "context_integrity", "repository_skills", "agent_chat", "everyday_workflow", "first_task", "instruction_persistence", "pi_native", "pi_controls", "copilot_protection", "cursor_native", "native_active_stop", "native_provider_loss", "public_mcp", "case_handoff", "memory_recall"].includes(execution.task.flow);
     const publicMcpUsage = execution.task.flow === "public_mcp" ? assistantUsage(execution.profile.provider === "claude" ? "anthropic" : "openai", execution.profile.model) : undefined;
@@ -1216,20 +1246,6 @@ for (const execution of executions) {
         });
         issue = firstTask.issue as IssueRecord; selectedRuns = firstTask.runs as RunRecord[];
       } else if (execution.task.flow === "memory_recall") {
-        const adminDsn = process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL;
-        let dsnSecrets: string[] = [];
-        if (adminDsn) {
-          try {
-            const parsedUrl = new URL(adminDsn);
-            if (parsedUrl.password) {
-              dsnSecrets = [
-                parsedUrl.password,
-                decodeURIComponent(parsedUrl.password),
-              ].filter(Boolean);
-            }
-          } catch {}
-        }
-        const effectiveSecrets = [...secrets, ...dsnSecrets];
         const memoryRecall = await runMemoryRecallFlow({
           api, fixtures, execution, nonce, workspacePath,
           deadlineAt: startedAtMs + deadlineMs,
@@ -1238,7 +1254,7 @@ for (const execution of executions) {
             selectedRuns = currentRuns as unknown as RunRecord[];
             matcherResults = checks.map(check => ({ matcher: { kind: "json_path" as const, path: `memoryRecall.${check.id}`, expected: true }, passed: check.passed, detail: check.detail }));
           },
-          evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, effectiveSecrets),
+          evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),
         });
         issue = memoryRecall.issue as unknown as IssueRecord;
         selectedRuns = memoryRecall.runs as unknown as RunRecord[];

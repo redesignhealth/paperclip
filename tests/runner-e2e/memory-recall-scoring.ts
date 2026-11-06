@@ -192,16 +192,27 @@ export function summarizeMemories(memories: MemoryItem[]): {
 
 function selectDraftRun(
   runs: readonly MemoryRecallRunRecord[],
-  issues?: Array<{ id: string }>,
+  issues?: Array<{ id: string; title?: string }>,
 ): MemoryRecallRunRecord | undefined {
-  return (
-    runs.find(
-      (r) =>
-        r.issueId &&
-        r.issueId !== issues?.[0]?.id &&
-        r.issueId !== issues?.[1]?.id,
-    ) ?? runs[runs.length - 1]
-  );
+  if (!runs || runs.length === 0) return undefined;
+  if (!issues || issues.length === 0) {
+    return runs[runs.length - 1];
+  }
+  const draftIssue = issues[issues.length - 1];
+  if (draftIssue) {
+    const runForDraft = runs.find((r) => r.issueId === draftIssue.id);
+    if (runForDraft) return runForDraft;
+  }
+  const nonControlRuns = runs.filter((r) => {
+    if (!r.issueId) return false;
+    const isControl = issues[0]?.id && r.issueId === issues[0].id;
+    const isSeed = issues.length > 1 && issues[1]?.id && r.issueId === issues[1].id;
+    return !isControl && !isSeed;
+  });
+  if (nonControlRuns.length > 0) {
+    return nonControlRuns[nonControlRuns.length - 1];
+  }
+  return runs[runs.length - 1];
 }
 
 export function gradeMemoryRecall(input: {
@@ -274,7 +285,8 @@ export function gradeMemoryRecall(input: {
           .filter(
             (c) =>
               c.issueId === runB?.issueId &&
-              (!c.createdByRunId || !runB?.id || c.createdByRunId === runB.id),
+              runB?.id !== undefined &&
+              c.createdByRunId === runB.id,
           )
           .map((c) => c.body),
       ].join("\n");
@@ -297,7 +309,8 @@ export function gradeMemoryRecall(input: {
           .filter(
             (c) =>
               c.issueId === draftRun?.issueId &&
-              (!c.createdByRunId || !draftRun?.id || c.createdByRunId === draftRun.id),
+              draftRun?.id !== undefined &&
+              c.createdByRunId === draftRun.id,
           )
           .map((c) => c.body),
       ].join("\n");
@@ -356,7 +369,8 @@ export function gradeMemoryRecall(input: {
           .filter(
             (c) =>
               c.issueId === agentYRun?.issueId &&
-              (!c.createdByRunId || !agentYRun?.id || c.createdByRunId === agentYRun.id),
+              agentYRun?.id !== undefined &&
+              c.createdByRunId === agentYRun.id,
           )
           .map((c) => c.body),
       ].join("\n");
@@ -404,7 +418,18 @@ export function gradeMemoryRecall(input: {
       );
 
       const legitimateEmpty = summary.totalCount === 0 && heartbeatRuns.length >= 10;
-      const memoryObservationValid = Array.isArray(obs.memories) && (summary.totalCount > 0 || legitimateEmpty);
+      const allWellFormed =
+        summary.totalCount > 0 &&
+        memories.every(
+          (m) =>
+            m &&
+            typeof m.id === "string" &&
+            m.id.trim().length > 0 &&
+            typeof m.data === "string" &&
+            m.data.trim().length > 0,
+        );
+      const memoryObservationValid =
+        Array.isArray(obs.memories) && (allWellFormed || legitimateEmpty);
       check(
         "noise-memory-observation",
         memoryObservationValid,
@@ -412,7 +437,9 @@ export function gradeMemoryRecall(input: {
           ? "Memory observation is missing or invalid."
           : summary.totalCount === 0 && heartbeatRuns.length < 10
             ? "Empty memory outcome is only valid when all 10 heartbeat runs completed successfully."
-            : "Valid memory observation recorded.",
+            : summary.totalCount > 0 && !allWellFormed
+              ? "Observed memory records contain malformed or empty data."
+              : "Valid memory observation recorded.",
       );
 
       if (flags.hermesMemoryConfig) {
@@ -493,7 +520,8 @@ export function gradeMemoryRecall(input: {
         .filter(
           (c) =>
             c.issueId === draftRun?.issueId &&
-            (!c.createdByRunId || !draftRun?.id || c.createdByRunId === draftRun.id),
+            draftRun?.id !== undefined &&
+            c.createdByRunId === draftRun.id,
         )
         .map((c) => c.body),
     ].join("\n");

@@ -140,8 +140,18 @@ export const memoryRecallTasks: readonly RunnerTaskFixture[] =
         expectedRunCount:
           caseId === "noise" ? 10 : caseId === "implicit-recall" ? 3 : 2,
         attemptTimeoutMs: {
-          local: caseId === "noise" ? 20 * 60_000 : 8 * 60_000,
-          daytona: caseId === "noise" ? 25 * 60_000 : 12 * 60_000,
+          local:
+            caseId === "noise"
+              ? 20 * 60_000
+              : caseId === "implicit-recall"
+                ? 12 * 60_000
+                : 8 * 60_000,
+          daytona:
+            caseId === "noise"
+              ? 25 * 60_000
+              : caseId === "implicit-recall"
+                ? 18 * 60_000
+                : 12 * 60_000,
         },
         expectedTerminalState: {
           issue: "done",

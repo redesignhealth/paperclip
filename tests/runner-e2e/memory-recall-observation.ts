@@ -126,9 +126,9 @@ export interface TenantMemoryReader {
 }
 
 export const TEST_TENANT_DB_REGEX =
-  /^paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$/;
+  /^(?:pcmem_[0-9a-f]{32}|paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12})$/;
 export const TEST_TENANT_ROLE_REGEX =
-  /^paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}_owner$/;
+  /^(?:pcmem_r_[0-9a-f]{32}|paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}_owner)$/;
 
 export async function openTenantReader(
   adminDsn: string,
@@ -220,13 +220,27 @@ export async function dropTenantDatabase(
     `);
     await sql.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} WITH (FORCE);`);
     if (roleName) {
+      let roleDepError: unknown;
       try {
         await sql.unsafe(`REASSIGN OWNED BY ${quoteIdentifier(roleName)} TO CURRENT_USER;`);
         await sql.unsafe(`DROP OWNED BY ${quoteIdentifier(roleName)};`);
-      } catch {
-        // best-effort reassignment/drop owned
+      } catch (err) {
+        roleDepError = err;
+        console.warn(
+          `[dropTenantDatabase] REASSIGN/DROP OWNED failed for role "${roleName}": ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
-      await sql.unsafe(`DROP ROLE IF EXISTS ${quoteIdentifier(roleName)};`);
+      try {
+        await sql.unsafe(`DROP ROLE IF EXISTS ${quoteIdentifier(roleName)};`);
+      } catch (err) {
+        if (roleDepError) {
+          throw new AggregateError(
+            [roleDepError, err],
+            `Failed to drop role "${roleName}" after dependency cleanup failure: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        throw err;
+      }
     }
   } finally {
     await sql.end({ timeout: 5 });
@@ -241,8 +255,24 @@ export interface ServerBootProof {
 
 export function extractBootProof(serverLogContent: string): ServerBootProof {
   const lines = serverLogContent.split(/\r?\n/);
-  let memoryInitLine: string | undefined;
-  let resolvedFlags: MemoryHardeningFlags | undefined;
+
+  interface BootCandidate {
+    initLine?: string;
+    pid?: number | string;
+    flags?: MemoryHardeningFlags;
+  }
+
+  function isNewLogEntryStart(line: string): boolean {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith("{")) return true;
+    if (/^\[?\d{2,4}[-:/.]/.test(trimmed)) return true;
+    if (/^\[?(?:INFO|WARN|ERROR|DEBUG|TRACE)\]?/i.test(trimmed)) return true;
+    return false;
+  }
+
+  const boots: BootCandidate[] = [];
+  let currentBoot: BootCandidate = {};
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i]!;
@@ -259,68 +289,115 @@ export function extractBootProof(serverLogContent: string): ServerBootProof {
       // not JSON line
     }
 
-    if (
+    const isInitLine =
       rawLine.includes("[company-memory] Initialized company memory configuration") ||
-      text.includes("[company-memory] Initialized company memory configuration")
-    ) {
-      const window = lines.slice(i, Math.min(i + 15, lines.length)).join("\n");
-      const hasEnabledTrue =
-        (parsedObj && parsedObj.enabled === true) ||
-        /["']?enabled["']?\s*:\s*true\b/i.test(window);
-      const hasCompanyScopeAll =
-        (parsedObj && parsedObj.companyScope === "all") ||
-        /["']?companyScope["']?\s*:\s*["']all["']/i.test(window);
-      if (hasEnabledTrue && hasCompanyScopeAll) {
-        memoryInitLine = rawLine.trim();
+      text.includes("[company-memory] Initialized company memory configuration");
+
+    if (isInitLine) {
+      let qualifies = false;
+      if (parsedObj && typeof parsedObj === "object") {
+        const hasEnabledField = "enabled" in parsedObj;
+        const hasScopeField = "companyScope" in parsedObj;
+        if (hasEnabledField || hasScopeField) {
+          if (parsedObj.enabled === true && parsedObj.companyScope === "all") {
+            qualifies = true;
+          }
+        } else {
+          qualifies = checkBoundedWindow(i);
+        }
+      } else {
+        qualifies = checkBoundedWindow(i);
+      }
+
+      if (qualifies) {
+        if (currentBoot.initLine) {
+          boots.push(currentBoot);
+          currentBoot = {};
+        }
+        currentBoot.initLine = rawLine.trim();
+        if (parsedObj?.pid !== undefined) {
+          currentBoot.pid = parsedObj.pid;
+        }
       }
     }
 
-    if (
-      rawLine.includes("[company-memory-hardening] Server resolved hardening flags:") ||
-      text.includes("[company-memory-hardening] Server resolved hardening flags:")
-    ) {
-      const source = text.includes("[company-memory-hardening] Server resolved hardening flags:")
+    const isFlagsLine =
+      (rawLine.includes("[company-memory-hardening]") || text.includes("[company-memory-hardening]")) &&
+      (rawLine.includes("resolved hardening flags") || text.includes("resolved hardening flags"));
+
+    if (isFlagsLine) {
+      const source = (text.includes("[company-memory-hardening]") && text.includes("resolved hardening flags:"))
         ? text
         : rawLine;
-      const idx = source.indexOf("[company-memory-hardening] Server resolved hardening flags:");
-      const rawJson = source
-        .slice(idx + "[company-memory-hardening] Server resolved hardening flags:".length)
-        .trim();
-      try {
-        const parsed = JSON.parse(rawJson);
-        if (
-          parsed &&
-          typeof parsed === "object" &&
-          typeof parsed.hermesMemoryConfig === "boolean" &&
-          typeof parsed.hermesPromptSplit === "boolean" &&
-          typeof parsed.agentScopedMem0 === "boolean" &&
-          typeof parsed.capabilityMemoryGuidance === "boolean"
-        ) {
-          resolvedFlags = parsed;
+      const flagsMatch = /(?:\[company-memory-hardening\][^\n:]*resolved hardening flags(?:[^\n:]*)?:\s*)(.*)/.exec(source);
+      if (flagsMatch && flagsMatch[1]) {
+        try {
+          const parsed = JSON.parse(flagsMatch[1].trim());
+          if (
+            parsed &&
+            typeof parsed === "object" &&
+            typeof parsed.hermesMemoryConfig === "boolean" &&
+            typeof parsed.hermesPromptSplit === "boolean" &&
+            typeof parsed.agentScopedMem0 === "boolean" &&
+            typeof parsed.capabilityMemoryGuidance === "boolean"
+          ) {
+            if (currentBoot.pid !== undefined && parsedObj?.pid !== undefined && currentBoot.pid !== parsedObj.pid) {
+              boots.push(currentBoot);
+              currentBoot = { flags: parsed, pid: parsedObj.pid };
+            } else {
+              currentBoot.flags = parsed;
+              if (currentBoot.pid === undefined && parsedObj?.pid !== undefined) {
+                currentBoot.pid = parsedObj.pid;
+              }
+            }
+          }
+        } catch {
+          // invalid JSON line
         }
-      } catch {
-        // invalid JSON line
       }
     }
   }
 
-  if (!memoryInitLine) {
+  boots.push(currentBoot);
+
+  function checkBoundedWindow(startIdx: number): boolean {
+    const windowLines: string[] = [lines[startIdx]!];
+    for (let j = startIdx + 1; j < Math.min(startIdx + 15, lines.length); j++) {
+      const candidateLine = lines[j]!;
+      if (isNewLogEntryStart(candidateLine)) {
+        break;
+      }
+      windowLines.push(candidateLine);
+    }
+    const windowText = windowLines.join("\n");
+    if (/["']?enabled["']?\s*:\s*false\b/i.test(windowText)) return false;
+    if (/["']?companyScope["']?\s*:\s*["'](?!all["'])/i.test(windowText)) return false;
+    const hasEnabledTrue = /["']?enabled["']?\s*:\s*true\b/i.test(windowText);
+    const hasCompanyScopeAll = /["']?companyScope["']?\s*:\s*["']all["']/i.test(windowText);
+    return hasEnabledTrue && hasCompanyScopeAll;
+  }
+
+  const hasAnyInitLine = boots.some((b) => b.initLine);
+  if (!hasAnyInitLine) {
     throw new Error(
       "Server log missing required '[company-memory] Initialized company memory configuration' with enabled=true and companyScope='all'",
     );
   }
 
-  if (!resolvedFlags) {
+  const validBoot = boots.reverse().find((b) => Boolean(b.initLine && b.flags));
+  if (!validBoot || !validBoot.initLine || !validBoot.flags) {
     throw new Error(
       "Server log missing required '[company-memory-hardening] Server resolved hardening flags' proof line with server-resolved flags",
     );
   }
 
+  const line = validBoot.initLine;
+  const flags = validBoot.flags;
   return {
-    line: memoryInitLine,
-    flags: resolvedFlags,
+    line,
+    flags,
     toString() {
-      return memoryInitLine!;
+      return line;
     },
   };
 }

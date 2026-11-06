@@ -81,12 +81,20 @@ if (contextCommentGate || completionBusyGate) {
     return Reflect.apply(end, this, args);
   } as typeof end;
 }
-const { resolveMemoryHardeningFlags } = await import(
-  "../../packages/shared/src/memory-hardening.js"
-);
-console.log(
-  `[company-memory-hardening] Server resolved hardening flags: ${JSON.stringify(
-    resolveMemoryHardeningFlags(process.env),
-  )}`,
-);
+const executionIds: string[] = JSON.parse(process.env.PAPERCLIP_RUNNER_E2E_EXECUTION_IDS ?? "[]");
+const isMemorySuite =
+  executionIds.some((id) => id.startsWith("memory-recall.") || id === "memory-recall") ||
+  Boolean(process.env.PAPERCLIP_MEMORY_HARDENING);
+if (isMemorySuite) {
+  // NOTE: This log line is test harness wrapper self-attestation of resolved memory hardening flags
+  // for the memory-recall suite (not an internal server kernel proof).
+  const { resolveMemoryHardeningFlags } = await import(
+    "../../packages/shared/src/memory-hardening.js"
+  );
+  console.log(
+    `[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): ${JSON.stringify(
+      resolveMemoryHardeningFlags(process.env),
+    )}`,
+  );
+}
 await import("../../cli/src/index.js");

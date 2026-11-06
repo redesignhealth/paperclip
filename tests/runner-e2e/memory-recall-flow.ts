@@ -64,6 +64,7 @@ export async function runMemoryRecallFlow(input: {
   evidence(name: string, value: unknown): Promise<void>;
   tenantReaderFactory?: (adminDsn: string, dbName: string) => Promise<TenantMemoryReader>;
   tenantDropper?: (adminDsn: string, dbName: string, roleName?: string) => Promise<void>;
+  bootProofLoader?: () => Promise<ServerBootProof>;
   serverLogPath?: string;
   serverFlags?: MemoryHardeningFlags;
   skipPreflightProbe?: boolean;
@@ -107,7 +108,10 @@ export async function runMemoryRecallFlow(input: {
   const serverLogPath =
     input.serverLogPath ?? process.env.PAPERCLIP_RUNNER_E2E_SERVER_LOG;
   let bootProof: ServerBootProof | undefined;
-  if (serverLogPath) {
+  let isSyntheticBootProof = false;
+  if (input.bootProofLoader) {
+    bootProof = await input.bootProofLoader();
+  } else if (serverLogPath) {
     try {
       const logContent = await fs.promises.readFile(serverLogPath, "utf8");
       bootProof = extractBootProof(logContent);
@@ -115,6 +119,7 @@ export async function runMemoryRecallFlow(input: {
       throw new Error(`Failed to read server boot proof from ${serverLogPath}: ${err}`);
     }
   } else if (input.serverFlags) {
+    isSyntheticBootProof = true;
     bootProof = {
       line: "[company-memory] Mock boot proof",
       flags: input.serverFlags,
@@ -123,6 +128,7 @@ export async function runMemoryRecallFlow(input: {
       },
     };
   } else if (input.skipPreflightProbe) {
+    isSyntheticBootProof = true;
     bootProof = {
       line: '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
       flags: {
@@ -193,19 +199,23 @@ export async function runMemoryRecallFlow(input: {
     }
 
     // Snapshot memory IDs before scenario runs
-    let tenantReader: TenantMemoryReader | undefined;
     let snapshotIds = new Set<string>();
     const readerFactory = input.tenantReaderFactory ?? openTenantReader;
     if (input.tenantReaderFactory || adminDsn) {
+      let snapshotReader: TenantMemoryReader | undefined;
       try {
-        tenantReader = await readerFactory(adminDsn ?? "postgres://localhost/test", tenantDbName);
-        snapshotIds = await tenantReader.snapshotMemoryIds();
+        snapshotReader = await readerFactory(adminDsn ?? "postgres://localhost/test", tenantDbName);
+        snapshotIds = await snapshotReader.snapshotMemoryIds();
       } catch (err) {
         if (isDatabaseDoesNotExistError(err)) {
           // Tenant DB not yet created (lazy provisioning)
           snapshotIds = new Set<string>();
         } else {
           throw err;
+        }
+      } finally {
+        if (snapshotReader) {
+          await snapshotReader.close().catch(() => {});
         }
       }
     }
@@ -232,17 +242,60 @@ export async function runMemoryRecallFlow(input: {
       >(`${companyPath}/heartbeat-runs?limit=100`);
     }
 
-    async function waitForIssueRun(issueId: string, label: string, deadline: number) {
+    function selectLatestTerminalRun(
+      summaries: Array<{
+        id: string;
+        status: string;
+        issueId?: string;
+        agentId?: string;
+        createdAt?: string;
+        startedAt?: string;
+      }>,
+      issueId: string,
+      expectedAgentId: string,
+    ) {
+      const candidates = summaries.filter(
+        (r) =>
+          r.issueId === issueId &&
+          HARNESS_TERMINAL_RUN_STATUSES.has(r.status) &&
+          (r.agentId === undefined || r.agentId === expectedAgentId),
+      );
+      return (
+        candidates.sort(
+          (a, b) =>
+            new Date(a.startedAt ?? a.createdAt ?? 0).getTime() -
+            new Date(b.startedAt ?? b.createdAt ?? 0).getTime(),
+        )[candidates.length - 1] ?? null
+      );
+    }
+
+    async function waitForIssueRun(
+      issueId: string,
+      expectedAgentId: string,
+      label: string,
+      deadline: number,
+    ) {
       const terminalRun = await pollUntil({
         label,
         deadlineAt: deadline,
         intervalMs: 1500,
         load: async () => {
           const summaries = await pollRunsSummary();
-          const targetRuns = summaries.filter(
+          const issueTerminalRuns = summaries.filter(
             (r) => r.issueId === issueId && HARNESS_TERMINAL_RUN_STATUSES.has(r.status),
           );
-          return targetRuns.length > 0 ? targetRuns[0] : null;
+          if (issueTerminalRuns.length === 0) return null;
+          const sorted = [...issueTerminalRuns].sort(
+            (a, b) =>
+              new Date(a.startedAt ?? a.createdAt ?? 0).getTime() -
+              new Date(b.startedAt ?? b.createdAt ?? 0).getTime(),
+          );
+          const expectedRuns = sorted.filter(
+            (r) => r.agentId === undefined || r.agentId === expectedAgentId,
+          );
+          return expectedRuns.length > 0
+            ? expectedRuns[expectedRuns.length - 1]
+            : sorted[sorted.length - 1];
         },
         accept: (run) => run !== null,
       });
@@ -265,6 +318,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: primaryIssue, expectedAgentId: fixtures.agent.id });
         await waitForIssueRun(
           primaryIssue.id,
+          fixtures.agent.id,
           `memory-recall save turn ${nonce}`,
           Math.max(Date.now() + 5000, input.deadlineAt - 30_000),
         );
@@ -278,6 +332,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: recallIssue, expectedAgentId: fixtures.agent.id });
         await waitForIssueRun(
           recallIssue.id,
+          fixtures.agent.id,
           `memory-recall fresh recall turn ${nonce}`,
           input.deadlineAt,
         );
@@ -291,6 +346,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: controlIssue, expectedAgentId: fixtures.agent.id });
         await waitForIssueRun(
           controlIssue.id,
+          fixtures.agent.id,
           `memory-recall control run ${nonce}`,
           Math.max(Date.now() + 5000, input.deadlineAt - 45_000),
         );
@@ -304,6 +360,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: seedIssue, expectedAgentId: fixtures.agent.id });
         await waitForIssueRun(
           seedIssue.id,
+          fixtures.agent.id,
           `memory-recall seed preference ${nonce}`,
           Math.max(Date.now() + 5000, input.deadlineAt - 30_000),
         );
@@ -317,6 +374,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: primaryIssue, expectedAgentId: fixtures.agent.id });
         await waitForIssueRun(
           primaryIssue.id,
+          fixtures.agent.id,
           `memory-recall ask update ${nonce}`,
           input.deadlineAt,
         );
@@ -330,6 +388,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: primaryIssue, expectedAgentId: fixtures.agent.id });
         await waitForIssueRun(
           primaryIssue.id,
+          fixtures.agent.id,
           `memory-recall agent X save ${nonce}`,
           Math.max(Date.now() + 5000, input.deadlineAt - 30_000),
         );
@@ -343,6 +402,7 @@ export async function runMemoryRecallFlow(input: {
         boundIssues.push({ issue: issueY, expectedAgentId: secondaryAgentId });
         await waitForIssueRun(
           issueY.id,
+          secondaryAgentId,
           `memory-recall agent Y query ${nonce}`,
           input.deadlineAt,
         );
@@ -372,6 +432,7 @@ export async function runMemoryRecallFlow(input: {
                   (r) =>
                     r.issueId &&
                     targetIssueIds.has(r.issueId) &&
+                    (r.agentId === undefined || r.agentId === fixtures.agent.id) &&
                     HARNESS_TERMINAL_RUN_STATUSES.has(r.status),
                 )
                 .map((r) => r.issueId!),
@@ -386,13 +447,12 @@ export async function runMemoryRecallFlow(input: {
     }
 
     try {
-      // 1. Read new memories from tenant DB (propagate all observation failures)
-      if (!tenantReader && (input.tenantReaderFactory || adminDsn)) {
-        tenantReader = await readerFactory(adminDsn ?? "postgres://localhost/test", tenantDbName);
-      }
-      if (tenantReader) {
+      // 1. Read new memories from tenant DB (tolerate ONLY missing lazy DB/table after run as empty observation)
+      if (input.tenantReaderFactory || adminDsn) {
+        let obsReader: TenantMemoryReader | undefined;
         try {
-          const rows = await tenantReader.readMemoriesSince(snapshotIds);
+          obsReader = await readerFactory(adminDsn ?? "postgres://localhost/test", tenantDbName);
+          const rows = await obsReader.readMemoriesSince(snapshotIds);
           newMemories = rows.map((r) => ({
             id: r.id,
             data: r.data,
@@ -400,46 +460,42 @@ export async function runMemoryRecallFlow(input: {
             userId: r.userId,
             createdAt: r.createdAt,
           }));
+        } catch (err) {
+          if (isDatabaseDoesNotExistError(err)) {
+            // Tenant DB / mem0_memories table was never created lazily (e.g. noise case formed no memories)
+            newMemories = [];
+          } else {
+            throw err;
+          }
         } finally {
-          await tenantReader.close();
+          if (obsReader) {
+            await obsReader.close().catch(() => {});
+          }
         }
       }
 
       // 2. Fetch run details, logs, comments per issue (propagate failures, select exact attribution)
       const summaries = await pollRunsSummary();
       for (const { issue, expectedAgentId } of boundIssues) {
-        const issueRuns = summaries.filter(
-          (r) =>
-            r.issueId === issue.id &&
-            (r.agentId === undefined || r.agentId === expectedAgentId) &&
-            HARNESS_TERMINAL_RUN_STATUSES.has(r.status),
-        );
-        // Sort explicitly ascending by timestamp to select latest terminal run
-        const sortedRuns = [...issueRuns].sort(
-          (a, b) =>
-            new Date(a.startedAt ?? a.createdAt ?? 0).getTime() -
-            new Date(b.startedAt ?? b.createdAt ?? 0).getTime(),
-        );
-        const terminalRunSummary = sortedRuns[sortedRuns.length - 1];
+        const terminalRunSummary = selectLatestTerminalRun(summaries, issue.id, expectedAgentId);
         if (terminalRunSummary) {
           const runDetail = (await api.get<Row>(
             `/api/heartbeat-runs/${terminalRunSummary.id}`,
           )) as Row;
+
+          if (!runDetail.agentId || runDetail.agentId !== expectedAgentId) {
+            console.warn(
+              `[memory-recall-flow] Excluding run ${runDetail.id}: agentId "${runDetail.agentId}" does not match expected "${expectedAgentId}"`,
+            );
+            continue;
+          }
+
           const logRes = await api.get<{ content?: string }>(
             `/api/heartbeat-runs/${terminalRunSummary.id}/log`,
           );
           const logContent = logRes.content ?? "";
           const logText = extractLogText(logContent);
           const toolRecords = typedToolRecords(logText);
-
-          if (runDetail.agentId === undefined || runDetail.agentId === null) {
-            throw new Error(`Heartbeat run ${runDetail.id} is missing agentId`);
-          }
-          if (runDetail.agentId !== expectedAgentId) {
-            throw new Error(
-              `Heartbeat run ${runDetail.id} agentId ${runDetail.agentId} does not match expected ${expectedAgentId}`,
-            );
-          }
 
           rawRuns.push(runDetail);
           mappedRuns.push({
@@ -463,11 +519,16 @@ export async function runMemoryRecallFlow(input: {
           const issueComments = await api.get<Row[]>(
             `/api/issues/${issue.id}/comments?order=asc`,
           );
-          const attributedComments = issueComments.filter(
-            (c) =>
-              c.createdByRunId === terminalRunSummary.id &&
-              (!c.authorAgentId || c.authorAgentId === expectedAgentId),
-          );
+          const attributedComments = issueComments
+            .filter(
+              (c) =>
+                c.createdByRunId === terminalRunSummary.id &&
+                c.authorAgentId === expectedAgentId,
+            )
+            .map((c) => ({
+              ...c,
+              issueId: issue.id,
+            }));
           comments.push(...attributedComments);
         }
       }
@@ -554,10 +615,16 @@ export async function runMemoryRecallFlow(input: {
         },
         bootProof: bootProof.line,
         serverHardeningFlags: bootProof.flags,
+        ...(isSyntheticBootProof ? { synthetic: true } : {}),
       });
     } catch (obsErr) {
       if (!scenarioError) {
         scenarioError = obsErr;
+      } else {
+        scenarioError = new AggregateError(
+          [scenarioError, obsErr],
+          `Both scenario execution and observation failed: scenario=${String(scenarioError)}; observation=${String(obsErr)}`,
+        );
       }
     }
   } finally {
@@ -574,11 +641,18 @@ export async function runMemoryRecallFlow(input: {
     }
 
     // 6. teardown fixtures (including Agent Y if created)
+    // Active secondary agents cannot be purged via DELETE /api/agents/:id if their lifecycle
+    // is not terminated/rejected, and metered runs keep cost-event references (matching live-fixtures.ts policy).
+    // The launcher tears down the entire ephemeral instance at the end of the run anyway.
+    // Therefore, secondary agent deletion during in-flow teardown is best-effort and must not fail legitimate runs.
     if (secondaryAgentId) {
       try {
         await api.delete(`/api/agents/${secondaryAgentId}`);
       } catch (err) {
-        cleanupErrors.push(err);
+        console.warn(
+          `[memory-recall-flow] Best-effort secondary agent ${secondaryAgentId} deletion skipped or failed:`,
+          err,
+        );
       }
     }
 

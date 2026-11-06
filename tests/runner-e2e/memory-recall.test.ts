@@ -29,10 +29,17 @@ import {
   extractBootProof,
   extractLogText,
   dropTenantDatabase,
+  openTenantReader,
   typedToolRecords,
   TEST_TENANT_DB_REGEX,
   TEST_TENANT_ROLE_REGEX,
 } from "./memory-recall-observation.js";
+import { isDatabaseDoesNotExistError } from "./memory-recall-flow.js";
+import { hermesMemoryProfile } from "./catalog.js";
+import { createRequire } from "node:module";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../packages/db/src/test-embedded-postgres.js";
+const serverRequire = createRequire(new URL("../../server/package.json", import.meta.url));
+const postgres = (serverRequire("postgres")?.default ?? serverRequire("postgres")) as any;
 import { memoryRecallTasks } from "./memory-recall-cases.js";
 import { loadLocalEnvironment } from "./launch.js";
 import { assertMemoryRecallPrerequisites } from "./prerequisites.js";
@@ -704,37 +711,39 @@ describe("launch prerequisites ordering and local environment loading", () => {
 
   it("loads local env file before evaluating memory recall prerequisites", async () => {
     const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "launch-env-test-"));
-    const envFilePath = path.join(tmpDir, ".env.runner-e2e.local");
-    const envContent = [
-      "PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED=true",
-      "PAPERCLIP_MEMORY_COMPANY_SCOPE=all",
-      "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL=postgresql://postgres:pass@localhost:5432/postgres?sslmode=require",
-      "PAPERCLIP_E2E_MEMORY_HERMES_MODEL=anthropic/claude-3.5-sonnet",
-      "OPENROUTER_API_KEY=sk-or-test",
-      "OPENAI_API_KEY=sk-oa-test",
-    ].join("\n");
-    await fs.promises.writeFile(envFilePath, envContent, "utf8");
+    try {
+      const envFilePath = path.join(tmpDir, ".env.runner-e2e.local");
+      const envContent = [
+        "PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED=true",
+        "PAPERCLIP_MEMORY_COMPANY_SCOPE=all",
+        "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL=postgresql://postgres:pass@localhost:5432/postgres?sslmode=require",
+        "PAPERCLIP_E2E_MEMORY_HERMES_MODEL=anthropic/claude-3.5-sonnet",
+        "OPENROUTER_API_KEY=sk-or-test",
+        "OPENAI_API_KEY=sk-oa-test",
+      ].join("\n");
+      await fs.promises.writeFile(envFilePath, envContent, "utf8");
 
-    const targetEnv: NodeJS.ProcessEnv = {};
-    const dummyExecution: MatrixExecution = {
-      id: "memory-recall.memory-hermes-local.local.save-then-fresh-recall-rep-1",
-      suite: { id: "memory-recall" } as any,
-      profile: { id: "memory-hermes-local" } as any,
-      environment: { id: "local" } as any,
-      task: { id: "save-then-fresh-recall-rep-1", flow: "memory_recall" } as any,
-      requiredCredentials: ["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
-      groups: [],
-      suiteDefinitionHash: "dummy-hash",
-    };
+      const targetEnv: NodeJS.ProcessEnv = {};
+      const dummyExecution: MatrixExecution = {
+        id: "memory-recall.memory-hermes-local.local.save-then-fresh-recall-rep-1",
+        suite: { id: "memory-recall" } as any,
+        profile: { id: "memory-hermes-local" } as any,
+        environment: { id: "local" } as any,
+        task: { id: "save-then-fresh-recall-rep-1", flow: "memory_recall" } as any,
+        requiredCredentials: ["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+        groups: [],
+        suiteDefinitionHash: "dummy-hash",
+      };
 
-    // Before loading env: prerequisites throw
-    expect(() => assertMemoryRecallPrerequisites([dummyExecution], targetEnv)).toThrow();
+      // Before loading env: prerequisites throw
+      expect(() => assertMemoryRecallPrerequisites([dummyExecution], targetEnv)).toThrow();
 
-    // After loading env file: prerequisites pass
-    await loadLocalEnvironment(targetEnv, envFilePath);
-    expect(() => assertMemoryRecallPrerequisites([dummyExecution], targetEnv)).not.toThrow();
-
-    await fs.promises.rm(tmpDir, { recursive: true, force: true });
+      // After loading env file: prerequisites pass
+      await loadLocalEnvironment(targetEnv, envFilePath);
+      expect(() => assertMemoryRecallPrerequisites([dummyExecution], targetEnv)).not.toThrow();
+    } finally {
+      await fs.promises.rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -766,6 +775,13 @@ describe("task run counts, budgets, and scenario prompt correspondence", () => {
     expect(noiseTask).toBeDefined();
     expect(noiseTask.attemptTimeoutMs?.local).toBe(20 * 60_000);
     expect(noiseTask.attemptTimeoutMs?.daytona).toBe(25 * 60_000);
+  });
+
+  it("provides an explicit 12-minute local and 18-minute Daytona attempt budget for implicit-recall 3-turn sequence", () => {
+    const implicitTask = memoryRecallTasks.find((t) => t.id === "implicit-recall-rep-1")!;
+    expect(implicitTask).toBeDefined();
+    expect(implicitTask.attemptTimeoutMs?.local).toBe(12 * 60_000);
+    expect(implicitTask.attemptTimeoutMs?.daytona).toBe(18 * 60_000);
   });
 });
 
@@ -803,6 +819,44 @@ describe("server boot proof extraction and server-resolved flags", () => {
   it("fails closed when company memory init line is missing", () => {
     const log = '[company-memory-hardening] Server resolved hardening flags: {"hermesMemoryConfig":false,"hermesPromptSplit":false,"agentScopedMem0":false,"capabilityMemoryGuidance":false}';
     expect(() => extractBootProof(log)).toThrow(/Initialized company memory configuration/);
+  });
+
+  it("fails closed when company memory init line has enabled: false in JSON", () => {
+    const log = [
+      '{"level":30,"time":1700000000000,"pid":1234,"msg":"[company-memory] Initialized company memory configuration","enabled":false,"companyScope":"all"}',
+      '{"level":30,"time":1700000000001,"pid":1234,"msg":"[company-memory-hardening] Server resolved hardening flags: {\\"hermesMemoryConfig\\":false,\\"hermesPromptSplit\\":false,\\"agentScopedMem0\\":false,\\"capabilityMemoryGuidance\\":false}"}',
+    ].join("\n");
+    expect(() => extractBootProof(log)).toThrow(/Initialized company memory configuration/);
+  });
+
+  it("fails closed when company memory init line has non-all scope in JSON", () => {
+    const log = [
+      '{"level":30,"time":1700000000000,"pid":1234,"msg":"[company-memory] Initialized company memory configuration","enabled":true,"companyScope":"pilot"}',
+      '{"level":30,"time":1700000000001,"pid":1234,"msg":"[company-memory-hardening] Server resolved hardening flags: {\\"hermesMemoryConfig\\":false,\\"hermesPromptSplit\\":false,\\"agentScopedMem0\\":false,\\"capabilityMemoryGuidance\\":false}"}',
+    ].join("\n");
+    expect(() => extractBootProof(log)).toThrow(/Initialized company memory configuration/);
+  });
+
+  it("bounds multiline log window so an unrelated next log entry cannot satisfy proof", () => {
+    const log = [
+      "[12:34:56.789] INFO: [company-memory] Initialized company memory configuration",
+      "    enabled: false",
+      '    companyScope: "all"',
+      "[12:34:57.000] INFO: unrelated-service-log",
+      "    enabled: true",
+      "[12:34:57.001] INFO: [company-memory-hardening] Server resolved hardening flags: {\"hermesMemoryConfig\":false,\"hermesPromptSplit\":false,\"agentScopedMem0\":false,\"capabilityMemoryGuidance\":false}",
+    ].join("\n");
+    expect(() => extractBootProof(log)).toThrow(/Initialized company memory configuration/);
+  });
+
+  it("extracts flags when line includes harness wrapper self-attestation label", () => {
+    const log = [
+      '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
+      '[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): {"hermesMemoryConfig":true,"hermesPromptSplit":true,"agentScopedMem0":true,"capabilityMemoryGuidance":true}',
+    ].join("\n");
+    const proof = extractBootProof(log);
+    expect(proof.flags.hermesMemoryConfig).toBe(true);
+    expect(proof.flags.agentScopedMem0).toBe(true);
   });
 
   it("fails closed when server resolved hardening flags proof is missing", () => {
@@ -863,14 +917,25 @@ describe("tenant database drop safety", () => {
     }
   });
 
-  it("validates exact regex patterns for tenant databases and roles", () => {
+  it("validates exact regex patterns for tenant databases and roles and matches deriveTenantNames output", () => {
+    // Real deriveTenantNames output must match both regexes
+    const realCompanyId = randomUUID();
+    const { databaseName, databaseRole } = deriveTenantNames(realCompanyId);
+    expect(databaseName).toMatch(/^pcmem_[0-9a-f]{32}$/);
+    expect(databaseRole).toMatch(/^pcmem_r_[0-9a-f]{32}$/);
+    expect(TEST_TENANT_DB_REGEX.test(databaseName)).toBe(true);
+    expect(TEST_TENANT_ROLE_REGEX.test(databaseRole)).toBe(true);
+
+    // Legacy pattern also accepted
     expect(TEST_TENANT_DB_REGEX.test("paperclip_tenant_11111111_2222_4333_8444_555555555555")).toBe(true);
     expect(TEST_TENANT_DB_REGEX.test("paperclip_tenant_invalid_uuid")).toBe(false);
     expect(TEST_TENANT_DB_REGEX.test("postgres")).toBe(false);
+    expect(TEST_TENANT_DB_REGEX.test("pcmem_invalid")).toBe(false);
 
     expect(TEST_TENANT_ROLE_REGEX.test("paperclip_tenant_11111111_2222_4333_8444_555555555555_owner")).toBe(true);
     expect(TEST_TENANT_ROLE_REGEX.test("paperclip_tenant_11111111_2222_4333_8444_555555555555")).toBe(false);
     expect(TEST_TENANT_ROLE_REGEX.test("postgres")).toBe(false);
+    expect(TEST_TENANT_ROLE_REGEX.test("pcmem_r_invalid")).toBe(false);
   });
 });
 
@@ -976,5 +1041,197 @@ describe("mandatory baseline checks and empty/invalid evidence", () => {
     });
     expect(result.passed).toBe(true);
     expect(result.checks.find((c) => c.id === "noise-memory-observation")?.passed).toBe(true);
+  });
+
+  it("fails baseline noise when memories array contains malformed or empty data entries", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, false);
+    observation.memories = [
+      { id: "mem-1", data: "" }, // empty data
+    ];
+    const result = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation,
+      env: {},
+    });
+    expect(result.passed).toBe(false);
+    expect(result.checks.find((c) => c.id === "noise-memory-observation")?.passed).toBe(false);
+  });
+
+  it("fails baseline noise when 0 memories recorded but heartbeat runs are fewer than 10", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, false);
+    observation.runs = observation.runs.slice(0, 5); // only 5 runs
+    observation.memories = [];
+    const result = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation,
+      env: {},
+    });
+    expect(result.passed).toBe(false);
+    expect(result.checks.find((c) => c.id === "noise-memory-observation")?.passed).toBe(false);
+  });
+});
+
+describe("isDatabaseDoesNotExistError", () => {
+  it("recognizes postgres error code 3D000 (database does not exist)", () => {
+    expect(isDatabaseDoesNotExistError({ code: "3D000" })).toBe(true);
+  });
+
+  it("recognizes postgres error code 42P01 (relation/table does not exist)", () => {
+    expect(isDatabaseDoesNotExistError({ code: "42P01" })).toBe(true);
+  });
+
+  it("recognizes text message indicating missing database or relation", () => {
+    expect(isDatabaseDoesNotExistError(new Error('database "pcmem_abc" does not exist'))).toBe(true);
+    expect(isDatabaseDoesNotExistError(new Error('relation "mem0_memories" does not exist'))).toBe(true);
+  });
+
+  it("returns false for non-matching errors and non-objects", () => {
+    expect(isDatabaseDoesNotExistError({ code: "ECONNREFUSED" })).toBe(false);
+    expect(isDatabaseDoesNotExistError({ code: "28P01", message: "password authentication failed" })).toBe(false);
+    expect(isDatabaseDoesNotExistError({ code: "42601", message: "syntax error" })).toBe(false);
+    expect(isDatabaseDoesNotExistError(null)).toBe(false);
+    expect(isDatabaseDoesNotExistError(undefined)).toBe(false);
+    expect(isDatabaseDoesNotExistError("string error")).toBe(false);
+    expect(isDatabaseDoesNotExistError(12345)).toBe(false);
+  });
+});
+
+describe("hermesMemoryProfile.buildAgent", () => {
+  const originalEnv = process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
+
+  it("throws when PAPERCLIP_E2E_MEMORY_HERMES_MODEL is unset", () => {
+    delete process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
+    expect(() =>
+      hermesMemoryProfile.buildAgent({
+        agentId: "test-agent",
+        companyId: "test-company",
+        environmentFixtureId: "local",
+        workspacePath: "/tmp/ws",
+      } as any),
+    ).toThrow(/PAPERCLIP_E2E_MEMORY_HERMES_MODEL is required/);
+  });
+
+  it("returns configured agent when PAPERCLIP_E2E_MEMORY_HERMES_MODEL is set", () => {
+    process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL = "anthropic/claude-3.5-sonnet";
+    try {
+      const agent = hermesMemoryProfile.buildAgent({
+        agentId: "test-agent",
+        companyId: "test-company",
+        environmentFixtureId: "local",
+        workspacePath: "/tmp/ws",
+        secretRefs: {
+          OPENROUTER_API_KEY: { name: "OPENROUTER_API_KEY" },
+          OPENAI_API_KEY: { name: "OPENAI_API_KEY" },
+        },
+      } as any);
+      expect(agent).toBeDefined();
+      expect(agent.adapterType).toBe("hermes_local");
+      expect((agent.adapterConfig as any).model).toBe("anthropic/claude-3.5-sonnet");
+      expect((agent.adapterConfig as any).timeoutSec).toBe(360);
+      expect((agent.adapterConfig as any).maxTurnsPerRun).toBe(12);
+    } finally {
+      if (originalEnv !== undefined) {
+        process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL = originalEnv;
+      } else {
+        delete process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
+      }
+    }
+  });
+});
+
+describe("selectDraftRun and comment attribution scoring", () => {
+  it("selectDraftRun falls back to the last run when issues is undefined or empty", () => {
+    const { marker, observation } = buildValidObservation("implicit-recall", 1, false);
+    // Replace issues with empty array
+    observation.issues = [];
+    const controlRun = observation.runs[0]!;
+    const lastRun = observation.runs[observation.runs.length - 1]!;
+    // Set different results on controlRun vs lastRun
+    controlRun.result = "Control result: no preference";
+    lastRun.result = `Draft result: preference applied with ${marker}`;
+
+    const result = gradeMemoryRecall({
+      caseId: "implicit-recall",
+      rep: 1,
+      marker,
+      observation,
+      env: {},
+    });
+    // With draftRun correctly selecting lastRun instead of controlRun, metrics reflect preference
+    expect(result.metrics.implicitRecall?.followsPreference).toBe(true);
+    expect(result.checks.find((c) => c.id === "draft-run-observed")?.passed).toBe(true);
+  });
+
+  it("strictly requires exact createdByRunId on comments and excludes unattributed comments", () => {
+    const { marker, observation } = buildValidObservation("save-then-fresh-recall", 1, false);
+    const recallRun = observation.runs[1]!;
+    // Remove marker from recallRun result
+    recallRun.result = "Recall turn completed without inline mention";
+    // Add a comment that has the marker, but NO createdByRunId (e.g. human comment)
+    observation.comments = [
+      {
+        id: "c-human",
+        issueId: recallRun.issueId!,
+        authorAgentId: "agent-x-id",
+        createdByRunId: undefined, // human or unassigned comment!
+        body: `Human comment mentioning ${marker}`,
+      },
+    ];
+
+    const result = gradeMemoryRecall({
+      caseId: "save-then-fresh-recall",
+      rep: 1,
+      marker,
+      observation,
+      env: {},
+    });
+    // Human comment must not satisfy recall check!
+    expect(result.checks.find((c) => c.id === "fresh-session-recall-matched")?.passed).toBe(false);
+  });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+describe.skipIf(!embeddedPostgresSupport.supported)("tenant reader real database integration", () => {
+  it("connects to real postgres, reads snapshot and new memories, and closes reader", async () => {
+    const dbInstance = await startEmbeddedPostgresTestDatabase("paperclip-memory-reader-test");
+    try {
+      const url = new URL(dbInstance.connectionString);
+      const dbName = url.pathname.replace(/^\//, "");
+      const sqlClient = postgres(dbInstance.connectionString, { max: 1 });
+      try {
+        await sqlClient.unsafe(`
+          CREATE TABLE IF NOT EXISTS mem0_memories (
+            id SERIAL PRIMARY KEY,
+            payload JSONB NOT NULL
+          );
+        `);
+
+        const reader = await openTenantReader(dbInstance.connectionString, dbName);
+        try {
+          const initialSnapshot = await reader.snapshotMemoryIds();
+          expect(initialSnapshot.size).toBe(0);
+
+          await sqlClient.unsafe(`
+            INSERT INTO mem0_memories (payload)
+            VALUES ('{"data": "Release codename: AURORA-99", "agent_id": "agent-1", "user_id": "user-1", "created_at": "2026-11-06T00:00:00Z"}'::jsonb);
+          `);
+
+          const newMemories = await reader.readMemoriesSince(initialSnapshot);
+          expect(newMemories).toHaveLength(1);
+          expect(newMemories[0]?.data).toBe("Release codename: AURORA-99");
+          expect(newMemories[0]?.agentId).toBe("agent-1");
+        } finally {
+          await reader.close();
+        }
+      } finally {
+        await sqlClient.end({ timeout: 5 });
+      }
+    } finally {
+      await dbInstance.cleanup();
+    }
   });
 });

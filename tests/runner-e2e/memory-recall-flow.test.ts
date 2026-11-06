@@ -174,7 +174,7 @@ describe("memory-recall flow unit tests", () => {
     await expect(flowPromise).rejects.toThrow(/Agent Y setup failed/);
   });
 
-  it("(4) throws when run agentId is undefined", async () => {
+  it("(4) excludes run when run agentId is undefined/unknown and fails scoring gracefully", async () => {
     const api: Partial<RunnerApi> = {
       post: vi.fn().mockImplementation(async (path: string, body: any) => ({
         id: "issue-1",
@@ -191,7 +191,7 @@ describe("memory-recall flow unit tests", () => {
       }),
     };
 
-    const flowPromise = runMemoryRecallFlow({
+    const result = await runMemoryRecallFlow({
       api: api as RunnerApi,
       fixtures: makeFixtures(),
       execution: makeExecution("save-then-fresh-recall"),
@@ -205,7 +205,9 @@ describe("memory-recall flow unit tests", () => {
       evidence: vi.fn().mockResolvedValue(undefined),
     });
 
-    await expect(flowPromise).rejects.toThrow(/missing agentId/);
+    expect(result.runs).toHaveLength(0);
+    expect(result.scoreResult.passed).toBe(false);
+    expect(result.scoreResult.checks.find((c) => c.id === "runs-recorded")?.passed).toBe(false);
   });
 
   it("(5) implicit-recall control run uses controlPrompt and precedes seed", async () => {
@@ -691,5 +693,258 @@ describe("memory-recall flow unit tests", () => {
         evidence: vi.fn(),
       }),
     ).rejects.toThrow(/server boot proof is required/);
+  });
+
+  it("(14) post-run lazy missing database tolerates 3D000 as empty observation", async () => {
+    let callCount = 0;
+    const lazyMissingReaderFactory = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // Pre-run snapshot
+        return makeStubTenantReader();
+      }
+      // Post-run observation: DB does not exist (3D000)
+      const err = new Error('database "pcmem_abc" does not exist');
+      (err as any).code = "3D000";
+      throw err;
+    };
+
+    let postCount = 0;
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        postCount++;
+        return { id: `issue-${postCount}`, ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-2", issueId: "issue-2", status: "succeeded", agentId: "agent-x-id" },
+          ];
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return { id: "run-detail", agentId: "agent-x-id", status: "succeeded", toolRecords: [] };
+        }
+        return [];
+      }),
+    };
+
+    let capturedEvidence: any = null;
+    const result = await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "lazy-post-run",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: lazyMissingReaderFactory,
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockImplementation(async (_name, val) => {
+        capturedEvidence = val;
+      }),
+    });
+
+    expect(capturedEvidence.observation.memoryCount).toBe(0);
+    expect(capturedEvidence.observation.memories).toEqual([]);
+    expect(result).toBeDefined();
+  });
+
+  it("(15) aggregates scenario error and observation error when both fail", async () => {
+    let callCount = 0;
+    const failObsReaderFactory = async () => {
+      callCount++;
+      if (callCount === 1) return makeStubTenantReader();
+      // Post-run observation throws non-lazy error
+      const err = new Error("Connection refused ECONNREFUSED");
+      (err as any).code = "ECONNREFUSED";
+      throw err;
+    };
+
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockResolvedValue({ id: "issue-1" }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          // Terminal run ended in failure -> causes scenarioError
+          return [{ id: "run-failed", issueId: "issue-1", status: "failed", agentId: "agent-x-id" }];
+        }
+        return [];
+      }),
+    };
+
+    const flowPromise = runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "agg-err",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: failObsReaderFactory,
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn(),
+    });
+
+    await expect(flowPromise).rejects.toThrow(AggregateError);
+    await expect(flowPromise).rejects.toThrow(/Both scenario execution and observation failed/);
+  });
+
+  it("(16) secondary agent delete 409 is best-effort and does not push to cleanupErrors", async () => {
+    let deleteAttempted = false;
+    let postCount = 0;
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        if (path.endsWith("/agents")) {
+          return { id: "secondary-agent-id", ...body };
+        }
+        if (path.endsWith("/issues")) {
+          postCount++;
+          return { id: `issue-${postCount}`, ...body };
+        }
+        return { id: "misc", ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-x", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-y", issueId: "issue-2", status: "succeeded", agentId: "secondary-agent-id" },
+          ];
+        }
+        if (path === "/api/heartbeat-runs/run-x") {
+          return { id: "run-x", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" };
+        }
+        if (path === "/api/heartbeat-runs/run-y") {
+          return { id: "run-y", issueId: "issue-2", status: "succeeded", agentId: "secondary-agent-id" };
+        }
+        return [];
+      }),
+      delete: vi.fn().mockImplementation(async (path: string) => {
+        deleteAttempted = true;
+        // Simulate Paperclip active agent purge error: HTTP 409 Conflict
+        const err = new Error("HTTP 409 Conflict: Cannot purge active agent with live references");
+        (err as any).status = 409;
+        throw err;
+      }),
+    };
+
+    // cross-agent-leak creates secondary agent and attempts teardown
+    const result = await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("cross-agent-leak"),
+      nonce: "delete-409",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn(),
+    });
+
+    expect(deleteAttempted).toBe(true);
+    // Does NOT throw cleanupErrors; returns clean result
+    expect(result).toBeDefined();
+  });
+
+  it("(17) marks synthetic boot proof explicitly and supports injected bootProofLoader", async () => {
+    let capturedEvidence: any = null;
+    let postCount = 0;
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        postCount++;
+        return { id: `issue-${postCount}`, ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-2", issueId: "issue-2", status: "succeeded", agentId: "agent-x-id" },
+          ];
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return { id: "run-detail", agentId: "agent-x-id", status: "succeeded" };
+        }
+        return [];
+      }),
+    };
+
+    // Test injected loader
+    const customBootProof = {
+      line: "[company-memory] Custom injected proof",
+      flags: {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      },
+      toString() {
+        return this.line;
+      },
+    };
+
+    await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "injected-loader",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      bootProofLoader: async () => customBootProof,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockImplementation(async (_name, val) => {
+        capturedEvidence = val;
+      }),
+    });
+
+    expect(capturedEvidence.bootProof).toBe("[company-memory] Custom injected proof");
+    expect(capturedEvidence.serverHardeningFlags.hermesMemoryConfig).toBe(true);
+    // When loader injected, synthetic is not marked
+    expect(capturedEvidence.synthetic).toBeUndefined();
+
+    // Now test skipPreflightProbe marks synthetic: true
+    let postCount2 = 0;
+    const api2: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        postCount2++;
+        return { id: `issue-${postCount2}`, ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-2", issueId: "issue-2", status: "succeeded", agentId: "agent-x-id" },
+          ];
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return { id: "run-detail", agentId: "agent-x-id", status: "succeeded" };
+        }
+        return [];
+      }),
+    };
+
+    let syntheticEvidence: any = null;
+    await runMemoryRecallFlow({
+      api: api2 as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "synthetic-proof",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockImplementation(async (_name, val) => {
+        syntheticEvidence = val;
+      }),
+    });
+
+    expect(syntheticEvidence.synthetic).toBe(true);
   });
 });

@@ -120,11 +120,18 @@ function appendLog(message: string) {
   log.write(message);
 }
 
-appendLog(
-  `[company-memory-hardening] Server resolved hardening flags: ${JSON.stringify(
-    resolveMemoryHardeningFlags(definedServerEnvironment),
-  )}\n`,
+const hasMemoryRecallExecution = executionIds.some(
+  (id) => id.startsWith("memory-recall.") || id === "memory-recall",
 );
+if (hasMemoryRecallExecution) {
+  // NOTE: This log line is test harness wrapper self-attestation of resolved memory hardening flags
+  // for the memory-recall suite (not an internal server kernel proof).
+  appendLog(
+    `[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): ${JSON.stringify(
+      resolveMemoryHardeningFlags(definedServerEnvironment),
+    )}\n`,
+  );
+}
 
 function shutdownRequested() {
   return shutdownSignal !== null;
