@@ -4,7 +4,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CONNECTION_INTENT_AGENT_GUIDANCE, MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
+import {
+  CONNECTION_INTENT_AGENT_GUIDANCE,
+  MEMORY_AGENT_GUIDANCE,
+  resolveMemoryHardeningFlags,
+  type MemoryHardeningFlags,
+} from "@paperclipai/shared";
+
+export { resolveMemoryHardeningFlags, type MemoryHardeningFlags };
+
 import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
