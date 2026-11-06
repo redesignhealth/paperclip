@@ -122,6 +122,71 @@ describe("memory-config", () => {
       ).toThrow('unrecognized key "extraField"');
     });
 
+    it("accepts valid syncMaxChars and sync_max_chars values", () => {
+      const c1 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 4000,
+      });
+      expect(c1.syncMaxChars).toBe(4000);
+
+      const c2 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        sync_max_chars: 8000,
+      });
+      expect(c2.syncMaxChars).toBe(8000);
+
+      const c3 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 6000,
+        sync_max_chars: 6000,
+      });
+      expect(c3.syncMaxChars).toBe(6000);
+
+      const c4 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 1,
+      });
+      expect(c4.syncMaxChars).toBe(1);
+
+      const c5 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 16000,
+      });
+      expect(c5.syncMaxChars).toBe(16000);
+    });
+
+    it("rejects invalid syncMaxChars values (0, -1, 1.5, 16001, '6000')", () => {
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: 0 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: -1 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: 1.5 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: 16001 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: "6000" as unknown as number }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+    });
+
+    it("throws on camel/snake conflict for syncMaxChars and sync_max_chars", () => {
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          syncMaxChars: 4000,
+          sync_max_chars: 5000,
+        }),
+      ).toThrow("conflicting syncMaxChars and sync_max_chars values provided");
+    });
+
     it("fails closed on non-mem0 provider or non-oss mode", () => {
       expect(() =>
         validateHermesMemoryConfig({
@@ -138,21 +203,61 @@ describe("memory-config", () => {
       ).toThrow('mode must be "oss"');
     });
 
-    it("requires userId to be exactly 'company'", () => {
+    it("validates userId: accepts 'company' and agentId; rejects a third value; rejects userId !== agentId when not 'company'", () => {
+      // accepts "company"
+      const resCompany = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: "company",
+      });
+      expect(resCompany.userId).toBe("company");
+
+      // accepts agentId via camelCase
+      const resAgent = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: validMemoryInput.agentId,
+      });
+      expect(resAgent.userId).toBe(validMemoryInput.agentId);
+
+      // accepts agentId via snake_case user_id alias
+      const resSnakeAgent = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: undefined,
+        user_id: validMemoryInput.agentId,
+      });
+      expect(resSnakeAgent.userId).toBe(validMemoryInput.agentId);
+
+      // rejects a third value
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "some_other_agent",
+        }),
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
+
+      // rejects userId !== agentId when not "company"
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
           userId: "user_123",
         }),
-      ).toThrow('userId must be "company"');
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
 
+      // rejects undefined / missing userId
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
           userId: undefined,
           user_id: undefined,
         }),
-      ).toThrow('userId must be "company"');
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
+
+      // rejects unsafe identifier (control characters / sql injection)
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "invalid; DROP TABLE users;--",
+        }),
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
     });
 
     it("validates agentId against safe identifier constraints and rejects control characters", () => {
@@ -451,6 +556,23 @@ describe("memory-config", () => {
           ...validMemoryInput,
           userId: "company",
           user_id: "other_company",
+        }),
+      ).toThrow("conflicting userId and user_id values provided");
+
+      // Conflicting individually valid userId values (e.g. "company" vs agentId)
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "company",
+          user_id: validMemoryInput.agentId,
+        }),
+      ).toThrow("conflicting userId and user_id values provided");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: validMemoryInput.agentId,
+          user_id: "company",
         }),
       ).toThrow("conflicting userId and user_id values provided");
 
@@ -754,12 +876,108 @@ describe("memory-config", () => {
       const reparsed = JSON.parse(serialized);
       expect(reparsed).toEqual(canonical);
     });
+
+    it("emits user_id = agentId in canonical object and serialized JSON when agent-scoped", () => {
+      const agentScoped = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: validMemoryInput.agentId,
+      });
+      const canonical = buildCanonicalMem0Object(agentScoped);
+      expect(canonical.user_id).toBe(validMemoryInput.agentId);
+      expect(canonical.agent_id).toBe(validMemoryInput.agentId);
+
+      const serialized = serializeMem0Json(agentScoped);
+      expect(serialized).toContain(`"user_id": "${validMemoryInput.agentId}"`);
+      expect(serialized).toContain(`"agent_id": "${validMemoryInput.agentId}"`);
+
+      const reparsed = JSON.parse(serialized);
+      expect(reparsed).toEqual(canonical);
+    });
+
+    it("preserves exact serialized key order with flag off (no sync_max_chars)", () => {
+      const validated = validateHermesMemoryConfig(validMemoryInput);
+      const canonical = buildCanonicalMem0Object(validated, {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+
+      expect(Object.keys(canonical)).toEqual(["mode", "oss", "user_id", "agent_id"]);
+      const serialized = serializeMem0Json(validated, {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(serialized).not.toContain("sync_max_chars");
+    });
+
+    it("preserves exact serialized key order with flag on (sync_max_chars immediately after agent_id)", () => {
+      const validatedWithChars = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 8000,
+      });
+      const canonicalWithChars = buildCanonicalMem0Object(validatedWithChars, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+
+      expect(Object.keys(canonicalWithChars)).toEqual([
+        "mode",
+        "oss",
+        "user_id",
+        "agent_id",
+        "sync_max_chars",
+      ]);
+      expect(canonicalWithChars.sync_max_chars).toBe(8000);
+
+      const serializedWithChars = serializeMem0Json(validatedWithChars, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      const lines = serializedWithChars.split("\n");
+      const agentIdIdx = lines.findIndex((l) => l.includes('"agent_id":'));
+      const syncMaxCharsIdx = lines.findIndex((l) => l.includes('"sync_max_chars":'));
+      expect(syncMaxCharsIdx).toBe(agentIdIdx + 1);
+
+      // Default to 6000 if not specified in config
+      const validatedDefault = validateHermesMemoryConfig(validMemoryInput);
+      const canonicalDefault = buildCanonicalMem0Object(validatedDefault, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(canonicalDefault.sync_max_chars).toBe(6000);
+    });
   });
 
   describe("generateHermesMemoryYaml", () => {
-    it("emits the separate Hermes config.yaml memory block", () => {
-      const yaml = generateHermesMemoryYaml();
+    it("emits the separate Hermes config.yaml memory block when flag is off", () => {
+      const yaml = generateHermesMemoryYaml({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
       expect(yaml).toBe("memory:\n  provider: mem0\n");
+    });
+
+    it("emits memory_enabled: false and user_profile_enabled: false when flag is on", () => {
+      const yaml = generateHermesMemoryYaml({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(yaml).toBe(
+        "memory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n",
+      );
     });
   });
 
@@ -1444,7 +1662,7 @@ describe("memory-config", () => {
           validateHermesMemoryConfig({ ...validMemoryInput, userId: sensitiveProbe });
           expect.unreachable();
         } catch (err: any) {
-          expect(err.message).toBe('Invalid memory configuration: userId must be "company"');
+          expect(err.message).toBe('Invalid memory configuration: userId must be a safe identifier and equal either "company" or agentId');
           expect(err.message).not.toContain(sensitiveProbe);
         }
       });

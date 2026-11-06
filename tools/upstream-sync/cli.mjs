@@ -7,6 +7,8 @@ import { classifyPending } from "./lib/classify.mjs";
 import { alertForClassifiedRows, escapeMarkdownCell, flushAlerts, opsAlerts, renderOutboxText } from "./lib/alerts.mjs";
 import { createBudget } from "./lib/budget.mjs";
 import { ensureMirror, resolveCommit } from "./lib/upstreamGit.mjs";
+import { parseArgs } from "node:util";
+import * as handle from "./lib/handle.mjs";
 
 const USAGE = `usage: node tools/upstream-sync/cli.mjs <command>
   migrate                 verify the ledger tables + view exist (schema is owned by Paperclip migrations)
@@ -23,7 +25,17 @@ const USAGE = `usage: node tools/upstream-sync/cli.mjs <command>
   alerts pending          list undelivered alerts (outbox sink)
   alerts ack <id> [ref]   mark an outbox alert delivered
   view                    print the readable ledger view (JSON)
-  report                  print the ledger as a markdown table (for the doc view)`;
+  report                  print the ledger as a markdown table (for the doc view)
+
+worker commands (JSON on stdout; common flags: --run-id, --repo, --integration-ref, --master-ref):
+  claim                   claim the oldest pending/expired row   [--lease-minutes]
+  assess --sha S          claimed row -> skipped (already present) or assessed clean|conflict
+  merge-plan --shas A,B,..  longest clean prefix to merge into integration (oldest first; default: assessed rows)
+  delta --base B --upstream U --merge M [--expect SHA256]   resolution delta of merge commit M
+  record --shas A,B --status S [--path --integration-sha --delta-sha256 --review-pr --promote-pr --master-sha
+         --skip-reason --argus-verdict] [--argus-round JSON] [--argus-round-cap N (default 10)]
+  promote --promote-pr N  mark integrated rows now in master as promoted (after a human merged the PR)
+  verify                  check integrated/promoted rows against git ancestry (exit 1 on mismatch)`;
 
 const [cmd, sub, ...rest] = process.argv.slice(2);
 const cfg = loadConfig();
@@ -86,6 +98,59 @@ async function status(db) {
     flagged: flags.rows[0],
     alerts: alerts.rows,
   };
+}
+
+const WORKER_COMMANDS = new Set(["claim", "assess", "merge-plan", "delta", "record", "promote", "verify"]);
+
+async function workerCommand(db, argv) {
+  const { values: v } = parseArgs({
+    args: argv,
+    options: {
+      "run-id": { type: "string" }, repo: { type: "string" }, "integration-ref": { type: "string" }, "master-ref": { type: "string" },
+      "lease-minutes": { type: "string" }, sha: { type: "string" }, shas: { type: "string" }, base: { type: "string" },
+      upstream: { type: "string" }, merge: { type: "string" }, expect: { type: "string" }, status: { type: "string" },
+      path: { type: "string" }, "integration-sha": { type: "string" }, "delta-sha256": { type: "string" },
+      "review-pr": { type: "string" }, "promote-pr": { type: "string" }, "master-sha": { type: "string" },
+      "skip-reason": { type: "string" }, "argus-verdict": { type: "string" }, "argus-round": { type: "string" },
+      "argus-round-cap": { type: "string" },
+    },
+  });
+  const w = cfg.worker;
+  const repo = v.repo ?? w.repoDir;
+  const refs = { integrationRef: v["integration-ref"] ?? w.integrationRef, masterRef: v["master-ref"] ?? w.masterRef };
+  const runId = v["run-id"] ?? w.runId;
+  const num = (name) => (v[name] === undefined ? undefined : Number(v[name]));
+  const out = (x) => console.log(JSON.stringify(x, null, 2));
+
+  if (cmd === "claim") return out(await handle.claim(db, { runId, leaseMinutes: num("lease-minutes") ?? w.leaseMinutes }));
+  if (cmd === "assess") return out(await handle.assess(db, repo, { sha: v.sha, runId, ...refs }));
+  if (cmd === "merge-plan") {
+    const { shas, flagged, blockedBy } = await handle.planCandidates(db, { shas: v.shas ? v.shas.split(",").filter(Boolean) : null });
+    const plan = await handle.mergePlan(repo, shas, { integrationRef: refs.integrationRef, isFlagged: (s) => flagged.has(s) });
+    return out({ ...plan, blockedBy });
+  }
+  if (cmd === "delta") {
+    return out(await handle.delta(repo, { base: v.base, upstreamSha: v.upstream, mergeCommit: v.merge, expectSha256: v.expect ?? null }));
+  }
+  if (cmd === "record") {
+    const fields = {};
+    for (const [flag, col] of [["path", "path"], ["integration-sha", "integration_sha"], ["delta-sha256", "resolution_delta_sha256"],
+      ["review-pr", "review_pr"], ["promote-pr", "promote_pr"], ["master-sha", "master_sha"], ["skip-reason", "skip_reason"],
+      ["argus-verdict", "argus_verdict"]]) {
+      if (v[flag] !== undefined) fields[col] = /-pr$/.test(flag) ? Number(v[flag]) : v[flag];
+    }
+    return out(await handle.record(db, {
+      shas: (v.shas ?? v.sha ?? "").split(",").filter(Boolean), status: v.status, runId, fields,
+      argusRound: v["argus-round"] ? JSON.parse(v["argus-round"]) : null,
+      argusRoundCap: num("argus-round-cap") ?? w.argusRoundCap,
+    }));
+  }
+  if (cmd === "promote") return out(await handle.promote(db, repo, { runId, promotePr: num("promote-pr"), masterRef: refs.masterRef, masterSha: v["master-sha"] ?? null }));
+  if (cmd === "verify") {
+    const r = await handle.verify(db, repo, refs);
+    out(r);
+    if (!r.ok) process.exitCode = 1;
+  }
 }
 
 async function main() {
@@ -177,6 +242,7 @@ async function main() {
       }
       return console.log(lines.join("\n"));
     }
+    if (WORKER_COMMANDS.has(cmd)) return await workerCommand(pool, [sub, ...rest].filter((a) => a !== undefined));
     console.log(USAGE);
     process.exitCode = 2;
   } finally {

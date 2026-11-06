@@ -19,6 +19,9 @@ let interceptedOpts: {
   tempHomeAtExecution?: string | null;
   tempHomeExistsAtExecution?: boolean;
   mem0JsonExistedAtExecution?: boolean;
+  mem0JsonContentAtExecution?: string | null;
+  configYamlContentAtExecution?: string | null;
+  promptFileContent?: string | null;
 } = {};
 
 let mockChildProcessBehavior: "success" | "failure" | "timeout" | "throw" | "emit_secrets" | "emit_chunks" | "real_spawn" = "success";
@@ -68,11 +71,21 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
       const tempHome = opts.env?.HERMES_HOME ?? null;
       let tempHomeExists = false;
       let mem0JsonExists = false;
+      let mem0JsonContent: string | null = null;
+      let configYamlContent: string | null = null;
 
       if (tempHome) {
         tempHomeExists = await fs.access(tempHome).then(() => true).catch(() => false);
         const mem0Path = path.join(tempHome, "mem0.json");
         mem0JsonExists = await fs.access(mem0Path).then(() => true).catch(() => false);
+        if (mem0JsonExists) {
+          mem0JsonContent = await fs.readFile(mem0Path, "utf8");
+        }
+        const configPath = path.join(tempHome, "config.yaml");
+        const configExists = await fs.access(configPath).then(() => true).catch(() => false);
+        if (configExists) {
+          configYamlContent = await fs.readFile(configPath, "utf8");
+        }
 
         // Simulate mem0 creating a local history SQLite file inside HERMES_HOME
         try {
@@ -82,6 +95,12 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
         }
       }
 
+      let promptFileContent: string | null = null;
+      const queryFileIdx = args.indexOf("--query-file");
+      if (queryFileIdx !== -1 && args[queryFileIdx + 1] && args[queryFileIdx + 1] !== "-") {
+        promptFileContent = await fs.readFile(args[queryFileIdx + 1], "utf8");
+      }
+
       interceptedOpts = {
         command: cmd,
         args,
@@ -89,6 +108,9 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
         tempHomeAtExecution: tempHome,
         tempHomeExistsAtExecution: tempHomeExists,
         mem0JsonExistedAtExecution: mem0JsonExists,
+        mem0JsonContentAtExecution: mem0JsonContent,
+        configYamlContentAtExecution: configYamlContent,
+        promptFileContent,
       };
 
       if (mockChildProcessBehavior === "throw") {
@@ -172,6 +194,7 @@ import {
   DEFAULT_MEMORY_PROBE_TIMEOUT_MS,
   resolveOptHermesPath,
   isPaperclipProductionContainer,
+  HERMES_MAX_SYSTEM_PROMPT_BYTES,
 } from "./execute.js";
 import { MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 import * as memoryConfigModule from "./memory-config.js";
@@ -948,6 +971,189 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(childEnv.MEM0_TELEMETRY).toBe("False");
     // Forbidden env vars are stripped unconditionally even on no-memory runs
     expect(childEnv.PGHOST).toBeUndefined();
+  });
+
+  it("uses promptViaFile with --query-file when oversized task body pushes shrunk prompt >=128 KiB under hermes-prompt-split", async () => {
+    const ctx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+    });
+    (ctx as any).context.paperclipTaskMarkdownAssignment = "x".repeat(150_000);
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    expect(interceptedOpts.args).toContain("--query-file");
+    expect(interceptedOpts.args).not.toContain("-q");
+    expect(interceptedOpts.promptFileContent).toBeTruthy();
+    expect(interceptedOpts.promptFileContent?.startsWith("x".repeat(100))).toBe(true);
+    expect(interceptedOpts.promptFileContent).not.toContain("Paperclip runtime identity:");
+    expect(interceptedOpts.promptFileContent).not.toContain("Initial communication guidance:");
+    expect(interceptedOpts.promptFileContent).not.toContain("You are agent");
+    expect(interceptedOpts.promptFileContent).toContain("Paperclip invocation:");
+    expect(interceptedOpts.promptFileContent).toContain("- Run ID:");
+  });
+
+  it("falls back to keeping relocated content in query when candidate system overlay exceeds HERMES_MAX_SYSTEM_PROMPT_BYTES", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+      onLogCollector: logs,
+    });
+    // Supply task markdown and large task communication guidance pushing candidate overlay > HERMES_MAX_SYSTEM_PROMPT_BYTES
+    const largeGuidance = "Oversized communication guidance: ".repeat(5000); // ~170 KiB
+    (ctx as any).context.paperclipTaskMarkdownAssignment = "Paperclip task context: brief work description.";
+    (ctx as any).context.paperclipTaskCommunicationGuidance = largeGuidance;
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    // Verify stderr fallback notice was emitted (reserved for advisories/warnings, not stdout)
+    const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+    expect(stderrLogs).toContain("[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.");
+
+    // Because prompt became >= 128 KiB with the relocated content kept in query, it uses --query-file
+    expect(interceptedOpts.args).toContain("--query-file");
+    expect(interceptedOpts.promptFileContent).toBeTruthy();
+    expect(interceptedOpts.promptFileContent).toContain(largeGuidance.trim());
+    // In fallback, query keeps relocated sections
+    expect(interceptedOpts.promptFileContent).toContain("Paperclip runtime identity:");
+
+    // And system prompt stays bounded (<= HERMES_MAX_SYSTEM_PROMPT_BYTES)
+    const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+    const systemPrompt = childEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT;
+    expect(Buffer.byteLength(systemPrompt, "utf8")).toBeLessThanOrEqual(HERMES_MAX_SYSTEM_PROMPT_BYTES);
+    expect(systemPrompt).not.toContain(largeGuidance);
+  });
+
+  it("keeps fresh-session handoff markdown in -q rather than the system overlay under hermes-prompt-split", async () => {
+    const ctx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+    });
+    const handoffText = "Fresh session handoff: prior goals and approved decisions.";
+    (ctx as any).context.paperclipTaskMarkdownAssignment = "Complete assigned task.";
+    (ctx as any).context.paperclipFreshSessionHandoffMarkdown = handoffText;
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    const queryArg = interceptedOpts.args?.indexOf("-q");
+    expect(queryArg).not.toBe(-1);
+    const queryContent = interceptedOpts.args![queryArg! + 1];
+    expect(queryContent).toContain(handoffText);
+
+    const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+    const systemPrompt = childEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT;
+    expect(systemPrompt).not.toContain(handoffText);
+  });
+
+  it("respects exact size guard boundary (131040 bytes fits in overlay, 131041 triggers fallback)", async () => {
+    const baseCtx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+    });
+    (baseCtx as any).context.paperclipTaskMarkdownAssignment = "Task brief.";
+    await execute(baseCtx);
+    const baseOverlay = (interceptedOpts.opts?.env as Record<string, string>).HERMES_EPHEMERAL_SYSTEM_PROMPT;
+    const baseLen = Buffer.byteLength(baseOverlay, "utf8");
+
+    // Padding bytes to reach exactly HERMES_MAX_SYSTEM_PROMPT_BYTES (131040 bytes)
+    // joinPromptSections joins sections with "\n\n" (2 bytes)
+    const padLenFit = HERMES_MAX_SYSTEM_PROMPT_BYTES - baseLen - 2;
+    expect(padLenFit).toBeGreaterThan(0);
+
+    const fitLogs: Array<{ stream: string; chunk: string }> = [];
+    const fitCtx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+      onLogCollector: fitLogs,
+    });
+    (fitCtx as any).context.paperclipTaskMarkdownAssignment = "Task brief.";
+    (fitCtx as any).context.paperclipTaskCommunicationGuidance = "a".repeat(padLenFit);
+
+    await execute(fitCtx);
+    const fitOverlay = (interceptedOpts.opts?.env as Record<string, string>).HERMES_EPHEMERAL_SYSTEM_PROMPT;
+    expect(Buffer.byteLength(fitOverlay, "utf8")).toBe(HERMES_MAX_SYSTEM_PROMPT_BYTES);
+    const fitStderr = fitLogs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+    expect(fitStderr).not.toContain("Ephemeral system prompt exceeds size limit");
+    expect(fitOverlay).toContain("a".repeat(padLenFit));
+
+    // Exceeds limit by 1 byte: 131041 bytes triggers fallback
+    const exceedLogs: Array<{ stream: string; chunk: string }> = [];
+    const exceedCtx = makeContext({
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+      onLogCollector: exceedLogs,
+    });
+    (exceedCtx as any).context.paperclipTaskMarkdownAssignment = "Task brief.";
+    (exceedCtx as any).context.paperclipTaskCommunicationGuidance = "a".repeat(padLenFit + 1);
+
+    await execute(exceedCtx);
+    const exceedStderr = exceedLogs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+    expect(exceedStderr).toContain("[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.");
+  });
+
+  it("fails closed before spawn when non-relocatable operator HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds HERMES_MAX_SYSTEM_PROMPT_BYTES", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = makeContext({
+      extraEnv: {
+        HERMES_EPHEMERAL_SYSTEM_PROMPT: "x".repeat(HERMES_MAX_SYSTEM_PROMPT_BYTES + 100),
+      },
+      onLogCollector: logs,
+    });
+
+    await expect(execute(ctx)).rejects.toThrow("HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds maximum argument size");
+    const stderrLogs = logs.filter((l) => l.stream === "stderr").map((l) => l.chunk).join("");
+    expect(stderrLogs).toContain("[hermes] HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds maximum argument size");
+  });
+
+  it("agent config.env with PAPERCLIP_MEMORY_HARDENING: 'all' hardens both mem0.json and config.yaml through execute()", async () => {
+    const memory = createValidMemoryConfig();
+    const ctx = makeContext({
+      memoryConfig: memory,
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "all" },
+    });
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    expect(interceptedOpts.mem0JsonContentAtExecution).toBeTruthy();
+    const mem0 = JSON.parse(interceptedOpts.mem0JsonContentAtExecution!);
+    expect(mem0.sync_max_chars).toBe(6000);
+
+    expect(interceptedOpts.configYamlContentAtExecution).toBeTruthy();
+    expect(interceptedOpts.configYamlContentAtExecution).toContain("memory_enabled: false");
+    expect(interceptedOpts.configYamlContentAtExecution).toContain("user_profile_enabled: false");
+  });
+
+  it("server env hermes-memory-config cannot be disabled by agent config.env empty string through execute()", async () => {
+    process.env.PAPERCLIP_MEMORY_HARDENING = "hermes-memory-config";
+    const memory = createValidMemoryConfig();
+    const ctx = makeContext({
+      memoryConfig: memory,
+      extraEnv: { PAPERCLIP_MEMORY_HARDENING: "" },
+    });
+
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+
+    expect(interceptedOpts.mem0JsonContentAtExecution).toBeTruthy();
+    const mem0 = JSON.parse(interceptedOpts.mem0JsonContentAtExecution!);
+    expect(mem0.sync_max_chars).toBe(6000);
+
+    expect(interceptedOpts.configYamlContentAtExecution).toBeTruthy();
+    expect(interceptedOpts.configYamlContentAtExecution).toContain("memory_enabled: false");
+    expect(interceptedOpts.configYamlContentAtExecution).toContain("user_profile_enabled: false");
+  });
+
+  it("end-to-end execute writes agent-scoped user_id to mem0.json when userId equals agentId", async () => {
+    const memory = createValidMemoryConfig();
+    (memory as any).userId = memory.agentId;
+
+    const ctx = makeContext({ memoryConfig: memory });
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(interceptedOpts.mem0JsonContentAtExecution).toBeTruthy();
+    const mem0 = JSON.parse(interceptedOpts.mem0JsonContentAtExecution!);
+    expect(mem0.user_id).toBe(memory.agentId);
+    expect(mem0.agent_id).toBe(memory.agentId);
   });
 
   describe("benign stderr reclassification and logging notices", () => {

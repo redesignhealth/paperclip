@@ -10,7 +10,7 @@ All commands below assume you are in the **project root** (the directory contain
 docker build -t paperclip-local .
 ```
 
-The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, OpenCode, and Hermes CLIs.
+The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, OpenCode, Gemini, Kimi, Pi, and Hermes CLIs.
 
 Build arguments:
 

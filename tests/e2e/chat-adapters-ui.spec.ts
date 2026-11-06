@@ -1,3 +1,4 @@
+import { defaultSlackAppConfiguration } from "../../packages/shared/src/slack-app-manifest";
 import {
   expect,
   test,
@@ -163,6 +164,7 @@ type Seed = {
   prefix: string;
   agentId: string;
   otherAgentId: string;
+  companyName: string;
 };
 
 async function json<T>(
@@ -177,9 +179,10 @@ async function json<T>(
 }
 
 async function seedCompanyAndAgent(request: APIRequestContext): Promise<Seed> {
+  const companyName = `Chat adapters browser E2E ${Date.now()}`;
   const company = await json<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
-      data: { visibility: "shared", name: `Chat adapters browser E2E ${Date.now()}` },
+      data: { visibility: "shared", name: companyName },
     }),
     "create company",
   );
@@ -220,6 +223,7 @@ async function seedCompanyAndAgent(request: APIRequestContext): Promise<Seed> {
     prefix: company.issuePrefix,
     agentId: agent.id,
     otherAgentId: otherAgent.id,
+    companyName,
   };
 }
 
@@ -2026,7 +2030,7 @@ test.describe.serial("native chat adapter UI", () => {
       name: "Slack app manifest",
       exact: true,
     });
-    await expect(manifest).toHaveValue(expectedSlackManifest(webhookUrl));
+    await expect(manifest).toHaveValue(expectedSlackManifest(webhookUrl, defaultSlackAppConfiguration("Maya", seed.companyName)));
     await expect(manifest).toHaveAttribute("readonly", "");
     await expect(
       page.getByText(

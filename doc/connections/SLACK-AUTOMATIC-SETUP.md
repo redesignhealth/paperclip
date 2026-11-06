@@ -77,6 +77,36 @@ stored value changes on every use. A pasted one-time **access token** is used fo
 app creation, `apps.manifest.update`, and `apps.icon.set`, then discarded after the
 request. Save & exit keeps the draft and all saved non-secret progress.
 
+### Instance-wide configuration token
+
+Most people cannot generate a Slack configuration token. An instance
+administrator can save **one refresh token per Slack workspace for every
+company**: paste it in any company's Slack setup and choose **Save for every
+company in this instance**. Everyone who manages connections then sees "Using the
+Slack configuration token your administrator saved for every company" and creates
+their app without a Slack token of their own.
+
+- It is stored on `instance_slack_configuration_credentials`, a table with no
+  company, because the tenant policy would hide one company's row from another's
+  requests. The token pair is encrypted with the instance master key
+  (`PAPERCLIP_SECRETS_MASTER_KEY`, as for SSO client secrets), never stored as a
+  company secret and never returned by any API. If the key is missing or changed
+  the credential cannot be read; this surfaces as
+  `slack_configuration_refresh_required`, and the server log names the key.
+- It follows the same single-use rotation as a personal token. One chain rotates
+  once even when several companies ask at the same moment; the rotation is logged
+  in the company whose request started it.
+- Only an instance administrator can save, replace or forget it. The check runs
+  before the pasted token is spent. Using it needs `tools:manage_connections` in
+  the company, as for any setup.
+- **Blast radius.** The token acts as the Slack user who generated it. It can
+  create and modify every Slack app that user owns in the workspace, including
+  other companies' apps, and anyone who can set up Slack in any company can create
+  apps through it. Generate it from a **dedicated Slack service-account user**, not
+  a person, so ownership survives people leaving.
+- Personal tokens still work and appear in the same list; the shared one is marked
+  "(shared)".
+
 **Create manually** and **Use an existing app** are under Advanced on the token step.
 **Create manually** uses the same generated manifest. **Use an existing app**
 keeps the existing credential-entry workflow. These paths retain explicit
@@ -163,7 +193,8 @@ the browser cannot supply a manifest, scopes, or callback destination.
 | Saved token identity mismatch (`slack_configuration_credential_mismatch`) | Slack returned a token for a different workspace or account. Paperclip requires reauthorization; generate a token for the intended workspace and account and save its **Refresh Token** again. |
 | Saved token rotation uncertain (`slack_configuration_refresh_uncertain`) | Slack may have issued a replacement Paperclip could not save. Retry once; if it still fails, generate a new token in Slack and save its refresh token again. |
 | Saved token rotation busy (`slack_configuration_refresh_busy`) | Another rotation for this credential was already in flight. Wait a moment and retry. |
-| Saved token belongs to another account (`slack_configuration_credential_forbidden`) | Saved tokens are per Paperclip user. Sign in as the owner or save your own token. |
+| Saved token belongs to another account (`slack_configuration_credential_forbidden`) | Personal saved tokens are per Paperclip user. Sign in as the owner or save your own token. The instance-wide token is exempt: anyone who manages connections can use it. |
+| Shared token save or forget refused (`slack_configuration_shared_forbidden`) | Only an instance administrator can save, replace or forget the token shared by every company. Ask one, or use your own token. |
 | Creation uncertain after timeout/restart | Inspect Slack app settings. Recover an existing app manually on this draft. Start another creation only after explicitly confirming that no app exists. |
 | App saved; event configuration pending after failure/restart | Enter an app configuration access token and select Retry app configuration. The same saved app and canonical manifest are reused; installation is blocked until this update succeeds. |
 | App created; installation declined/pending | Install the saved app again. No configuration token is needed. |
