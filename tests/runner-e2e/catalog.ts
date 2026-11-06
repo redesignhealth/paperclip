@@ -213,7 +213,12 @@ export const hermesMemoryProfile: RunnerProfileFixture = {
   }),
   supportedEnvironments: ["local"],
   buildAgent(buildInput) {
-    const configuredModel = process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL || "configured-in-memory-recall-env";
+    const configuredModel = process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL?.trim();
+    if (!configuredModel) {
+      throw new Error(
+        "PAPERCLIP_E2E_MEMORY_HERMES_MODEL is required to build Hermes agent for memory recall",
+      );
+    }
     const agent = commonAgent(
       buildInput,
       "memory-hermes-local",

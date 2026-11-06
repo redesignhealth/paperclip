@@ -54,7 +54,7 @@ export interface MemoryRecallObservation {
   nonce: string;
   runs: MemoryRecallRunRecord[];
   issues?: Array<{ id: string; status: string; title?: string; description?: string }>;
-  comments?: Array<{ id: string; issueId: string; authorAgentId?: string; body: string }>;
+  comments?: Array<{ id: string; issueId: string; authorAgentId?: string; createdByRunId?: string; body: string }>;
   memories?: MemoryItem[];
   controlOutput?: string;
   secondaryAgentId?: string;
@@ -190,6 +190,20 @@ export function summarizeMemories(memories: MemoryItem[]): {
   return { classified, byCategory: counts, totalCount, noiseCount, noiseRatio };
 }
 
+function selectDraftRun(
+  runs: readonly MemoryRecallRunRecord[],
+  issues?: Array<{ id: string }>,
+): MemoryRecallRunRecord | undefined {
+  return (
+    runs.find(
+      (r) =>
+        r.issueId &&
+        r.issueId !== issues?.[0]?.id &&
+        r.issueId !== issues?.[1]?.id,
+    ) ?? runs[runs.length - 1]
+  );
+}
+
 export function gradeMemoryRecall(input: {
   caseId: MemoryRecallCase;
   rep: number;
@@ -229,15 +243,15 @@ export function gradeMemoryRecall(input: {
     case "save-then-fresh-recall": {
       check(
         "runs-recorded",
-        runs.length >= 2 && runs.every((r) => ["succeeded", "done"].includes(r.status)),
+        runs.length >= 2 && runs.every((r) => r.status === "succeeded"),
         `Recorded ${runs.length} runs; save and recall runs must complete successfully.`,
       );
 
       const runA = runs[0];
       const runB = runs[1];
 
-      const runAValid = Boolean(runA && (runA.status === "succeeded" || runA.status === "done"));
-      const runBValid = Boolean(runB && (runB.status === "succeeded" || runB.status === "done"));
+      const runAValid = Boolean(runA && runA.status === "succeeded");
+      const runBValid = Boolean(runB && runB.status === "succeeded");
       check("dual-run-completion", runAValid && runBValid, "Both save run A and recall run B must succeed.");
 
       // Verify memory was extracted/stored from Run A into tenant DB AND typed mem0_add completed
@@ -256,7 +270,13 @@ export function gradeMemoryRecall(input: {
 
       const runBText = [
         runB?.result ?? "",
-        ...comments.filter((c) => c.issueId === runB?.issueId).map((c) => c.body),
+        ...comments
+          .filter(
+            (c) =>
+              c.issueId === runB?.issueId &&
+              (!c.createdByRunId || !runB?.id || c.createdByRunId === runB.id),
+          )
+          .map((c) => c.body),
       ].join("\n");
       const recalled = runBText.toLowerCase().includes(marker.toLowerCase());
       const typedSearchCompleted = (runB?.toolRecords ?? []).some((tr) => tr.tool === "mem0_search");
@@ -270,28 +290,48 @@ export function gradeMemoryRecall(input: {
     }
 
     case "implicit-recall": {
-      // In baseline: emit metrics only (zero checks)
-      // In hardened: check implicit-preference-applied and guidance-off-control-unbiased
-      const draftRun = runs.find((r) => r.issueId && r.issueId !== obs.issues?.[0]?.id && r.issueId !== obs.issues?.[1]?.id) ?? runs[runs.length - 1];
+      const draftRun = selectDraftRun(runs, obs.issues);
       const draftText = [
         draftRun?.result ?? "",
-        ...comments.filter((c) => c.issueId === draftRun?.issueId).map((c) => c.body),
+        ...comments
+          .filter(
+            (c) =>
+              c.issueId === draftRun?.issueId &&
+              (!c.createdByRunId || !draftRun?.id || c.createdByRunId === draftRun.id),
+          )
+          .map((c) => c.body),
       ].join("\n");
 
       const followsPreference = draftText.includes(marker);
       const controlText = obs.controlOutput ?? "";
       const controlUnbiased = controlText.length > 0 && !controlText.includes(marker);
 
+      check(
+        "implicit-runs-completed",
+        runs.length >= 3 && runs.every((r) => r.status === "succeeded"),
+        `Expected at least 3 succeeded runs (control, seed, draft); observed ${runs.filter((r) => r.status === "succeeded").length}/${runs.length}.`,
+      );
+      check(
+        "actual-control-recorded",
+        controlText.length > 0,
+        "Control run must produce non-empty control output prior to seeding preference.",
+      );
+      check(
+        "guidance-off-control-unbiased",
+        controlUnbiased,
+        "Guidance-off control run must not hallucinate or use the synthetic formatting marker.",
+      );
+      check(
+        "draft-run-observed",
+        draftText.length > 0,
+        "Draft update run must produce non-empty output.",
+      );
+
       if (flags.capabilityMemoryGuidance) {
         check(
           "implicit-preference-applied",
           followsPreference,
           `Draft update must follow the seeded formatting preference ('${marker}') via capability memory guidance.`,
-        );
-        check(
-          "guidance-off-control-unbiased",
-          controlUnbiased,
-          "Guidance-off control run must not hallucinate or use the synthetic formatting marker.",
         );
       }
       break;
@@ -300,7 +340,9 @@ export function gradeMemoryRecall(input: {
     case "cross-agent-leak": {
       // Precondition: Agent Y run belongs to Agent Y and its prompt has no marker
       const secondaryAgentId = obs.secondaryAgentId;
-      const agentYRun = runs.length > 1 ? runs[1] : runs[0];
+      const agentYRun = secondaryAgentId
+        ? runs.find((r) => r.agentId === secondaryAgentId)
+        : runs.length > 1 ? runs[1] : runs[0];
       const agentYIssue = obs.issues?.find((i) => i.id === agentYRun?.issueId);
       const agentYIssueText = `${agentYIssue?.title ?? ""} ${agentYIssue?.description ?? ""}`;
 
@@ -310,14 +352,20 @@ export function gradeMemoryRecall(input: {
 
       const agentYText = [
         agentYRun?.result ?? "",
-        ...comments.filter((c) => c.issueId === agentYRun?.issueId).map((c) => c.body),
+        ...comments
+          .filter(
+            (c) =>
+              c.issueId === agentYRun?.issueId &&
+              (!c.createdByRunId || !agentYRun?.id || c.createdByRunId === agentYRun.id),
+          )
+          .map((c) => c.body),
       ].join("\n");
 
       const leaked = agentYText.toLowerCase().includes(marker.toLowerCase());
 
       check(
         "runs-recorded",
-        runs.length >= 2 && runs.every((r) => ["succeeded", "done"].includes(r.status)),
+        runs.length >= 2 && runs.every((r) => r.status === "succeeded"),
         `Recorded ${runs.length} runs; Agent X and Agent Y runs must complete successfully.`,
       );
 
@@ -348,14 +396,26 @@ export function gradeMemoryRecall(input: {
 
     case "noise": {
       const summary = summarizeMemories(memories);
-      if (flags.hermesMemoryConfig) {
-        const heartbeatRuns = runs.filter((r) => r.status === "succeeded" || r.status === "done");
-        check(
-          "heartbeat-run-count",
-          heartbeatRuns.length >= 10,
-          `Expected at least 10 ordinary heartbeat runs; observed ${heartbeatRuns.length}.`,
-        );
+      const heartbeatRuns = runs.filter((r) => r.status === "succeeded");
+      check(
+        "heartbeat-run-count",
+        heartbeatRuns.length >= 10,
+        `Expected at least 10 ordinary heartbeat runs; observed ${heartbeatRuns.length}.`,
+      );
 
+      const legitimateEmpty = summary.totalCount === 0 && heartbeatRuns.length >= 10;
+      const memoryObservationValid = Array.isArray(obs.memories) && (summary.totalCount > 0 || legitimateEmpty);
+      check(
+        "noise-memory-observation",
+        memoryObservationValid,
+        !Array.isArray(obs.memories)
+          ? "Memory observation is missing or invalid."
+          : summary.totalCount === 0 && heartbeatRuns.length < 10
+            ? "Empty memory outcome is only valid when all 10 heartbeat runs completed successfully."
+            : "Valid memory observation recorded.",
+      );
+
+      if (flags.hermesMemoryConfig) {
         // Min-sample guard that FAILS if fewer than 5 memories, else ratio <= 0.3
         const minSampleMet = summary.totalCount >= 5;
         const bounded = minSampleMet && summary.noiseRatio <= 0.3;
@@ -367,7 +427,6 @@ export function gradeMemoryRecall(input: {
             : `Noise ratio under hardening must be bounded <= 30% (observed: ${(summary.noiseRatio * 100).toFixed(1)}%, count: ${summary.noiseCount}/${summary.totalCount}).`,
         );
       }
-      // Baseline noise: emit metrics only (zero checks)
       break;
     }
   }
@@ -404,7 +463,11 @@ export function gradeMemoryRecall(input: {
           cachedInputTokens: runsWithUsage.reduce((acc, r) => acc + (r.usage?.cachedInputTokens ?? 0), 0),
           outputTokens: runsWithUsage.reduce((acc, r) => acc + (r.usage?.outputTokens ?? 0), 0),
           totalTokens: runsWithUsage.reduce(
-            (acc, r) => acc + ((r.usage?.inputTokens ?? 0) + (r.usage?.outputTokens ?? 0)),
+            (acc, r) =>
+              acc +
+              ((r.usage?.inputTokens ?? 0) +
+                (r.usage?.cachedInputTokens ?? 0) +
+                (r.usage?.outputTokens ?? 0)),
             0,
           ),
           count: runsWithUsage.length,
@@ -423,10 +486,16 @@ export function gradeMemoryRecall(input: {
 
   let implicitRecallMetrics: MemoryRecallScoreResult["metrics"]["implicitRecall"] = undefined;
   if (caseId === "implicit-recall") {
-    const draftRun = runs[runs.length - 1];
+    const draftRun = selectDraftRun(runs, obs.issues);
     const draftText = [
       draftRun?.result ?? "",
-      ...comments.filter((c) => c.issueId === draftRun?.issueId).map((c) => c.body),
+      ...comments
+        .filter(
+          (c) =>
+            c.issueId === draftRun?.issueId &&
+            (!c.createdByRunId || !draftRun?.id || c.createdByRunId === draftRun.id),
+        )
+        .map((c) => c.body),
     ].join("\n");
     const followsPreference = draftText.includes(marker);
     const controlText = obs.controlOutput ?? "";
@@ -439,8 +508,8 @@ export function gradeMemoryRecall(input: {
 
   const passedChecks = checks.filter((c) => c.passed).length;
   const totalChecks = checks.length;
-  const passRate = totalChecks > 0 ? passedChecks / totalChecks : 1;
-  const passed = totalChecks === 0 ? true : checks.every((c) => c.passed);
+  const passRate = totalChecks > 0 ? passedChecks / totalChecks : 0;
+  const passed = totalChecks > 0 && checks.every((c) => c.passed);
 
   return {
     passed,

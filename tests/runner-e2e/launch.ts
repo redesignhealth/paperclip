@@ -204,8 +204,11 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-async function loadLocalEnvironment(target: NodeJS.ProcessEnv) {
-  const contents = await readFile(localEnvPath, "utf8").catch(
+export async function loadLocalEnvironment(
+  target: NodeJS.ProcessEnv,
+  envPath = localEnvPath,
+) {
+  const contents = await readFile(envPath, "utf8").catch(
     (error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return null;
       throw error;
@@ -218,7 +221,7 @@ async function loadLocalEnvironment(target: NodeJS.ProcessEnv) {
     const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
     if (!match)
       throw new Error(
-        `Invalid ${path.basename(localEnvPath)} line ${index + 1}`,
+        `Invalid ${path.basename(envPath)} line ${index + 1}`,
       );
     if (target[match[1]] !== undefined) continue;
     let value = match[2].trim();
@@ -989,7 +992,6 @@ async function main() {
   if (options.installedStartupOnly) {
     assertInstalledStartupOnly(process.env, executions, options);
     assertRunnerE2EPrerequisites(executions);
-    assertMemoryRecallPrerequisites(executions, process.env);
     const campaignId = cleanId(process.env.PAPERCLIP_E2E_CAMPAIGN_ID ?? `installed-startup-${Date.now()}`);
     await runAttempt({ executions, attempt: 1, campaignId, options });
     console.log(`PASS installed launch chain (no provider qualification) -> ${path.join(resultsRoot, campaignId, "installed-startup-only")}`);
@@ -1021,7 +1023,6 @@ async function main() {
   // Keep admission before local-env loading and credential checks. Pending
   // profiles remain discoverable, but cannot reach a provider.
   assertRunnerE2EPrerequisites(executions);
-  assertMemoryRecallPrerequisites(executions, process.env);
   assertNativeCompletionSelection(executions);
   assertNativeInstructionSelection(executions);
   const campaignId = cleanId(
@@ -1041,6 +1042,7 @@ async function main() {
   }
 
   await loadLocalEnvironment(process.env);
+  assertMemoryRecallPrerequisites(executions, process.env);
   assertRemoteNativeEvidencePrerequisites(executions, process.env);
   const missingCredentials = [
     ...new Set(

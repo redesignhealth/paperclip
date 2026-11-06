@@ -15,6 +15,7 @@ import {
   buildPaperclipServerEnvironment,
   runnerE2EServerControlPaths,
 } from "./harness-env.js";
+import { resolveMemoryHardeningFlags } from "../../packages/shared/src/memory-hardening.js";
 
 function required(name: string) {
   const value = process.env[name]?.trim();
@@ -118,6 +119,12 @@ function appendLog(message: string) {
   process.stderr.write(message);
   log.write(message);
 }
+
+appendLog(
+  `[company-memory-hardening] Server resolved hardening flags: ${JSON.stringify(
+    resolveMemoryHardeningFlags(definedServerEnvironment),
+  )}\n`,
+);
 
 function shutdownRequested() {
   return shutdownSignal !== null;

@@ -12,6 +12,7 @@ function makeExecution(caseId: string, rep = 1): MatrixExecution {
     suite: { id: "memory-recall" } as any,
     profile: {
       id: "memory-hermes-local",
+      model: "openrouter/anthropic/claude-3.5-sonnet",
       buildAgent: () => ({ name: "Agent" }),
     } as any,
     environment: { id: "local" } as any,
@@ -357,5 +358,338 @@ describe("memory-recall flow unit tests", () => {
         expect(postedIssues[i]?.description).toBe(scenario.heartbeatPrompts[i]);
       }
     }
+  });
+
+  it("(8) binds issues to expected agent and excludes wrong-agent runs", async () => {
+    let issueCount = 0;
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        issueCount++;
+        return { id: `issue-${issueCount}`, ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-wrong", issueId: "issue-1", status: "succeeded", agentId: "intruder-agent" },
+            { id: "run-wrong-2", issueId: "issue-2", status: "succeeded", agentId: "intruder-agent" },
+          ];
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return { id: "run-wrong", status: "succeeded", agentId: "intruder-agent" };
+        }
+        return [];
+      }),
+    };
+
+    const result = await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "wrong-agent-test",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    // Wrong-agent runs must never be admitted into mappedRuns or satisfy scoring
+    expect(result.runs).toHaveLength(0);
+    expect(result.scoreResult.passed).toBe(false);
+    expect(result.scoreResult.checks.find((c) => c.id === "runs-recorded")?.passed).toBe(false);
+  });
+
+  it("(9) selects comments only through exact run attribution", async () => {
+    let capturedEvidence: any = null;
+    let postCount = 0;
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        postCount++;
+        return { id: postCount === 1 ? "issue-save" : "issue-recall", ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-save", issueId: "issue-save", status: "succeeded", agentId: "agent-x-id", startedAt: "2026-01-01T00:00:00Z" },
+            { id: "run-recall", issueId: "issue-recall", status: "succeeded", agentId: "agent-x-id", startedAt: "2026-01-01T00:01:00Z" },
+          ];
+        }
+        if (path === "/api/heartbeat-runs/run-save") {
+          return { id: "run-save", issueId: "issue-save", status: "succeeded", agentId: "agent-x-id" };
+        }
+        if (path === "/api/heartbeat-runs/run-recall") {
+          return { id: "run-recall", issueId: "issue-recall", status: "succeeded", agentId: "agent-x-id" };
+        }
+        if (path === "/api/issues/issue-save/comments?order=asc") {
+          return [
+            { id: "c1", createdByRunId: "run-save", authorAgentId: "agent-x-id", body: "attributed to terminal run" },
+            { id: "c2", createdByRunId: "other-run", authorAgentId: "agent-x-id", body: "attributed to prior run" },
+            { id: "c3", createdByRunId: null, authorAgentId: null, body: "unattributed user comment" },
+            { id: "c4", createdByRunId: "run-save", authorAgentId: "foreign-agent", body: "wrong agent comment" },
+          ];
+        }
+        return [];
+      }),
+    };
+
+    await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "comment-attr",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockImplementation(async (_name, val) => {
+        capturedEvidence = val;
+      }),
+    });
+
+    expect(capturedEvidence).toBeDefined();
+    // Only c1 matched run-recall with agent-x-id
+    expect(capturedEvidence.observation.commentCount).toBe(1);
+  });
+
+  it("(10) propagates observation failures after execution", async () => {
+    // 10a: pre-run non-database error throws
+    const nonDbErrorFactory = async () => {
+      const err = new Error("Connection refused ECONNREFUSED");
+      (err as any).code = "ECONNREFUSED";
+      throw err;
+    };
+    await expect(
+      runMemoryRecallFlow({
+        api: { post: vi.fn(), get: vi.fn() } as any,
+        fixtures: makeFixtures(),
+        execution: makeExecution("save-then-fresh-recall"),
+        nonce: "nondb-test",
+        workspacePath: "/tmp/ws",
+        deadlineAt: Date.now() + 10_000,
+        skipPreflightProbe: true,
+        tenantReaderFactory: nonDbErrorFactory,
+        observe: vi.fn(),
+        evidence: vi.fn(),
+      }),
+    ).rejects.toThrow("ECONNREFUSED");
+
+    // 10b: post-run run summary poll failure propagates
+    const failSummaryApi: Partial<RunnerApi> = {
+      post: vi.fn().mockResolvedValue({ id: "issue-1" }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          throw new Error("HTTP 500: Failed to fetch heartbeat runs");
+        }
+        return [];
+      }),
+    };
+    await expect(
+      runMemoryRecallFlow({
+        api: failSummaryApi as RunnerApi,
+        fixtures: makeFixtures(),
+        execution: makeExecution("save-then-fresh-recall"),
+        nonce: "summary-fail",
+        workspacePath: "/tmp/ws",
+        deadlineAt: Date.now() + 10_000,
+        skipPreflightProbe: true,
+        tenantReaderFactory: async () => makeStubTenantReader(),
+        tenantDropper: async () => {},
+        observe: vi.fn(),
+        evidence: vi.fn(),
+      }),
+    ).rejects.toThrow("HTTP 500: Failed to fetch heartbeat runs");
+
+    // 10c: post-run comment fetch failure propagates
+    const failCommentApi: Partial<RunnerApi> = {
+      post: vi.fn().mockResolvedValue({ id: "issue-1" }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [{ id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" }];
+        }
+        if (path === "/api/heartbeat-runs/run-1") {
+          return { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" };
+        }
+        if (path.includes("/comments")) {
+          throw new Error("HTTP 502: Comment service unavailable");
+        }
+        return [];
+      }),
+    };
+    await expect(
+      runMemoryRecallFlow({
+        api: failCommentApi as RunnerApi,
+        fixtures: makeFixtures(),
+        execution: makeExecution("save-then-fresh-recall"),
+        nonce: "comment-fail",
+        workspacePath: "/tmp/ws",
+        deadlineAt: Date.now() + 10_000,
+        skipPreflightProbe: true,
+        tenantReaderFactory: async () => makeStubTenantReader(),
+        tenantDropper: async () => {},
+        observe: vi.fn(),
+        evidence: vi.fn(),
+      }),
+    ).rejects.toThrow("HTTP 502: Comment service unavailable");
+  });
+
+  it("(11) aggregates cleanup failures and preserves primary failure", async () => {
+    let postCount = 0;
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        postCount++;
+        return { id: `issue-${postCount}`, ...body };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-2", issueId: "issue-2", status: "succeeded", agentId: "agent-x-id" },
+          ];
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" };
+        }
+        return [];
+      }),
+    };
+
+    // Dropper failure alone throws
+    await expect(
+      runMemoryRecallFlow({
+        api: api as RunnerApi,
+        fixtures: makeFixtures(),
+        execution: makeExecution("save-then-fresh-recall"),
+        nonce: "drop-fail",
+        workspacePath: "/tmp/ws",
+        deadlineAt: Date.now() + 10_000,
+        skipPreflightProbe: true,
+        tenantReaderFactory: async () => makeStubTenantReader(),
+        tenantDropper: async () => {
+          throw new Error("PostgreSQL drop database error: permission denied");
+        },
+        observe: vi.fn(),
+        evidence: vi.fn().mockResolvedValue(undefined),
+      }),
+    ).rejects.toThrow(/PostgreSQL drop database error/);
+
+    // Scenario failure + dropper failure aggregates both
+    const failScenarioApi: Partial<RunnerApi> = {
+      post: vi.fn().mockRejectedValue(new Error("Primary scenario POST failure")),
+      get: vi.fn().mockResolvedValue([]),
+    };
+
+    let caughtError: any = null;
+    try {
+      await runMemoryRecallFlow({
+        api: failScenarioApi as RunnerApi,
+        fixtures: makeFixtures(),
+        execution: makeExecution("save-then-fresh-recall"),
+        nonce: "both-fail",
+        workspacePath: "/tmp/ws",
+        deadlineAt: Date.now() + 10_000,
+        skipPreflightProbe: true,
+        tenantReaderFactory: async () => makeStubTenantReader(),
+        tenantDropper: async () => {
+          throw new Error("Cleanup drop failure");
+        },
+        observe: vi.fn(),
+        evidence: vi.fn().mockResolvedValue(undefined),
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    expect(caughtError.errors).toHaveLength(2);
+    expect(String(caughtError.errors[0])).toContain("Primary scenario POST failure");
+    expect(String(caughtError.errors[1])).toContain("Cleanup drop failure");
+  });
+
+  it("(12) removes all raw memory text from serialized evidence (no dataExcerpt) and prevents secret leaks", async () => {
+    let capturedEvidence: any = null;
+    const secretContent = "TOP_SECRET_CREDENTIAL_XYZ_99999";
+    const stubReader = makeStubTenantReader([
+      { id: "mem-secret", data: `The master key is ${secretContent}` },
+    ]);
+
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => ({
+        id: "issue-1",
+        ...body,
+      })),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [
+            { id: "run-save", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-recall", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+          ];
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return { id: "run-detail", agentId: "agent-x-id", status: "succeeded" };
+        }
+        return [];
+      }),
+    };
+
+    await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "secrets-hygiene",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => stubReader,
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockImplementation(async (_name, val) => {
+        capturedEvidence = val;
+      }),
+    });
+
+    expect(capturedEvidence).toBeDefined();
+    const serialized = JSON.stringify(capturedEvidence);
+
+    // Verify raw secret and prefix excerpts are completely absent
+    expect(serialized).not.toContain(secretContent);
+    expect(serialized).not.toContain("dataExcerpt");
+
+    // Verify lengths and hashes exist instead
+    expect(capturedEvidence.observation.memories[0]).toMatchObject({
+      dataLength: `The master key is ${secretContent}`.length,
+      dataHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+
+    // Verify graderVersion and contentDigest provenance
+    expect(capturedEvidence.graderVersion).toBe("paperclip.memory-recall.v1");
+    expect(capturedEvidence.contentDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(capturedEvidence.resolvedModel).toBeDefined();
+  });
+
+  it("(13) fails closed on preflight when server boot proof is required but missing", async () => {
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockResolvedValue({}),
+      get: vi.fn().mockResolvedValue([]),
+    };
+
+    await expect(
+      runMemoryRecallFlow({
+        api: api as RunnerApi,
+        fixtures: makeFixtures(),
+        execution: makeExecution("save-then-fresh-recall"),
+        nonce: "fail-closed",
+        workspacePath: "/tmp/ws",
+        deadlineAt: Date.now() + 10_000,
+        skipPreflightProbe: false, // Live mode requiring boot proof
+        tenantReaderFactory: async () => makeStubTenantReader(),
+        tenantDropper: async () => {},
+        observe: vi.fn(),
+        evidence: vi.fn(),
+      }),
+    ).rejects.toThrow(/server boot proof is required/);
   });
 });

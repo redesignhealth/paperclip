@@ -137,10 +137,11 @@ export const memoryRecallTasks: readonly RunnerTaskFixture[] =
         groups: ["memory"],
         workMode: "standard",
         flow: "memory_recall",
-        expectedRunCount: caseId === "noise" ? 10 : 2,
+        expectedRunCount:
+          caseId === "noise" ? 10 : caseId === "implicit-recall" ? 3 : 2,
         attemptTimeoutMs: {
-          local: 8 * 60_000,
-          daytona: 12 * 60_000,
+          local: caseId === "noise" ? 20 * 60_000 : 8 * 60_000,
+          daytona: caseId === "noise" ? 25 * 60_000 : 12 * 60_000,
         },
         expectedTerminalState: {
           issue: "done",
@@ -153,7 +154,7 @@ export const memoryRecallTasks: readonly RunnerTaskFixture[] =
           if (scenario.caseId === "save-then-fresh-recall")
             return scenario.savePrompt;
           if (scenario.caseId === "implicit-recall")
-            return scenario.askPrompt;
+            return scenario.controlPrompt;
           if (scenario.caseId === "cross-agent-leak")
             return scenario.agentXPrompt;
           return (

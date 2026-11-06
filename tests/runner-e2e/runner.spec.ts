@@ -1216,6 +1216,20 @@ for (const execution of executions) {
         });
         issue = firstTask.issue as IssueRecord; selectedRuns = firstTask.runs as RunRecord[];
       } else if (execution.task.flow === "memory_recall") {
+        const adminDsn = process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL;
+        let dsnSecrets: string[] = [];
+        if (adminDsn) {
+          try {
+            const parsedUrl = new URL(adminDsn);
+            if (parsedUrl.password) {
+              dsnSecrets = [
+                parsedUrl.password,
+                decodeURIComponent(parsedUrl.password),
+              ].filter(Boolean);
+            }
+          } catch {}
+        }
+        const effectiveSecrets = [...secrets, ...dsnSecrets];
         const memoryRecall = await runMemoryRecallFlow({
           api, fixtures, execution, nonce, workspacePath,
           deadlineAt: startedAtMs + deadlineMs,
@@ -1224,7 +1238,7 @@ for (const execution of executions) {
             selectedRuns = currentRuns as unknown as RunRecord[];
             matcherResults = checks.map(check => ({ matcher: { kind: "json_path" as const, path: `memoryRecall.${check.id}`, expected: true }, passed: check.passed, detail: check.detail }));
           },
-          evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),
+          evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, effectiveSecrets),
         });
         issue = memoryRecall.issue as unknown as IssueRecord;
         selectedRuns = memoryRecall.runs as unknown as RunRecord[];

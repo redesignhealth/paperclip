@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import type { MemoryHardeningFlags } from "../../packages/shared/src/memory-hardening.js";
 import {
   deriveCompanyMemoryDatabaseNames,
   quoteIdentifier,
@@ -124,6 +125,11 @@ export interface TenantMemoryReader {
   close(): Promise<void>;
 }
 
+export const TEST_TENANT_DB_REGEX =
+  /^paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$/;
+export const TEST_TENANT_ROLE_REGEX =
+  /^paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}_owner$/;
+
 export async function openTenantReader(
   adminDsn: string,
   databaseName: string,
@@ -131,12 +137,17 @@ export async function openTenantReader(
   const tenantUrl = new URL(adminDsn);
   tenantUrl.pathname = `/${databaseName}`;
   const sql = postgres(tenantUrl.toString(), { max: 1 });
-  await sql`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;`;
+  try {
+    await sql.unsafe("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;");
+  } catch (err) {
+    await sql.end({ timeout: 5 }).catch(() => {});
+    throw err;
+  }
 
   return {
     async snapshotMemoryIds(): Promise<Set<string>> {
       const rows = await sql<{ id: string }[]>`
-        SELECT id::text as id FROM mem0_memories;
+        SELECT id::text as id FROM mem0_memories ORDER BY id ASC;
       `;
       return new Set(rows.map((r: { id: string }) => String(r.id)));
     },
@@ -156,7 +167,8 @@ export async function openTenantReader(
           payload->>'agent_id' as agent_id,
           payload->>'user_id' as user_id,
           payload->>'created_at' as created_at
-        FROM mem0_memories;
+        FROM mem0_memories
+        ORDER BY id ASC;
       `;
       const results: TenantMemoryRow[] = [];
       for (const row of rows) {
@@ -187,6 +199,17 @@ export async function dropTenantDatabase(
   databaseName: string,
   roleName?: string,
 ): Promise<void> {
+  if (!TEST_TENANT_DB_REGEX.test(databaseName)) {
+    throw new Error(
+      `Refusing to drop database "${databaseName}": does not match expected test tenant pattern`,
+    );
+  }
+  if (roleName && !TEST_TENANT_ROLE_REGEX.test(roleName)) {
+    throw new Error(
+      `Refusing to drop role "${roleName}": does not match expected test tenant role pattern`,
+    );
+  }
+
   const sql = postgres(adminDsn, { max: 1 });
   try {
     await sql.unsafe(`
@@ -195,8 +218,14 @@ export async function dropTenantDatabase(
       WHERE datname = '${databaseName.replace(/'/g, "''")}'
         AND pid <> pg_backend_pid();
     `);
-    await sql.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)};`);
+    await sql.unsafe(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} WITH (FORCE);`);
     if (roleName) {
+      try {
+        await sql.unsafe(`REASSIGN OWNED BY ${quoteIdentifier(roleName)} TO CURRENT_USER;`);
+        await sql.unsafe(`DROP OWNED BY ${quoteIdentifier(roleName)};`);
+      } catch {
+        // best-effort reassignment/drop owned
+      }
       await sql.unsafe(`DROP ROLE IF EXISTS ${quoteIdentifier(roleName)};`);
     }
   } finally {
@@ -204,19 +233,94 @@ export async function dropTenantDatabase(
   }
 }
 
-export function extractBootProof(serverLogContent: string): string {
+export interface ServerBootProof {
+  line: string;
+  flags: MemoryHardeningFlags;
+  toString(): string;
+}
+
+export function extractBootProof(serverLogContent: string): ServerBootProof {
   const lines = serverLogContent.split(/\r?\n/);
-  for (const line of lines) {
-    if (line.includes("[company-memory] Initialized company memory configuration")) {
-      // Must reflect enabled=true and companyScope=all
-      const hasEnabledTrue = /"enabled"\s*:\s*true\b/.test(line);
-      const hasCompanyScopeAll = /"companyScope"\s*:\s*"all"/.test(line);
+  let memoryInitLine: string | undefined;
+  let resolvedFlags: MemoryHardeningFlags | undefined;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i]!;
+    let text = rawLine;
+    let parsedObj: any = null;
+    try {
+      parsedObj = JSON.parse(rawLine.trim());
+      if (parsedObj && typeof parsedObj === "object") {
+        if (typeof parsedObj.msg === "string") {
+          text = parsedObj.msg;
+        }
+      }
+    } catch {
+      // not JSON line
+    }
+
+    if (
+      rawLine.includes("[company-memory] Initialized company memory configuration") ||
+      text.includes("[company-memory] Initialized company memory configuration")
+    ) {
+      const window = lines.slice(i, Math.min(i + 15, lines.length)).join("\n");
+      const hasEnabledTrue =
+        (parsedObj && parsedObj.enabled === true) ||
+        /["']?enabled["']?\s*:\s*true\b/i.test(window);
+      const hasCompanyScopeAll =
+        (parsedObj && parsedObj.companyScope === "all") ||
+        /["']?companyScope["']?\s*:\s*["']all["']/i.test(window);
       if (hasEnabledTrue && hasCompanyScopeAll) {
-        return line.trim();
+        memoryInitLine = rawLine.trim();
+      }
+    }
+
+    if (
+      rawLine.includes("[company-memory-hardening] Server resolved hardening flags:") ||
+      text.includes("[company-memory-hardening] Server resolved hardening flags:")
+    ) {
+      const source = text.includes("[company-memory-hardening] Server resolved hardening flags:")
+        ? text
+        : rawLine;
+      const idx = source.indexOf("[company-memory-hardening] Server resolved hardening flags:");
+      const rawJson = source
+        .slice(idx + "[company-memory-hardening] Server resolved hardening flags:".length)
+        .trim();
+      try {
+        const parsed = JSON.parse(rawJson);
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof parsed.hermesMemoryConfig === "boolean" &&
+          typeof parsed.hermesPromptSplit === "boolean" &&
+          typeof parsed.agentScopedMem0 === "boolean" &&
+          typeof parsed.capabilityMemoryGuidance === "boolean"
+        ) {
+          resolvedFlags = parsed;
+        }
+      } catch {
+        // invalid JSON line
       }
     }
   }
-  throw new Error(
-    "Server log missing required '[company-memory] Initialized company memory configuration' with enabled=true and companyScope='all'",
-  );
+
+  if (!memoryInitLine) {
+    throw new Error(
+      "Server log missing required '[company-memory] Initialized company memory configuration' with enabled=true and companyScope='all'",
+    );
+  }
+
+  if (!resolvedFlags) {
+    throw new Error(
+      "Server log missing required '[company-memory-hardening] Server resolved hardening flags' proof line with server-resolved flags",
+    );
+  }
+
+  return {
+    line: memoryInitLine,
+    flags: resolvedFlags,
+    toString() {
+      return memoryInitLine!;
+    },
+  };
 }

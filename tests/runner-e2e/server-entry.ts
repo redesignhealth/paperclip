@@ -81,4 +81,12 @@ if (contextCommentGate || completionBusyGate) {
     return Reflect.apply(end, this, args);
   } as typeof end;
 }
+const { resolveMemoryHardeningFlags } = await import(
+  "../../packages/shared/src/memory-hardening.js"
+);
+console.log(
+  `[company-memory-hardening] Server resolved hardening flags: ${JSON.stringify(
+    resolveMemoryHardeningFlags(process.env),
+  )}`,
+);
 await import("../../cli/src/index.js");
