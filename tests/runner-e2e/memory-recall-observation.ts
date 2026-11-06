@@ -128,11 +128,10 @@ export interface TenantMemoryReader {
 /**
  * Format guards for tenant database and role names.
  *
- * NOTE: Because the test harness provisions tenants using the standard tenant naming
- * scheme (pcmem_<32hex> derived from companyId), format regex validation alone does
- * not distinguish test tenants from production tenants. Isolation is achieved by
- * requiring exact equality with fixture-derived names, ensuring no production
- * database operations occur, and operating exclusively against a throwaway admin DSN.
+ * NOTE: The drop guard checks that names match the expected tenant format and match
+ * the names derived from the freshly created fixture company. Real isolation
+ * relies on the operator supplying a throwaway admin DSN; regex format and name
+ * equality checks do not isolate tests from production.
  */
 export const TENANT_DB_NAME_REGEX =
   /^(?:pcmem_[0-9a-f]{32}|paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12})$/;
@@ -208,33 +207,46 @@ export async function openTenantReader(
 }
 
 export interface DropTenantDatabaseOptions {
-  expectedDatabaseName?: string;
-  expectedRoleName?: string;
+  expectedDatabaseName: string;
+  expectedRoleName: string;
   sqlFactory?: (dsn: string, options: { max: number }) => any;
 }
 
+/**
+ * Drops an ephemeral tenant database and its dedicated role.
+ *
+ * NOTE: The drop guard enforces that target names match the format pattern and match
+ * the names derived from the freshly created fixture company. Real isolation relies
+ * on the operator supplying a throwaway admin DSN; regex validation and name equality
+ * do not isolate tests from production.
+ */
 export async function dropTenantDatabase(
   adminDsn: string,
   databaseName: string,
-  roleName?: string,
-  options?: DropTenantDatabaseOptions,
+  roleName: string,
+  options: DropTenantDatabaseOptions,
 ): Promise<void> {
+  if (!options?.expectedDatabaseName || !options?.expectedRoleName) {
+    throw new Error(
+      "dropTenantDatabase requires expectedDatabaseName and expectedRoleName options",
+    );
+  }
   if (!TENANT_DB_NAME_REGEX.test(databaseName)) {
     throw new Error(
       `Refusing to drop database "${databaseName}": does not match expected tenant database naming format`,
     );
   }
-  if (roleName && !TENANT_ROLE_NAME_REGEX.test(roleName)) {
+  if (!TENANT_ROLE_NAME_REGEX.test(roleName)) {
     throw new Error(
       `Refusing to drop role "${roleName}": does not match expected tenant role naming format`,
     );
   }
-  if (options?.expectedDatabaseName !== undefined && databaseName !== options.expectedDatabaseName) {
+  if (databaseName !== options.expectedDatabaseName) {
     throw new Error(
       `Refusing to drop database "${databaseName}": does not match expected fixture-derived database name "${options.expectedDatabaseName}"`,
     );
   }
-  if (options?.expectedRoleName !== undefined && roleName !== options.expectedRoleName) {
+  if (roleName !== options.expectedRoleName) {
     throw new Error(
       `Refusing to drop role "${roleName}": does not match expected fixture-derived role name "${options.expectedRoleName}"`,
     );

@@ -302,7 +302,15 @@ describe("memory-recall flow unit tests", () => {
     // Verify all cleanup and evidence callbacks ran
     expect(observer).toHaveBeenCalled();
     expect(evidenceWriter).toHaveBeenCalled();
-    expect(dropper).toHaveBeenCalled();
+    expect(dropper).toHaveBeenCalledWith(
+      "postgres://eval-fake-placeholder/unused",
+      expect.stringMatching(/^pcmem_[0-9a-f]{32}$/),
+      expect.stringMatching(/^pcmem_r_[0-9a-f]{32}$/),
+      expect.objectContaining({
+        expectedDatabaseName: expect.stringMatching(/^pcmem_[0-9a-f]{32}$/),
+        expectedRoleName: expect.stringMatching(/^pcmem_r_[0-9a-f]{32}$/),
+      }),
+    );
   });
 
   it("(7) noise creates exactly 10 issues and polls per id without parent issue", async () => {

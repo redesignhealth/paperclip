@@ -23,6 +23,7 @@ import {
   openTenantReader,
   typedToolRecords,
   verifyAdminPreflight,
+  type DropTenantDatabaseOptions,
   type ServerBootProof,
   type TenantMemoryReader,
   type TypedToolRecord,
@@ -40,6 +41,8 @@ export const HARNESS_TERMINAL_RUN_STATUSES = new Set([
   "interrupted",
   "timed_out",
 ]);
+
+const FAKE_INJECTED_DSN_PLACEHOLDER = "postgres://eval-fake-placeholder/unused";
 
 export function isDatabaseDoesNotExistError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
@@ -63,7 +66,12 @@ export async function runMemoryRecallFlow(input: {
   observe(issue: Row | undefined, runs: Row[], checks: MemoryRecallCheck[]): void;
   evidence(name: string, value: unknown): Promise<void>;
   tenantReaderFactory?: (adminDsn: string, dbName: string) => Promise<TenantMemoryReader>;
-  tenantDropper?: (adminDsn: string, dbName: string, roleName?: string) => Promise<void>;
+  tenantDropper?: (
+    adminDsn: string,
+    dbName: string,
+    roleName: string,
+    options: DropTenantDatabaseOptions,
+  ) => Promise<void>;
   bootProofLoader?: () => Promise<ServerBootProof>;
   serverLogPath?: string;
   serverFlags?: MemoryHardeningFlags;
@@ -203,9 +211,10 @@ export async function runMemoryRecallFlow(input: {
     let snapshotIds = new Set<string>();
     const readerFactory = input.tenantReaderFactory ?? openTenantReader;
     if (input.tenantReaderFactory || adminDsn) {
+      const readerDsn = adminDsn ?? FAKE_INJECTED_DSN_PLACEHOLDER;
       let snapshotReader: TenantMemoryReader | undefined;
       try {
-        snapshotReader = await readerFactory(adminDsn ?? "postgres://localhost/test", tenantDbName);
+        snapshotReader = await readerFactory(readerDsn, tenantDbName);
         snapshotIds = await snapshotReader.snapshotMemoryIds();
       } catch (err) {
         if (isDatabaseDoesNotExistError(err)) {
@@ -439,9 +448,10 @@ export async function runMemoryRecallFlow(input: {
       // 1. Read new memories from tenant DB (tolerate ONLY missing lazy DB/table after run as empty observation)
       let tenantDbMissing = false;
       if (input.tenantReaderFactory || adminDsn) {
+        const readerDsn = adminDsn ?? FAKE_INJECTED_DSN_PLACEHOLDER;
         let obsReader: TenantMemoryReader | undefined;
         try {
-          obsReader = await readerFactory(adminDsn ?? "postgres://localhost/test", tenantDbName);
+          obsReader = await readerFactory(readerDsn, tenantDbName);
           const rows = await obsReader.readMemoriesSince(snapshotIds);
           newMemories = rows.map((r) => ({
             id: r.id,
@@ -636,8 +646,9 @@ export async function runMemoryRecallFlow(input: {
     // 5. drop tenant DB
     const dropper = input.tenantDropper ?? dropTenantDatabase;
     if (adminDsn || input.tenantDropper) {
+      const dropperDsn = adminDsn ?? FAKE_INJECTED_DSN_PLACEHOLDER;
       try {
-        await dropper(adminDsn ?? "postgres://localhost/test", tenantDbName, tenantRoleName, {
+        await dropper(dropperDsn, tenantDbName, tenantRoleName, {
           expectedDatabaseName: tenantDbName,
           expectedRoleName: tenantRoleName,
         });

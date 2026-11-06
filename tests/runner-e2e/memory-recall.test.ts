@@ -949,41 +949,63 @@ describe("server boot proof extraction and server-resolved flags", () => {
 });
 
 describe("tenant database drop safety", () => {
-  it("refuses to drop non-tenant database names to protect system/production DBs", async () => {
+  it("refuses to drop database names that do not match expected tenant format", async () => {
     for (const dangerousName of ["postgres", "template1", "prod_company_db", "paperclip_main"]) {
       await expect(
-        dropTenantDatabase("postgres://localhost/test", dangerousName),
+        dropTenantDatabase("postgres://eval-fake-placeholder/unused", dangerousName, "pcmem_r_0123456789abcdef0123456789abcdef", {
+          expectedDatabaseName: dangerousName,
+          expectedRoleName: "pcmem_r_0123456789abcdef0123456789abcdef",
+        }),
       ).rejects.toThrow(/does not match expected tenant database naming format/);
     }
   });
 
-  it("refuses to drop non-tenant role names", async () => {
+  it("refuses to drop role names that do not match expected tenant format", async () => {
     const validDbName = "paperclip_tenant_11111111_2222_4333_8444_555555555555";
     for (const dangerousRole of ["postgres", "admin", "app_user", "paperclip_service"]) {
       await expect(
-        dropTenantDatabase("postgres://localhost/test", validDbName, dangerousRole),
+        dropTenantDatabase("postgres://eval-fake-placeholder/unused", validDbName, dangerousRole, {
+          expectedDatabaseName: validDbName,
+          expectedRoleName: dangerousRole,
+        }),
       ).rejects.toThrow(/does not match expected tenant role naming format/);
     }
   });
 
-  it("requires exact match against expected fixture-derived database and role names when provided", async () => {
+  it("requires exact match against expected fixture-derived database and role names", async () => {
     const validDb = "pcmem_0123456789abcdef0123456789abcdef";
     const otherValidDb = "pcmem_fedcba9876543210fedcba9876543210";
     const validRole = "pcmem_r_0123456789abcdef0123456789abcdef";
     const otherValidRole = "pcmem_r_fedcba9876543210fedcba9876543210";
 
     await expect(
-      dropTenantDatabase("postgres://localhost/test", validDb, validRole, {
+      dropTenantDatabase("postgres://eval-fake-placeholder/unused", validDb, validRole, {
         expectedDatabaseName: otherValidDb,
+        expectedRoleName: validRole,
       }),
     ).rejects.toThrow(/does not match expected fixture-derived database name/);
 
     await expect(
-      dropTenantDatabase("postgres://localhost/test", validDb, validRole, {
+      dropTenantDatabase("postgres://eval-fake-placeholder/unused", validDb, validRole, {
         expectedDatabaseName: validDb,
         expectedRoleName: otherValidRole,
       }),
     ).rejects.toThrow(/does not match expected fixture-derived role name/);
+  });
+
+  it("requires expectedDatabaseName and expectedRoleName options", async () => {
+    const validDb = "pcmem_0123456789abcdef0123456789abcdef";
+    const validRole = "pcmem_r_0123456789abcdef0123456789abcdef";
+
+    await expect(
+      dropTenantDatabase("postgres://eval-fake-placeholder/unused", validDb, validRole, undefined as any),
+    ).rejects.toThrow(/requires expectedDatabaseName and expectedRoleName/);
+
+    await expect(
+      dropTenantDatabase("postgres://eval-fake-placeholder/unused", validDb, validRole, {
+        expectedDatabaseName: validDb,
+      } as any),
+    ).rejects.toThrow(/requires expectedDatabaseName and expectedRoleName/);
   });
 
   it("throws AggregateError when role dependency cleanup and drop role both fail", async () => {
@@ -1004,7 +1026,9 @@ describe("tenant database drop safety", () => {
     mockSql.end = () => Promise.resolve();
 
     await expect(
-      dropTenantDatabase("postgres://localhost/test", validDb, validRole, {
+      dropTenantDatabase("postgres://eval-fake-placeholder/unused", validDb, validRole, {
+        expectedDatabaseName: validDb,
+        expectedRoleName: validRole,
         sqlFactory: () => mockSql,
       }),
     ).rejects.toThrow(AggregateError);

@@ -2,7 +2,16 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { extractDsnSecrets, findSecretLeak, findSecretLeakInDirectory, findSecretLeakMatch, normalizedSecrets, secretScanFailureEvidence } from "./redaction.js";
+import {
+  assertSecretFree,
+  extractDsnSecrets,
+  findSecretLeak,
+  findSecretLeakInDirectory,
+  findSecretLeakMatch,
+  normalizedSecrets,
+  sanitizeJson,
+  secretScanFailureEvidence,
+} from "./redaction.js";
 
 const tokens = {
   account_id: "identity-canary-private-90123",
@@ -95,5 +104,34 @@ describe("extractDsnSecrets", () => {
     expect(extractDsnSecrets("postgres://localhost:5432/test_db")).toEqual([]);
     expect(extractDsnSecrets("postgres://user@localhost:5432/test_db")).toEqual([]);
     expect(extractDsnSecrets("postgres://user:12@localhost:5432/test_db")).toEqual([]); // < 4 chars
+  });
+
+  it("covers DSN secrets in campaign redaction so assertSecretFree protects campaign outputs", () => {
+    const dsn = "postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres?sslmode=require";
+    const dsnSecrets = extractDsnSecrets(dsn);
+    const campaignSecrets = normalizedSecrets([
+      "some_other_secret_value",
+      ...dsnSecrets,
+    ]);
+
+    const campaignData = {
+      campaignId: "campaign-test-123",
+      results: [
+        {
+          error: "Connection failed to postgresql://eval_admin:superSecretDsnPass987@db.internal:5432/postgres",
+        },
+      ],
+    };
+
+    const rawJson = JSON.stringify(campaignData, null, 2);
+    expect(() => assertSecretFree(rawJson, campaignSecrets, "campaign.json")).toThrow(
+      /Secret leak in campaign\.json/,
+    );
+
+    const safeCampaign = sanitizeJson(campaignData, campaignSecrets);
+    const safeJson = JSON.stringify(safeCampaign, null, 2);
+    expect(() => assertSecretFree(safeJson, campaignSecrets, "campaign.json")).not.toThrow();
+    expect(safeJson).not.toContain("superSecretDsnPass987");
+    expect(safeJson).toContain("[REDACTED]");
   });
 });

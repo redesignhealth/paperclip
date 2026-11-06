@@ -531,13 +531,22 @@ async function runAttempt(input: {
     const decisionSigningSecret = secret(48);
     const toolActionSigningSecret = secret(48);
     const betterAuthSecret = secret(48);
-    const dsnSecrets = extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
+    const hasMemoryRecall = executions.some(
+      (candidate) =>
+        candidate.suite.id === "memory-recall" || candidate.task.flow === "memory_recall",
+    );
+    const dsnSecrets = hasMemoryRecall
+      ? extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL)
+      : [];
     const credentialSources = {
       ...Object.fromEntries(CREDENTIAL_NAMES.map((name) => [name, process.env[name]])),
       PAPERCLIP_AGENT_JWT_SECRET: agentJwtSecret,
       PAPERCLIP_DECISION_SIGNING_SECRET: decisionSigningSecret,
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
       BETTER_AUTH_SECRET: betterAuthSecret,
+      ...(hasMemoryRecall && process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL
+        ? { PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL }
+        : {}),
     };
     const credentials = normalizedSecrets([
       ...Object.values(credentialSources),
@@ -1105,9 +1114,11 @@ async function main() {
     expected: executions.map((execution) => execution.id),
     results: finalResults,
   });
-  const campaignSecrets = normalizedSecrets(
-    CREDENTIAL_NAMES.map((name) => process.env[name]),
-  );
+  const dsnSecrets = extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
+  const campaignSecrets = normalizedSecrets([
+    ...CREDENTIAL_NAMES.map((name) => process.env[name]),
+    ...dsnSecrets,
+  ]);
   const safeCampaign = sanitizeJson(
     campaign,
     campaignSecrets,
