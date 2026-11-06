@@ -15,6 +15,7 @@ import {
   LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController } from "../legacy-controller-lease.js";
+import { UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE } from "../company-memory-constants.js";
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
@@ -506,6 +507,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   "native_provider_model_rejected",
   "provider_tool_definition_invalid",
   "adapter_engine_unavailable",
@@ -642,7 +644,12 @@ export function classifyAdapterFailureForRecovery(
 ): AdapterFailureRecoveryClassification {
   // An engine prerequisite cannot be repaired by asking the same unavailable
   // engine to retry. Use the existing configuration-blocker path.
-  if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
+  if (
+    latestRun.errorCode === "adapter_engine_unavailable" ||
+    latestRun.errorCode === "provider_tool_definition_invalid" ||
+    latestRun.errorCode === "native_provider_model_rejected" ||
+    latestRun.errorCode === UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE
+  ) {
     return { kind: "configuration_incomplete" };
   }
   if (

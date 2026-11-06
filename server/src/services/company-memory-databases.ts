@@ -25,9 +25,28 @@ import {
   SAFE_PG_IDENTIFIER_REGEX,
   UUID_REGEX,
   LEASE_TTL_MS,
+  SUPPORTED_COMPANY_MEMORY_EMBEDDINGS,
+  DEFAULT_COMPANY_MEMORY_EMBEDDING,
+  isSupportedCompanyMemoryEmbedding,
+  UnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+  isUnsupportedMemoryEmbeddingError,
 } from "./company-memory-constants.js";
 
-export { SAFE_PG_IDENTIFIER_REGEX, UUID_REGEX, LEASE_TTL_MS, CompanyMemoryConfigurationError };
+export const PROVISIONER_DEFAULT_EMBEDDING = DEFAULT_COMPANY_MEMORY_EMBEDDING;
+
+export {
+  SAFE_PG_IDENTIFIER_REGEX,
+  UUID_REGEX,
+  LEASE_TTL_MS,
+  CompanyMemoryConfigurationError,
+  SUPPORTED_COMPANY_MEMORY_EMBEDDINGS,
+  DEFAULT_COMPANY_MEMORY_EMBEDDING,
+  isSupportedCompanyMemoryEmbedding,
+  UnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+  isUnsupportedMemoryEmbeddingError,
+};
 
 export class CompanyMemoryDatabaseError extends Error {
   constructor(message: string, readonly code: string) {
@@ -526,8 +545,8 @@ export function createPostgresCompanyMemoryDatabaseService(
     const port = parseInt(parsedAdminUrl.port || "5432", 10);
     const sslmode = "require";
     const collectionName = "mem0_memories";
-    const embeddingModel = "text-embedding-3-small";
-    const embeddingDimensions = 1536;
+    const embeddingModel = PROVISIONER_DEFAULT_EMBEDDING.model;
+    const embeddingDimensions = PROVISIONER_DEFAULT_EMBEDDING.dimensions;
 
     const leaseToken = randomUUID();
     const now = new Date();
@@ -1005,12 +1024,41 @@ export function createPostgresCompanyMemoryDatabaseService(
       .where(eq(companyMemoryDatabases.companyId, companyId))
       .then((rows) => rows[0] ?? null);
 
+    // Validate allowlist immediately after row is loaded, before any rotation
+    // convergence, credential rotation, or secret reads.
+    if (
+      row &&
+      !isSupportedCompanyMemoryEmbedding({
+        model: row.embeddingModel,
+        dimensions: row.embeddingDimensions,
+      })
+    ) {
+      throw new UnsupportedMemoryEmbeddingError(
+        companyId,
+        row.embeddingModel,
+        row.embeddingDimensions,
+      );
+    }
+
     if (!row || (row.status === "failed" && row.operation !== "rotate" && !row.pendingSecretVersion)) {
       try {
         row = await ensureProvisioned(companyId);
       } catch (err) {
         const reason = sanitizeDbError(err);
         throw new CompanyMemoryNotReadyError(`Failed to provision company memory database: ${reason}`);
+      }
+      if (
+        row &&
+        !isSupportedCompanyMemoryEmbedding({
+          model: row.embeddingModel,
+          dimensions: row.embeddingDimensions,
+        })
+      ) {
+        throw new UnsupportedMemoryEmbeddingError(
+          companyId,
+          row.embeddingModel,
+          row.embeddingDimensions,
+        );
       }
     }
 
@@ -1031,6 +1079,19 @@ export function createPostgresCompanyMemoryDatabaseService(
     if (!row || row.status !== "ready" || !row.secretId || !row.secretVersion) {
       throw new CompanyMemoryNotReadyError(
         `Company memory database is not ready (status: ${row?.status ?? "unprovisioned"})`,
+      );
+    }
+
+    if (
+      !isSupportedCompanyMemoryEmbedding({
+        model: row.embeddingModel,
+        dimensions: row.embeddingDimensions,
+      })
+    ) {
+      throw new UnsupportedMemoryEmbeddingError(
+        companyId,
+        row.embeddingModel,
+        row.embeddingDimensions,
       );
     }
 

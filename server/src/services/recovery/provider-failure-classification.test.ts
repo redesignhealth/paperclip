@@ -8,6 +8,7 @@ import {
 } from "./service.js";
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 import { isConfigurationIncompleteFailedRun } from "../../modules/wake-queue/domain/values.js";
+import { UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE } from "../company-memory-constants.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
   it("waits for model configuration changes instead of retrying a typed native model rejection", () => {
@@ -20,6 +21,17 @@ describe("classifyAdapterFailureForRecovery", () => {
     expect(classifyAdapterFailureForRecovery(unknown)).toBeNull();
     expect(classifyContinuationFailure(unknown as never).kind).toBe("transient_infra");
     expect(isConfigurationIncompleteFailedRun(unknown)).toBe(false);
+  });
+  it("treats unsupported_memory_embedding as non-retryable configuration failure with no automatic retry", () => {
+    const run = {
+      errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+      error: 'Unsupported company memory embedding configuration for company "c1": model "text-embedding-3-large" with 3072 dimensions is not in the supported allowlist',
+      resultJson: null,
+    };
+    expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
+    expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0 });
+    expect(isConfigurationIncompleteFailedRun(run)).toBe(true);
+    expect(isAiAuthenticationBlocked(run as never)).toBe(false);
   });
   it("retries a continuation whose host lost the controller lease before dispatch", () => {
     expect(classifyContinuationFailure({ errorCode: "controller_lease_lost", error: "Legacy controller lease lost", resultJson: null } as never))

@@ -11,6 +11,7 @@ import {
   CompanyMemoryDatabaseError,
   CompanyMemoryNotReadyError,
   CompanyMemoryConfigurationError,
+  UnsupportedMemoryEmbeddingError,
   type CompanyMemoryDdlExecutor,
 } from "./company-memory-databases.js";
 
@@ -372,6 +373,53 @@ describe("company-memory-databases", () => {
       expect(runtimeConfig).not.toBeNull();
       expect(runtimeConfig!.scopeMigrationCompletedAt).toEqual(completedAt);
       expect(runtimeConfig!.scopeMigrationMode).toBe("copy");
+    });
+
+    it("refuses to resolve runtime config and never decrypts/resolves secret material when embedding is unsupported", async () => {
+      const service = createTestService();
+      await service.ensureProvisioned(companyA);
+
+      // Mutate row in db to have unsupported embedding configuration
+      expect(memoryDbRows.length).toBe(1);
+      memoryDbRows[0].embeddingModel = "text-embedding-3-large";
+      memoryDbRows[0].embeddingDimensions = 3072;
+
+      const { getSecretProvider } = await import("../secrets/provider-registry.js");
+      const provider = getSecretProvider("local_encrypted");
+      const resolveSpy = vi.spyOn(provider, "resolveVersion");
+
+      try {
+        await expect(service.resolveRuntimeConfig(companyA)).rejects.toThrow(UnsupportedMemoryEmbeddingError);
+        expect(resolveSpy).not.toHaveBeenCalled();
+      } finally {
+        resolveSpy.mockRestore();
+      }
+    });
+
+    it("refuses to resolve runtime config and performs no credential rotation or secret writes for a rotating row when embedding is unsupported", async () => {
+      const service = createTestService();
+      await service.ensureProvisioned(companyA);
+
+      // Mutate row in db to have mid-rotation state AND unsupported embedding configuration
+      expect(memoryDbRows.length).toBe(1);
+      memoryDbRows[0].operation = "rotate";
+      memoryDbRows[0].pendingSecretVersion = 2;
+      memoryDbRows[0].embeddingModel = "text-embedding-3-large";
+      memoryDbRows[0].embeddingDimensions = 3072;
+
+      const initialSecretVersionCount = companySecretVersionRows.length;
+      const initialMaintenanceSqlCount = maintenanceSqlLog.length;
+      const rotateSpy = vi.spyOn(service, "rotateCredential");
+
+      try {
+        await expect(service.resolveRuntimeConfig(companyA)).rejects.toThrow(UnsupportedMemoryEmbeddingError);
+        expect(rotateSpy).not.toHaveBeenCalled();
+        expect(companySecretVersionRows.length).toBe(initialSecretVersionCount);
+        expect(maintenanceSqlLog.length).toBe(initialMaintenanceSqlCount);
+        expect(maintenanceSqlLog.some((sql) => sql.includes("ALTER ROLE") && sql.includes("PASSWORD"))).toBe(false);
+      } finally {
+        rotateSpy.mockRestore();
+      }
     });
 
     it("rotates credentials, updates secret version and role password", async () => {
