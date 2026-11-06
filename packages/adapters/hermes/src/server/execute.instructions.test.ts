@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
-import { buildPrompt, execute } from "./execute.js";
+import { buildPrompt, execute, renderHermesSystemPrompt } from "./execute.js";
 import { sessionCodec } from "./index.js";
 
 const SESSION_ID = "20261006_200000_abcdef";
@@ -22,8 +22,10 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
   let command: string;
   let instructionsFilePath: string;
   let capturePath: string;
+  let origHardeningEnv: string | undefined;
 
   beforeEach(async () => {
+    origHardeningEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-instructions-"));
     command = path.join(dir, "hermes.cjs");
     instructionsFilePath = path.join(dir, "instructions.md");
@@ -63,6 +65,11 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   });
 
   afterEach(async () => {
+    if (origHardeningEnv !== undefined) {
+      process.env.PAPERCLIP_MEMORY_HARDENING = origHardeningEnv;
+    } else {
+      delete process.env.PAPERCLIP_MEMORY_HARDENING;
+    }
     await fs.rm(dir, { recursive: true, force: true });
   });
 
@@ -263,6 +270,7 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(query(invocation)).not.toContain(INSTRUCTIONS);
     expect(invocation.systemPrompt).toContain("User configured system guidance.");
     expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
+    expect(invocation.systemPrompt).not.toContain("Current custom direction for run-fresh.");
 
     if (splitEnabled) {
       expect(query(invocation)).not.toContain("Paperclip runtime identity:");
@@ -275,6 +283,42 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       expect(invocation.systemPrompt).not.toContain("Paperclip runtime identity:");
       expect(invocation.systemPrompt).toContain("You are agent agent-synthetic (Hermes fixture).");
     }
+  });
+
+  it.each([false, true])("drops communication guidance on resumed sessions (hermesPromptSplit=%s)", async (splitEnabled) => {
+    const commGuidance = "Synthetic Slack connection guidance preference.";
+    const ctx = context({
+      runtime: {
+        sessionId: SESSION_ID,
+        sessionParams: { sessionId: SESSION_ID },
+        sessionDisplayId: SESSION_ID.slice(0, 16),
+        taskKey: "task-synthetic",
+      },
+      context: {
+        issueId: "task-synthetic",
+        paperclipTaskCommunicationGuidance: commGuidance,
+        paperclipTaskMarkdownAssignment: "Complete current synthetic task assignment.",
+        paperclipWake: {
+          reason: "issue_commented",
+          issue: { id: "task-synthetic", title: "Synthetic task", status: "in_progress" },
+          comments: [{ id: "comment-resume", body: "New resume direction." }],
+          commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+          fallbackFetchNeeded: false,
+        },
+      },
+      config: {
+        ...context().config,
+        env: {
+          CAPTURE_PATH: capturePath,
+          PAPERCLIP_MEMORY_HARDENING: splitEnabled ? "hermes-prompt-split" : "",
+        },
+      },
+    });
+
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(query(invocation)).not.toContain(commGuidance);
+    expect(invocation.systemPrompt).not.toContain(commGuidance);
   });
 
   it("splits runtime identity, connection guidance, and runtime tools guidance into system prompt under hermes-prompt-split", async () => {
@@ -394,6 +438,11 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(offQuery).not.toContain("Paperclip invocation:");
 
     const offSystem = splitOff.systemPrompt!;
+    const expectedGoldenSystem = [
+      `${INSTRUCTIONS}\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${dir}/.`,
+      renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: true }),
+    ].join("\n\n");
+    expect(offSystem).toBe(expectedGoldenSystem);
     expect(offSystem).toContain("You are agent agent-synthetic (Hermes fixture).");
     expect(offSystem.split("You are agent agent-synthetic (Hermes fixture).")).toHaveLength(2);
     expect(offSystem).not.toContain("Paperclip runtime identity:");
@@ -475,26 +524,17 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   });
 
   it("enables prompt split when PAPERCLIP_MEMORY_HARDENING is set in ambient process.env", async () => {
-    const origEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
     process.env.PAPERCLIP_MEMORY_HARDENING = "hermes-prompt-split";
-    try {
-      const ctx = context({
-        config: {
-          ...context().config,
-          env: { CAPTURE_PATH: capturePath },
-        },
-      });
-      await execute(ctx);
-      const [invocation] = await invocations();
-      expect(query(invocation)).not.toContain("Paperclip runtime identity:");
-      expect(query(invocation)).toContain("Paperclip invocation:\n- Run ID: run-fresh");
-      expect(invocation.systemPrompt).toContain("Paperclip runtime identity:");
-    } finally {
-      if (origEnv !== undefined) {
-        process.env.PAPERCLIP_MEMORY_HARDENING = origEnv;
-      } else {
-        delete process.env.PAPERCLIP_MEMORY_HARDENING;
-      }
-    }
+    const ctx = context({
+      config: {
+        ...context().config,
+        env: { CAPTURE_PATH: capturePath },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(query(invocation)).not.toContain("Paperclip runtime identity:");
+    expect(query(invocation)).toContain("Paperclip invocation:\n- Run ID: run-fresh");
+    expect(invocation.systemPrompt).toContain("Paperclip runtime identity:");
   });
 });

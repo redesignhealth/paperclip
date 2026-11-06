@@ -1885,6 +1885,98 @@ print(json.dumps(data))
       }
     });
 
+    it("serializeHermesMcpYaml gives explicit flags precedence over ambient process.env", () => {
+      const origEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+      try {
+        // process.env enables hardening, but explicit flags argument disables it
+        process.env.PAPERCLIP_MEMORY_HARDENING = "hermes-memory-config";
+        const explicitOff = serializeHermesMcpYaml({}, "model: gpt-5.4", true, {
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: false,
+        });
+        expect(explicitOff).toBe("model: gpt-5.4\n\nmemory:\n  provider: mem0\n");
+
+        // process.env has no hardening, but explicit flags argument enables it
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        const explicitOn = serializeHermesMcpYaml({}, "model: gpt-5.4", true, {
+          hermesMemoryConfig: true,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: false,
+        });
+        expect(explicitOn).toBe(
+          "model: gpt-5.4\n\nmemory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n",
+        );
+      } finally {
+        if (origEnv !== undefined) {
+          process.env.PAPERCLIP_MEMORY_HARDENING = origEnv;
+        } else {
+          delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        }
+      }
+    });
+
+    it("prepareHermesMcpHome honors explicit options.flags over ambient env", async () => {
+      const origEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-flags-explicit-"));
+      cleanupDirs.push(mockHost);
+      try {
+        process.env.PAPERCLIP_MEMORY_HARDENING = "hermes-memory-config";
+        // Explicit options.flags: false overrides ambient process.env
+        const prepared = await prepareHermesMcpHome({
+          servers: [],
+          memory: validMemConfig,
+          config: { env: { HERMES_HOME: mockHost } },
+          flags: {
+            hermesMemoryConfig: false,
+            hermesPromptSplit: false,
+            agentScopedMem0: false,
+            capabilityMemoryGuidance: false,
+          },
+        });
+        cleanupDirs.push(prepared.homeDir);
+
+        const configYaml = await fs.readFile(prepared.configPath, "utf8");
+        expect(configYaml).toContain("memory:\n  provider: mem0\n");
+        expect(configYaml).not.toContain("memory_enabled: false");
+
+        const mem0Content = JSON.parse(await fs.readFile(prepared.mem0JsonPath!, "utf8"));
+        expect(mem0Content.sync_max_chars).toBeUndefined();
+      } finally {
+        if (origEnv !== undefined) {
+          process.env.PAPERCLIP_MEMORY_HARDENING = origEnv;
+        } else {
+          delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        }
+      }
+    });
+
+    it("prepareHermesMcpHome falls back to config.env when options.flags is undefined", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-flags-config-fallback-"));
+      cleanupDirs.push(mockHost);
+
+      const prepared = await prepareHermesMcpHome({
+        servers: [],
+        memory: validMemConfig,
+        config: {
+          env: {
+            HERMES_HOME: mockHost,
+            PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config",
+          },
+        },
+      });
+      cleanupDirs.push(prepared.homeDir);
+
+      const configYaml = await fs.readFile(prepared.configPath, "utf8");
+      expect(configYaml).toContain("memory_enabled: false");
+      expect(configYaml).toContain("user_profile_enabled: false");
+
+      const mem0Content = JSON.parse(await fs.readFile(prepared.mem0JsonPath!, "utf8"));
+      expect(mem0Content.sync_max_chars).toBe(6000);
+    });
+
     it("never emits disabled_toolsets in serialized YAML", () => {
       const output = serializeHermesMcpYaml(
         {

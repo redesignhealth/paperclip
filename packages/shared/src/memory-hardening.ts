@@ -75,3 +75,36 @@ export function resolveMemoryHardeningFlags(
     capabilityMemoryGuidance,
   });
 }
+
+export function mergeMemoryHardeningFlags(
+  a: MemoryHardeningFlags,
+  b: MemoryHardeningFlags,
+): MemoryHardeningFlags {
+  return Object.freeze({
+    hermesMemoryConfig: a.hermesMemoryConfig || b.hermesMemoryConfig,
+    hermesPromptSplit: a.hermesPromptSplit || b.hermesPromptSplit,
+    agentScopedMem0: a.agentScopedMem0 || b.agentScopedMem0,
+    capabilityMemoryGuidance: a.capabilityMemoryGuidance || b.capabilityMemoryGuidance,
+  });
+}
+
+/**
+ * Resolves memory hardening flags with additive semantics:
+ * - Server flags are resolved from `serverEnv` (or process.env).
+ * - Agent flags are resolved from `agentEnv` (e.g. agent config.env).
+ * - Flags are merged via logical OR: agent config can enable additional hardening
+ *   flags, but cannot disable hardening flags enabled by the server.
+ * - Fails closed: an unknown token in either environment throws MemoryHardeningConfigurationError.
+ */
+export function resolveEffectiveMemoryHardeningFlags(
+  serverEnv?: Record<string, string | undefined>,
+  agentEnv?: Record<string, string | undefined> | null,
+): MemoryHardeningFlags {
+  const serverFlags = resolveMemoryHardeningFlags(serverEnv);
+  if (!agentEnv) {
+    return serverFlags;
+  }
+  const agentFlags = resolveMemoryHardeningFlags(agentEnv);
+  return mergeMemoryHardeningFlags(serverFlags, agentFlags);
+}
+

@@ -444,11 +444,28 @@ test("renderHermesSystemPrompt handles default identity stripping and CRLF line 
   expect(stripped).toContain("Paperclip API guidance:");
   expect(stripped).toContain("Connection tools:");
 
-  // Verify regex handles \r?\n line breaks
-  const regex = /^You are agent \{\{agent\.id\}\} \(\{\{agent\.name\}\}\)\.\r?\n\r?\n?/;
-  expect(regex.test("You are agent {{agent.id}} ({{agent.name}}).\n\nRest")).toBe(true);
-  expect(regex.test("You are agent {{agent.id}} ({{agent.name}}).\r\n\r\nRest")).toBe(true);
-  expect(regex.test("You are agent {{agent.id}} ({{agent.name}}).\nRest")).toBe(true);
-  expect(regex.test("You are agent {{agent.id}} ({{agent.name}}).\r\nRest")).toBe(true);
-  expect(regex.test("Different text\n\nRest")).toBe(false);
+  // Exercise production renderHermesSystemPrompt directly with CRLF line breaks
+  const crlfDoubleTemplate = "You are agent {{agent.id}} ({{agent.name}}).\r\n\r\nRest of prompt with CRLF";
+  const strippedCrlfDouble = renderHermesSystemPrompt(agent, {
+    includeDefaultIdentity: false,
+    agentPromptTemplate: crlfDoubleTemplate,
+  });
+  expect(strippedCrlfDouble).not.toContain("You are agent");
+  expect(strippedCrlfDouble).toContain("Rest of prompt with CRLF");
+
+  const crlfSingleTemplate = "You are agent {{agent.id}} ({{agent.name}}).\r\nRest of prompt with single CRLF";
+  const strippedCrlfSingle = renderHermesSystemPrompt(agent, {
+    includeDefaultIdentity: false,
+    agentPromptTemplate: crlfSingleTemplate,
+  });
+  expect(strippedCrlfSingle).not.toContain("You are agent");
+  expect(strippedCrlfSingle).toContain("Rest of prompt with single CRLF");
+
+  // When default identity line is missing, renderHermesSystemPrompt throws
+  expect(() =>
+    renderHermesSystemPrompt(agent, {
+      includeDefaultIdentity: false,
+      agentPromptTemplate: "Different text without identity\n\nRest",
+    }),
+  ).toThrow("failed to strip default identity line");
 });

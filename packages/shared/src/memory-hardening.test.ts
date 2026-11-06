@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveMemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+  mergeMemoryHardeningFlags,
   MemoryHardeningConfigurationError,
 } from "./memory-hardening.js";
 
@@ -221,6 +223,86 @@ describe("resolveMemoryHardeningFlags", () => {
           delete (globalThis as Record<string, unknown>).process;
         }
       }
+    });
+  });
+
+  describe("mergeMemoryHardeningFlags", () => {
+    it("performs logical OR across all flags", () => {
+      const a = resolveMemoryHardeningFlags({ PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" });
+      const b = resolveMemoryHardeningFlags({ PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" });
+      const merged = mergeMemoryHardeningFlags(a, b);
+      expect(merged).toEqual({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: true,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+    });
+  });
+
+  describe("resolveEffectiveMemoryHardeningFlags", () => {
+    it("returns server flags when agentEnv is null or undefined", () => {
+      const serverEnv = { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" };
+      expect(resolveEffectiveMemoryHardeningFlags(serverEnv, undefined)).toEqual({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(resolveEffectiveMemoryHardeningFlags(serverEnv, null)).toEqual({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+    });
+
+    it("enforces additive semantics: agent env can only add hardening, not disable server flags", () => {
+      // Server sets hermes-memory-config; agent sets empty string
+      const serverEnv = { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" };
+      const agentEnvEmpty = { PAPERCLIP_MEMORY_HARDENING: "" };
+      expect(resolveEffectiveMemoryHardeningFlags(serverEnv, agentEnvEmpty)).toEqual({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+
+      // Server sets hermes-memory-config; agent sets hermes-prompt-split
+      const agentEnvSplit = { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" };
+      expect(resolveEffectiveMemoryHardeningFlags(serverEnv, agentEnvSplit)).toEqual({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: true,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+
+      // Server sets nothing; agent sets all
+      const agentEnvAll = { PAPERCLIP_MEMORY_HARDENING: "all" };
+      expect(resolveEffectiveMemoryHardeningFlags({}, agentEnvAll)).toEqual({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: true,
+        agentScopedMem0: true,
+        capabilityMemoryGuidance: true,
+      });
+    });
+
+    it("fails closed if server env contains an unknown token", () => {
+      expect(() =>
+        resolveEffectiveMemoryHardeningFlags(
+          { PAPERCLIP_MEMORY_HARDENING: "unknown-flag" },
+          { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+        ),
+      ).toThrow(MemoryHardeningConfigurationError);
+    });
+
+    it("fails closed if agent env contains an unknown token", () => {
+      expect(() =>
+        resolveEffectiveMemoryHardeningFlags(
+          { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" },
+          { PAPERCLIP_MEMORY_HARDENING: "unknown-agent-flag" },
+        ),
+      ).toThrow(MemoryHardeningConfigurationError);
     });
   });
 });
