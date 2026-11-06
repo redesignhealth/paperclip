@@ -104,6 +104,12 @@ export async function resolveApprovedRemoteHttpAddresses(
     || (!options.allowPrivateNetwork && isPrivateOrReservedIp(result.address)))) {
     throw error("Remote MCP connection URL cannot resolve to private or reserved network addresses", "remote_http_private_endpoint");
   }
+  if (results.some((result) => isTailnetCgnatIp(result.address)) && (endpoint.protocol !== "https:" || (endpoint.port !== "" && endpoint.port !== "443"))) {
+    throw error(
+      "Remote MCP connection host name resolves to a tailnet (100.64.0.0/10) address; use the tailnet host name over https on port 443",
+      "remote_http_tailnet_address_denied",
+    );
+  }
   return results.map((result) => result.address);
 }
 
@@ -164,7 +170,7 @@ export function isAlwaysDeniedLinkLocalIp(address: string): boolean {
   return isIP(normalized) === 6 && /^fe[89ab]/.test(normalized);
 }
 
-/** Tailscale CGNAT range: IP literals here bypass the tailnet host-name port limit, so deny them in every mode. */
+/** Tailscale CGNAT range: IP literals here bypass the tailnet https:443 limit, so deny them in every mode; host names resolving here are limited to https:443. */
 function isTailnetCgnatIp(address: string): boolean {
   const octets = parseIpv4Address(normalizeIpAddress(address));
   return octets !== null && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;

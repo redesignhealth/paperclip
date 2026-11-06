@@ -120,11 +120,28 @@ describe("remote HTTP endpoint guard", () => {
     await expect(assertPublicRemoteHttpEndpoint(new URL(url), {}, guardError)).resolves.toBeUndefined();
   });
 
-  it("does not block a hostname whose DNS answer is in the CGNAT range", async () => {
-    await expect(assertPublicRemoteHttpEndpoint(
-      new URL("https://svc.internal.example/"),
-      { allowPrivateNetwork: true, lookup: async () => [{ address: "100.64.0.9", family: 4 }] },
-      guardError,
-    )).resolves.toBeUndefined();
+  const cgnat = [{ address: "100.64.0.9", family: 4 }];
+  const hostCheck = (url: string, answers = cgnat, allowPrivateNetwork = true) =>
+    assertPublicRemoteHttpEndpoint(new URL(url), { allowPrivateNetwork, lookup: async () => answers }, guardError);
+
+  it.each(["https://svc.example/", "https://svc.example:443/"])("allows hostname resolving to CGNAT on %s", async (url) => {
+    await expect(hostCheck(url)).resolves.toBeUndefined();
+  });
+
+  it.each(["https://svc.example:8443/", "http://svc.example/", "http://svc.example:443/", "wss://svc.example/", "ws://svc.example/"])(
+    "denies hostname resolving to CGNAT on %s",
+    async (url) => {
+      await expect(hostCheck(url)).rejects.toMatchObject({ code: "remote_http_tailnet_address_denied", message: expect.stringContaining("https on port 443") });
+    },
+  );
+
+  it("applies the rule to the whole request when answers mix public and CGNAT", async () => {
+    const mixed = [{ address: "93.184.216.34", family: 4 }, ...cgnat];
+    await expect(hostCheck("https://svc.example:8443/", mixed)).rejects.toMatchObject({ code: "remote_http_tailnet_address_denied" });
+    await expect(hostCheck("https://svc.example/", mixed)).resolves.toBeUndefined();
+  });
+
+  it("keeps the private-endpoint code for CGNAT answers when private networking is off", async () => {
+    await expect(hostCheck("https://svc.example:8443/", cgnat, false)).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
   });
 });
