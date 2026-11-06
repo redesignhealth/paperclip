@@ -1405,6 +1405,19 @@ export async function execute(
     detected: detectedConfig,
   });
   const { provider: resolvedProvider, resolvedFrom } = effective;
+  // Auto mode can select Anthropic from its explicit API credential in Hermes.
+  // An unused Anthropic-only setting must not block other providers or local runs.
+  const usesAnthropicRequestTimeout = hostIsolated &&
+    (resolvedProvider === "anthropic" || resolvedProvider === "auto");
+  let anthropicRequestTimeoutSec: number | undefined;
+  if (usesAnthropicRequestTimeout) {
+    const value = config.requestTimeoutSec ?? 300;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      throw new Error("Hermes requestTimeoutSec must be a positive finite number");
+    }
+    anthropicRequestTimeoutSec = value;
+  }
+
 
   // TECH-7895: Ramp Router runs are only supported where this adapter actually executes (the local
   // host). Never probe the host on behalf of a remote/sandbox target, and never swap providers.
@@ -1880,6 +1893,8 @@ export async function execute(
         onWarning: onCleanupWarning,
         canonicalRouterEndpoint: isRouterRun,
         isolatedFromHost: hostIsolated,
+        ...(anthropicRequestTimeoutSec !== undefined
+          ? { anthropicRequestTimeoutSec } : {}),
         ...(runHome ? { tempDirPrefix: path.join(runHome.path, "hermes-") } : {}),
       });
       tempHome = preparedHome.homeDir;
