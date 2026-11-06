@@ -116,21 +116,27 @@ with `isAppAvailableForCompanyVisibility`, and test both a shared and a NULL-vis
 ### D. Turn something off for one private company
 Use the Permissions UI (Layer 4). Do not edit code for a per-company choice.
 
-## Proposed risk grouping for RH Google MCP tools
+## Risk grouping for RH Google MCP tools
 
-Used when deciding what to enable broadly (implemented 2026-11-06 as the starting list; dangerous tools stay off by default and owners can enable them in the UI):
+The rule (set 2026-11-06): off only for real danger, which means sending, deleting, sharing or publishing, reaching other
+people, and running code. Dangerous tools stay off by default and owners can enable them in the UI.
 
-- **Keep gated, enable only with a reason:** `send_gmail_message`, `send_message` (Chat), `manage_drive_access`,
-  `set_drive_file_permissions`, `set_publish_settings`, `manage_event`, `respond_to_event`, `manage_gmail_filter`
-  (auto-forward or auto-delete), script tools (`run_script_function`, `create_script_project`, `update_script_content`,
-  `manage_deployment`, `delete_script_project`), `manage_contact*`, `create_event_with_zoom`, `delete_doc_tab`, `copy_drive_file`, `export_doc_to_pdf`,
-  `import_to_google_doc`, `generate_trigger_code`, `create_drive_file`, `update_drive_file`, and
-  `modify_gmail_message_labels` / `batch_modify_gmail_message_labels` (see below). Also off, because each can delete
-  through an `action` argument: `manage_gmail_label`, `manage_task`, `manage_task_list`.
-- **Low-risk writes (on at first connect, `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`):** Docs and Sheets edit and create tools
-  and `draft_gmail_message`.
-- **Label tools (kept off):** `modify_gmail_message_labels` and `batch_modify_gmail_message_labels`. They need `gmail.modify`,
-  which also lets a call add the `TRASH` or `SPAM` label, so they are not strictly "tags only".
+- **Off by default, enable only with a reason:**
+  - Sending: `send_gmail_message`, `send_message` (Chat).
+  - Deleting, or deleting through an `action` argument: `delete_script_project`, `delete_doc_tab`, `manage_gmail_label`,
+    `manage_task`, `manage_task_list`, `manage_contact`, `manage_contacts_batch`, `manage_contact_group`.
+  - Sharing and publishing: `manage_drive_access`, `set_drive_file_permissions`, `set_publish_settings`,
+    `get_drive_shareable_link`.
+  - Reaching other people: `manage_event`, `respond_to_event`, `create_event_with_zoom`, `manage_gmail_filter`
+    (auto-forward or auto-delete).
+  - Apps Script execution or change: `run_script_function`, `create_script_project`, `update_script_content`,
+    `manage_deployment`, `create_version`.
+- **On at first connect (`RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`):** `draft_gmail_message`, Gmail label tagging
+  (`modify_gmail_message_labels`, `batch_modify_gmail_message_labels`), Docs, Sheets, Slides and Forms edit and create
+  tools, Drive file writes (`create_drive_file`, `update_drive_file`, `copy_drive_file`, `export_doc_to_pdf`, ...), and
+  comment tools.
+- **Known trade-off:** the label tools need `gmail.modify`, which also lets a call add the `TRASH` or `SPAM` label, so
+  they are not strictly "tags only". They are on so agents can tag mail.
 
 ## Verify
 
