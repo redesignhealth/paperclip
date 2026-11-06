@@ -7,6 +7,14 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { buildPrompt, execute, renderHermesSystemPrompt } from "./execute.js";
 import { sessionCodec } from "./index.js";
 
+vi.mock("./mcp-preflight.js", () => ({
+  preflightHermesMcpServers: vi.fn(async (servers: any[], serverKeys: string[]) => ({
+    ok: true,
+    failures: [],
+    servers: servers.map((s, i) => ({ serverKey: serverKeys[i], listedToolCount: s.allowedTools?.length ?? 0 })),
+  })),
+}));
+
 const SESSION_ID = "20261006_200000_abcdef";
 const INSTRUCTIONS = "Synthetic governance marker: request approval before governed actions.";
 
@@ -501,7 +509,10 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     });
     await execute(ctx);
     const [invocation] = await invocations();
-    expect(invocation.systemPrompt).toContain("Hermes built-in stores handle session continuity; do not duplicate that in Mem0.");
+    expect(invocation.systemPrompt).toContain(
+      "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+    );
+    expect(invocation.systemPrompt).not.toContain("handle session continuity");
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
     expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
   });
@@ -527,7 +538,10 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     // Default identity line is stripped from system prompt
     expect(invocation.systemPrompt).not.toContain("You are agent agent-synthetic (Hermes fixture).");
     // Guidance from write-rules is present in system prompt
-    expect(invocation.systemPrompt).toContain("Hermes built-in stores handle session continuity; do not duplicate that in Mem0.");
+    expect(invocation.systemPrompt).toContain(
+      "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+    );
+    expect(invocation.systemPrompt).not.toContain("handle session continuity");
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
     // Legacy guidance is absent
     expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
@@ -619,6 +633,150 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       (l) => l.stream === "stderr" && l.chunk.includes("paperclipMemoryGuidance"),
     );
     expect(stderrLog).toBeUndefined();
+  });
+
+  describe("isolation-boundary memory guidance (TECH-8192)", () => {
+    it("forces hermesBuiltInStores false on runtime-MCP-only runs without Mem0", async () => {
+      const ctx = context({
+        runtimeMcp: {
+          getServers: () => [
+            {
+              name: "paperclip-issue-tools",
+              transport: "sse",
+              url: "http://localhost:3000/sse",
+              token: "mock-bearer-token",
+              allowedTools: ["paperclip_get_issue"],
+            },
+          ],
+        } as any,
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+      expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+      expect(invocation.systemPrompt).not.toContain("session continuity");
+      expect(invocation.systemPrompt).not.toContain("not a durable store");
+    });
+
+    it("forces hermesBuiltInStores false when host isolation is enabled", async () => {
+      const origHostIso = process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+      process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
+      try {
+        const baseCtx = context();
+        const ctx: AdapterExecutionContext = {
+          ...baseCtx,
+          config: {
+            ...baseCtx.config,
+            env: {
+              ...(baseCtx.config.env as Record<string, string>),
+              OPENROUTER_API_KEY: "sk-or-test-key",
+            },
+          },
+          paperclipMemoryGuidance: {
+            capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+            variant: "write-rules",
+          },
+        };
+        await execute(ctx);
+        const [invocation] = await invocations();
+        expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+        expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+        expect(invocation.systemPrompt).not.toContain("session continuity");
+      } finally {
+        if (origHostIso !== undefined) {
+          process.env.PAPERCLIP_HERMES_HOST_ISOLATION = origHostIso;
+        } else {
+          delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+        }
+      }
+    });
+
+    it("forces hermesBuiltInStores false on real execute path with Mem0", async () => {
+      const baseCtx = context();
+      const ctx: AdapterExecutionContext = {
+        ...baseCtx,
+        runtimeMemory: {
+          getConfig: async () => ({
+            provider: "mem0",
+            mode: "oss",
+            userId: "company",
+            agentId: "agent-synthetic",
+            llm: {
+              provider: "openai",
+              config: {
+                model: "gpt-4o-mini",
+                api_key: "sk-openai-key-secret-9999",
+              },
+            },
+            embedder: {
+              provider: "openai",
+              config: {
+                model: "text-embedding-3-small",
+              },
+            },
+            vectorStore: {
+              provider: "pgvector",
+              config: {
+                host: "127.0.0.1",
+                port: 5432,
+                user: "tenant_user",
+                password: "Tenant_Password_123!",
+                dbname: "tenant_db",
+                sslmode: "require",
+                collectionName: "mem0_collection",
+              },
+            },
+          }),
+        } as any,
+        config: {
+          ...baseCtx.config,
+          env: {
+            ...(baseCtx.config.env as Record<string, string>),
+            OPENAI_API_KEY: "sk-openai-key-secret-9999",
+          },
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      };
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain("Mem0: save short, self-contained facts");
+      expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+      expect(invocation.systemPrompt).not.toContain("session continuity");
+    });
+
+    it("retains conservative hermesBuiltInStores guidance without continuity promise on non-isolated runs without Mem0", async () => {
+      const ctx = context({
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain(
+        "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+      );
+      expect(invocation.systemPrompt).not.toContain("handle session continuity");
+    });
+
+    it("preserves legacy prompt byte-identical when paperclipMemoryGuidance is absent", async () => {
+      const ctx = context();
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain(
+        "Memory:\n- Task progress and handoffs go in issue comments, not memory.",
+      );
+      expect(invocation.systemPrompt).not.toContain(
+        "- Task progress belongs in issue comments, not memory.",
+      );
+    });
   });
 
   it("removes an obsolete instruction overlay when the bundle is removed", async () => {

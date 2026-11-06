@@ -139,6 +139,7 @@ describe("runtime connection tool delivery", () => {
     const guidance = selectMemoryAgentGuidance(ctx);
     const template = buildPaperclipAgentPromptTemplate(ctx);
 
+    expect(template).toContain("Memory:\n");
     expect(template).toContain(guidance);
 
     const prefixBeforeGuidance = template.slice(0, template.indexOf(guidance));
@@ -147,6 +148,17 @@ describe("runtime connection tool delivery", () => {
       DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.indexOf(MEMORY_AGENT_GUIDANCE),
     );
     expect(prefixBeforeGuidance).toBe(prefixBeforeDefault);
+  });
+
+  it("buildPaperclipAgentPromptTemplate substitutes guidance and preserves prefix and suffix of custom template", () => {
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: true, arcana: false, hermesBuiltInStores: false },
+      variant: "write-rules",
+    };
+    const customTemplate = `PREFIX HEADER\n\n${MEMORY_AGENT_GUIDANCE}\n\nSUFFIX FOOTER`;
+    const result = buildPaperclipAgentPromptTemplate(ctx, customTemplate);
+    const expectedGuidance = selectMemoryAgentGuidance(ctx);
+    expect(result).toBe(`PREFIX HEADER\n\n${expectedGuidance}\n\nSUFFIX FOOTER`);
   });
 
   it("buildPaperclipAgentPromptTemplate does not expand $-patterns in replacement", () => {

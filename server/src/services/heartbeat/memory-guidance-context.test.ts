@@ -184,7 +184,10 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
       variant: "write-rules",
     });
     const guidance = buildMemoryAgentGuidance(result!);
-    expect(guidance).toContain("Hermes built-in stores handle session continuity.");
+    expect(guidance).toContain(
+      "Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+    );
+    expect(guidance).not.toContain("handle session continuity");
   });
 
   it("keeps hermesBuiltInStores false for Hermes when runtimeMemory is present even without hermesMemoryConfig", () => {

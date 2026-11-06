@@ -1134,11 +1134,21 @@ export function renderHermesSystemPrompt(
   return renderTemplate(promptTemplate, { agent });
 }
 
-async function resolveMemoryGuidance(
+export async function resolveMemoryGuidance(
   ctx: AdapterExecutionContext,
+  options?: { usingIsolatedHome?: boolean },
 ): Promise<MemoryAgentGuidanceContext | undefined> {
   const result = parseMemoryAgentGuidanceContextResult(ctx.paperclipMemoryGuidance);
   if (result.status === "valid") {
+    if (options?.usingIsolatedHome) {
+      return {
+        ...result.data,
+        capabilities: {
+          ...result.data.capabilities,
+          hermesBuiltInStores: false,
+        },
+      };
+    }
     return result.data;
   }
   if (result.status === "malformed") {
@@ -1671,7 +1681,7 @@ export async function execute(
   let prompt = builtPrompt.query;
   let finalSystemPrompt: string;
 
-  const memoryGuidance = await resolveMemoryGuidance(ctx);
+  const memoryGuidance = await resolveMemoryGuidance(ctx, { usingIsolatedHome });
   const agentPromptTemplate = memoryGuidance
     ? buildPaperclipAgentPromptTemplate(memoryGuidance)
     : undefined;

@@ -89,15 +89,9 @@ export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): strin
   }
 
   if (ctx.capabilities.hermesBuiltInStores) {
-    if (ctx.capabilities.mem0) {
-      lines.push(
-        "- Hermes built-in stores handle session continuity; do not duplicate that in Mem0.",
-      );
-    } else {
-      lines.push(
-        "- Hermes built-in stores handle session continuity.",
-      );
-    }
+    lines.push(
+      "- Hermes built-in stores are scratch/local session context, not a durable store; save durable facts only to available Mem0/Arcana and progress to issue comments.",
+    );
   }
 
   lines.push(
