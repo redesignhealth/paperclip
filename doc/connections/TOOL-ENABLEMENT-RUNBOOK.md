@@ -1,9 +1,8 @@
 # Tool enablement runbook: what is on, off, hard-blocked, and hidden for shared companies
 
 Audience: anyone who needs to change which tools agents can use (for example "let agents tag emails" or "turn off
-send email everywhere"). Read this before editing any allowlist. It describes the code as of 2026-11-06 on branch
-`dancostanza/tech-8187-m1-mem0-hardening`; verify against the source files named in each section, because the lists
-change.
+send email everywhere"). Read this before editing any allowlist. It describes the code as of 2026-11-06; verify against the
+source files named in each section, because the lists change.
 
 ## The four layers (most to least restrictive)
 
@@ -32,10 +31,11 @@ and people decide what is *actually on for an agent* (layer 4).
 - **Shared companies get a different RH MCP path.** They get `rh-mcp-service`, a per-org service token with a scope-limited
   tool list (`RH_MCP_SERVICE_TOOLS_BY_SCOPE`), never the personal OAuth `rh-mcp`. It is created only for companies whose
   visibility is `shared` (`shared-org-rh-mcp.ts`, [DEFAULT-MCP-SPEC.md](./DEFAULT-MCP-SPEC.md) section "Shared-org rh-mcp").
-- **Open item: RH Google MCP.** I found no `companyVisibility` declaration or visibility check for `rh-google-mcp`. It is
-  a personal-only OAuth entry (each person connects their own Google account), which is why it behaves as private-only in
-  practice, but the code does not enforce "not in shared companies" for it. Confirm that is the intended exclusion
-  before relying on it, and if you need it enforced, add `companyVisibility: ["private"]` to its app definition.
+- **Open item: RH Google MCP.** `rh-google-mcp` is an entry in `DEFAULT_MCP_SPEC`, not an app definition, and nothing in
+  the code checks company visibility for it. It is a personal-only OAuth entry (each person connects their own Google
+  account), which is why it behaves as private-only in practice, but "not in shared companies" is not enforced. If you
+  need it enforced, add a visibility check to its seed/connect path (`default-mcp-oauth-seed.ts`); `companyVisibility`
+  only applies to app definitions.
 
 ## Layer 2: hard-disabled tools
 
@@ -46,7 +46,7 @@ Changing it needs a code change and a test.
   name matches `send|trash|spam|delete|remove|destroy|execute|run`, and any label tool that is not a read. The one
   exception is `unlabel_thread` (archive). Tests: `server/src/services/gmail-tool-governance.test.ts`.
 - **Google Workspace profiles**: `isGoogleWorkspaceToolAllowed` allows only the read tools in
-  `GOOGLE_WORKSPACE_READ_TOOLS` plus each profile's `writeTools`
+  `GOOGLE_WORKSPACE_READ_TOOLS` (`tool-access.ts`) plus each profile's `writeTools`
   (`packages/shared/src/google-workspace-connectors.ts`). Everything else is `disabled`.
 - **Railway**: `isRailwayToolBlocked`.
 - **Not hard-disabled:** RH Google MCP (the self-hosted server). Nothing in code blocks its tools; they are only
@@ -100,7 +100,7 @@ Important details:
    list version if one is recorded. Put low-risk writes in `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`, and add dangerous tools to the `DANGEROUS` guard in `default-mcp-spec.test.ts` instead.
 3. For existing instances, the owner enables it under Permissions (it will be quarantined). Do not expect a deploy alone
    to switch it on.
-4. For the self-provisioned per-agent profile (`rh-paperclip-tech-7028/scripts/mcp-targets.json`), add the tool to the
+4. For the self-provisioned per-agent profile (`scripts/mcp-targets.json` in the `rh-paperclip` repo), add the tool to the
    agent's `allow["rh-google-mcp"]` list and add the scope to `oauthScopes`; the mailbox owner must redo OAuth consent
    in their own board session (a board API key cannot).
 5. Add or update tests under `server/src/__tests__/default-mcp-*.test.ts`.
@@ -123,10 +123,13 @@ Used when deciding what to enable broadly (implemented 2026-11-06 as the startin
 - **Keep gated, enable only with a reason:** `send_gmail_message`, `send_message` (Chat), `manage_drive_access`,
   `set_drive_file_permissions`, `set_publish_settings`, `manage_event`, `respond_to_event`, `manage_gmail_filter`
   (auto-forward or auto-delete), script tools (`run_script_function`, `create_script_project`, `update_script_content`,
-  `manage_deployment`, `delete_script_project`), `manage_contact*`, `create_event_with_zoom`, `delete_doc_tab`.
-- **Low-risk writes (on at first connect, `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`):** Docs and Sheets edit and create tools,
-  `draft_gmail_message`, `manage_gmail_label`, Tasks tools.
-- **Needs a decision:** `modify_gmail_message_labels` and `batch_modify_gmail_message_labels`. They need `gmail.modify`,
+  `manage_deployment`, `delete_script_project`), `manage_contact*`, `create_event_with_zoom`, `delete_doc_tab`, `copy_drive_file`, `export_doc_to_pdf`,
+  `import_to_google_doc`, `generate_trigger_code`, `create_drive_file`, `update_drive_file`, and
+  `modify_gmail_message_labels` / `batch_modify_gmail_message_labels` (see below). Also off, because each can delete
+  through an `action` argument: `manage_gmail_label`, `manage_task`, `manage_task_list`.
+- **Low-risk writes (on at first connect, `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`):** Docs and Sheets edit and create tools
+  and `draft_gmail_message`.
+- **Label tools (kept off):** `modify_gmail_message_labels` and `batch_modify_gmail_message_labels`. They need `gmail.modify`,
   which also lets a call add the `TRASH` or `SPAM` label, so they are not strictly "tags only".
 
 ## Verify

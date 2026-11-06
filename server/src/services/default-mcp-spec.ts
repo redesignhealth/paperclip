@@ -240,17 +240,12 @@ export function connectionHealthColumns<S extends string>(
 }
 
 /**
- * RH Google MCP tools switched on at first consent: every read tool, plus the reviewed low-risk writes in
- * `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`. The server's own `isReadOnly` flag is NOT used: it marks 95 of 121 tools read-only,
- * including ones that change data (`manage_drive_access`, `modify_gmail_message_labels`, `modify_sheet_values`,
- * `manage_event`, `run_script_function`, `export_doc_to_pdf`, `draft_gmail_message`). Anything not listed here
- * (send, sharing, filters, scripts, event invites, deletes, contact changes, Gmail label modify) stays quarantined
- * until the owner enables it in Permissions. See doc/connections/TOOL-ENABLEMENT-RUNBOOK.md.
+ * Low-risk writes: drafts (never sent) and Docs/Sheets edits. Reviewed 2026-11-06. Tools that also delete through an
+ * `action` argument (`manage_gmail_label`, `manage_task`, `manage_task_list`) are deliberately NOT here: activation is
+ * per tool name, so enabling them would switch on the delete too.
  */
-/** Low-risk writes: drafts (never sent), labels as objects, Docs/Sheets edits, Tasks. Reviewed 2026-11-06. */
 export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
   "draft_gmail_message",
-  "manage_gmail_label",
   "create_doc",
   "modify_doc_text",
   "find_and_replace_doc",
@@ -266,10 +261,17 @@ export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
   "modify_sheet_values",
   "format_sheet_range",
   "manage_conditional_formatting",
-  "manage_task",
-  "manage_task_list",
 ]);
 
+/**
+ * RH Google MCP tools switched on at first consent: every read tool, plus the reviewed low-risk writes in
+ * `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`. The server's own `isReadOnly` flag is NOT used: it marks 95 of 121 tools read-only,
+ * including ones that change data (`manage_drive_access`, `modify_gmail_message_labels`, `modify_sheet_values`,
+ * `manage_event`, `run_script_function`, `export_doc_to_pdf`, `draft_gmail_message`). Anything not listed here
+ * (send, sharing, filters, scripts, event invites, deletes, label and task management, contact changes, Gmail label
+ * modify) stays quarantined
+ * until the owner enables it in Permissions. See doc/connections/TOOL-ENABLEMENT-RUNBOOK.md.
+ */
 export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.freeze([
   ...RH_GOOGLE_MCP_SAFE_WRITE_TOOLS,
   // Calendar

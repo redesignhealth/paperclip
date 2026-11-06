@@ -36,8 +36,9 @@ company/entry advisory lock, and an archived seed is an organization opt-out tha
 After the consenting owner first connects a personal Google instance, the tools named in
 `RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS` (`default-mcp-spec.ts`) are switched on and every other discovered
 catalog entry remains quarantined until the owner reviews it. That list is hand-built: every read tool plus the
-reviewed low-risk writes in `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS` (drafts, label management, Docs and Sheets edits, Tasks).
-Send, sharing, filters, scripts, event invites, deletes, contact changes and Gmail label modify stay quarantined, and
+reviewed low-risk writes in `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS` (drafts and Docs and Sheets edits).
+Send, sharing, filters, scripts, event invites, deletes, label and task management (they can delete through an `action`
+argument), contact changes and Gmail label modify stay quarantined, and
 an owner can enable them in Permissions. The Google server's own read-only flag is not used, because it marks tools
 that change data (for example `manage_drive_access`, `modify_sheet_values`, `run_script_function`) as read-only. See
 [TOOL-ENABLEMENT-RUNBOOK.md](./TOOL-ENABLEMENT-RUNBOOK.md). The instance is also installed,
