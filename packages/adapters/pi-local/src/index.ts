@@ -30,7 +30,7 @@ Core fields:
 - env (object, optional): KEY=VALUE environment variables
 - PAPERCLIP_PI_PROVIDERS (env, optional): JSON in Pi models.json "providers" shape for custom gateways, read from the agent env, else the server env.
   Set apiKey to a bare env var NAME (e.g. "RAMP_ROUTER_API_KEY") and supply that variable in the agent env; "\${NAME}" is not expanded by Pi.
-  Example: {"ramp-router":{"baseUrl":"https://api.router.com/v1","api":"openai-responses","apiKey":"RAMP_ROUTER_API_KEY","models":[{"id":"gpt-6-luna"}]},"ramp-router-anthropic":{"baseUrl":"https://api.router.com","api":"anthropic-messages","apiKey":"RAMP_ROUTER_API_KEY","models":[{"id":"claude-sonnet-5-5"}]}}
+  Example (one provider; a model can override api and baseUrl): {"ramp-router":{"baseUrl":"https://api.router.com/v1","api":"openai-responses","apiKey":"RAMP_ROUTER_API_KEY","models":[{"id":"gpt-6-luna"},{"id":"claude-sonnet-5-5","api":"anthropic-messages","baseUrl":"https://api.router.com"}]}}
 
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds

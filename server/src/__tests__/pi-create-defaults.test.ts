@@ -26,8 +26,9 @@ describe("needsPlatformDefaultRouterKeyForPi", () => {
     ["pi, non-object config", "pi_local", null, true, true],
     ["pi, blank model", "pi_local", { model: "  " }, true, true],
     ["pi, ramp-router model", "pi_local", { model: "ramp-router/gpt-6-luna" }, true, true],
-    ["pi, anthropic router model", "pi_local", { model: PI_DEFAULT_ROUTER_MODEL }, true, true],
-    ["pi, other model", "pi_local", { model: "openai/gpt-5.4-mini" }, true, false],
+    ["pi, default router model", "pi_local", { model: PI_DEFAULT_ROUTER_MODEL }, true, true],
+    ["pi, retired provider model", "pi_local", { model: "ramp-router-anthropic/claude-sonnet-5-5" }, true, true],
+    ["pi, other model", "pi_local", { model: "openai/gpt-5.4-mini" }, true, true],
     ["pi, key present", "pi_local", { env: { RAMP_ROUTER_API_KEY: { type: "plain", value: "" } } }, true, false],
     ["pi, other env ok", "pi_local", { env: { FOO: "x" } }, true, true],
     ["pi, env not a record", "pi_local", { env: "x" }, true, false],
@@ -97,11 +98,13 @@ describeDb("pi_local platform default Ramp Router key", () => {
     expect(JSON.stringify(await db.select().from(activityLog))).not.toContain(KEY);
   });
 
-  it("explicit model and explicit key are untouched", async () => {
+  it("explicit model and explicit key are untouched; the key is still bound", async () => {
     const companyId = await seedCompany();
     const a = await pi(companyId, { model: "openai/gpt-5.4-mini" });
     expect((a.adapterConfig as any).model).toBe("openai/gpt-5.4-mini");
-    expect((a.adapterConfig as any).env).toBeUndefined();
+    expect((a.adapterConfig as any).env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "secret_ref" });
+    const r = await pi(companyId, { model: "ramp-router-anthropic/claude-sonnet-5-5" });
+    expect((r.adapterConfig as any).model).toBe("ramp-router/claude-sonnet-5-5");
     const b = await pi(companyId, { env: { RAMP_ROUTER_API_KEY: { type: "plain", value: "mine" } } });
     expect((b.adapterConfig as any).env.RAMP_ROUTER_API_KEY).toEqual({ type: "plain", value: "mine" });
     expect((b.adapterConfig as any).model ?? "").toBe("");
@@ -114,9 +117,10 @@ describeDb("pi_local platform default Ramp Router key", () => {
     const legacy1 = await pi(c1);
     const legacy2 = await pi(c2, { model: "ramp-router/gpt-6-luna" });
     const explicit = await pi(c1, { model: "openai/gpt-5.4-mini" });
+    const retired = await pi(c2, { model: "ramp-router-anthropic/claude-sonnet-5-5", env: { RAMP_ROUTER_API_KEY: { type: "plain", value: "mine" } } });
     expect((legacy1.adapterConfig as any).env).toBeUndefined();
 
-    expect(await reconcilePiAgentsRouterKey(db, KEY)).toEqual({ scanned: 3, bound: 2, failed: 0 });
+    expect(await reconcilePiAgentsRouterKey(db, KEY)).toEqual({ scanned: 4, bound: 4, failed: 0 });
     const cfg1 = await configOf(legacy1.id);
     const cfg2 = await configOf(legacy2.id);
     expect(cfg1.model).toBe(PI_DEFAULT_ROUTER_MODEL);
@@ -125,19 +129,24 @@ describeDb("pi_local platform default Ramp Router key", () => {
     expect(rows.find((r) => r.id === cfg1.env.RAMP_ROUTER_API_KEY.secretId)?.companyId).toBe(c1);
     expect(rows.find((r) => r.id === cfg2.env.RAMP_ROUTER_API_KEY.secretId)?.companyId).toBe(c2);
     expect(rows).toHaveLength(2);
-    expect((await configOf(explicit.id)).env).toBeUndefined();
+    const cfgExplicit = await configOf(explicit.id);
+    expect(cfgExplicit.model).toBe("openai/gpt-5.4-mini");
+    expect(cfgExplicit.env.RAMP_ROUTER_API_KEY).toMatchObject({ type: "secret_ref" });
+    const cfgRetired = await configOf(retired.id);
+    expect(cfgRetired.model).toBe("ramp-router/claude-sonnet-5-5");
+    expect(cfgRetired.env.RAMP_ROUTER_API_KEY).toEqual({ type: "plain", value: "mine" });
     expect(JSON.stringify([cfg1, cfg2])).not.toContain(KEY);
 
     const bindingsFor = (id: string) =>
       db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, id));
-    for (const [id, cfg] of [[legacy1.id, cfg1], [legacy2.id, cfg2]] as const) {
+    for (const [id, cfg] of [[legacy1.id, cfg1], [legacy2.id, cfg2], [explicit.id, cfgExplicit]] as const) {
       const b = await bindingsFor(id);
       expect(b).toHaveLength(1);
       expect(b[0]).toMatchObject({ secretId: cfg.env.RAMP_ROUTER_API_KEY.secretId, configPath: "env.RAMP_ROUTER_API_KEY" });
     }
-    expect(await bindingsFor(explicit.id)).toHaveLength(0);
+    expect(await bindingsFor(retired.id)).toHaveLength(0);
 
-    expect(await reconcilePiAgentsRouterKey(db, KEY)).toEqual({ scanned: 3, bound: 0, failed: 0 });
+    expect(await reconcilePiAgentsRouterKey(db, KEY)).toEqual({ scanned: 4, bound: 0, failed: 0 });
     expect(await bindingsFor(legacy1.id)).toHaveLength(1);
     expect(await bindingsFor(legacy2.id)).toHaveLength(1);
     expect(await reconcilePiAgentsRouterKey(db, null)).toEqual({ scanned: 0, bound: 0, failed: 0 });

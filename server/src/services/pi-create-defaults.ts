@@ -9,8 +9,9 @@ import { createAgentLifecycle } from "./agent-lifecycle.js";
 import { logger } from "../middleware/logger.js";
 
 export const PI_LOCAL_ADAPTER_TYPE = "pi_local";
-export const PI_DEFAULT_ROUTER_MODEL = "ramp-router-anthropic/claude-sonnet-5-5";
-const PI_ROUTER_MODEL_PREFIX = "ramp-router";
+export const PI_DEFAULT_ROUTER_MODEL = "ramp-router/claude-sonnet-5-5";
+// Earlier releases exposed Claude through a second provider; there is now one `ramp-router` provider.
+const PI_LEGACY_ANTHROPIC_PROVIDER_PREFIX = "ramp-router-anthropic/";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -20,7 +21,7 @@ function modelOf(config: unknown): string {
   return isRecord(config) && typeof config.model === "string" ? config.model.trim() : "";
 }
 
-/** True for a pi_local agent with a captured key, no RAMP_ROUTER_API_KEY env entry, and an empty or ramp-router model. */
+/** True for a pi_local agent with a captured key and no RAMP_ROUTER_API_KEY env entry. Every pi_local agent uses the Ramp Router. */
 export function needsPlatformDefaultRouterKeyForPi(
   adapterType: string,
   adapterConfig: unknown,
@@ -29,19 +30,29 @@ export function needsPlatformDefaultRouterKeyForPi(
   if (adapterType !== PI_LOCAL_ADAPTER_TYPE || !capturedKeyPresent) return false;
   const env = isRecord(adapterConfig) ? adapterConfig.env : undefined;
   if (env !== undefined && !isRecord(env)) return false;
-  if (env && Object.prototype.hasOwnProperty.call(env, RAMP_ROUTER_API_KEY_ENV)) return false;
-  const model = modelOf(adapterConfig);
-  return model === "" || model.startsWith(PI_ROUTER_MODEL_PREFIX);
+  return !(env && Object.prototype.hasOwnProperty.call(env, RAMP_ROUTER_API_KEY_ENV));
 }
 
-/** Adds the secret_ref and fills the default model only when empty; never overwrites an explicit model. */
+/** True when the model still names the retired `ramp-router-anthropic` provider. */
+export function needsPiRouterModelMigration(adapterConfig: unknown): boolean {
+  return modelOf(adapterConfig).startsWith(PI_LEGACY_ANTHROPIC_PROVIDER_PREFIX);
+}
+
+function migratedModel(adapterConfig: Record<string, unknown>): Record<string, unknown> {
+  const model = modelOf(adapterConfig);
+  return model.startsWith(PI_LEGACY_ANTHROPIC_PROVIDER_PREFIX)
+    ? { model: `ramp-router/${model.slice(PI_LEGACY_ANTHROPIC_PROVIDER_PREFIX.length)}` }
+    : {};
+}
+
+/** Adds the secret_ref, fills the default model only when empty, and renames the retired provider prefix; never overwrites another explicit model. */
 export function applyPiRouterDefaults(adapterConfig: Record<string, unknown>, secretId: string): Record<string, unknown> {
   const env = isRecord(adapterConfig.env) ? { ...adapterConfig.env } : {};
   env[RAMP_ROUTER_API_KEY_ENV] = { type: "secret_ref", secretId, version: "latest" };
   return {
     ...adapterConfig,
     env,
-    ...(modelOf(adapterConfig) === "" ? { model: PI_DEFAULT_ROUTER_MODEL } : {}),
+    ...(modelOf(adapterConfig) === "" ? { model: PI_DEFAULT_ROUTER_MODEL } : migratedModel(adapterConfig)),
   };
 }
 
@@ -56,8 +67,16 @@ export async function reconcilePiAgentsRouterKey(db: Db, deploymentKey: string |
   const secretByCompany = new Map<string, string | null>();
   for (const row of rows) {
     summary.scanned += 1;
-    if (!needsPlatformDefaultRouterKeyForPi(PI_LOCAL_ADAPTER_TYPE, row.adapterConfig, true)) continue;
+    const needsKey = needsPlatformDefaultRouterKeyForPi(PI_LOCAL_ADAPTER_TYPE, row.adapterConfig, true);
+    if (!needsKey && !needsPiRouterModelMigration(row.adapterConfig)) continue;
     try {
+      if (!needsKey) {
+        const migrated = await createAgentLifecycle(db).updateConfiguration(row.id, {
+          adapterConfig: { ...(row.adapterConfig as Record<string, unknown>), ...migratedModel(row.adapterConfig as Record<string, unknown>) },
+        });
+        if (migrated) summary.bound += 1;
+        continue;
+      }
       let secretId = secretByCompany.get(row.companyId);
       if (secretId === undefined) {
         const outcome = await ensurePlatformDefaultSecret(
