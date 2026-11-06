@@ -203,21 +203,61 @@ describe("memory-config", () => {
       ).toThrow('mode must be "oss"');
     });
 
-    it("requires userId to be exactly 'company'", () => {
+    it("validates userId: accepts 'company' and agentId; rejects a third value; rejects userId !== agentId when not 'company'", () => {
+      // accepts "company"
+      const resCompany = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: "company",
+      });
+      expect(resCompany.userId).toBe("company");
+
+      // accepts agentId via camelCase
+      const resAgent = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: validMemoryInput.agentId,
+      });
+      expect(resAgent.userId).toBe(validMemoryInput.agentId);
+
+      // accepts agentId via snake_case user_id alias
+      const resSnakeAgent = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: undefined,
+        user_id: validMemoryInput.agentId,
+      });
+      expect(resSnakeAgent.userId).toBe(validMemoryInput.agentId);
+
+      // rejects a third value
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "some_other_agent",
+        }),
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
+
+      // rejects userId !== agentId when not "company"
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
           userId: "user_123",
         }),
-      ).toThrow('userId must be "company"');
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
 
+      // rejects undefined / missing userId
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
           userId: undefined,
           user_id: undefined,
         }),
-      ).toThrow('userId must be "company"');
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
+
+      // rejects unsafe identifier (control characters / sql injection)
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "invalid; DROP TABLE users;--",
+        }),
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
     });
 
     it("validates agentId against safe identifier constraints and rejects control characters", () => {
@@ -519,6 +559,23 @@ describe("memory-config", () => {
         }),
       ).toThrow("conflicting userId and user_id values provided");
 
+      // Conflicting individually valid userId values (e.g. "company" vs agentId)
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "company",
+          user_id: validMemoryInput.agentId,
+        }),
+      ).toThrow("conflicting userId and user_id values provided");
+
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: validMemoryInput.agentId,
+          user_id: "company",
+        }),
+      ).toThrow("conflicting userId and user_id values provided");
+
       // Conflicting agentId / agent_id
       expect(() =>
         validateHermesMemoryConfig({
@@ -816,6 +873,23 @@ describe("memory-config", () => {
       expect(serialized.endsWith("\n")).toBe(true);
 
       // Test parsing back
+      const reparsed = JSON.parse(serialized);
+      expect(reparsed).toEqual(canonical);
+    });
+
+    it("emits user_id = agentId in canonical object and serialized JSON when agent-scoped", () => {
+      const agentScoped = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: validMemoryInput.agentId,
+      });
+      const canonical = buildCanonicalMem0Object(agentScoped);
+      expect(canonical.user_id).toBe(validMemoryInput.agentId);
+      expect(canonical.agent_id).toBe(validMemoryInput.agentId);
+
+      const serialized = serializeMem0Json(agentScoped);
+      expect(serialized).toContain(`"user_id": "${validMemoryInput.agentId}"`);
+      expect(serialized).toContain(`"agent_id": "${validMemoryInput.agentId}"`);
+
       const reparsed = JSON.parse(serialized);
       expect(reparsed).toEqual(canonical);
     });
@@ -1588,7 +1662,7 @@ describe("memory-config", () => {
           validateHermesMemoryConfig({ ...validMemoryInput, userId: sensitiveProbe });
           expect.unreachable();
         } catch (err: any) {
-          expect(err.message).toBe('Invalid memory configuration: userId must be "company"');
+          expect(err.message).toBe('Invalid memory configuration: userId must be a safe identifier and equal either "company" or agentId');
           expect(err.message).not.toContain(sensitiveProbe);
         }
       });

@@ -1142,6 +1142,20 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     expect(interceptedOpts.configYamlContentAtExecution).toContain("user_profile_enabled: false");
   });
 
+  it("end-to-end execute writes agent-scoped user_id to mem0.json when userId equals agentId", async () => {
+    const memory = createValidMemoryConfig();
+    (memory as any).userId = memory.agentId;
+
+    const ctx = makeContext({ memoryConfig: memory });
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(interceptedOpts.mem0JsonContentAtExecution).toBeTruthy();
+    const mem0 = JSON.parse(interceptedOpts.mem0JsonContentAtExecution!);
+    expect(mem0.user_id).toBe(memory.agentId);
+    expect(mem0.agent_id).toBe(memory.agentId);
+  });
+
   describe("benign stderr reclassification and logging notices", () => {
     it("reclassifies benign INFO, DEBUG, MCP server, and timestamped lines to stdout while keeping errors on stderr", async () => {
       mockChildProcessBehavior = "emit_secrets";
