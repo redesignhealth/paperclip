@@ -21,6 +21,8 @@ import {
   validateMcpServer,
   ALLOWED_HOST_CONFIG_KEYS,
   HERMES_TOOL_SEARCH_SETTING,
+  HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS,
+  resolveHermesToolSearchSetting,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
 import { validateHermesMemoryConfig, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
@@ -1084,6 +1086,40 @@ print(json.dumps(data))
       expect(written.tools.tool_search).toEqual({ enabled: "off" });
       expect(typeof (written.tools.tool_search as { enabled: unknown }).enabled).toBe("string");
       expect(written.model.default).toBe("m");
+    });
+
+    it("keeps direct exposure at the cutoff and leaves the bridge on above it (TECH-8184)", () => {
+      expect(resolveHermesToolSearchSetting(1)).toBe("off");
+      expect(resolveHermesToolSearchSetting(HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS)).toBe("off");
+      expect(resolveHermesToolSearchSetting(HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS + 1)).toBe("auto");
+    });
+
+    it("writes tool_search \"auto\" for a large allowlist and still ignores host config", async () => {
+      const manyTools = Array.from({ length: HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS + 1 }, (_, i) => `tool_${i}`);
+      const largeServers: AdapterRuntimeMcpServer[] = [
+        { name: "gw", url: "http://localhost:3100/mcp/a", token: "tok-a", connectionId: "conn-a", allowedTools: manyTools },
+      ];
+      const mockHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mock-home-"));
+      cleanupDirs.push(mockHome);
+      const hostHermesDir = path.join(mockHome, ".hermes");
+      await fs.mkdir(hostHermesDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hostHermesDir, "config.yaml"),
+        ["model:", "  default: m", "tools:", "  tool_search:", "    enabled: off", ""].join("\n"),
+      );
+
+      const prepared = await prepareHermesMcpHome({ servers: largeServers, config: { env: { HOME: mockHome } } });
+      cleanupDirs.push(prepared.homeDir);
+
+      const raw = await fs.readFile(prepared.configPath, "utf8");
+      expect(raw.match(/^tools:/gm)).toHaveLength(1);
+      const written = YAML.parse(raw) as {
+        tools: Record<string, unknown>;
+        mcp_servers: Record<string, { tools: { include: string[] } }>;
+      };
+      expect(written.tools).toEqual({ tool_search: { enabled: "auto" } });
+      // The allowlist still bounds what the bridge can reach.
+      expect(Object.values(written.mcp_servers)[0]?.tools.include).toEqual(manyTools);
     });
 
     it("keeps host `tools` out of the inheritable key allowlist", () => {
