@@ -23,6 +23,7 @@ import {
   suiteDefinitionHash,
   validateRunnerCatalog,
 } from "./catalog.js";
+import { memoryRecallDefinitionDigest } from "./memory-recall-cases.js";
 import { assertRunnerE2EPrerequisites, UNQUALIFIED_PROFILE_GAPS } from "./prerequisites.js";
 import {
   buildMatrixJobs,
@@ -719,6 +720,36 @@ describe("runner E2E catalog", () => {
         "ghcr.io/paperclipai/paperclip-daytona-runner:e2e-latest",
       ),
     ).toBe(false);
+  });
+
+  it("keeps memory-recall manual-only and explicit, targeting hermes_local on local environment", () => {
+    const all = selectRunnerExecutions(parseRunnerSelectors(["--all"]));
+    expect(all.some((execution) => execution.suite.id === "memory-recall")).toBe(false);
+
+    const selected = selectRunnerExecutions(parseRunnerSelectors(["--suite", "memory-recall"]));
+    expect(selected).toHaveLength(12);
+    expect(selected.every((execution) => execution.environment.id === "local")).toBe(true);
+    expect(selected.every((execution) => execution.profile.id === "memory-hermes-local")).toBe(true);
+    expect(selected.every((execution) => execution.profile.adapterType === "hermes_local")).toBe(true);
+    expect(
+      selected.every(
+        (execution) =>
+          execution.requiredCredentials.includes("OPENROUTER_API_KEY") &&
+          execution.requiredCredentials.includes("OPENAI_API_KEY"),
+      ),
+    ).toBe(true);
+
+    const suite = runnerSuites.find((candidate) => candidate.id === "memory-recall")!;
+    expect(suite.manualOnly).toBe(true);
+    expect(suite.expectedMatrixSize).toBe(12);
+    expect(suite.definitionMetadata).toMatchObject({
+      maximumAttemptsPerCell: 1,
+      grading: "live-mem0-tenant-database-rows-and-typed-hermes-tool-records",
+    });
+
+    const digest = memoryRecallDefinitionDigest();
+    expect(typeof digest).toBe("string");
+    expect(digest).toMatch(/^[a-f0-9]{64}$/);
   });
 });
 

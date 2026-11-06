@@ -1217,18 +1217,24 @@ for (const execution of executions) {
         issue = firstTask.issue as IssueRecord; selectedRuns = firstTask.runs as RunRecord[];
       } else if (execution.task.flow === "memory_recall") {
         const memoryRecall = await runMemoryRecallFlow({
-          page, api, fixtures, execution, nonce, workspacePath,
+          api, fixtures, execution, nonce, workspacePath,
           deadlineAt: startedAtMs + deadlineMs,
           observe: (currentIssue, currentRuns, checks) => {
             issue = currentIssue as unknown as IssueRecord;
             selectedRuns = currentRuns as unknown as RunRecord[];
             matcherResults = checks.map(check => ({ matcher: { kind: "json_path" as const, path: `memoryRecall.${check.id}`, expected: true }, passed: check.passed, detail: check.detail }));
           },
-          capture: captureScreenshot,
           evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),
         });
         issue = memoryRecall.issue as unknown as IssueRecord;
         selectedRuns = memoryRecall.runs as unknown as RunRecord[];
+        if (!memoryRecall.scoreResult.passed) {
+          const failed = memoryRecall.scoreResult.checks
+            .filter((c) => !c.passed)
+            .map((c) => `${c.id} (${c.detail})`)
+            .join(", ");
+          throw new Error(`Memory recall evaluation failed checks: ${failed}`);
+        }
       } else {
       const issuePrefix = fixtures.company.issuePrefix;
       if (!issuePrefix)

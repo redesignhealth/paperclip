@@ -1,0 +1,361 @@
+import { describe, expect, it, vi } from "vitest";
+import { runMemoryRecallFlow } from "./memory-recall-flow.js";
+import { memoryRecallScenario } from "./memory-recall-cases.js";
+import type { RunnerApi } from "./api.js";
+import type { LiveFixtureValues } from "./live-fixtures.js";
+import type { MatrixExecution } from "./types.js";
+import type { TenantMemoryReader } from "./memory-recall-observation.js";
+
+function makeExecution(caseId: string, rep = 1): MatrixExecution {
+  return {
+    id: `memory-recall.memory-hermes-local.local.${caseId}-rep-${rep}`,
+    suite: { id: "memory-recall" } as any,
+    profile: {
+      id: "memory-hermes-local",
+      buildAgent: () => ({ name: "Agent" }),
+    } as any,
+    environment: { id: "local" } as any,
+    task: { id: `${caseId}-rep-${rep}`, flow: "memory_recall" } as any,
+    requiredCredentials: ["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+    groups: [],
+    suiteDefinitionHash: "dummy-hash",
+  };
+}
+
+function makeFixtures(): LiveFixtureValues {
+  return {
+    company: { id: "11111111-1111-4111-8111-111111111111", issuePrefix: "TST" },
+    agent: {
+      id: "agent-x-id",
+      adapterConfig: { model: "anthropic/claude-3.5-sonnet" },
+    },
+    environment: { id: "local" },
+    secretRefs: {},
+  } as any;
+}
+
+function makeStubTenantReader(memories: any[] = []): TenantMemoryReader {
+  return {
+    snapshotMemoryIds: vi.fn().mockResolvedValue(new Set()),
+    readMemoriesSince: vi.fn().mockResolvedValue(memories),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+describe("memory-recall flow unit tests", () => {
+  it("(1) propagates 404 HTTP errors without swallowing", async () => {
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockRejectedValue(new Error("HTTP 404: Route not found")),
+      get: vi.fn().mockResolvedValue([]),
+    };
+
+    const flowPromise = runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "err-404",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(flowPromise).rejects.toThrow("HTTP 404: Route not found");
+  });
+
+  it("(2) grades runs strictly by issueId despite interleaving and foreign runs", async () => {
+    const postedIssues: any[] = [];
+    let issueCounter = 0;
+
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        if (path.endsWith("/issues")) {
+          issueCounter++;
+          const issue = { id: `issue-${issueCounter}`, ...body };
+          postedIssues.push(issue);
+          return issue;
+        }
+        return { id: "other" };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          // Interleaved runs including a foreign run from another issue
+          return [
+            { id: "run-foreign", issueId: "unrelated-issue-999", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-save", issueId: "issue-1", status: "succeeded", agentId: "agent-x-id" },
+            { id: "run-recall", issueId: "issue-2", status: "succeeded", agentId: "agent-x-id" },
+          ];
+        }
+        if (path === "/api/heartbeat-runs/run-save") {
+          return {
+            id: "run-save",
+            issueId: "issue-1",
+            status: "succeeded",
+            agentId: "agent-x-id",
+            resultJson: { result: "Saved codename-test-xyz" },
+          };
+        }
+        if (path === "/api/heartbeat-runs/run-recall") {
+          return {
+            id: "run-recall",
+            issueId: "issue-2",
+            status: "succeeded",
+            agentId: "agent-x-id",
+            resultJson: { result: "The codename is codename-test-xyz." },
+          };
+        }
+        if (path.endsWith("/log")) {
+          return {
+            content: [
+              "12:00:01 - agent.tool_executor - INFO - tool mem0_add completed (1.00s, 30 chars)",
+              "12:00:02 - agent.tool_executor - INFO - tool mem0_search completed (0.80s, 20 chars)",
+            ].join("\n"),
+          };
+        }
+        if (path.includes("/comments")) {
+          return [];
+        }
+        return [];
+      }),
+    };
+
+    const stubReader = makeStubTenantReader([
+      { id: "mem-1", data: "release codename is codename-test-xyz" },
+    ]);
+
+    const result = await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "test-xyz",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 60_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => stubReader,
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(result.runs).toHaveLength(2);
+    expect(result.runs[0]?.id).toBe("run-save");
+    expect(result.runs[1]?.id).toBe("run-recall");
+  });
+
+  it("(3) throws before issue Y if agent-y setup returns no ID", async () => {
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string) => {
+        if (path.endsWith("/agents")) {
+          return {}; // missing id!
+        }
+        return { id: "issue-1" };
+      }),
+      get: vi.fn().mockResolvedValue([]),
+    };
+
+    const flowPromise = runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("cross-agent-leak"),
+      nonce: "leak-test",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(flowPromise).rejects.toThrow(/Agent Y setup failed/);
+  });
+
+  it("(4) throws when run agentId is undefined", async () => {
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => ({
+        id: "issue-1",
+        ...body,
+      })),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return [{ id: "run-1", issueId: "issue-1", status: "succeeded" }];
+        }
+        if (path === "/api/heartbeat-runs/run-1") {
+          return { id: "run-1", issueId: "issue-1", status: "succeeded", agentId: undefined };
+        }
+        return [];
+      }),
+    };
+
+    const flowPromise = runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "agent-id-test",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(flowPromise).rejects.toThrow(/missing agentId/);
+  });
+
+  it("(5) implicit-recall control run uses controlPrompt and precedes seed", async () => {
+    const postedIssues: any[] = [];
+    const scenario = memoryRecallScenario("implicit-recall", "implicit-nonce");
+
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        if (path.endsWith("/issues")) {
+          const issue = { id: `issue-${postedIssues.length + 1}`, ...body };
+          postedIssues.push(issue);
+          return issue;
+        }
+        return { id: "agent-1" };
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return postedIssues.map((issue) => ({
+            id: `run-for-${issue.id}`,
+            issueId: issue.id,
+            status: "succeeded",
+            agentId: "agent-x-id",
+          }));
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return {
+            id: "run",
+            agentId: "agent-x-id",
+            status: "succeeded",
+            resultJson: { result: "response" },
+          };
+        }
+        return [];
+      }),
+    };
+
+    await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("implicit-recall"),
+      nonce: "implicit-nonce",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 60_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(postedIssues).toHaveLength(3);
+    // 1st: Control run with controlPrompt
+    expect(postedIssues[0]?.description).toBe(scenario.controlPrompt);
+    // 2nd: Seed run with seedPrompt
+    expect(postedIssues[1]?.description).toBe(scenario.seedPrompt);
+    // 3rd: Ask run with askPrompt
+    expect(postedIssues[2]?.description).toBe(scenario.askPrompt);
+  });
+
+  it("(6) writes evidence, calls observe, drops tenant DB, and tears down fixtures when pollUntil rejects", async () => {
+    const dropper = vi.fn().mockResolvedValue(undefined);
+    const observer = vi.fn();
+    const evidenceWriter = vi.fn().mockResolvedValue(undefined);
+
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockResolvedValue({ id: "issue-save" }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          // Never returns succeeded/failed run -> pollUntil times out
+          return [{ id: "run-running", issueId: "issue-save", status: "running" }];
+        }
+        return [];
+      }),
+    };
+
+    const flowPromise = runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("save-then-fresh-recall"),
+      nonce: "timeout-test",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 50, // fast timeout
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: dropper,
+      observe: observer,
+      evidence: evidenceWriter,
+    });
+
+    await expect(flowPromise).rejects.toThrow();
+
+    // Verify all cleanup and evidence callbacks ran
+    expect(observer).toHaveBeenCalled();
+    expect(evidenceWriter).toHaveBeenCalled();
+    expect(dropper).toHaveBeenCalled();
+  });
+
+  it("(7) noise creates exactly 10 issues and polls per id without parent issue", async () => {
+    const postedIssues: any[] = [];
+    const scenario = memoryRecallScenario("noise", "noise-nonce");
+
+    const api: Partial<RunnerApi> = {
+      post: vi.fn().mockImplementation(async (path: string, body: any) => {
+        if (path.endsWith("/issues")) {
+          const issue = { id: `issue-noise-${postedIssues.length + 1}`, ...body };
+          postedIssues.push(issue);
+          return issue;
+        }
+        return {};
+      }),
+      get: vi.fn().mockImplementation(async (path: string) => {
+        if (path.includes("/heartbeat-runs?limit=100")) {
+          return postedIssues.map((issue) => ({
+            id: `run-${issue.id}`,
+            issueId: issue.id,
+            status: "succeeded",
+            agentId: "agent-x-id",
+          }));
+        }
+        if (path.startsWith("/api/heartbeat-runs/")) {
+          return {
+            id: "run-noise",
+            agentId: "agent-x-id",
+            status: "succeeded",
+            resultJson: { result: "ok" },
+          };
+        }
+        return [];
+      }),
+    };
+
+    await runMemoryRecallFlow({
+      api: api as RunnerApi,
+      fixtures: makeFixtures(),
+      execution: makeExecution("noise"),
+      nonce: "noise-nonce",
+      workspacePath: "/tmp/ws",
+      deadlineAt: Date.now() + 10_000,
+      skipPreflightProbe: true,
+      tenantReaderFactory: async () => makeStubTenantReader(),
+      tenantDropper: async () => {},
+      observe: vi.fn(),
+      evidence: vi.fn().mockResolvedValue(undefined),
+    });
+
+    // Exactly 10 heartbeat issues, no parent issue
+    expect(postedIssues).toHaveLength(10);
+    if (scenario.caseId === "noise") {
+      for (let i = 0; i < 10; i++) {
+        expect(postedIssues[i]?.description).toBe(scenario.heartbeatPrompts[i]);
+      }
+    }
+  });
+});

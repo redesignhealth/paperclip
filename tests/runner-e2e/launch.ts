@@ -57,7 +57,11 @@ import {
   type MatrixExecution,
   type RunnerE2EResult,
 } from "./types.js";
-import { assertRemoteNativeEvidencePrerequisites, assertRunnerE2EPrerequisites } from "./prerequisites.js";
+import {
+  assertRemoteNativeEvidencePrerequisites,
+  assertRunnerE2EPrerequisites,
+  assertMemoryRecallPrerequisites,
+} from "./prerequisites.js";
 import { assertNativeCompletionSelection, prepareNativeCompletionPreflight, NATIVE_COMPLETION_PREFLIGHT_ENV } from "./native-completion-admission.js";
 import { assertNativeInstructionSelection, prepareNativeInstructionPreflight, NATIVE_INSTRUCTION_PREFLIGHT_ENV, NATIVE_INSTRUCTION_SUITE } from "./native-instruction-consolidation.js";
 import { prepareStockHarnessPreflight, STOCK_PREFLIGHT_ENV } from "./stock-harness-admission.js";
@@ -985,6 +989,7 @@ async function main() {
   if (options.installedStartupOnly) {
     assertInstalledStartupOnly(process.env, executions, options);
     assertRunnerE2EPrerequisites(executions);
+    assertMemoryRecallPrerequisites(executions, process.env);
     const campaignId = cleanId(process.env.PAPERCLIP_E2E_CAMPAIGN_ID ?? `installed-startup-${Date.now()}`);
     await runAttempt({ executions, attempt: 1, campaignId, options });
     console.log(`PASS installed launch chain (no provider qualification) -> ${path.join(resultsRoot, campaignId, "installed-startup-only")}`);
@@ -1016,6 +1021,7 @@ async function main() {
   // Keep admission before local-env loading and credential checks. Pending
   // profiles remain discoverable, but cannot reach a provider.
   assertRunnerE2EPrerequisites(executions);
+  assertMemoryRecallPrerequisites(executions, process.env);
   assertNativeCompletionSelection(executions);
   assertNativeInstructionSelection(executions);
   const campaignId = cleanId(
