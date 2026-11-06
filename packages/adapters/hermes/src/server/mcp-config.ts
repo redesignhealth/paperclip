@@ -32,6 +32,8 @@ export interface HermesMcpServerConfig {
 }
 
 export interface PrepareHermesMcpHomeOptions {
+  /** Hosted Anthropic request bound; independent of the total run timeout. */
+  anthropicRequestTimeoutSec?: number;
   servers?: AdapterRuntimeMcpServer[];
   memory?: ValidatedHermesMemoryConfig;
   config?: Record<string, unknown>;
@@ -428,6 +430,7 @@ export function serializeHermesMcpYaml(
   inheritedHostYaml = "",
   hasMemory = false,
   flags?: MemoryHardeningFlags,
+  anthropicRequestTimeoutSec?: number,
 ): string {
   const lines: string[] = [];
 
@@ -435,6 +438,13 @@ export function serializeHermesMcpYaml(
   if (trimmedHost.length > 0) {
     lines.push(trimmedHost);
     lines.push("");
+  }
+
+  if (anthropicRequestTimeoutSec !== undefined) {
+    if (!Number.isFinite(anthropicRequestTimeoutSec) || anthropicRequestTimeoutSec <= 0) {
+      throw new Error("Anthropic request timeout must be a positive finite number");
+    }
+    lines.push("providers:", "  anthropic:", `    request_timeout_seconds: ${anthropicRequestTimeoutSec}`, "");
   }
 
   if (hasMemory) {
@@ -933,7 +943,9 @@ export async function prepareHermesMcpHome(
       await fs.chmod(mem0JsonPath, 0o600);
     }
 
-    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml, Boolean(memory), hardeningFlags);
+    const yamlContent = serializeHermesMcpYaml(
+      mcpServers, inheritedHostYaml, Boolean(memory), hardeningFlags, options.anthropicRequestTimeoutSec,
+    );
     await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
     // Explicit hard fail on configPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(configPath, 0o600);
