@@ -20,7 +20,11 @@ const ALL_OFF_FLAGS: MemoryHardeningFlags = Object.freeze({
 });
 
 export function resolveMemoryHardeningFlags(
-  env: NodeJS.ProcessEnv = process.env,
+  env: Record<string, string | undefined> = (
+    globalThis as {
+      process?: { env?: Record<string, string | undefined> };
+    }
+  ).process?.env ?? {},
 ): MemoryHardeningFlags {
   const raw = env.PAPERCLIP_MEMORY_HARDENING?.trim();
   if (!raw) {

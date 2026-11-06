@@ -131,4 +131,96 @@ describe("resolveMemoryHardeningFlags", () => {
       }),
     ).toThrow(/invalid-token/);
   });
+
+  describe("zero-arg and environment defaults", () => {
+    it("reads from process.env when called with zero arguments in Node", () => {
+      const prevEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+      try {
+        process.env.PAPERCLIP_MEMORY_HARDENING =
+          "hermes-memory-config,capability-memory-guidance";
+        expect(resolveMemoryHardeningFlags()).toEqual({
+          hermesMemoryConfig: true,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: true,
+        });
+
+        process.env.PAPERCLIP_MEMORY_HARDENING = "invalid-token";
+        expect(() => resolveMemoryHardeningFlags()).toThrow(
+          MemoryHardeningConfigurationError,
+        );
+      } finally {
+        if (prevEnv === undefined) {
+          delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        } else {
+          process.env.PAPERCLIP_MEMORY_HARDENING = prevEnv;
+        }
+      }
+    });
+
+    it("defaults to all flags false when called with zero arguments and env is unset in process.env", () => {
+      const prevEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+      try {
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        expect(resolveMemoryHardeningFlags()).toEqual({
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: false,
+        });
+      } finally {
+        if (prevEnv === undefined) {
+          delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        } else {
+          process.env.PAPERCLIP_MEMORY_HARDENING = prevEnv;
+        }
+      }
+    });
+
+    it("defaults to all flags false in non-Node environments where global process is absent", () => {
+      const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, "process");
+      try {
+        Object.defineProperty(globalThis, "process", {
+          value: undefined,
+          configurable: true,
+          writable: true,
+        });
+        expect(resolveMemoryHardeningFlags()).toEqual({
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: false,
+        });
+      } finally {
+        if (origDescriptor) {
+          Object.defineProperty(globalThis, "process", origDescriptor);
+        } else {
+          delete (globalThis as Record<string, unknown>).process;
+        }
+      }
+    });
+
+    it("defaults to all flags false when global process.env is undefined", () => {
+      const origDescriptor = Object.getOwnPropertyDescriptor(globalThis, "process");
+      try {
+        Object.defineProperty(globalThis, "process", {
+          value: {},
+          configurable: true,
+          writable: true,
+        });
+        expect(resolveMemoryHardeningFlags()).toEqual({
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: false,
+        });
+      } finally {
+        if (origDescriptor) {
+          Object.defineProperty(globalThis, "process", origDescriptor);
+        } else {
+          delete (globalThis as Record<string, unknown>).process;
+        }
+      }
+    });
+  });
 });
