@@ -4,7 +4,10 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDb } from "../packages/db/src/index.js";
-import { redactSensitiveString } from "../packages/adapters/hermes/src/server/memory-config.js";
+import {
+  canSafelyRedactSecret,
+  redactSensitiveString,
+} from "../packages/adapters/hermes/src/server/memory-config.js";
 
 const require = createRequire(new URL("../packages/db/package.json", import.meta.url));
 type SqlFragment = any;
@@ -172,6 +175,57 @@ export function collectEnvironmentSecrets(
   return Array.from(secrets);
 }
 
+export function validateExplicitDatabaseUrl(urlString: string): {
+  url: URL;
+  rawPassword?: string;
+  decodedPassword?: string;
+} {
+  if (!urlString || typeof urlString !== "string" || !urlString.trim()) {
+    throw new Error("Invalid database URL: URL must be a non-empty string.");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    throw new Error(
+      "Invalid database URL: Unable to parse URL with standard WHATWG parser. Supported format: postgres://user:password@host:port/dbname (socket URLs or non-standard connection strings are not supported for memory sampling).",
+    );
+  }
+
+  const rawPassword = parsed.password;
+  if (rawPassword) {
+    let decodedPassword: string | undefined;
+    try {
+      decodedPassword = decodeURIComponent(rawPassword);
+    } catch {
+      // Malformed percent-encoding
+    }
+
+    if (
+      !canSafelyRedactSecret(rawPassword) ||
+      (decodedPassword !== undefined && decodedPassword.length > 0 && !canSafelyRedactSecret(decodedPassword))
+    ) {
+      throw new Error(
+        "Database URL password uses an unsupported format: short punctuation-only passwords (< 4 characters without alphanumeric characters) cannot be safely redacted.",
+      );
+    }
+
+    const isShortRaw = rawPassword.length < 4;
+    const isShortDecoded =
+      decodedPassword !== undefined && decodedPassword.length > 0 && decodedPassword.length < 4;
+    if (isShortRaw || isShortDecoded) {
+      console.error(
+        "Warning: Database URL uses a short password (< 4 characters). Token-boundary redaction is used and may affect surrounding punctuation or delimiters in exported excerpts.",
+      );
+    }
+
+    return { url: parsed, rawPassword, decodedPassword };
+  }
+
+  return { url: parsed };
+}
+
 export type SampleOptions = {
   outPath: string;
   limit: number;
@@ -207,6 +261,8 @@ export async function sampleMem0MemoryContent(options: SampleOptions): Promise<S
   if (!Number.isInteger(limit) || limit <= 0) {
     throw new Error(`Invalid limit value: ${limit}. Must be a positive integer.`);
   }
+
+  validateExplicitDatabaseUrl(databaseUrl);
 
   const resolvedOutPath = validateOutputPath(outPath, repoRoot);
   const tableIdent = validateAndResolveTableIdentifier(tableName, sql);

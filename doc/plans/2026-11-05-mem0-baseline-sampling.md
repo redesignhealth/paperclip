@@ -29,6 +29,9 @@ This runbook defines:
 The script's redaction pipeline:
 - Masks the first $N$ characters (default 16) with `[REDACTED_N_CHARS]`, leaving the remainder verbatim.
 - Scrubs exact string matches of configured process environment variables matching key/token/secret/password patterns, as well as password components parsed from connection URLs.
+  - Secrets $\ge 4$ characters are scrubbed via substring matching.
+  - Supported short alphanumeric passwords ($< 4$ characters) are scrubbed via token-boundary matching (`(?<![a-zA-Z0-9_-])` and `(?![a-zA-Z0-9_-])`) to avoid corrupting ordinary English words. Punctuation and JSON delimiters (quotes, braces, colons, brackets, commas, whitespace) act as boundaries, redacting standalone credentials in JSON structures while preserving words like "spawning" or identifiers. A stderr warning is emitted whenever a short password triggers token-boundary redaction.
+  - Punctuation-only short passwords ($< 4$ characters without alphanumeric characters) cannot be safely bounded and are unsupported.
 - **Does NOT** perform natural-language PII detection or scrub arbitrary unconfigured credentials.
 - **The export file contains sensitive near-raw content and is NOT safe for public distribution or version control.**
 
@@ -45,6 +48,7 @@ The script `scripts/sample-mem0-memory-content.ts` inspects existing Mem0 collec
 
 ### 3.1 Safety Invariants
 - **Database Boundary is Company Boundary:** Mem0 collection tables are strictly single-tenant per database (isolated via `company_memory_databases`). Control-plane databases do not contain Mem0 tables. Scoping is enforced by supplying the target company's memory database via `--database-url` (or the `COMPANY_MEMORY_DATABASE_URL` environment variable).
+- **Tenant Database URL Validation & Fail-Closed Credentials:** The explicit tenant database URL must be parseable by the standard WHATWG URL parser (e.g. `postgres://user:pass@host:port/dbname`). Unparseable URLs (such as Unix domain socket URLs `postgres://user:pass@/db?host=...` that postgres.js supports but standard URL parsers cannot extract credentials from) and unsupported credentials (such as punctuation-only passwords $< 4$ characters that cannot be safely boundary-redacted) fail closed and are rejected before connecting or exporting. Arbitrary environment URL scanning remains tolerant.
 - **Read-Only Transaction:** All queries execute on a single connection inside a transaction starting with `SET TRANSACTION READ ONLY;`.
 - **Client Teardown:** The database client pool is always ended in a `finally` block to prevent process hangs or connection leaks.
 - **Strict Flag Requirements:** Refuses to run without explicit `--out` and `--limit` flags, and requires `--database-url` (or `COMPANY_MEMORY_DATABASE_URL`).

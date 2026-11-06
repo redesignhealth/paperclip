@@ -13,6 +13,7 @@ import {
   redactSampleData,
   sampleMem0MemoryContent,
   validateAndResolveTableIdentifier,
+  validateExplicitDatabaseUrl,
   validateOutputPath,
   validateRedactPrefixChars,
   main,
@@ -388,6 +389,256 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
       process.exitCode = origExitCode;
       if (origEnv !== undefined) process.env.COMPANY_MEMORY_DATABASE_URL = origEnv;
     }
+  });
+
+  it("validates explicit database URLs, rejecting unparseable URLs and unsupported credentials without leaking passwords", () => {
+    // 1. Valid URLs with normal passwords
+    const res1 = validateExplicitDatabaseUrl("postgres://usr:secure_pass_123@localhost:5432/mem");
+    assert.equal(res1.rawPassword, "secure_pass_123");
+    assert.equal(res1.decodedPassword, "secure_pass_123");
+
+    // Valid URL without password
+    const res2 = validateExplicitDatabaseUrl("postgres://localhost:5432/mem");
+    assert.equal(res2.rawPassword, undefined);
+
+    // 2. Unparseable WHATWG URLs fail closed without leaking credentials
+    const socketUrl = "postgres://usr:super_secret_socket_pw@/db?host=/var/run/postgresql";
+    assert.throws(
+      () => validateExplicitDatabaseUrl(socketUrl),
+      (err: Error) => {
+        assert.ok(!err.message.includes("super_secret_socket_pw"), "Error message must not leak password");
+        assert.ok(/Unable to parse/.test(err.message));
+        return true;
+      },
+    );
+
+    assert.throws(
+      () => validateExplicitDatabaseUrl("not-a-valid-url"),
+      /Unable to parse/,
+    );
+    assert.throws(
+      () => validateExplicitDatabaseUrl("://bad-scheme"),
+      /Unable to parse/,
+    );
+    assert.throws(
+      () => validateExplicitDatabaseUrl(""),
+      /URL must be a non-empty string/,
+    );
+
+    // 3. Punctuation-only short passwords (< 4 chars without alphanumeric) fail closed without leaking credentials
+    const punctuationPasswords = [
+      { url: "postgres://usr:!!@localhost:5432/db", pass: "!!" },
+      { url: "postgres://usr:***@localhost:5432/db", pass: "***" },
+      { url: "postgres://usr:%21%21@localhost:5432/db", pass: "%21%21" },
+      { url: "postgres://usr:-_-@localhost:5432/db", pass: "-_-" },
+    ];
+    for (const { url, pass } of punctuationPasswords) {
+      assert.throws(
+        () => validateExplicitDatabaseUrl(url),
+        (err: Error) => {
+          assert.ok(!err.message.includes(pass), `Error message must not leak password "${pass}"`);
+          assert.ok(/unsupported format: short punctuation-only passwords/.test(err.message));
+          return true;
+        },
+      );
+    }
+  });
+
+  it("emits stderr warning for supported short alphanumeric passwords and remains silent for >= 4 char passwords", () => {
+    let stderrLogged = "";
+    const origError = console.error;
+    console.error = (msg: string) => {
+      stderrLogged += `${msg}\n`;
+    };
+
+    try {
+      // Short alphanumeric passwords (< 4 chars) emit warning
+      validateExplicitDatabaseUrl("postgres://usr:pw@localhost:5432/db");
+      assert.ok(stderrLogged.includes("Warning: Database URL uses a short password (< 4 characters)"));
+      assert.ok(/token-boundary redaction/i.test(stderrLogged));
+
+      stderrLogged = "";
+      validateExplicitDatabaseUrl("postgres://usr:k1@localhost:5432/db");
+      assert.ok(stderrLogged.includes("Warning: Database URL uses a short password (< 4 characters)"));
+
+      stderrLogged = "";
+      validateExplicitDatabaseUrl("postgres://usr:a@localhost:5432/db");
+      assert.ok(stderrLogged.includes("Warning: Database URL uses a short password (< 4 characters)"));
+
+      // Normal passwords (>= 4 chars) emit NO warning
+      stderrLogged = "";
+      validateExplicitDatabaseUrl("postgres://usr:pass1234@localhost:5432/db");
+      assert.equal(stderrLogged, "");
+    } finally {
+      console.error = origError;
+    }
+  });
+
+  it("fails closed in sampleMem0MemoryContent BEFORE connecting or creating output file for unparseable URLs and punctuation passwords", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem0-fail-closed-"));
+    try {
+      // 1. Unparseable socket URL
+      const unparseableOut = path.join(tmpDir, "socket-out.json");
+      await assert.rejects(
+        async () => {
+          await sampleMem0MemoryContent({
+            outPath: unparseableOut,
+            limit: 10,
+            databaseUrl: "postgres://usr:raw_secret_socket_pass@/db?host=/var/run/postgresql",
+          });
+        },
+        (err: Error) => {
+          assert.ok(!err.message.includes("raw_secret_socket_pass"), "Must not leak password");
+          assert.ok(/Unable to parse/.test(err.message));
+          return true;
+        },
+      );
+      assert.equal(fs.existsSync(unparseableOut), false, "Output file must not be created");
+
+      // 2. Punctuation-only short password
+      const punctuationOut = path.join(tmpDir, "punct-out.json");
+      await assert.rejects(
+        async () => {
+          await sampleMem0MemoryContent({
+            outPath: punctuationOut,
+            limit: 10,
+            databaseUrl: "postgres://usr:!!@localhost:5432/db",
+          });
+        },
+        (err: Error) => {
+          assert.ok(!err.message.includes("!!"), "Must not leak password");
+          assert.ok(/unsupported format: short punctuation-only passwords/.test(err.message));
+          return true;
+        },
+      );
+      assert.equal(fs.existsSync(punctuationOut), false, "Output file must not be created");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("CLI main() rejects unparseable URLs and punctuation-only short passwords without leaking credentials", async () => {
+    let errorLogged = "";
+    const origError = console.error;
+    console.error = (msg: string) => {
+      errorLogged += `${msg}\n`;
+    };
+    const origExitCode = process.exitCode;
+
+    try {
+      // Unparseable URL
+      await main([
+        "node",
+        "script.js",
+        "--out",
+        "/tmp/test.json",
+        "--limit",
+        "10",
+        "--database-url",
+        "postgres://usr:leak_pass_cli@/db?host=/var/run/postgresql",
+      ]);
+      assert.ok(errorLogged.includes("Sample mem0 memory content failed"));
+      assert.ok(!errorLogged.includes("leak_pass_cli"));
+      assert.equal(process.exitCode, 1);
+
+      // Punctuation password
+      errorLogged = "";
+      process.exitCode = 0;
+      await main([
+        "node",
+        "script.js",
+        "--out",
+        "/tmp/test.json",
+        "--limit",
+        "10",
+        "--database-url",
+        "postgres://usr:***@localhost:5432/db",
+      ]);
+      assert.ok(errorLogged.includes("unsupported format: short punctuation-only passwords"));
+      assert.ok(!errorLogged.includes("***"));
+      assert.equal(process.exitCode, 1);
+    } finally {
+      console.error = origError;
+      process.exitCode = origExitCode;
+    }
+  });
+
+  it("verifies exact boundary outputs with punctuation and JSON delimiters for short secrets", () => {
+    const secrets = ["k1", "pw"];
+
+    // 1. JSON delimiter boundaries: quotes, braces, colons, brackets, commas
+    assert.equal(
+      redactSampleData('{"secret":"k1"}', secrets, 0),
+      '{"secret":"***REDACTED***"}',
+    );
+    assert.equal(
+      redactSampleData('{"k1":"value"}', secrets, 0),
+      '{"***REDACTED***":"value"}',
+    );
+    assert.equal(
+      redactSampleData('["k1", "pw"]', secrets, 0),
+      '["***REDACTED***", "***REDACTED***"]',
+    );
+    assert.equal(
+      redactSampleData('{"a":1,"b":"pw","c":true}', secrets, 0),
+      '{"a":1,"b":"***REDACTED***","c":true}',
+    );
+    assert.equal(
+      redactSampleData('{"nested":{"inner":"k1"}}', secrets, 0),
+      '{"nested":{"inner":"***REDACTED***"}}',
+    );
+
+    // 2. Punctuation delimiters: parentheses, exclamation, question mark, colons, commas, semicolons, slashes
+    assert.equal(
+      redactSampleData("User token is (k1).", secrets, 0),
+      "User token is (***REDACTED***).",
+    );
+    assert.equal(
+      redactSampleData("Detected password pw!", secrets, 0),
+      "Detected password ***REDACTED***!",
+    );
+    assert.equal(
+      redactSampleData("Is this k1? Yes.", secrets, 0),
+      "Is this ***REDACTED***? Yes.",
+    );
+    assert.equal(
+      redactSampleData("k1: first item", secrets, 0),
+      "***REDACTED***: first item",
+    );
+    assert.equal(
+      redactSampleData("values: k1, second", secrets, 0),
+      "values: ***REDACTED***, second",
+    );
+    assert.equal(
+      redactSampleData("k1; next;", secrets, 0),
+      "***REDACTED***; next;",
+    );
+    assert.equal(
+      redactSampleData("/opt/k1/bin", secrets, 0),
+      "/opt/***REDACTED***/bin",
+    );
+    assert.equal(
+      redactSampleData("k1", secrets, 0),
+      "***REDACTED***",
+    );
+
+    // 3. Non-boundary word/token characters ([a-zA-Z0-9_-]) protecting legitimate text
+    assert.equal(
+      redactSampleData("spawning upward", secrets, 0),
+      "spawning upward",
+    );
+    assert.equal(
+      redactSampleData("k123 and prek1", secrets, 0),
+      "k123 and prek1",
+    );
+    assert.equal(
+      redactSampleData("k1_identifier and pre-k1-item", secrets, 0),
+      "k1_identifier and pre-k1-item",
+    );
+    assert.equal(
+      redactSampleData("pw_hash and var-pw", secrets, 0),
+      "pw_hash and var-pw",
+    );
   });
 });
 
