@@ -66,6 +66,15 @@ describe("TAILNET_HTTP_PROXY", () => {
     expect(proxy.targets).toEqual(["mcp.drum-mackarel.ts.net:443"]);
   });
 
+  it("leaves tunnelled names outside the CGNAT hostname rule (no local lookup)", async () => {
+    const proxy = await startProxy(null);
+    const lookup = vi.fn(async () => [{ address: "100.64.0.9", family: 4 }]);
+    await expect(
+      guardedRemoteHttpFetch("https://mcp.drum-mackarel.ts.net/mcp", {}, { error, ...trusted, tailnetHttpProxy: proxy.url, lookup }),
+    ).rejects.toMatchObject({ code: "remote_http_connect_failed" });
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
   it("never sends other ports or http:// to the proxy", async () => {
     const proxy = await startProxy(null);
     let lookups = 0;

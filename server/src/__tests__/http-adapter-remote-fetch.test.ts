@@ -67,6 +67,15 @@ describe("HTTP adapter guarded fetch", () => {
     })).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
   });
 
+  it("allows an exact allowlisted tailnet origin but not other 100.x origins or ports", async () => {
+    const unpinnedFetch = vi.fn(async () => new Response("ok", { status: 200 }));
+    const opts = { privateEndpointAllowlist: new Set(["http://100.64.0.5:8080"]), unpinnedFetch };
+    expect((await guardedHttpAdapterFetch("http://100.64.0.5:8080/hook", {}, opts)).status).toBe(200);
+    for (const url of ["http://100.64.0.6:8080/", "http://100.64.0.5:8081/"]) {
+      await expect(guardedHttpAdapterFetch(url, {}, opts)).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
+    }
+  });
+
   it("rejects metadata link-local addresses even when their origin is allowlisted", async () => {
     const unpinnedFetch = vi.fn();
 

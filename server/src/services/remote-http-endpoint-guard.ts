@@ -10,6 +10,8 @@ export type RemoteHttpEndpointLookup = (hostname: string) => Promise<LookupResul
 
 export type RemoteHttpEndpointGuardOptions = {
   allowPrivateNetwork?: boolean;
+  /** Operator-allowlisted origin: skip the tailnet address deny. Never set from user-supplied URLs. */
+  allowTailnetAddress?: boolean;
   dnsTimeoutMs?: number;
   lookup?: RemoteHttpEndpointLookup;
 };
@@ -74,6 +76,12 @@ export async function resolveApprovedRemoteHttpAddresses(
     if (isAlwaysDeniedLinkLocalIp(hostname) || (!options.allowPrivateNetwork && isPrivateOrReservedIp(hostname))) {
       throw error("Remote MCP connection URL cannot target private or reserved network addresses", "remote_http_private_endpoint");
     }
+    if (!options.allowTailnetAddress && isTailnetAddress(hostname)) {
+      throw error(
+        "Remote MCP connection URL cannot target tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) IP addresses; use the tailnet host name instead",
+        "remote_http_tailnet_address_denied",
+      );
+    }
     return [hostname];
   }
 
@@ -97,6 +105,12 @@ export async function resolveApprovedRemoteHttpAddresses(
     isAlwaysDeniedLinkLocalIp(result.address)
     || (!options.allowPrivateNetwork && isPrivateOrReservedIp(result.address)))) {
     throw error("Remote MCP connection URL cannot resolve to private or reserved network addresses", "remote_http_private_endpoint");
+  }
+  if (!options.allowTailnetAddress && results.some((result) => isTailnetAddress(result.address)) && (endpoint.protocol !== "https:" || (endpoint.port !== "" && endpoint.port !== "443"))) {
+    throw error(
+      "Remote MCP connection host name resolves to a tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) address; use the tailnet host name over https on port 443",
+      "remote_http_tailnet_address_denied",
+    );
   }
   return results.map((result) => result.address);
 }
@@ -156,6 +170,16 @@ export function isAlwaysDeniedLinkLocalIp(address: string): boolean {
     return octets !== null && octets[0] === 169 && octets[1] === 254;
   }
   return isIP(normalized) === 6 && /^fe[89ab]/.test(normalized);
+}
+
+/** Tailscale ranges (100.64.0.0/10, fd7a:115c:a1e0::/48, plus NAT64/IPv4-compatible/6to4 embeddings of the IPv4 range): literals are denied in every mode; host names resolving here are limited to https:443. */
+function isTailnetAddress(address: string): boolean {
+  const normalized = normalizeIpAddress(address);
+  if (normalized.startsWith("fd7a:115c:a1e0:")) return true;
+  const embedded = normalized.match(/^(?:64:ff9b::|::ffff:0:|::|2002:)([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/);
+  const hi = embedded ? Number.parseInt(embedded[1]!, 16) : null;
+  const octets = hi === null ? parseIpv4Address(normalized) : [hi >> 8, hi & 0xff];
+  return octets !== null && octets[0] === 100 && octets[1]! >= 64 && octets[1]! <= 127;
 }
 
 function isPrivateOrReservedIpv4(address: string): boolean {

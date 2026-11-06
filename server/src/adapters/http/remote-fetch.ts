@@ -69,9 +69,11 @@ export async function guardedHttpAdapterFetch(
 ): Promise<Response> {
   const endpoint = parseRemoteHttpEndpoint(url.toString(), endpointError);
   const allowlist = options.privateEndpointAllowlist ?? httpAdapterPrivateEndpointAllowlist();
+  const allowed = allowlist.has(endpoint.origin.toLowerCase());
   return guardedRemoteHttpFetch(endpoint, init, {
     ...options,
-    allowPrivateNetwork: allowlist.has(endpoint.origin.toLowerCase()),
+    allowPrivateNetwork: allowed,
+    allowTailnetAddress: allowed,
     error: endpointError,
   });
 }
