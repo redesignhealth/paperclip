@@ -122,6 +122,71 @@ describe("memory-config", () => {
       ).toThrow('unrecognized key "extraField"');
     });
 
+    it("accepts valid syncMaxChars and sync_max_chars values", () => {
+      const c1 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 4000,
+      });
+      expect(c1.syncMaxChars).toBe(4000);
+
+      const c2 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        sync_max_chars: 8000,
+      });
+      expect(c2.syncMaxChars).toBe(8000);
+
+      const c3 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 6000,
+        sync_max_chars: 6000,
+      });
+      expect(c3.syncMaxChars).toBe(6000);
+
+      const c4 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 1,
+      });
+      expect(c4.syncMaxChars).toBe(1);
+
+      const c5 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 16000,
+      });
+      expect(c5.syncMaxChars).toBe(16000);
+    });
+
+    it("rejects invalid syncMaxChars values (0, -1, 1.5, 16001, '6000')", () => {
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: 0 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: -1 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: 1.5 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: 16001 }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, syncMaxChars: "6000" as unknown as number }),
+      ).toThrow(/syncMaxChars must be an integer between 1 and 16000/);
+    });
+
+    it("throws on camel/snake conflict for syncMaxChars and sync_max_chars", () => {
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          syncMaxChars: 4000,
+          sync_max_chars: 5000,
+        }),
+      ).toThrow("conflicting syncMaxChars and sync_max_chars values provided");
+    });
+
     it("fails closed on non-mem0 provider or non-oss mode", () => {
       expect(() =>
         validateHermesMemoryConfig({
@@ -754,12 +819,91 @@ describe("memory-config", () => {
       const reparsed = JSON.parse(serialized);
       expect(reparsed).toEqual(canonical);
     });
+
+    it("preserves exact serialized key order with flag off (no sync_max_chars)", () => {
+      const validated = validateHermesMemoryConfig(validMemoryInput);
+      const canonical = buildCanonicalMem0Object(validated, {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+
+      expect(Object.keys(canonical)).toEqual(["mode", "oss", "user_id", "agent_id"]);
+      const serialized = serializeMem0Json(validated, {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(serialized).not.toContain("sync_max_chars");
+    });
+
+    it("preserves exact serialized key order with flag on (sync_max_chars immediately after agent_id)", () => {
+      const validatedWithChars = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        syncMaxChars: 8000,
+      });
+      const canonicalWithChars = buildCanonicalMem0Object(validatedWithChars, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+
+      expect(Object.keys(canonicalWithChars)).toEqual([
+        "mode",
+        "oss",
+        "user_id",
+        "agent_id",
+        "sync_max_chars",
+      ]);
+      expect(canonicalWithChars.sync_max_chars).toBe(8000);
+
+      const serializedWithChars = serializeMem0Json(validatedWithChars, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      const lines = serializedWithChars.split("\n");
+      const agentIdIdx = lines.findIndex((l) => l.includes('"agent_id":'));
+      const syncMaxCharsIdx = lines.findIndex((l) => l.includes('"sync_max_chars":'));
+      expect(syncMaxCharsIdx).toBe(agentIdIdx + 1);
+
+      // Default to 6000 if not specified in config
+      const validatedDefault = validateHermesMemoryConfig(validMemoryInput);
+      const canonicalDefault = buildCanonicalMem0Object(validatedDefault, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(canonicalDefault.sync_max_chars).toBe(6000);
+    });
   });
 
   describe("generateHermesMemoryYaml", () => {
-    it("emits the separate Hermes config.yaml memory block", () => {
-      const yaml = generateHermesMemoryYaml();
+    it("emits the separate Hermes config.yaml memory block when flag is off", () => {
+      const yaml = generateHermesMemoryYaml({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
       expect(yaml).toBe("memory:\n  provider: mem0\n");
+    });
+
+    it("emits memory_enabled: false and user_profile_enabled: false when flag is on", () => {
+      const yaml = generateHermesMemoryYaml({
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(yaml).toBe(
+        "memory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n",
+      );
     });
   });
 
