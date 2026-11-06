@@ -30,6 +30,15 @@ do not fail the agent. Read failures and a stopped worker emit
 observation is unavailable. Successful reads can restore observation.
 The worker stops before the temporary home is removed.
 
+### Hosted model request timeout
+
+Hosted Anthropic runs set `providers.anthropic.request_timeout_seconds` to 300
+in their generated profile, including when auto mode selects Anthropic,
+replacing Hermes's 900-second default. Set the
+adapter's positive numeric `requestTimeoutSec` to override it. This bounds inactive
+network waits within each request, not total streaming response duration.
+Hermes still owns provider retries, and `timeoutSec` still bounds
+the whole run. Other providers and local host configuration are unchanged.
 Native session resume remains disabled for isolated runs; this change does not
 share homes, change models, raise budgets or modify persistent memories.
 
@@ -272,6 +281,7 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 | `model` | string | `anthropic/claude-sonnet-4` | Model in `provider/model` format |
 | `provider` | string | *(auto-detected)* | API provider: `auto`, `openrouter`, `nous`, `openai-codex`, `zai`, `kimi-coding`, `minimax`, `minimax-cn` |
 | `timeoutSec` | number | `300` | Execution timeout in seconds |
+| `requestTimeoutSec` | number | `300` | Positive finite inactive-network wait for hosted Anthropic requests, including auto-selection |
 | `graceSec` | number | `10` | Grace period before SIGKILL |
 
 ### Tools
