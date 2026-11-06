@@ -116,6 +116,32 @@ export function redactSampleData(
   return `[REDACTED_${prefixLength}_CHARS]${scrubbed.slice(prefixLength)}`;
 }
 
+export function collectUrlPasswordSecrets(
+  urlString: string | null | undefined,
+  targetSecrets?: Set<string>,
+): string[] {
+  const secrets = targetSecrets ?? new Set<string>();
+  if (urlString && typeof urlString === "string") {
+    try {
+      const parsed = new URL(urlString);
+      if (parsed.password) {
+        secrets.add(parsed.password);
+        try {
+          const decoded = decodeURIComponent(parsed.password);
+          if (decoded) {
+            secrets.add(decoded);
+          }
+        } catch {
+          // Malformed percent-encoding; raw password was already preserved
+        }
+      }
+    } catch {
+      // Not a standard parseable URL, ignore parse failure
+    }
+  }
+  return Array.from(secrets);
+}
+
 export function collectEnvironmentSecrets(
   env: NodeJS.ProcessEnv = process.env,
   databaseUrl?: string,
@@ -123,40 +149,24 @@ export function collectEnvironmentSecrets(
   const secrets = new Set<string>();
 
   for (const [key, value] of Object.entries(env)) {
-    if (!value || typeof value !== "string" || value.length < 4) continue;
+    if (!value || typeof value !== "string") continue;
 
     // Generic direct credentials
     if (/(?:KEY|TOKEN|SECRET|PASSWORD)$/i.test(key)) {
-      secrets.add(value);
+      if (value.length >= 4) {
+        secrets.add(value);
+      }
     }
 
     // Known URL connection strings: scrub the password component specifically
     if (/(?:DATABASE_URL|DB_URL|_URL)$/i.test(key)) {
-      try {
-        const parsed = new URL(value);
-        if (parsed.password) {
-          const decoded = decodeURIComponent(parsed.password);
-          if (decoded.length >= 4) secrets.add(decoded);
-          if (parsed.password.length >= 4) secrets.add(parsed.password);
-        }
-      } catch {
-        // Not a standard parseable URL, ignore parse failure
-      }
+      collectUrlPasswordSecrets(value, secrets);
     }
   }
 
   // Also collect the password component directly from the provided database URL (e.g. from CLI options)
   if (databaseUrl) {
-    try {
-      const parsed = new URL(databaseUrl);
-      if (parsed.password) {
-        const decoded = decodeURIComponent(parsed.password);
-        if (decoded.length >= 4) secrets.add(decoded);
-        if (parsed.password.length >= 4) secrets.add(parsed.password);
-      }
-    } catch {
-      // Not a standard parseable URL, ignore parse failure
-    }
+    collectUrlPasswordSecrets(databaseUrl, secrets);
   }
 
   return Array.from(secrets);

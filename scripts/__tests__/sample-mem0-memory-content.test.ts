@@ -7,6 +7,7 @@ import test, { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   collectEnvironmentSecrets,
+  collectUrlPasswordSecrets,
   hasFlag,
   parseFlag,
   redactSampleData,
@@ -134,12 +135,113 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
     assert.ok(!secrets.includes("https://example.com/api"));
     assert.ok(!secrets.includes("abc"));
 
-    // Also extracts decoded password directly from databaseUrl even when not in env
+    // Also extracts raw and decoded passwords directly from databaseUrl even when not in env
     const secretsWithCliUrl = collectEnvironmentSecrets(
       {},
       "postgres://tenant:cli_only_db_pass%21@localhost:5432/mem",
     );
+    assert.ok(secretsWithCliUrl.includes("cli_only_db_pass%21"));
     assert.ok(secretsWithCliUrl.includes("cli_only_db_pass!"));
+  });
+
+  it("extracts URL passwords covering raw encoded, decoded, short, malformed percent, and invalid URLs", () => {
+    // 1. Raw encoded and decoded components
+    const encodedSecrets = collectUrlPasswordSecrets(
+      "postgres://usr:p%40ss%23word%20123@localhost:5432/db",
+    );
+    assert.ok(encodedSecrets.includes("p%40ss%23word%20123"));
+    assert.ok(encodedSecrets.includes("p@ss#word 123"));
+
+    // 2. Short passwords (< 4 chars) without >= 4 filtering
+    const shortSecrets1 = collectUrlPasswordSecrets("postgres://usr:pw@localhost:5432/db");
+    assert.ok(shortSecrets1.includes("pw"));
+    const shortSecrets2 = collectUrlPasswordSecrets("postgres://usr:k1@localhost:5432/db");
+    assert.ok(shortSecrets2.includes("k1"));
+
+    // 3. Malformed percent-encoding preserves raw password without dropping via swallowed catch
+    const malformedSecrets1 = collectUrlPasswordSecrets(
+      "postgres://usr:malformed%ZZpass@localhost:5432/db",
+    );
+    assert.ok(malformedSecrets1.includes("malformed%ZZpass"));
+    const malformedSecrets2 = collectUrlPasswordSecrets(
+      "postgres://usr:percent%8tail@localhost:5432/db",
+    );
+    assert.ok(malformedSecrets2.includes("percent%8tail"));
+    const malformedSecrets3 = collectUrlPasswordSecrets(
+      "postgres://usr:dangling%@localhost:5432/db",
+    );
+    assert.ok(malformedSecrets3.includes("dangling%"));
+
+    // 4. Invalid URLs and URLs without password return empty array without throwing
+    assert.deepEqual(collectUrlPasswordSecrets("not-a-valid-url"), []);
+    assert.deepEqual(collectUrlPasswordSecrets("://bad-scheme"), []);
+    assert.deepEqual(collectUrlPasswordSecrets(""), []);
+    assert.deepEqual(collectUrlPasswordSecrets(null as any), []);
+    assert.deepEqual(collectUrlPasswordSecrets(undefined), []);
+    assert.deepEqual(collectUrlPasswordSecrets("https://example.com/no-pass"), []);
+    assert.deepEqual(collectUrlPasswordSecrets("postgres://usr@localhost:5432/db"), []);
+
+    // 5. Environment connection URLs and actual options.databaseUrl share helper behavior
+    const envWithAllVariants = {
+      DATABASE_URL: "postgres://usr:env_raw%21pass@localhost:5432/db1",
+      COMPANY_MEMORY_DATABASE_URL: "postgres://usr:short_pw@localhost:5432/db2",
+      CUSTOM_DB_URL: "postgres://usr:env_malformed%ZZ@localhost:5432/db3",
+      INVALID_URL: "not-a-valid-url",
+    };
+    const combinedSecrets = collectEnvironmentSecrets(
+      envWithAllVariants,
+      "postgres://usr:direct_malformed%FF_pw@localhost:5432/db4",
+    );
+    // env URLs
+    assert.ok(combinedSecrets.includes("env_raw%21pass"));
+    assert.ok(combinedSecrets.includes("env_raw!pass"));
+    assert.ok(combinedSecrets.includes("short_pw"));
+    assert.ok(combinedSecrets.includes("env_malformed%ZZ"));
+    // actual options.databaseUrl
+    assert.ok(combinedSecrets.includes("direct_malformed%FF_pw"));
+  });
+
+  it("redacts sample data and ensures no credential leaks for raw encoded, decoded, short, and malformed passwords", () => {
+    const rawEncoded = "cli_pass%21%23secret";
+    const decoded = "cli_pass!#secret";
+    const shortPw = "pw";
+    const malformedPw = "malformed%ZZsecret";
+
+    const secrets = collectEnvironmentSecrets(
+      {
+        DATABASE_URL: `postgres://usr:${rawEncoded}@localhost:5432/db1`,
+        SHORT_URL: `postgres://usr:${shortPw}@localhost:5432/db2`,
+      },
+      `postgres://usr:${malformedPw}@localhost:5432/db3`,
+    );
+
+    // Verify all passwords collected
+    assert.ok(secrets.includes(rawEncoded));
+    assert.ok(secrets.includes(decoded));
+    assert.ok(secrets.includes(shortPw));
+    assert.ok(secrets.includes(malformedPw));
+
+    // Test data with all credential variants
+    const sampleText = [
+      `Connecting using raw password ${rawEncoded} in log.`,
+      `Decoded password ${decoded} was shown.`,
+      `User set password to ${shortPw} for rapid testing.`,
+      `Legacy system passed ${malformedPw} as credential.`,
+      `Unrelated word spawning upward should not corrupt word tokens.`,
+    ].join("\n");
+
+    const redacted = redactSampleData(sampleText, secrets, 0);
+
+    // Ensure NO credential leaks
+    assert.ok(!redacted.includes(rawEncoded), "Raw encoded credential must not leak");
+    assert.ok(!redacted.includes(decoded), "Decoded credential must not leak");
+    assert.ok(!redacted.includes(` ${shortPw} `), "Short password must not leak");
+    assert.ok(!redacted.includes(malformedPw), "Malformed percent credential must not leak");
+
+    // Ensure redactor boundary policy preserves surrounding word tokens for short secrets
+    assert.ok(redacted.includes("spawning"), "Surrounding word 'spawning' must be preserved");
+    assert.ok(redacted.includes("upward"), "Surrounding word 'upward' must be preserved");
+    assert.ok(redacted.includes("***REDACTED***"), "Redaction marker must be present");
   });
 
   it("handles embedded postgres unsupported environments by failing in CI and skipping locally", () => {
