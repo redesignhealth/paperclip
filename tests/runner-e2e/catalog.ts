@@ -28,6 +28,12 @@ import { publicMcpTasks, publicMcpExpandedDigest, publicMcpSetupDigest, publicMc
 import { graderVersion as publicMcpGraderVersion } from "./public-mcp-grading.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 import { CONNECTION_GUIDANCE_SUITE, CONNECTION_GUIDANCE_BUDGET_CENTS, connectionGuidanceTasks, connectionGuidanceDefinitionDigest } from "./connection-guidance-cases.js";
+import {
+  memoryRecallTasks,
+  memoryRecallProfile,
+  memoryRecallDefinitionDigest,
+  MEMORY_RECALL_BUDGET_CENTS,
+} from "./memory-recall-cases.js";
 
 import { firstTaskTasks } from "./first-task-cases.js";
 import { chatTasks, chatHardeningTasks, chatStoryTasks, chatQualificationTasks, chatCompletionTasks } from "./chat-cases.js";
@@ -1715,6 +1721,23 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     environments: [localEnvironment, daytonaWarmEnvironment], tasks: [repositorySkillsTask], expectedMatrixSize: 2,
     definitionMetadata: { version: 1, scheduling: "explicit-only", maximumAttemptsPerCell: 1,
       source: "paperclipai/poteto-stack", skills: ["architect", "bro"], grading: "independent-git-blob-hashes-and-file-modes-from-owned-runtime", budgetMonthlyCents: 1000 },
+  },
+  {
+    id: "memory-recall",
+    label: "Memory Recall and Isolation",
+    description: "Mem0 memory recall, implicit guidance, cross-agent isolation, and heartbeat noise evaluation.",
+    groups: [],
+    manualOnly: true,
+    profiles: runnerProfiles.filter(profile => profile.id === "runner-codex").map(memoryRecallProfile),
+    environments: [localEnvironment],
+    tasks: memoryRecallTasks,
+    expectedMatrixSize: memoryRecallTasks.length,
+    definitionMetadata: {
+      version: 1,
+      definitionDigest: memoryRecallDefinitionDigest(),
+      scheduling: "explicit-only",
+      budgetMonthlyCents: MEMORY_RECALL_BUDGET_CENTS,
+    },
   },
 ] as const;
 
