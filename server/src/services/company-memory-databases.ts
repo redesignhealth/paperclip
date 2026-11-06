@@ -60,6 +60,8 @@ export interface CompanyMemoryDatabaseRuntimeDescriptor {
   readonly collectionName: string;
   readonly embeddingModel: string;
   readonly embeddingDimensions: number;
+  readonly scopeMigrationCompletedAt?: Date | null;
+  readonly scopeMigrationMode?: string | null;
 }
 
 export interface RoleAccessVerificationInput {
@@ -1075,6 +1077,8 @@ export function createPostgresCompanyMemoryDatabaseService(
       collectionName: row.collectionName,
       embeddingModel: row.embeddingModel,
       embeddingDimensions: row.embeddingDimensions,
+      scopeMigrationCompletedAt: row.scopeMigrationCompletedAt,
+      scopeMigrationMode: row.scopeMigrationMode,
     };
   }
 

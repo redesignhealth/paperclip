@@ -270,6 +270,17 @@ const result = await companyMemoryDatabaseService(db).rotateCredential(companyId
      pg_restore --clean --if-exists --no-owner --no-privileges -h <rds_host> -U pcmem_r_<hex32> -d pcmem_<hex32> /backup/pcmem_<hex32>.dump
      ```
 
+### 4. Agent-Scoped Mem0 Scope Migration (TECH-8191)
+
+To isolate Mem0 memories per agent rather than sharing a global `"company"` scope, Mem0 uses `user_id = agent.id` instead of `"company"`.
+
+#### Operational Rules & Cutover Architecture
+
+- **Gated Runtime Scoping**: Runtime scoping is behind the `agent-scoped-mem0` hardening flag and additionally requires a per-company migration marker (`company_memory_databases.scope_migration_completed_at`). With no marker present on the company record, recall stays company-scoped (`user_id = 'company'`) and emits a warning with the company ID only.
+- **No Cutover Tool Ships in this Change**: Copying a company onto agent scope is a planned per-company offline cutover. Until the cutover tool lands in a follow-up PR, the `agent-scoped-mem0` flag has no operational effect on any company.
+- **Why Online Copying is Rejected**: A safety review proved an online cutover cannot be made safe. The Mem0 write path bypasses the control plane: the tenant role credential is handed to the Hermes adapter, which connects and writes directly to tenant Postgres for the entire duration of a run. Consequently, concurrent writes escape any census/copy window, and no control-plane in-process lock can prevent concurrent mutations. Instead, the offline cutover will be enforced directly by the database (setting the tenant role to `NOLOGIN` with a bounded backend drain) rather than relying on operator assertion.
+- **Do Not Hand-Edit Markers**: Operators must not manually edit or set `scope_migration_completed_at` or `scope_migration_mode` in the database. Markers must only be populated by the verified offline cutover tool once landed.
+
 ---
 
 ## 6. Capacity Planning & Production Placement

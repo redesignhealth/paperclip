@@ -7,6 +7,7 @@ import {
 import * as memoryModule from "../services/company-memory-databases.js";
 import { CompanyMemoryNotReadyError } from "../services/company-memory-databases.js";
 import * as redactionModule from "../services/run-secret-redaction.js";
+import { recordAgentScopedMemoryUse } from "../services/memory-scope-observations.js";
 
 describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
   const companyId = "11111111-1111-4111-8111-111111111111";
@@ -201,5 +202,255 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
     expect(registeredSecrets).toEqual([
       { companyId: unlistedCompanyId, runId, value: mockDescriptor.password },
     ]);
+  });
+
+  describe("agent-scoped mem0 scope decision (TECH-8191)", () => {
+    it("flag off => userId is 'company'", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: new Date(),
+          scopeMigrationMode: "copy",
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+        flags: {
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: false,
+          capabilityMemoryGuidance: false,
+        },
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(runtimeMemory!.getConfig().userId).toBe("company");
+    });
+
+    it("flag on + no marker => userId is 'company' and logs ONE warn line with companyId only", async () => {
+      const { logger } = await import("../middleware/logger.js");
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: null,
+          scopeMigrationMode: null,
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+        flags: {
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: true,
+          capabilityMemoryGuidance: false,
+        },
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(runtimeMemory!.getConfig().userId).toBe("company");
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        { companyId },
+        expect.stringContaining("has not completed agent scope migration"),
+      );
+
+      // Verify no secrets or agent IDs leaked in the warning object
+      const warnCalls = warnSpy.mock.calls;
+      const relevantCall = warnCalls.find(
+        ([obj]) => typeof obj === "object" && obj !== null && "companyId" in obj && (obj as any).companyId === companyId,
+      );
+      expect(relevantCall).toBeDefined();
+      expect(Object.keys(relevantCall![0] as object)).toEqual(["companyId"]);
+
+      warnSpy.mockRestore();
+    });
+
+    it("flag on + marker => userId is agent.id", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: new Date("2026-11-05T00:00:00Z"),
+          scopeMigrationMode: "copy",
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+        flags: {
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: true,
+          capabilityMemoryGuidance: false,
+        },
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(runtimeMemory!.getConfig().userId).toBe(agentId);
+      expect(runtimeMemory!.getConfig().agentId).toBe(agentId);
+    });
+
+    it("the recorder updates at most once per hour (mock db)", async () => {
+      let observedAt: Date | null = null;
+      const throttledMockDb = {
+        update: vi.fn(() => ({
+          set: vi.fn((values: { scopeMigrationAgentScopeObservedAt?: Date }) => ({
+            where: vi.fn(() => ({
+              returning: vi.fn(async () => {
+                const now = values.scopeMigrationAgentScopeObservedAt ?? new Date();
+                if (
+                  observedAt === null ||
+                  observedAt.getTime() <= now.getTime() - 60 * 60 * 1000
+                ) {
+                  observedAt = now;
+                  return [{ id: "mem-db-1" }];
+                }
+                return [];
+              }),
+            })),
+          })),
+        })),
+      };
+
+      const baseTime = new Date("2026-11-05T12:00:00Z");
+
+      // 1. Initial observation with null observedAt -> updates
+      const updated1 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, baseTime);
+      expect(updated1).toBe(true);
+      expect(observedAt).toEqual(baseTime);
+
+      // 2. Second observation 30 minutes later -> throttled (no update)
+      const timePlus30Min = new Date(baseTime.getTime() + 30 * 60 * 1000);
+      const updated2 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, timePlus30Min);
+      expect(updated2).toBe(false);
+      expect(observedAt).toEqual(baseTime);
+
+      // 3. Observation 59 minutes later -> throttled (no update)
+      const timePlus59Min = new Date(baseTime.getTime() + 59 * 60 * 1000);
+      const updated3 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, timePlus59Min);
+      expect(updated3).toBe(false);
+
+      // 4. Observation 61 minutes later -> updates
+      const timePlus61Min = new Date(baseTime.getTime() + 61 * 60 * 1000);
+      const updated4 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, timePlus61Min);
+      expect(updated4).toBe(true);
+      expect(observedAt).toEqual(timePlus61Min);
+    });
+
+    it("the recorder never throws into the run", async () => {
+      const { logger } = await import("../middleware/logger.js");
+      const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+
+      const failingDb = {
+        update: vi.fn(() => ({
+          set: vi.fn(() => ({
+            where: vi.fn(() => ({
+              returning: vi.fn(async () => {
+                throw new Error("simulated database outage");
+              }),
+            })),
+          })),
+        })),
+      };
+
+      let result: boolean | undefined;
+      await expect(
+        (async () => {
+          result = await recordAgentScopedMemoryUse(failingDb as any, companyId);
+        })(),
+      ).resolves.not.toThrow();
+
+      expect(result).toBe(false);
+      expect(debugSpy).toHaveBeenCalledWith(
+        { companyId },
+        expect.stringContaining("failed to record"),
+      );
+      const debugCalls = debugSpy.mock.calls;
+      const relevantCall = debugCalls.find(
+        ([obj]) => typeof obj === "object" && obj !== null && "companyId" in obj && (obj as any).companyId === companyId,
+      );
+      expect(relevantCall).toBeDefined();
+      expect(Object.keys(relevantCall![0] as object)).toEqual(["companyId"]);
+
+      debugSpy.mockRestore();
+    });
+
+    it("an agent-scoped run still resolves when the recorder rejects", async () => {
+      const observationsModule = await import("../services/memory-scope-observations.js");
+      const recordSpy = vi
+        .spyOn(observationsModule, "recordAgentScopedMemoryUse")
+        .mockRejectedValue(new Error("unhandled recorder rejection"));
+
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: new Date("2026-11-05T00:00:00Z"),
+          scopeMigrationMode: "copy",
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+        flags: {
+          hermesMemoryConfig: false,
+          hermesPromptSplit: false,
+          agentScopedMem0: true,
+          capabilityMemoryGuidance: false,
+        },
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(runtimeMemory!.getConfig().userId).toBe(agentId);
+      expect(recordSpy).toHaveBeenCalledWith(mockDb, companyId);
+
+      recordSpy.mockRestore();
+    });
   });
 });

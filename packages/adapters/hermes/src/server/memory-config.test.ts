@@ -203,21 +203,53 @@ describe("memory-config", () => {
       ).toThrow('mode must be "oss"');
     });
 
-    it("requires userId to be exactly 'company'", () => {
+    it("validates userId: accepts 'company' and agentId; rejects a third value; rejects userId !== agentId when not 'company'", () => {
+      // accepts "company"
+      const resCompany = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: "company",
+      });
+      expect(resCompany.userId).toBe("company");
+
+      // accepts agentId
+      const resAgent = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        userId: validMemoryInput.agentId,
+      });
+      expect(resAgent.userId).toBe(validMemoryInput.agentId);
+
+      // rejects a third value
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "some_other_agent",
+        }),
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
+
+      // rejects userId !== agentId when not "company"
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
           userId: "user_123",
         }),
-      ).toThrow('userId must be "company"');
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
 
+      // rejects undefined / missing userId
       expect(() =>
         validateHermesMemoryConfig({
           ...validMemoryInput,
           userId: undefined,
           user_id: undefined,
         }),
-      ).toThrow('userId must be "company"');
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
+
+      // rejects unsafe identifier (control characters / sql injection)
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          userId: "invalid; DROP TABLE users;--",
+        }),
+      ).toThrow('userId must be a safe identifier and equal either "company" or agentId');
     });
 
     it("validates agentId against safe identifier constraints and rejects control characters", () => {
@@ -1588,7 +1620,7 @@ describe("memory-config", () => {
           validateHermesMemoryConfig({ ...validMemoryInput, userId: sensitiveProbe });
           expect.unreachable();
         } catch (err: any) {
-          expect(err.message).toBe('Invalid memory configuration: userId must be "company"');
+          expect(err.message).toBe('Invalid memory configuration: userId must be a safe identifier and equal either "company" or agentId');
           expect(err.message).not.toContain(sensitiveProbe);
         }
       });

@@ -93,7 +93,7 @@ export const FORBIDDEN_CONFIG_KEYS: ReadonlySet<string> = Object.freeze({
 export interface ValidatedHermesMemoryConfig {
   readonly provider: "mem0";
   readonly mode: "oss";
-  readonly userId: "company";
+  readonly userId: string;
   readonly agentId: string;
   readonly syncMaxChars?: number;
   readonly llm: {
@@ -147,7 +147,7 @@ export interface CanonicalMem0Json {
       };
     };
   };
-  readonly user_id: "company";
+  readonly user_id: string;
   readonly agent_id: string;
   readonly sync_max_chars?: number;
 }
@@ -439,7 +439,7 @@ function validateModelConfig(
  * Enforces:
  * - provider: "mem0"
  * - mode: "oss"
- * - userId / user_id: strictly "company", rejects conflicting camel/snake values
+ * - userId / user_id: safe identifier matching SAFE_AGENT_ID_REGEX and equal to either "company" or agentId, rejects conflicting camel/snake values
  * - agentId / agent_id: safe identifier without controls, rejects conflicting camel/snake values
  * - llm and embedder blocks: providers "openai" | "ollama", non-empty model, recursive plain-JSON safe
  * - vectorStore / vector_store: provider "pgvector", split fields only, rejects conflicting camel/snake values
@@ -483,21 +483,25 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
     throw new Error('Invalid memory configuration: mode must be "oss"');
   }
 
-  // Detect conflicting camel/snake aliases
-  if (raw.userId !== undefined && raw.user_id !== undefined && raw.userId !== raw.user_id) {
-    throw new Error("Invalid memory configuration: conflicting userId and user_id values provided");
-  }
-  const userId = raw.userId ?? raw.user_id;
-  if (userId !== "company") {
-    throw new Error('Invalid memory configuration: userId must be "company"');
-  }
-
   if (raw.agentId !== undefined && raw.agent_id !== undefined && raw.agentId !== raw.agent_id) {
     throw new Error("Invalid memory configuration: conflicting agentId and agent_id values provided");
   }
   const agentId = raw.agentId ?? raw.agent_id;
   if (typeof agentId !== "string" || !SAFE_AGENT_ID_REGEX.test(agentId)) {
     throw new Error("Invalid memory configuration: agentId must be a non-empty safe identifier without control characters");
+  }
+
+  // Detect conflicting camel/snake aliases
+  if (raw.userId !== undefined && raw.user_id !== undefined && raw.userId !== raw.user_id) {
+    throw new Error("Invalid memory configuration: conflicting userId and user_id values provided");
+  }
+  const userId = raw.userId ?? raw.user_id;
+  if (
+    typeof userId !== "string" ||
+    !SAFE_AGENT_ID_REGEX.test(userId) ||
+    (userId !== "company" && userId !== agentId)
+  ) {
+    throw new Error('Invalid memory configuration: userId must be a safe identifier and equal either "company" or agentId');
   }
 
   if (raw.syncMaxChars !== undefined && raw.sync_max_chars !== undefined && raw.syncMaxChars !== raw.sync_max_chars) {
@@ -568,7 +572,7 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
   return {
     provider: "mem0",
     mode: "oss",
-    userId: "company",
+    userId,
     agentId,
     llm: validatedLlm,
     embedder: validatedEmbedder,
@@ -739,7 +743,7 @@ export function buildCanonicalMem0Object(
         },
       },
     },
-    user_id: "company",
+    user_id: config.userId,
     agent_id: config.agentId,
     ...(hardening.hermesMemoryConfig
       ? { sync_max_chars: config.syncMaxChars ?? 6000 }

@@ -2675,6 +2675,13 @@
       "when": 1793717411351,
       "tag": "0383_instance_slack_configuration_credentials",
       "breakpoints": true
+    },
+    {
+      "idx": 384,
+      "version": "7",
+      "when": 1793935761318,
+      "tag": "0384_slow_puck",
+      "breakpoints": true
     }
   ]
 }
