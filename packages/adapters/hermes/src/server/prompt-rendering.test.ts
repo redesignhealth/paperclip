@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 
-import { buildPrompt } from "./execute.js";
+import { buildPrompt, renderHermesSystemPrompt } from "./execute.js";
 
 function baseContext(overrides: Record<string, unknown> = {}) {
   return {
@@ -324,4 +324,148 @@ test.each([false, true])("conversation prompts preserve the handoff policy (resu
     expect(prompt).not.toContain("Create child issues");
     expect(prompt).not.toContain("--arg status done");
   }
+});
+
+test.each([false, true])("prompt split under hermes-prompt-split respects section ordering and resumedSession=%s", (resumedSession) => {
+  const taskBrief = 'Paperclip task context:\n- Issue: "PAP-8190"\nBrief description of the work.';
+  const handoff = "Prior session handoff note.";
+  const communicationGuidance = "Initial communication guidance block in Slack.";
+  const ctx = baseContext({
+    paperclipWake: {
+      reason: "issue_commented",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-8190",
+        title: "Test prompt split",
+        status: "in_progress",
+        priority: "medium",
+        workMode: "standard",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    },
+    paperclipTaskMarkdown: taskBrief,
+    paperclipTaskMarkdownCompact: 'Paperclip task context compact:\n- Issue: "PAP-8190"',
+    paperclipSessionHandoffMarkdown: handoff,
+    paperclipTaskCommunicationGuidance: communicationGuidance,
+  });
+  const config = {
+    env: { PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split" },
+    promptTemplate: "Custom template for {{agentId}}.",
+  };
+
+  const { query, systemSections, hermesPromptSplit } = buildPrompt(ctx, config, { resumedSession, returnSections: true });
+  expect(hermesPromptSplit).toBe(true);
+
+  // Query section ordering when split is on:
+  // 1. taskContextMarkdown (must come FIRST to dominate Mem0 recall query)
+  // 2. wakePrompt
+  // 3. sessionHandoffMarkdown
+  // 4. rendered template
+  // 5. trailing per-run context (Paperclip invocation: - Run ID)
+  const expectedTaskSnippet = resumedSession ? "Paperclip task context compact:" : "Paperclip task context:";
+  const taskIdx = query.indexOf(expectedTaskSnippet);
+  const wakeSnippet = resumedSession ? "## Paperclip Resume Delta" : "## Paperclip Wake Payload";
+  const wakeIdx = query.indexOf(wakeSnippet);
+  const handoffIdx = query.indexOf(handoff);
+  const renderedIdx = query.indexOf("Custom template for agent-1.");
+  const runIdx = query.indexOf("Paperclip invocation:\n- Run ID: run-1");
+
+  expect(taskIdx).toBeGreaterThanOrEqual(0);
+  expect(wakeIdx).toBeGreaterThan(taskIdx);
+  expect(handoffIdx).toBeGreaterThan(wakeIdx);
+  expect(renderedIdx).toBeGreaterThan(handoffIdx);
+  expect(runIdx).toBeGreaterThan(renderedIdx);
+
+  // Moved sections are NOT in query
+  expect(query).not.toContain("Paperclip runtime identity:");
+  expect(query).not.toContain(communicationGuidance);
+  expect(query).not.toContain("You are agent");
+
+  // System sections verify identity is present without per-run fields (for prompt cache reuse)
+  expect(systemSections.some((s) => s.includes("Paperclip runtime identity:"))).toBe(true);
+  expect(systemSections.some((s) => s.includes("Run ID:"))).toBe(false);
+  expect(systemSections.some((s) => s.includes("run-1"))).toBe(false);
+
+  // Initial communication guidance is present on fresh runs, absent on resumed runs
+  if (!resumedSession) {
+    expect(systemSections.some((s) => s.includes(communicationGuidance))).toBe(true);
+  } else {
+    expect(systemSections.some((s) => s.includes(communicationGuidance))).toBe(false);
+  }
+});
+
+test.each([false, true])("suppresses custom template on recovery wake payloads regardless of hermesPromptSplit=%s", (splitEnabled) => {
+  const ctx = baseContext({
+    paperclipWake: {
+      reason: "source_scoped_recovery_action",
+      recovery: true,
+      issue: {
+        id: "issue-recovery-1",
+        identifier: "PAP-9999",
+        title: "Recover stopped execution",
+        status: "in_progress",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    },
+  });
+  const config = {
+    env: { PAPERCLIP_MEMORY_HARDENING: splitEnabled ? "hermes-prompt-split" : "" },
+    promptTemplate: "RECOVERY_SUPPRESSED_TEMPLATE_MARKER",
+  };
+
+  const { query, systemSections } = buildPrompt(ctx, config, { returnSections: true });
+  expect(query).not.toContain("RECOVERY_SUPPRESSED_TEMPLATE_MARKER");
+
+  if (splitEnabled) {
+    // Under split, task context is first and identity is in systemSections
+    expect(query).not.toContain("Paperclip runtime identity:");
+    expect(systemSections.some((s) => s.includes("Paperclip runtime identity:"))).toBe(true);
+  } else {
+    // Under legacy/flag off, identity is in query
+    expect(query).toContain("Paperclip runtime identity:");
+    expect(systemSections).toHaveLength(0);
+  }
+});
+
+test("renderHermesSystemPrompt handles default identity stripping and CRLF line breaks", () => {
+  const agent = { id: "agent-test", name: "Test Agent" };
+
+  // When includeDefaultIdentity is true, contains the default identity line
+  const full = renderHermesSystemPrompt(agent, { includeDefaultIdentity: true });
+  expect(full).toContain("You are agent agent-test (Test Agent).");
+
+  // When includeDefaultIdentity is false, strips the default identity line
+  const stripped = renderHermesSystemPrompt(agent, { includeDefaultIdentity: false });
+  expect(stripped).not.toContain("You are agent agent-test (Test Agent).");
+  expect(stripped).toContain("Paperclip API guidance:");
+  expect(stripped).toContain("Connection tools:");
+
+  // Exercise production renderHermesSystemPrompt directly with CRLF line breaks
+  const crlfDoubleTemplate = "You are agent {{agent.id}} ({{agent.name}}).\r\n\r\nRest of prompt with CRLF";
+  const strippedCrlfDouble = renderHermesSystemPrompt(agent, {
+    includeDefaultIdentity: false,
+    agentPromptTemplate: crlfDoubleTemplate,
+  });
+  expect(strippedCrlfDouble).not.toContain("You are agent");
+  expect(strippedCrlfDouble).toContain("Rest of prompt with CRLF");
+
+  const crlfSingleTemplate = "You are agent {{agent.id}} ({{agent.name}}).\r\nRest of prompt with single CRLF";
+  const strippedCrlfSingle = renderHermesSystemPrompt(agent, {
+    includeDefaultIdentity: false,
+    agentPromptTemplate: crlfSingleTemplate,
+  });
+  expect(strippedCrlfSingle).not.toContain("You are agent");
+  expect(strippedCrlfSingle).toContain("Rest of prompt with single CRLF");
+
+  // When default identity line is missing, renderHermesSystemPrompt throws
+  expect(() =>
+    renderHermesSystemPrompt(agent, {
+      includeDefaultIdentity: false,
+      agentPromptTemplate: "Different text without identity\n\nRest",
+    }),
+  ).toThrow("failed to strip default identity line");
 });

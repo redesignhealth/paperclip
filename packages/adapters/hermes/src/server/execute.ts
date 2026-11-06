@@ -44,6 +44,9 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
   selectPaperclipPromptSections,
+  resolveEffectiveMemoryHardeningFlags,
+  resolveMemoryHardeningFlags,
+  type MemoryHardeningFlags,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -1021,6 +1024,28 @@ export function buildRouterProbeLaunchEnv(finalEnv: Record<string, string | unde
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
 
+export const LINUX_MAX_ARG_STRLEN_BYTES = 128 * 1024;
+export const HERMES_SYSTEM_PROMPT_ENV_KEY = "HERMES_EPHEMERAL_SYSTEM_PROMPT";
+export const HERMES_SYSTEM_PROMPT_ENV_PREFIX = `${HERMES_SYSTEM_PROMPT_ENV_KEY}=`;
+export const HERMES_SYSTEM_PROMPT_ENV_OVERHEAD_BYTES =
+  Buffer.byteLength(HERMES_SYSTEM_PROMPT_ENV_PREFIX, "utf8") + 1; // 31 + 1 NUL = 32 bytes
+export const HERMES_MAX_SYSTEM_PROMPT_BYTES =
+  LINUX_MAX_ARG_STRLEN_BYTES - HERMES_SYSTEM_PROMPT_ENV_OVERHEAD_BYTES; // 131040 bytes
+
+const HERMES_STATIC_RUNTIME_IDENTITY_TEMPLATE = [
+  'You are "{{agent.name}}", an AI agent employee in a Paperclip-managed company.',
+  "",
+  "Paperclip runtime identity:",
+  "- Agent ID: {{agent.id}}",
+  "- Company ID: {{agent.companyId}}",
+  "- API base: {{paperclipApiUrl}}",
+].join("\n");
+
+const HERMES_RUN_CONTEXT_TEMPLATE = [
+  "Paperclip invocation:",
+  "- Run ID: {{run.id}}",
+].join("\n");
+
 const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
   'You are "{{agent.name}}", an AI agent employee in a Paperclip-managed company.',
   "",
@@ -1031,9 +1056,7 @@ const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
   "- API base: {{paperclipApiUrl}}",
 ].join("\n");
 
-// Hermes applies this overlay at each API call, including after compaction,
-// without storing it in conversation history. Keep run/task deltas in -q.
-const HERMES_SYSTEM_PROMPT_TEMPLATE = [
+const HERMES_SYSTEM_PROMPT_API_GUIDANCE = [
   "Paperclip API guidance:",
   "- Use `curl` from the terminal for Paperclip API calls; browser/web extraction tools may not reach localhost.",
   "- Use `$PAPERCLIP_API_URL`, `$PAPERCLIP_API_KEY`, and `$PAPERCLIP_RUN_ID`; do not hard-code local ports or copy secrets into comments.",
@@ -1061,9 +1084,51 @@ const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "    -H \"Content-Type: application/json\" \\",
   "    --data-binary @-",
   "```",
+].join("\n");
+
+// Hermes applies this overlay at each API call, including after compaction,
+// without storing it in conversation history. Keep run/task deltas (such as Run ID
+// and task briefs) in -q to preserve provider prompt-cache prefix reuse across runs.
+const HERMES_SYSTEM_PROMPT_TEMPLATE = [
+  HERMES_SYSTEM_PROMPT_API_GUIDANCE,
   "",
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ].join("\n");
+
+export function renderHermesSystemPrompt(
+  agent: unknown,
+  options: { includeDefaultIdentity?: boolean; agentPromptTemplate?: string } = {},
+): string {
+  const includeDefaultIdentity = options.includeDefaultIdentity ?? true;
+  const baseTemplate = options.agentPromptTemplate ?? DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+  if (includeDefaultIdentity) {
+    if (baseTemplate === DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE) {
+      return renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, { agent });
+    }
+    const fullTemplate = [
+      HERMES_SYSTEM_PROMPT_API_GUIDANCE,
+      "",
+      baseTemplate,
+    ].join("\n");
+    return renderTemplate(fullTemplate, { agent });
+  }
+  const identityRegex = /^You are agent \{\{agent\.id\}\} \(\{\{agent\.name\}\}\)\.\r?\n\r?\n?/;
+  if (!identityRegex.test(baseTemplate)) {
+    throw new Error(
+      "renderHermesSystemPrompt: failed to strip default identity line from DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE; template format may have changed",
+    );
+  }
+  const agentTemplate = baseTemplate.replace(
+    identityRegex,
+    "",
+  );
+  const promptTemplate = [
+    HERMES_SYSTEM_PROMPT_API_GUIDANCE,
+    "",
+    agentTemplate,
+  ].join("\n");
+  return renderTemplate(promptTemplate, { agent });
+}
 
 function renderConditionalSections(template: string, vars: Record<string, unknown>): string {
   const isTruthy = (key: string) => {
@@ -1078,11 +1143,27 @@ function renderConditionalSections(template: string, vars: Record<string, unknow
   );
 }
 
+export interface HermesBuiltPrompt {
+  query: string;
+  systemSections: string[];
+  hermesPromptSplit: boolean;
+}
+
 export function buildPrompt(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
-  options: { resumedSession?: boolean } = {},
-): string {
+  options: { resumedSession?: boolean; returnSections: true; hardeningFlags?: MemoryHardeningFlags },
+): HermesBuiltPrompt;
+export function buildPrompt(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+  options?: { resumedSession?: boolean; returnSections?: false; hardeningFlags?: MemoryHardeningFlags },
+): string;
+export function buildPrompt(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+  options?: { resumedSession?: boolean; returnSections?: boolean; hardeningFlags?: MemoryHardeningFlags },
+): string | HermesBuiltPrompt {
   const context = (ctx as any).context || {};
   const template = cfgString(config.promptTemplate);
   const taskId = cfgString(context.taskId) || cfgString(context.issueId) || cfgString(ctx.config?.taskId);
@@ -1104,15 +1185,35 @@ export function buildPrompt(
     paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
   }
 
+  const resolvedHardeningFlags = options?.hardeningFlags ?? resolveEffectiveMemoryHardeningFlags(
+    process.env,
+    (config.env ?? ctx.config?.env) as Record<string, string | undefined> | undefined,
+  );
+  const hermesPromptSplit = resolvedHardeningFlags.hermesPromptSplit;
+
   const { taskContextNote: taskContextMarkdown, wakePrompt } = selectPaperclipPromptSections(context, {
-    resumedSession: options.resumedSession === true,
-    includeCommunicationGuidance: true,
+    resumedSession: options?.resumedSession === true,
+    includeCommunicationGuidance: !hermesPromptSplit,
   });
   // Keep the historical variable available to custom templates. Automatic
   // assembly uses the ownership-aware assignment variant below.
   const paperclipTaskMarkdown = cfgString(context.paperclipTaskMarkdown)?.trim() || "";
   const sessionHandoffMarkdown = cfgString(context.paperclipSessionHandoffMarkdown)?.trim() || "";
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake) || "";
+
+  const fullTaskMarkdown = cfgString(
+    context.paperclipTaskMarkdownAssignment ?? context.paperclipTaskMarkdown,
+  )?.trim() || "";
+  const hasTask = Boolean(fullTaskMarkdown);
+  const isResumed = options?.resumedSession === true;
+  const includeInitialGuidance = hasTask && !isResumed;
+
+  const taskCommunicationGuidance = includeInitialGuidance
+    ? cfgString(context.paperclipTaskCommunicationGuidance)?.trim() || ""
+    : "";
+  const freshSessionHandoffMarkdown = includeInitialGuidance
+    ? cfgString(context.paperclipFreshSessionHandoffMarkdown)?.trim() || ""
+    : "";
 
   const vars: Record<string, unknown> = {
     agentId: ctx.agent?.id || "",
@@ -1146,14 +1247,40 @@ export function buildPrompt(
   const rendered = template && !isPaperclipRecoveryWakePayload(context.paperclipWake)
     ? renderTemplate(renderConditionalSections(template, vars), vars)
     : "";
-  return joinPromptSections([
-    renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
-    wakePrompt,
-    sessionHandoffMarkdown,
-    runtimeGuidance,
-    taskContextMarkdown,
-    rendered,
-  ]);
+
+  let query: string;
+  let systemSections: string[];
+
+  if (hermesPromptSplit) {
+    query = joinPromptSections([
+      freshSessionHandoffMarkdown,
+      taskContextMarkdown,
+      wakePrompt,
+      sessionHandoffMarkdown,
+      rendered,
+      renderTemplate(HERMES_RUN_CONTEXT_TEMPLATE, vars),
+    ]);
+    systemSections = [
+      renderTemplate(HERMES_STATIC_RUNTIME_IDENTITY_TEMPLATE, vars),
+      taskCommunicationGuidance,
+      runtimeGuidance,
+    ].filter(Boolean);
+  } else {
+    query = joinPromptSections([
+      renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
+      wakePrompt,
+      sessionHandoffMarkdown,
+      runtimeGuidance,
+      taskContextMarkdown,
+      rendered,
+    ]);
+    systemSections = [];
+  }
+
+  if (options?.returnSections === true) {
+    return { query, systemSections, hermesPromptSplit };
+  }
+  return query;
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1458,17 @@ export async function execute(
 
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
+  // Resolve memory hardening flags once early from agreed server and agent env sources (additive)
+  const userEnvForHardening = (config.env ?? ctx.config?.env) as Record<string, string | undefined> | undefined;
+  let hardeningFlags: MemoryHardeningFlags;
+  try {
+    hardeningFlags = resolveEffectiveMemoryHardeningFlags(process.env, userEnvForHardening);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await ctx.onLog("stderr", `[hermes] Invalid PAPERCLIP_MEMORY_HARDENING configuration: ${reason}\n`);
+    throw err;
+  }
+
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
   const configuredModel = normalizeConfiguredModel(cfgString(config.model));
@@ -1473,7 +1611,7 @@ export async function execute(
     }
   }
 
-  // ── Build prompt ───────────────────────────────────────────────────────
+  // ── Build prompt and environment ───────────────────────────────────────
   const userEnvForPrompt = config.env as Record<string, unknown> | undefined;
   const promptConfig: Record<string, unknown> = { ...config };
   if (!cfgString(promptConfig.paperclipApiUrl) && userEnvForPrompt && typeof userEnvForPrompt === "object") {
@@ -1486,7 +1624,80 @@ export async function execute(
   // Isolated per-run HERMES_HOME runs (runtime MCP, memory, host isolation) have ephemeral
   // native session state, so they never resume a prior Hermes session.
   const sessionId = persistSession && !usingIsolatedHome ? prevSessionId : undefined;
-  const prompt = buildPrompt(ctx, promptConfig, { resumedSession: Boolean(sessionId) });
+  const builtPrompt = buildPrompt(ctx, promptConfig, {
+    resumedSession: Boolean(sessionId),
+    returnSections: true,
+    hardeningFlags,
+  });
+
+  const userEnv = config.env as Record<string, string> | undefined;
+  // TECH-7076: never spread the whole server process.env into the agent. It carries
+  // server-only secrets (SSO provider definitions, Better Auth secret, secrets master
+  // key, database URLs, cloud credentials, the server's own provider keys) that the
+  // agent's terminal tool could print before log redaction. Start from the strict
+  // allowlisted base; credentials come only from explicit config/managed AI connection.
+  const env: Record<string, string> = {
+    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
+    ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
+    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
+  };
+
+  let prompt = builtPrompt.query;
+  let finalSystemPrompt: string;
+
+  if (builtPrompt.hermesPromptSplit) {
+    const candidateOverlay = joinPromptSections([
+      env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+      agentInstructions,
+      ...builtPrompt.systemSections,
+      renderHermesSystemPrompt(ctx.agent, {
+        includeDefaultIdentity: false,
+      }),
+    ]);
+    if (Buffer.byteLength(candidateOverlay, "utf8") > HERMES_MAX_SYSTEM_PROMPT_BYTES) {
+      // Ephemeral system prompt would exceed Linux MAX_ARG_STRLEN (128 KiB).
+      // Fall back: keep relocated sections in the query (-q / --query-file) instead of the system prompt.
+      await ctx.onLog(
+        "stderr",
+        "[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.\n",
+      );
+      const fallbackPrompt = buildPrompt(ctx, promptConfig, {
+        resumedSession: Boolean(sessionId),
+        returnSections: true,
+        hardeningFlags: { ...hardeningFlags, hermesPromptSplit: false },
+      });
+      prompt = fallbackPrompt.query;
+      finalSystemPrompt = joinPromptSections([
+        env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+        agentInstructions,
+        renderHermesSystemPrompt(ctx.agent, {
+          includeDefaultIdentity: true,
+        }),
+      ]);
+    } else {
+      finalSystemPrompt = candidateOverlay;
+    }
+  } else {
+    finalSystemPrompt = joinPromptSections([
+      env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+      agentInstructions,
+      renderHermesSystemPrompt(ctx.agent, {
+        includeDefaultIdentity: true,
+      }),
+    ]);
+  }
+
+  // Scope the overlay to this child process. Read the current bundle on every
+  // invocation; never infer its availability from a persisted session ID.
+  // Preserve an operator's explicit overlay before Paperclip's instructions.
+  const finalSystemPromptBytes = Buffer.byteLength(finalSystemPrompt, "utf8");
+  if (finalSystemPromptBytes > HERMES_MAX_SYSTEM_PROMPT_BYTES) {
+    const errorMsg = `[hermes] HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds maximum argument size (${finalSystemPromptBytes} bytes > ${HERMES_MAX_SYSTEM_PROMPT_BYTES} bytes limit)`;
+    await ctx.onLog("stderr", `${errorMsg}\n`);
+    throw new Error(errorMsg);
+  }
+
+  env.HERMES_EPHEMERAL_SYSTEM_PROMPT = finalSystemPrompt;
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
@@ -1539,30 +1750,6 @@ export async function execute(
   // Failed resumes remain failures. Do not infer a safe restart from CLI text.
   if (sessionId) args.push("--resume", sessionId);
   if (extraArgs?.length) args.push(...extraArgs);
-
-  // ── Build environment ──────────────────────────────────────────────────
-  const userEnv = config.env as Record<string, string> | undefined;
-  // TECH-7076: never spread the whole server process.env into the agent. It carries
-  // server-only secrets (SSO provider definitions, Better Auth secret, secrets master
-  // key, database URLs, cloud credentials, the server's own provider keys) that the
-  // agent's terminal tool could print before log redaction. Start from the strict
-  // allowlisted base; credentials come only from explicit config/managed AI connection.
-  const env: Record<string, string> = {
-    ...(buildAgentChildBaseEnv(process.env) as Record<string, string>),
-    ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
-  };
-
-  // Scope the overlay to this child process. Read the current bundle on every
-  // invocation; never infer its availability from a persisted session ID.
-  // Preserve an operator's explicit overlay before Paperclip's instructions.
-  env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
-    env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-    agentInstructions,
-    renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
-      agent: ctx.agent,
-    }),
-  ]);
 
   // TECH-7895: a Router run needs the canonical RAMP_ROUTER_API_KEY itself; another provider's key
   // never satisfies it, and the provider is never switched. Key precedence:
@@ -1876,6 +2063,7 @@ export async function execute(
         servers: runtimeMcpServers,
         memory: memoryConfig ?? undefined,
         config,
+        flags: hardeningFlags,
         onWarning: onCleanupWarning,
         canonicalRouterEndpoint: isRouterRun,
         isolatedFromHost: hostIsolated,

@@ -8,10 +8,17 @@ import {
   CONNECTION_INTENT_AGENT_GUIDANCE,
   MEMORY_AGENT_GUIDANCE,
   resolveMemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+  mergeMemoryHardeningFlags,
   type MemoryHardeningFlags,
 } from "@paperclipai/shared";
 
-export { resolveMemoryHardeningFlags, type MemoryHardeningFlags };
+export {
+  resolveMemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+  mergeMemoryHardeningFlags,
+  type MemoryHardeningFlags,
+};
 
 import { buildAgentChildBaseEnv } from "./agent-child-env.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";

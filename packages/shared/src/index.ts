@@ -2863,6 +2863,8 @@ export * from "./workspace-provider.js";
 
 export {
   resolveMemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+  mergeMemoryHardeningFlags,
   MemoryHardeningConfigurationError,
   type MemoryHardeningFlags,
 } from "./memory-hardening.js";

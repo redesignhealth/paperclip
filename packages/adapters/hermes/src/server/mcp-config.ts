@@ -5,6 +5,10 @@ import dotenv from "dotenv";
 import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import {
+  type MemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+} from "@paperclipai/adapter-utils/server-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
 import {
   type ValidatedHermesMemoryConfig,
@@ -43,6 +47,7 @@ export interface PrepareHermesMcpHomeOptions {
    * the Router key only reaches Hermes's built-in Router endpoint.
    */
   canonicalRouterEndpoint?: boolean;
+  flags?: MemoryHardeningFlags;
   onWarning?: (msg: string) => void;
 }
 
@@ -422,6 +427,7 @@ export function serializeHermesMcpYaml(
   mcpServers: Record<string, HermesMcpServerConfig>,
   inheritedHostYaml = "",
   hasMemory = false,
+  flags?: MemoryHardeningFlags,
 ): string {
   const lines: string[] = [];
 
@@ -432,7 +438,7 @@ export function serializeHermesMcpYaml(
   }
 
   if (hasMemory) {
-    lines.push(generateHermesMemoryYaml().trimEnd());
+    lines.push(generateHermesMemoryYaml(flags).trimEnd());
     lines.push("");
   }
 
@@ -910,19 +916,24 @@ export async function prepareHermesMcpHome(
       }
     }
 
+    const hardeningFlags = options.flags ?? resolveEffectiveMemoryHardeningFlags(
+      process.env,
+      (options.config?.env as Record<string, string | undefined>) ?? undefined,
+    );
+
     const configPath = path.join(homeDir, "config.yaml");
     const envPath = path.join(homeDir, ".env");
     let mem0JsonPath: string | undefined;
 
     if (memory) {
       mem0JsonPath = path.join(homeDir, "mem0.json");
-      const mem0Content = serializeMem0Json(memory);
+      const mem0Content = serializeMem0Json(memory, hardeningFlags);
       await fs.writeFile(mem0JsonPath, mem0Content, { mode: 0o600 });
       // Explicit hard fail on mem0.json chmod; failures abort and trigger cleanup in catch
       await fs.chmod(mem0JsonPath, 0o600);
     }
 
-    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml, Boolean(memory));
+    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml, Boolean(memory), hardeningFlags);
     await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
     // Explicit hard fail on configPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(configPath, 0o600);
