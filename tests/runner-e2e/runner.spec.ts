@@ -85,6 +85,7 @@ import {
   normalizedSecrets,
   sanitizeJson,
   browserDiagnosticUrl,
+  extractDsnSecrets,
 } from "./redaction.js";
 import {
   CREDENTIAL_NAMES,
@@ -602,36 +603,7 @@ for (const execution of executions) {
       verifyNativeInstructionPreflight(process.env[NATIVE_INSTRUCTION_PREFLIGHT_ENV]);
     }
     const credentials = credentialValues();
-    const dsnSecrets: string[] = [];
-    const memoryAdminDsn = process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL;
-    if (memoryAdminDsn) {
-      try {
-        const parsedUrl = new URL(memoryAdminDsn);
-        if (parsedUrl.password) {
-          // Add raw password before decoding so URIError from decodeURIComponent never leaves raw password unredacted
-          dsnSecrets.push(parsedUrl.password);
-          try {
-            const decoded = decodeURIComponent(parsedUrl.password);
-            if (decoded && decoded !== parsedUrl.password) {
-              dsnSecrets.push(decoded);
-            }
-          } catch {
-            // raw password already added
-          }
-        }
-      } catch {
-        const match = memoryAdminDsn.match(/:\/\/[^:]+:([^@]+)@/);
-        if (match?.[1]) {
-          dsnSecrets.push(match[1]);
-          try {
-            const decoded = decodeURIComponent(match[1]);
-            if (decoded && decoded !== match[1]) {
-              dsnSecrets.push(decoded);
-            }
-          } catch {}
-        }
-      }
-    }
+    const dsnSecrets = extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
     const secrets = normalizedSecrets([...Object.values(credentials), ...dsnSecrets]);
     const api = new RunnerApi(request);
     const companyRunFlow = execution.suite.id === "task-titles" || ["plan_task_guidance", "blocker_guidance", "continuation_accounting", "continuation", "context_integrity", "repository_skills", "agent_chat", "everyday_workflow", "first_task", "instruction_persistence", "pi_native", "pi_controls", "copilot_protection", "cursor_native", "native_active_stop", "native_provider_loss", "public_mcp", "case_handoff", "memory_recall"].includes(execution.task.flow);

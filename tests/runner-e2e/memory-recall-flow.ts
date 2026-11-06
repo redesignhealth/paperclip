@@ -158,6 +158,7 @@ export async function runMemoryRecallFlow(input: {
   let comments: Row[] = [];
   let newMemories: MemoryItem[] = [];
   let scoreResult: ReturnType<typeof gradeMemoryRecall> | undefined;
+  let observation: MemoryRecallObservation | undefined;
 
   interface BoundIssue {
     issue: Row;
@@ -215,7 +216,9 @@ export async function runMemoryRecallFlow(input: {
         }
       } finally {
         if (snapshotReader) {
-          await snapshotReader.close().catch(() => {});
+          await snapshotReader.close().catch((err) => {
+            console.warn("[memory-recall-flow] Failed to close snapshot reader:", err);
+          });
         }
       }
     }
@@ -281,21 +284,7 @@ export async function runMemoryRecallFlow(input: {
         intervalMs: 1500,
         load: async () => {
           const summaries = await pollRunsSummary();
-          const issueTerminalRuns = summaries.filter(
-            (r) => r.issueId === issueId && HARNESS_TERMINAL_RUN_STATUSES.has(r.status),
-          );
-          if (issueTerminalRuns.length === 0) return null;
-          const sorted = [...issueTerminalRuns].sort(
-            (a, b) =>
-              new Date(a.startedAt ?? a.createdAt ?? 0).getTime() -
-              new Date(b.startedAt ?? b.createdAt ?? 0).getTime(),
-          );
-          const expectedRuns = sorted.filter(
-            (r) => r.agentId === undefined || r.agentId === expectedAgentId,
-          );
-          return expectedRuns.length > 0
-            ? expectedRuns[expectedRuns.length - 1]
-            : sorted[sorted.length - 1];
+          return selectLatestTerminalRun(summaries, issueId, expectedAgentId);
         },
         accept: (run) => run !== null,
       });
@@ -448,6 +437,7 @@ export async function runMemoryRecallFlow(input: {
 
     try {
       // 1. Read new memories from tenant DB (tolerate ONLY missing lazy DB/table after run as empty observation)
+      let tenantDbMissing = false;
       if (input.tenantReaderFactory || adminDsn) {
         let obsReader: TenantMemoryReader | undefined;
         try {
@@ -463,18 +453,22 @@ export async function runMemoryRecallFlow(input: {
         } catch (err) {
           if (isDatabaseDoesNotExistError(err)) {
             // Tenant DB / mem0_memories table was never created lazily (e.g. noise case formed no memories)
+            tenantDbMissing = true;
             newMemories = [];
           } else {
             throw err;
           }
         } finally {
           if (obsReader) {
-            await obsReader.close().catch(() => {});
+            await obsReader.close().catch((err) => {
+              console.warn("[memory-recall-flow] Failed to close observation reader:", err);
+            });
           }
         }
       }
 
       // 2. Fetch run details, logs, comments per issue (propagate failures, select exact attribution)
+      const excludedRuns: Array<{ id: string; agentId?: string; expectedAgentId: string }> = [];
       const summaries = await pollRunsSummary();
       for (const { issue, expectedAgentId } of boundIssues) {
         const terminalRunSummary = selectLatestTerminalRun(summaries, issue.id, expectedAgentId);
@@ -487,6 +481,11 @@ export async function runMemoryRecallFlow(input: {
             console.warn(
               `[memory-recall-flow] Excluding run ${runDetail.id}: agentId "${runDetail.agentId}" does not match expected "${expectedAgentId}"`,
             );
+            excludedRuns.push({
+              id: String(runDetail.id),
+              agentId: runDetail.agentId ? String(runDetail.agentId) : undefined,
+              expectedAgentId,
+            });
             continue;
           }
 
@@ -547,7 +546,7 @@ export async function runMemoryRecallFlow(input: {
           .join("\n");
       }
 
-      const observation: MemoryRecallObservation = {
+      observation = {
         caseId,
         rep,
         nonce,
@@ -568,6 +567,8 @@ export async function runMemoryRecallFlow(input: {
         memories: newMemories,
         controlOutput,
         secondaryAgentId: secondaryAgentId || undefined,
+        ...(tenantDbMissing ? { tenantDbMissing: true } : {}),
+        ...(excludedRuns.length > 0 ? { excludedRuns } : {}),
       };
 
       scoreResult = gradeMemoryRecall({
@@ -612,6 +613,8 @@ export async function runMemoryRecallFlow(input: {
           memoryCount: newMemories.length,
           commentCount: comments.length,
           memories: sanitizedMemories,
+          ...(tenantDbMissing ? { tenantDbMissing: true } : {}),
+          ...(excludedRuns.length > 0 ? { excludedRuns } : {}),
         },
         bootProof: bootProof.line,
         serverHardeningFlags: bootProof.flags,
@@ -634,7 +637,10 @@ export async function runMemoryRecallFlow(input: {
     const dropper = input.tenantDropper ?? dropTenantDatabase;
     if (adminDsn || input.tenantDropper) {
       try {
-        await dropper(adminDsn ?? "postgres://localhost/test", tenantDbName, tenantRoleName);
+        await dropper(adminDsn ?? "postgres://localhost/test", tenantDbName, tenantRoleName, {
+          expectedDatabaseName: tenantDbName,
+          expectedRoleName: tenantRoleName,
+        });
       } catch (err) {
         cleanupErrors.push(err);
       }
@@ -693,5 +699,6 @@ export async function runMemoryRecallFlow(input: {
     runs: rawRuns,
     scoreResult: scoreResult!,
     checks: scoreResult!.checks,
+    observation: observation!,
   };
 }

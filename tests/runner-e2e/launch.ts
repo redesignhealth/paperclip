@@ -38,6 +38,7 @@ import {
 import { assertEmbeddedDatabaseIsolation } from "./instance-isolation.js";
 import {
   assertSecretFree,
+  extractDsnSecrets,
   findSecretLeakInDirectory,
   isEphemeralCodexRuntimeAuthFile,
   isEphemeralPostgresScanFile,
@@ -530,6 +531,7 @@ async function runAttempt(input: {
     const decisionSigningSecret = secret(48);
     const toolActionSigningSecret = secret(48);
     const betterAuthSecret = secret(48);
+    const dsnSecrets = extractDsnSecrets(process.env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL);
     const credentialSources = {
       ...Object.fromEntries(CREDENTIAL_NAMES.map((name) => [name, process.env[name]])),
       PAPERCLIP_AGENT_JWT_SECRET: agentJwtSecret,
@@ -537,7 +539,10 @@ async function runAttempt(input: {
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
       BETTER_AUTH_SECRET: betterAuthSecret,
     };
-    const credentials = normalizedSecrets(Object.values(credentialSources));
+    const credentials = normalizedSecrets([
+      ...Object.values(credentialSources),
+      ...dsnSecrets,
+    ]);
     attemptSecrets = credentials;
     if (installedCli) await writeFile(path.join(privateDir, "installed-cli-admission.json"), `${JSON.stringify(installedCli, null, 2)}\n`, { mode: 0o600 });
     if (installedPlugin) await writeFile(path.join(privateDir, "installed-daytona-plugin-admission.json"), `${JSON.stringify(installedPlugin, null, 2)}\n`, { mode: 0o600 });

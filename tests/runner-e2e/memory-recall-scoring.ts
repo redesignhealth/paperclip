@@ -58,6 +58,8 @@ export interface MemoryRecallObservation {
   memories?: MemoryItem[];
   controlOutput?: string;
   secondaryAgentId?: string;
+  tenantDbMissing?: boolean;
+  excludedRuns?: Array<{ id: string; agentId?: string; expectedAgentId: string }>;
 }
 
 export interface MemoryRecallCheck {
@@ -179,8 +181,9 @@ export function summarizeMemories(memories: MemoryItem[]): {
     unclassified: 0,
   };
   const classified = memories.map((m, idx) => {
-    const priors = memories.slice(0, idx).map((p) => p.data);
-    const category = m.category ?? classifyMemory(m.data, priors);
+    const priors = memories.slice(0, idx).map((p) => p?.data ?? "");
+    const category =
+      m?.category ?? (typeof m?.data === "string" ? classifyMemory(m.data, priors) : "unclassified");
     counts[category]++;
     return { ...m, category };
   });
@@ -190,18 +193,26 @@ export function summarizeMemories(memories: MemoryItem[]): {
   return { classified, byCategory: counts, totalCount, noiseCount, noiseRatio };
 }
 
-function selectDraftRun(
+export function selectDraftRun(
   runs: readonly MemoryRecallRunRecord[],
   issues?: Array<{ id: string; title?: string }>,
 ): MemoryRecallRunRecord | undefined {
   if (!runs || runs.length === 0) return undefined;
   if (!issues || issues.length === 0) {
-    return runs[runs.length - 1];
+    // Without issues, cannot safely attribute a draft run.
+    // Never fall back to unrelated runs (e.g. control/seed).
+    return undefined;
   }
   const draftIssue = issues[issues.length - 1];
   if (draftIssue) {
     const runForDraft = runs.find((r) => r.issueId === draftIssue.id);
-    if (runForDraft) return runForDraft;
+    if (runForDraft) {
+      const isControl = issues[0]?.id && runForDraft.issueId === issues[0].id;
+      const isSeed = issues.length > 1 && issues[1]?.id && runForDraft.issueId === issues[1].id;
+      if (!isControl && !isSeed) {
+        return runForDraft;
+      }
+    }
   }
   const nonControlRuns = runs.filter((r) => {
     if (!r.issueId) return false;
@@ -212,7 +223,7 @@ function selectDraftRun(
   if (nonControlRuns.length > 0) {
     return nonControlRuns[nonControlRuns.length - 1];
   }
-  return runs[runs.length - 1];
+  return undefined;
 }
 
 export function gradeMemoryRecall(input: {
@@ -336,15 +347,19 @@ export function gradeMemoryRecall(input: {
       );
       check(
         "draft-run-observed",
-        draftText.length > 0,
-        "Draft update run must produce non-empty output.",
+        draftRun !== undefined && draftText.length > 0,
+        draftRun === undefined
+          ? "Expected draft run was not observed or could not be attributed."
+          : "Draft update run must produce non-empty output.",
       );
 
       if (flags.capabilityMemoryGuidance) {
         check(
           "implicit-preference-applied",
-          followsPreference,
-          `Draft update must follow the seeded formatting preference ('${marker}') via capability memory guidance.`,
+          draftRun !== undefined && followsPreference,
+          draftRun === undefined
+            ? "Cannot evaluate implicit preference: expected draft run is absent."
+            : `Draft update must follow the seeded formatting preference ('${marker}') via capability memory guidance.`,
         );
       }
       break;
@@ -409,25 +424,44 @@ export function gradeMemoryRecall(input: {
     }
 
     case "noise": {
-      const summary = summarizeMemories(memories);
+      const allRunsSucceeded =
+        runs.length >= 10 && runs.every((r) => r.status === "succeeded");
       const heartbeatRuns = runs.filter((r) => r.status === "succeeded");
       check(
         "heartbeat-run-count",
-        heartbeatRuns.length >= 10,
-        `Expected at least 10 ordinary heartbeat runs; observed ${heartbeatRuns.length}.`,
+        allRunsSucceeded,
+        `Expected at least 10 ordinary heartbeat runs and all runs to succeed; observed ${heartbeatRuns.length}/${runs.length} successful runs.`,
       );
 
-      const legitimateEmpty = summary.totalCount === 0 && heartbeatRuns.length >= 10;
+      const memoriesArray = Array.isArray(obs.memories) ? obs.memories : [];
       const allWellFormed =
-        summary.totalCount > 0 &&
-        memories.every(
+        memoriesArray.length > 0 &&
+        memoriesArray.every(
           (m) =>
-            m &&
+            Boolean(m) &&
             typeof m.id === "string" &&
             m.id.trim().length > 0 &&
             typeof m.data === "string" &&
             m.data.trim().length > 0,
         );
+
+      const summary = allWellFormed
+        ? summarizeMemories(memories)
+        : {
+            classified: [],
+            byCategory: {
+              template_boilerplate: 0,
+              task_status: 0,
+              durable_fact: 0,
+              duplicate_conflicting: 0,
+              unclassified: 0,
+            },
+            totalCount: memoriesArray.length,
+            noiseCount: 0,
+            noiseRatio: 0,
+          };
+
+      const legitimateEmpty = memoriesArray.length === 0 && allRunsSucceeded;
       const memoryObservationValid =
         Array.isArray(obs.memories) && (allWellFormed || legitimateEmpty);
       check(
@@ -435,23 +469,25 @@ export function gradeMemoryRecall(input: {
         memoryObservationValid,
         !Array.isArray(obs.memories)
           ? "Memory observation is missing or invalid."
-          : summary.totalCount === 0 && heartbeatRuns.length < 10
+          : memoriesArray.length === 0 && !allRunsSucceeded
             ? "Empty memory outcome is only valid when all 10 heartbeat runs completed successfully."
-            : summary.totalCount > 0 && !allWellFormed
+            : memoriesArray.length > 0 && !allWellFormed
               ? "Observed memory records contain malformed or empty data."
               : "Valid memory observation recorded.",
       );
 
       if (flags.hermesMemoryConfig) {
         // Min-sample guard that FAILS if fewer than 5 memories, else ratio <= 0.3
-        const minSampleMet = summary.totalCount >= 5;
+        const minSampleMet = allWellFormed && summary.totalCount >= 5;
         const bounded = minSampleMet && summary.noiseRatio <= 0.3;
         check(
           "hardened-noise-bounded",
           bounded,
-          !minSampleMet
-            ? `Insufficient sample: observed ${summary.totalCount} new memories (minimum 5 required for evaluation).`
-            : `Noise ratio under hardening must be bounded <= 30% (observed: ${(summary.noiseRatio * 100).toFixed(1)}%, count: ${summary.noiseCount}/${summary.totalCount}).`,
+          !allWellFormed && memoriesArray.length > 0
+            ? "Observed memory records are malformed; cannot evaluate noise ratio."
+            : !minSampleMet
+              ? `Insufficient sample: observed ${summary.totalCount} new memories (minimum 5 required for evaluation).`
+              : `Noise ratio under hardening must be bounded <= 30% (observed: ${(summary.noiseRatio * 100).toFixed(1)}%, count: ${summary.noiseCount}/${summary.totalCount}).`,
         );
       }
       break;

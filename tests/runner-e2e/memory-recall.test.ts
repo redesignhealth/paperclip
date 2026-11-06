@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import {
   resolveMemoryHardeningFlags,
   MemoryHardeningConfigurationError,
@@ -16,11 +17,13 @@ import {
   memoryRecallScenario,
   memoryRecallDefinitionDigest,
   parseMemoryRecallTask,
+  memoryRecallTasks,
   type MemoryRecallCase,
 } from "./memory-recall-cases.js";
 import {
   classifyMemory,
   gradeMemoryRecall,
+  selectDraftRun,
   summarizeMemories,
   type MemoryRecallObservation,
 } from "./memory-recall-scoring.js";
@@ -36,14 +39,13 @@ import {
 } from "./memory-recall-observation.js";
 import { isDatabaseDoesNotExistError } from "./memory-recall-flow.js";
 import { hermesMemoryProfile } from "./catalog.js";
-import { createRequire } from "node:module";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../packages/db/src/test-embedded-postgres.js";
-const serverRequire = createRequire(new URL("../../server/package.json", import.meta.url));
-const postgres = (serverRequire("postgres")?.default ?? serverRequire("postgres")) as any;
-import { memoryRecallTasks } from "./memory-recall-cases.js";
 import { loadLocalEnvironment } from "./launch.js";
 import { assertMemoryRecallPrerequisites } from "./prerequisites.js";
 import type { MatrixExecution } from "./types.js";
+
+const serverRequire = createRequire(new URL("../../server/package.json", import.meta.url));
+const postgres = (serverRequire("postgres")?.default ?? serverRequire("postgres")) as any;
 
 function buildValidObservation(
   caseId: MemoryRecallCase,
@@ -859,6 +861,53 @@ describe("server boot proof extraction and server-resolved flags", () => {
     expect(proof.flags.agentScopedMem0).toBe(true);
   });
 
+  it("extracts proof when flags line precedes init line as emitted by server startup", () => {
+    const log = [
+      '[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): {"hermesMemoryConfig":true,"hermesPromptSplit":true,"agentScopedMem0":false,"capabilityMemoryGuidance":false}',
+      '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
+    ].join("\n");
+    const proof = extractBootProof(log);
+    expect(proof.flags.hermesMemoryConfig).toBe(true);
+    expect(proof.flags.hermesPromptSplit).toBe(true);
+  });
+
+  it("extracts structured JSON log msg with harness wrapper self-attestation label", () => {
+    const log = [
+      '{"level":30,"time":1700000000000,"pid":1234,"msg":"[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): {\\"hermesMemoryConfig\\":true,\\"hermesPromptSplit\\":false,\\"agentScopedMem0\\":false,\\"capabilityMemoryGuidance\\":false}"}',
+      '{"level":30,"time":1700000000001,"pid":1234,"msg":"[company-memory] Initialized company memory configuration","enabled":true,"companyScope":"all"}',
+    ].join("\n");
+    const proof = extractBootProof(log);
+    expect(proof.flags.hermesMemoryConfig).toBe(true);
+    expect(proof.flags.hermesPromptSplit).toBe(false);
+  });
+
+  it("evaluates latest boot only on supervisor restart and does not accept earlier boot", () => {
+    const log = [
+      // Boot 1: earlier flags
+      '[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): {"hermesMemoryConfig":false,"hermesPromptSplit":false,"agentScopedMem0":false,"capabilityMemoryGuidance":false}',
+      '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
+      // Boot 2 (restart): later flags
+      '[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): {"hermesMemoryConfig":true,"hermesPromptSplit":true,"agentScopedMem0":false,"capabilityMemoryGuidance":false}',
+      '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
+    ].join("\n");
+    const proof = extractBootProof(log);
+    expect(proof.flags.hermesMemoryConfig).toBe(true);
+    expect(proof.flags.hermesPromptSplit).toBe(true);
+  });
+
+  it("fails closed on restart when latest boot is missing hardening flags self-attestation", () => {
+    const log = [
+      // Boot 1 has flags and init
+      '[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): {"hermesMemoryConfig":true,"hermesPromptSplit":true,"agentScopedMem0":false,"capabilityMemoryGuidance":false}',
+      '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
+      // Boot 2 (restart) only logs init, missing flags
+      '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}',
+    ].join("\n");
+    expect(() => extractBootProof(log)).toThrow(
+      /Server log missing required '\[company-memory-hardening\] Server resolved hardening flags \(harness wrapper self-attestation\)' proof line for latest boot/,
+    );
+  });
+
   it("fails closed when server resolved hardening flags proof is missing", () => {
     const log = '[company-memory] Initialized company memory configuration {"enabled":true,"companyScope":"all"}';
     expect(() => extractBootProof(log)).toThrow(/Server resolved hardening flags/);
@@ -904,7 +953,7 @@ describe("tenant database drop safety", () => {
     for (const dangerousName of ["postgres", "template1", "prod_company_db", "paperclip_main"]) {
       await expect(
         dropTenantDatabase("postgres://localhost/test", dangerousName),
-      ).rejects.toThrow(/does not match expected test tenant pattern/);
+      ).rejects.toThrow(/does not match expected tenant database naming format/);
     }
   });
 
@@ -913,8 +962,52 @@ describe("tenant database drop safety", () => {
     for (const dangerousRole of ["postgres", "admin", "app_user", "paperclip_service"]) {
       await expect(
         dropTenantDatabase("postgres://localhost/test", validDbName, dangerousRole),
-      ).rejects.toThrow(/does not match expected test tenant role pattern/);
+      ).rejects.toThrow(/does not match expected tenant role naming format/);
     }
+  });
+
+  it("requires exact match against expected fixture-derived database and role names when provided", async () => {
+    const validDb = "pcmem_0123456789abcdef0123456789abcdef";
+    const otherValidDb = "pcmem_fedcba9876543210fedcba9876543210";
+    const validRole = "pcmem_r_0123456789abcdef0123456789abcdef";
+    const otherValidRole = "pcmem_r_fedcba9876543210fedcba9876543210";
+
+    await expect(
+      dropTenantDatabase("postgres://localhost/test", validDb, validRole, {
+        expectedDatabaseName: otherValidDb,
+      }),
+    ).rejects.toThrow(/does not match expected fixture-derived database name/);
+
+    await expect(
+      dropTenantDatabase("postgres://localhost/test", validDb, validRole, {
+        expectedDatabaseName: validDb,
+        expectedRoleName: otherValidRole,
+      }),
+    ).rejects.toThrow(/does not match expected fixture-derived role name/);
+  });
+
+  it("throws AggregateError when role dependency cleanup and drop role both fail", async () => {
+    const validDb = "pcmem_0123456789abcdef0123456789abcdef";
+    const validRole = "pcmem_r_0123456789abcdef0123456789abcdef";
+    const mockSql: any = () => Promise.resolve([]);
+    mockSql.unsafe = (query: string) => {
+      if (query.includes("DROP DATABASE")) return Promise.resolve([]);
+      if (query.includes("pg_terminate_backend")) return Promise.resolve([]);
+      if (query.includes("REASSIGN OWNED") || query.includes("DROP OWNED")) {
+        return Promise.reject(new Error("role dep cleanup failed"));
+      }
+      if (query.includes("DROP ROLE")) {
+        return Promise.reject(new Error("role drop failed"));
+      }
+      return Promise.resolve([]);
+    };
+    mockSql.end = () => Promise.resolve();
+
+    await expect(
+      dropTenantDatabase("postgres://localhost/test", validDb, validRole, {
+        sqlFactory: () => mockSql,
+      }),
+    ).rejects.toThrow(AggregateError);
   });
 
   it("validates exact regex patterns for tenant databases and roles and matches deriveTenantNames output", () => {
@@ -1102,6 +1195,13 @@ describe("isDatabaseDoesNotExistError", () => {
 
 describe("hermesMemoryProfile.buildAgent", () => {
   const originalEnv = process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
+  afterEach(() => {
+    if (originalEnv !== undefined) {
+      process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL = originalEnv;
+    } else {
+      delete process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
+    }
+  });
 
   it("throws when PAPERCLIP_E2E_MEMORY_HERMES_MODEL is unset", () => {
     delete process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
@@ -1117,42 +1217,54 @@ describe("hermesMemoryProfile.buildAgent", () => {
 
   it("returns configured agent when PAPERCLIP_E2E_MEMORY_HERMES_MODEL is set", () => {
     process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL = "anthropic/claude-3.5-sonnet";
-    try {
-      const agent = hermesMemoryProfile.buildAgent({
-        agentId: "test-agent",
-        companyId: "test-company",
-        environmentFixtureId: "local",
-        workspacePath: "/tmp/ws",
-        secretRefs: {
-          OPENROUTER_API_KEY: { name: "OPENROUTER_API_KEY" },
-          OPENAI_API_KEY: { name: "OPENAI_API_KEY" },
-        },
-      } as any);
-      expect(agent).toBeDefined();
-      expect(agent.adapterType).toBe("hermes_local");
-      expect((agent.adapterConfig as any).model).toBe("anthropic/claude-3.5-sonnet");
-      expect((agent.adapterConfig as any).timeoutSec).toBe(360);
-      expect((agent.adapterConfig as any).maxTurnsPerRun).toBe(12);
-    } finally {
-      if (originalEnv !== undefined) {
-        process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL = originalEnv;
-      } else {
-        delete process.env.PAPERCLIP_E2E_MEMORY_HERMES_MODEL;
-      }
-    }
+    const agent = hermesMemoryProfile.buildAgent({
+      agentId: "test-agent",
+      companyId: "test-company",
+      environmentFixtureId: "local",
+      workspacePath: "/tmp/ws",
+      secretRefs: {
+        OPENROUTER_API_KEY: { name: "OPENROUTER_API_KEY" },
+        OPENAI_API_KEY: { name: "OPENAI_API_KEY" },
+      },
+    } as any);
+    expect(agent).toBeDefined();
+    expect(agent.adapterType).toBe("hermes_local");
+    expect((agent.adapterConfig as any).model).toBe("anthropic/claude-3.5-sonnet");
+    expect((agent.adapterConfig as any).timeoutSec).toBe(360);
+    expect((agent.adapterConfig as any).maxTurnsPerRun).toBe(12);
   });
 });
 
 describe("selectDraftRun and comment attribution scoring", () => {
-  it("selectDraftRun falls back to the last run when issues is undefined or empty", () => {
+  it("selectDraftRun returns undefined when issues is undefined or empty, never falling back to control/seed", () => {
     const { marker, observation } = buildValidObservation("implicit-recall", 1, false);
     // Replace issues with empty array
     observation.issues = [];
     const controlRun = observation.runs[0]!;
     const lastRun = observation.runs[observation.runs.length - 1]!;
-    // Set different results on controlRun vs lastRun
     controlRun.result = "Control result: no preference";
     lastRun.result = `Draft result: preference applied with ${marker}`;
+
+    expect(selectDraftRun(observation.runs, undefined)).toBeUndefined();
+    expect(selectDraftRun(observation.runs, [])).toBeUndefined();
+
+    // When issues is empty, draftRun cannot be attributed and fails explicitly
+    const result = gradeMemoryRecall({
+      caseId: "implicit-recall",
+      rep: 1,
+      marker,
+      observation,
+      env: {},
+    });
+    expect(result.checks.find((c) => c.id === "draft-run-observed")?.passed).toBe(false);
+    expect(result.passed).toBe(false);
+  });
+
+  it("selectDraftRun never uses unrelated control or seed run when expected draft run is absent", () => {
+    const { marker, observation } = buildValidObservation("implicit-recall", 1, false);
+    // Drop the draft run so only control and seed runs exist
+    observation.runs = [observation.runs[0]!, observation.runs[1]!];
+    expect(selectDraftRun(observation.runs, observation.issues)).toBeUndefined();
 
     const result = gradeMemoryRecall({
       caseId: "implicit-recall",
@@ -1161,9 +1273,8 @@ describe("selectDraftRun and comment attribution scoring", () => {
       observation,
       env: {},
     });
-    // With draftRun correctly selecting lastRun instead of controlRun, metrics reflect preference
-    expect(result.metrics.implicitRecall?.followsPreference).toBe(true);
-    expect(result.checks.find((c) => c.id === "draft-run-observed")?.passed).toBe(true);
+    expect(result.checks.find((c) => c.id === "draft-run-observed")?.passed).toBe(false);
+    expect(result.passed).toBe(false);
   });
 
   it("strictly requires exact createdByRunId on comments and excludes unattributed comments", () => {

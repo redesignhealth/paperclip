@@ -125,10 +125,23 @@ export interface TenantMemoryReader {
   close(): Promise<void>;
 }
 
-export const TEST_TENANT_DB_REGEX =
+/**
+ * Format guards for tenant database and role names.
+ *
+ * NOTE: Because the test harness provisions tenants using the standard tenant naming
+ * scheme (pcmem_<32hex> derived from companyId), format regex validation alone does
+ * not distinguish test tenants from production tenants. Isolation is achieved by
+ * requiring exact equality with fixture-derived names, ensuring no production
+ * database operations occur, and operating exclusively against a throwaway admin DSN.
+ */
+export const TENANT_DB_NAME_REGEX =
   /^(?:pcmem_[0-9a-f]{32}|paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12})$/;
-export const TEST_TENANT_ROLE_REGEX =
+export const TENANT_ROLE_NAME_REGEX =
   /^(?:pcmem_r_[0-9a-f]{32}|paperclip_tenant_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}_owner)$/;
+
+// Backwards-compatible aliases
+export const TEST_TENANT_DB_REGEX = TENANT_DB_NAME_REGEX;
+export const TEST_TENANT_ROLE_REGEX = TENANT_ROLE_NAME_REGEX;
 
 export async function openTenantReader(
   adminDsn: string,
@@ -194,23 +207,42 @@ export async function openTenantReader(
   };
 }
 
+export interface DropTenantDatabaseOptions {
+  expectedDatabaseName?: string;
+  expectedRoleName?: string;
+  sqlFactory?: (dsn: string, options: { max: number }) => any;
+}
+
 export async function dropTenantDatabase(
   adminDsn: string,
   databaseName: string,
   roleName?: string,
+  options?: DropTenantDatabaseOptions,
 ): Promise<void> {
-  if (!TEST_TENANT_DB_REGEX.test(databaseName)) {
+  if (!TENANT_DB_NAME_REGEX.test(databaseName)) {
     throw new Error(
-      `Refusing to drop database "${databaseName}": does not match expected test tenant pattern`,
+      `Refusing to drop database "${databaseName}": does not match expected tenant database naming format`,
     );
   }
-  if (roleName && !TEST_TENANT_ROLE_REGEX.test(roleName)) {
+  if (roleName && !TENANT_ROLE_NAME_REGEX.test(roleName)) {
     throw new Error(
-      `Refusing to drop role "${roleName}": does not match expected test tenant role pattern`,
+      `Refusing to drop role "${roleName}": does not match expected tenant role naming format`,
+    );
+  }
+  if (options?.expectedDatabaseName !== undefined && databaseName !== options.expectedDatabaseName) {
+    throw new Error(
+      `Refusing to drop database "${databaseName}": does not match expected fixture-derived database name "${options.expectedDatabaseName}"`,
+    );
+  }
+  if (options?.expectedRoleName !== undefined && roleName !== options.expectedRoleName) {
+    throw new Error(
+      `Refusing to drop role "${roleName}": does not match expected fixture-derived role name "${options.expectedRoleName}"`,
     );
   }
 
-  const sql = postgres(adminDsn, { max: 1 });
+  const sql = options?.sqlFactory
+    ? options.sqlFactory(adminDsn, { max: 1 })
+    : postgres(adminDsn, { max: 1 });
   try {
     await sql.unsafe(`
       SELECT pg_terminate_backend(pid)
@@ -326,7 +358,7 @@ export function extractBootProof(serverLogContent: string): ServerBootProof {
       (rawLine.includes("resolved hardening flags") || text.includes("resolved hardening flags"));
 
     if (isFlagsLine) {
-      const source = (text.includes("[company-memory-hardening]") && text.includes("resolved hardening flags:"))
+      const source = (text.includes("[company-memory-hardening]") && text.includes("resolved hardening flags"))
         ? text
         : rawLine;
       const flagsMatch = /(?:\[company-memory-hardening\][^\n:]*resolved hardening flags(?:[^\n:]*)?:\s*)(.*)/.exec(source);
@@ -341,9 +373,12 @@ export function extractBootProof(serverLogContent: string): ServerBootProof {
             typeof parsed.agentScopedMem0 === "boolean" &&
             typeof parsed.capabilityMemoryGuidance === "boolean"
           ) {
-            if (currentBoot.pid !== undefined && parsedObj?.pid !== undefined && currentBoot.pid !== parsedObj.pid) {
+            if (
+              (currentBoot.flags !== undefined && currentBoot.initLine !== undefined) ||
+              (currentBoot.pid !== undefined && parsedObj?.pid !== undefined && currentBoot.pid !== parsedObj.pid)
+            ) {
               boots.push(currentBoot);
-              currentBoot = { flags: parsed, pid: parsedObj.pid };
+              currentBoot = { flags: parsed, pid: parsedObj?.pid };
             } else {
               currentBoot.flags = parsed;
               if (currentBoot.pid === undefined && parsedObj?.pid !== undefined) {
@@ -377,22 +412,23 @@ export function extractBootProof(serverLogContent: string): ServerBootProof {
     return hasEnabledTrue && hasCompanyScopeAll;
   }
 
-  const hasAnyInitLine = boots.some((b) => b.initLine);
-  if (!hasAnyInitLine) {
+  const bootsWithInit = boots.filter((b) => Boolean(b.initLine));
+  if (bootsWithInit.length === 0) {
     throw new Error(
       "Server log missing required '[company-memory] Initialized company memory configuration' with enabled=true and companyScope='all'",
     );
   }
 
-  const validBoot = boots.reverse().find((b) => Boolean(b.initLine && b.flags));
-  if (!validBoot || !validBoot.initLine || !validBoot.flags) {
+  // Evaluate latest boot only
+  const latestBoot = bootsWithInit[bootsWithInit.length - 1]!;
+  if (!latestBoot.flags) {
     throw new Error(
-      "Server log missing required '[company-memory-hardening] Server resolved hardening flags' proof line with server-resolved flags",
+      "Server log missing required '[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation)' proof line for latest boot",
     );
   }
 
-  const line = validBoot.initLine;
-  const flags = validBoot.flags;
+  const line = latestBoot.initLine!;
+  const flags = latestBoot.flags;
   return {
     line,
     flags,

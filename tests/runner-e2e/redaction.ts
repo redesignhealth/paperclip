@@ -48,6 +48,51 @@ function secretEntries(value: string | undefined): Array<{ value: string; fieldP
   return entries;
 }
 
+export function extractDsnSecrets(dsn: string | undefined): string[] {
+  if (!dsn || typeof dsn !== "string") return [];
+  const trimmed = dsn.trim();
+  if (!trimmed) return [];
+  const secrets = new Set<string>();
+
+  const addCandidate = (val: string | undefined) => {
+    if (!val || val.length < 4) return;
+    secrets.add(val);
+    try {
+      const decoded = decodeURIComponent(val);
+      if (decoded && decoded.length >= 4) {
+        secrets.add(decoded);
+      }
+    } catch {
+      // ignore URI decode error
+    }
+  };
+
+  try {
+    const parsedUrl = new URL(trimmed);
+    if (parsedUrl.password) {
+      addCandidate(parsedUrl.password);
+    }
+  } catch {
+    // Robust fallback for non-standard DSNs:
+    // Extract authority between '://' and first '/' (or end), then find password before last '@'
+    const schemeEnd = trimmed.indexOf("://");
+    const afterScheme = schemeEnd >= 0 ? trimmed.slice(schemeEnd + 3) : trimmed;
+    const pathStart = afterScheme.indexOf("/");
+    const authority = pathStart >= 0 ? afterScheme.slice(0, pathStart) : afterScheme;
+    const lastAt = authority.lastIndexOf("@");
+    if (lastAt > 0) {
+      const userinfo = authority.slice(0, lastAt);
+      const colonIdx = userinfo.indexOf(":");
+      if (colonIdx >= 0) {
+        const password = userinfo.slice(colonIdx + 1);
+        addCandidate(password);
+      }
+    }
+  }
+
+  return [...secrets].filter((s) => s.length >= 4);
+}
+
 export function normalizedSecrets(values: readonly (string | undefined)[]) {
   return [...new Set(values.flatMap(value => secretEntries(value).map(entry => entry.value)))].sort((left, right) => right.length - left.length);
 }

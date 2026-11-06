@@ -372,8 +372,8 @@ describe("memory-recall flow unit tests", () => {
       get: vi.fn().mockImplementation(async (path: string) => {
         if (path.includes("/heartbeat-runs?limit=100")) {
           return [
-            { id: "run-wrong", issueId: "issue-1", status: "succeeded", agentId: "intruder-agent" },
-            { id: "run-wrong-2", issueId: "issue-2", status: "succeeded", agentId: "intruder-agent" },
+            { id: "run-wrong", issueId: "issue-1", status: "succeeded" },
+            { id: "run-wrong-2", issueId: "issue-2", status: "succeeded" },
           ];
         }
         if (path.startsWith("/api/heartbeat-runs/")) {
@@ -399,6 +399,7 @@ describe("memory-recall flow unit tests", () => {
 
     // Wrong-agent runs must never be admitted into mappedRuns or satisfy scoring
     expect(result.runs).toHaveLength(0);
+    expect(result.observation.excludedRuns).toHaveLength(2);
     expect(result.scoreResult.passed).toBe(false);
     expect(result.scoreResult.checks.find((c) => c.id === "runs-recorded")?.passed).toBe(false);
   });
@@ -748,6 +749,8 @@ describe("memory-recall flow unit tests", () => {
 
     expect(capturedEvidence.observation.memoryCount).toBe(0);
     expect(capturedEvidence.observation.memories).toEqual([]);
+    expect(capturedEvidence.observation.tenantDbMissing).toBe(true);
+    expect(result.observation.tenantDbMissing).toBe(true);
     expect(result).toBeDefined();
   });
 

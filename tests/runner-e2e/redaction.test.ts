@@ -1,8 +1,8 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, expect, it } from "vitest";
-import { findSecretLeak, findSecretLeakInDirectory, findSecretLeakMatch, normalizedSecrets, secretScanFailureEvidence } from "./redaction.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { extractDsnSecrets, findSecretLeak, findSecretLeakInDirectory, findSecretLeakMatch, normalizedSecrets, secretScanFailureEvidence } from "./redaction.js";
 
 const tokens = {
   account_id: "identity-canary-private-90123",
@@ -68,4 +68,32 @@ it("preserves the original provider failure as sanitized scan provenance", () =>
   expect(evidence.finding.matchCategory).toBe("CODEX_AUTH_JSON.tokens.account_id");
   expect(findSecretLeak(JSON.stringify(evidence), secrets)).toBeNull();
   for (const value of secrets) expect(JSON.stringify(evidence)).not.toContain(value);
+});
+
+describe("extractDsnSecrets", () => {
+  it("extracts plain and URL-encoded passwords from standard DSN URLs", () => {
+    const dsn = "postgres://pg_user:mySecretPass123!@localhost:5432/test_db";
+    expect(extractDsnSecrets(dsn)).toEqual(["mySecretPass123!"]);
+
+    const encodedDsn = "postgres://pg_user:secret%23pass%21@localhost:5432/test_db";
+    const extracted = extractDsnSecrets(encodedDsn);
+    expect(extracted).toContain("secret%23pass%21");
+    expect(extracted).toContain("secret#pass!");
+  });
+
+  it("handles non-standard URLs and passwords containing @ characters via fallback", () => {
+    // URL parser might fail on custom/invalid schemes or unencoded @ in userinfo
+    const complexDsn = "custom-db://admin:pass%40word_secret@internal-db:5432/data";
+    const extracted = extractDsnSecrets(complexDsn);
+    expect(extracted).toContain("pass%40word_secret");
+    expect(extracted).toContain("pass@word_secret");
+  });
+
+  it("returns empty array for empty, undefined, password-less, or very short passwords", () => {
+    expect(extractDsnSecrets(undefined)).toEqual([]);
+    expect(extractDsnSecrets("")).toEqual([]);
+    expect(extractDsnSecrets("postgres://localhost:5432/test_db")).toEqual([]);
+    expect(extractDsnSecrets("postgres://user@localhost:5432/test_db")).toEqual([]);
+    expect(extractDsnSecrets("postgres://user:12@localhost:5432/test_db")).toEqual([]); // < 4 chars
+  });
 });
