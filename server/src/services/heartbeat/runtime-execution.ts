@@ -22,6 +22,7 @@ import {
 } from "./workspaces.js";
 import { recordLegacyWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
 import { adapterSupportsRuntimeMemory, resolveHeartbeatRuntimeMemory } from "./runtime-memory.js";
+import { buildHeartbeatMemoryGuidanceContext } from "./memory-guidance-context.js";
 import { projectToolDefinitions } from "../project-tools.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildAgentIdentityEnv, resolveEffectiveMemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
@@ -828,6 +829,28 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         runId: run.id,
         flags: hardeningFlags,
       });
+      let memoryGuidanceContext: ReturnType<typeof buildHeartbeatMemoryGuidanceContext> = undefined;
+      if (hardeningFlags?.capabilityMemoryGuidance) {
+        memoryGuidanceContext =
+          buildHeartbeatMemoryGuidanceContext({
+            agentMetadata: agent.metadata,
+            runtimeMemory,
+            flags: hardeningFlags,
+            adapterType: agent.adapterType,
+          });
+        logger.debug(
+          {
+            runId: run.id,
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            mem0: memoryGuidanceContext?.capabilities.mem0,
+            arcana: memoryGuidanceContext?.capabilities.arcana,
+            hermesBuiltInStores: memoryGuidanceContext?.capabilities.hermesBuiltInStores,
+          },
+          "capability memory guidance enabled",
+        );
+      }
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
@@ -856,6 +879,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               runtimeMcp,
               runtimeTools,
               runtimeMemory,
+              paperclipMemoryGuidance: memoryGuidanceContext,
               onLog,
               onMeta: onAdapterMeta,
               onEvent: onAdapterEvent,

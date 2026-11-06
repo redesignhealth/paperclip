@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as shared from "@paperclipai/shared";
 import { CONNECTION_INTENT_AGENT_GUIDANCE, MEMORY_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
@@ -16,6 +17,11 @@ import {
   buildRuntimeToolsEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  selectMemoryAgentGuidance,
+  buildPaperclipAgentPromptTemplate,
+  buildMemoryAgentGuidance,
+  resolveEffectiveMemoryHardeningFlags,
+  type MemoryAgentGuidanceContext,
   isPaperclipExternalChatContractTurn,
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
@@ -107,6 +113,117 @@ describe("runtime connection tool delivery", () => {
   it("puts the memory guidance in both default prompts", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(MEMORY_AGENT_GUIDANCE);
     expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(MEMORY_AGENT_GUIDANCE);
+  });
+
+  it("selectMemoryAgentGuidance delegates to buildMemoryAgentGuidance", () => {
+    const legacyCtx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: true, arcana: true, hermesBuiltInStores: true },
+      variant: "legacy",
+    };
+    expect(selectMemoryAgentGuidance(legacyCtx)).toBe(MEMORY_AGENT_GUIDANCE);
+
+    const writeRulesCtx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+      variant: "write-rules",
+    };
+    expect(selectMemoryAgentGuidance(writeRulesCtx)).toBe(
+      buildMemoryAgentGuidance(writeRulesCtx),
+    );
+  });
+
+  it("buildPaperclipAgentPromptTemplate contains selected guidance and leaves the rest of DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE intact", () => {
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+      variant: "write-rules",
+    };
+    const guidance = selectMemoryAgentGuidance(ctx);
+    const template = buildPaperclipAgentPromptTemplate(ctx);
+
+    expect(template).toContain("Memory:\n");
+    expect(template).toContain(guidance);
+
+    const prefixBeforeGuidance = template.slice(0, template.indexOf(guidance));
+    const prefixBeforeDefault = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.slice(
+      0,
+      DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.indexOf(MEMORY_AGENT_GUIDANCE),
+    );
+    expect(prefixBeforeGuidance).toBe(prefixBeforeDefault);
+  });
+
+  it("buildPaperclipAgentPromptTemplate substitutes guidance and preserves prefix and suffix of custom template", () => {
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: true, arcana: false, hermesBuiltInStores: false },
+      variant: "write-rules",
+    };
+    const customTemplate = `PREFIX HEADER\n\n${MEMORY_AGENT_GUIDANCE}\n\nSUFFIX FOOTER`;
+    const result = buildPaperclipAgentPromptTemplate(ctx, customTemplate);
+    const expectedGuidance = selectMemoryAgentGuidance(ctx);
+    expect(result).toBe(`PREFIX HEADER\n\n${expectedGuidance}\n\nSUFFIX FOOTER`);
+  });
+
+  it("buildPaperclipAgentPromptTemplate does not expand $-patterns in replacement", () => {
+    // Function replacement prevents $` $' $& $1 from being interpreted by String.replace
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+      variant: "write-rules",
+    };
+    const dollarGuidance = "Memory:\n- Spend $100 on $$ patterns and $& and $' and $` and $1";
+    const spy = vi.spyOn(shared, "buildMemoryAgentGuidance").mockReturnValue(dollarGuidance);
+    try {
+      const template = buildPaperclipAgentPromptTemplate(ctx);
+      expect(template).toContain(dollarGuidance);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("buildPaperclipAgentPromptTemplate asserts template includes MEMORY_AGENT_GUIDANCE", () => {
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.includes(MEMORY_AGENT_GUIDANCE)).toBe(true);
+    const ctx: MemoryAgentGuidanceContext = {
+      capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+      variant: "legacy",
+    };
+    expect(() => buildPaperclipAgentPromptTemplate(ctx)).not.toThrow();
+    expect(() =>
+      buildPaperclipAgentPromptTemplate(ctx, "template without memory guidance marker"),
+    ).toThrow("buildPaperclipAgentPromptTemplate: template does not include MEMORY_AGENT_GUIDANCE");
+  });
+
+  describe("resolveEffectiveMemoryHardeningFlags", () => {
+    it("uses server env flags when agent env is not provided", () => {
+      const serverEnv = {
+        PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance",
+      };
+      const flags = resolveEffectiveMemoryHardeningFlags(serverEnv, undefined);
+      expect(flags.capabilityMemoryGuidance).toBe(true);
+      expect(flags.hermesMemoryConfig).toBe(false);
+    });
+
+    it("merges server and agent flags using logical OR (additive)", () => {
+      const serverEnv = {
+        PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config",
+      };
+      const agentEnv = {
+        PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance",
+      };
+      const flags = resolveEffectiveMemoryHardeningFlags(serverEnv, agentEnv);
+      expect(flags.hermesMemoryConfig).toBe(true);
+      expect(flags.capabilityMemoryGuidance).toBe(true);
+    });
+
+    it("agent env cannot disable server hardening flags", () => {
+      const serverEnv = {
+        PAPERCLIP_MEMORY_HARDENING: "all",
+      };
+      const agentEnv = {
+        PAPERCLIP_MEMORY_HARDENING: "",
+      };
+      const flags = resolveEffectiveMemoryHardeningFlags(serverEnv, agentEnv);
+      expect(flags.capabilityMemoryGuidance).toBe(true);
+      expect(flags.hermesMemoryConfig).toBe(true);
+      expect(flags.agentScopedMem0).toBe(true);
+      expect(flags.hermesPromptSplit).toBe(true);
+    });
   });
 });
 

@@ -4,8 +4,16 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
-import { buildPrompt, execute, renderHermesSystemPrompt } from "./execute.js";
+import { buildPrompt, execute, renderHermesSystemPrompt, resolveMemoryGuidance } from "./execute.js";
 import { sessionCodec } from "./index.js";
+
+vi.mock("./mcp-preflight.js", () => ({
+  preflightHermesMcpServers: vi.fn(async (servers: any[], serverKeys: string[]) => ({
+    ok: true,
+    failures: [],
+    servers: servers.map((s, i) => ({ serverKey: serverKeys[i], listedToolCount: s.allowedTools?.length ?? 0 })),
+  })),
+}));
 
 const SESSION_ID = "20261006_200000_abcdef";
 const INSTRUCTIONS = "Synthetic governance marker: request approval before governed actions.";
@@ -23,9 +31,15 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
   let instructionsFilePath: string;
   let capturePath: string;
   let origHardeningEnv: string | undefined;
+  let origHostIsoEnv: string | undefined;
+  let origDeploymentModeEnv: string | undefined;
 
   beforeEach(async () => {
     origHardeningEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+    origHostIsoEnv = process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    origDeploymentModeEnv = process.env.PAPERCLIP_DEPLOYMENT_MODE;
+    delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    delete process.env.PAPERCLIP_DEPLOYMENT_MODE;
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-instructions-"));
     command = path.join(dir, "hermes.cjs");
     instructionsFilePath = path.join(dir, "instructions.md");
@@ -69,6 +83,16 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       process.env.PAPERCLIP_MEMORY_HARDENING = origHardeningEnv;
     } else {
       delete process.env.PAPERCLIP_MEMORY_HARDENING;
+    }
+    if (origHostIsoEnv !== undefined) {
+      process.env.PAPERCLIP_HERMES_HOST_ISOLATION = origHostIsoEnv;
+    } else {
+      delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+    }
+    if (origDeploymentModeEnv !== undefined) {
+      process.env.PAPERCLIP_DEPLOYMENT_MODE = origDeploymentModeEnv;
+    } else {
+      delete process.env.PAPERCLIP_DEPLOYMENT_MODE;
     }
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -490,6 +514,415 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     // receive the summary regardless of status); the failure stays in errorMessage.
     expect(result.summary).toBeUndefined();
     expect(result.errorMessage).toBe("Error: provider unavailable after tool execution");
+  });
+
+  it("uses buildPaperclipAgentPromptTemplate when paperclipMemoryGuidance is present in context", async () => {
+    const ctx = context({
+      paperclipMemoryGuidance: {
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+        variant: "write-rules",
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(invocation.systemPrompt).toContain(
+      "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
+    );
+    expect(invocation.systemPrompt).not.toContain("handle session continuity");
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+    expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).not.toContain("Mem0");
+    expect(invocation.systemPrompt).not.toContain("Arcana");
+  });
+
+  it("uses buildPaperclipAgentPromptTemplate and strips default identity when hermesPromptSplit is true and paperclipMemoryGuidance is present", async () => {
+    const baseCtx = context();
+    const ctx: AdapterExecutionContext = {
+      ...baseCtx,
+      paperclipMemoryGuidance: {
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+        variant: "write-rules",
+      },
+      config: {
+        ...baseCtx.config,
+        env: {
+          ...(baseCtx.config.env as Record<string, string>),
+          PAPERCLIP_MEMORY_HARDENING: "hermes-prompt-split",
+        },
+      },
+    };
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Default identity line is stripped from system prompt
+    expect(invocation.systemPrompt).not.toContain("You are agent agent-synthetic (Hermes fixture).");
+    // Guidance from write-rules is present in system prompt
+    expect(invocation.systemPrompt).toContain(
+      "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
+    );
+    expect(invocation.systemPrompt).not.toContain("handle session continuity");
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+    // Legacy guidance is absent
+    expect(invocation.systemPrompt).not.toContain("Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).not.toContain("Mem0");
+    expect(invocation.systemPrompt).not.toContain("Arcana");
+  });
+
+  it("gives typed paperclipMemoryGuidance precedence over stale nested context", async () => {
+    const ctx = context({
+      paperclipMemoryGuidance: {
+        capabilities: { mem0: false, arcana: true, hermesBuiltInStores: false },
+        variant: "write-rules",
+      },
+      context: {
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(invocation.systemPrompt).toContain(
+      "Arcana brain tools exist; use them for source documents (docs, research, specs) and propose new documents per `skills/paperclip/references/arcana-brain-proposals.md`.",
+    );
+    expect(invocation.systemPrompt).not.toContain("save durable facts only to available Arcana");
+    expect(invocation.systemPrompt).not.toContain("save durable facts to Arcana");
+    expect(invocation.systemPrompt).not.toContain("Mem0");
+    expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+  });
+
+  it("ignores nested context entirely when typed field is undefined", async () => {
+    const ctx = context({
+      context: {
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: true, hermesBuiltInStores: false },
+          variant: "write-rules",
+        },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Nested context is ignored; prompt uses default template
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).not.toContain(
+      "Arcana brain tools exist; use them for source documents (docs, research, specs) and propose new documents per `skills/paperclip/references/arcana-brain-proposals.md`.",
+    );
+  });
+
+  it("does not crash prompt build when nested context is malformed", async () => {
+    const ctx = context({
+      context: {
+        paperclipMemoryGuidance: {
+          notEvenValid: true,
+          capabilities: 123,
+        },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Falls back cleanly to default prompt template without throwing
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+  });
+
+  it("does not crash prompt build when typed paperclipMemoryGuidance is malformed and logs to stderr", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = context({
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+      paperclipMemoryGuidance: {
+        capabilities: null,
+        variant: "invalid-variant",
+      } as any,
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Falls back cleanly to default prompt template without throwing
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    const stderrLog = logs.find(
+      (l) => l.stream === "stderr" && l.chunk.includes("Malformed paperclipMemoryGuidance"),
+    );
+    expect(stderrLog).toBeDefined();
+  });
+
+  it("does not log to stderr when paperclipMemoryGuidance is absent", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const ctx = context({
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    const stderrLog = logs.find(
+      (l) => l.stream === "stderr" && l.chunk.includes("paperclipMemoryGuidance"),
+    );
+    expect(stderrLog).toBeUndefined();
+  });
+
+  describe("isolation-boundary memory guidance (TECH-8192)", () => {
+    it("forces hermesBuiltInStores false on runtime-MCP-only runs without Mem0", async () => {
+      const ctx = context({
+        runtimeMcp: {
+          getServers: () => [
+            {
+              name: "paperclip-issue-tools",
+              transport: "sse",
+              url: "http://localhost:3000/sse",
+              token: "mock-bearer-token",
+              allowedTools: ["paperclip_get_issue"],
+            },
+          ],
+        } as any,
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+      expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+      expect(invocation.systemPrompt).not.toContain("session continuity");
+      expect(invocation.systemPrompt).not.toContain("not a durable store");
+      expect(invocation.systemPrompt).not.toContain("mock-bearer-token");
+      expect(query(invocation)).not.toContain("mock-bearer-token");
+    });
+
+    it("forces hermesBuiltInStores false when host isolation is enabled", async () => {
+      const origHostIso = process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+      process.env.PAPERCLIP_HERMES_HOST_ISOLATION = "true";
+      try {
+        const baseCtx = context();
+        const ctx: AdapterExecutionContext = {
+          ...baseCtx,
+          config: {
+            ...baseCtx.config,
+            env: {
+              ...(baseCtx.config.env as Record<string, string>),
+              OPENROUTER_API_KEY: "sk-or-test-key",
+            },
+          },
+          paperclipMemoryGuidance: {
+            capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+            variant: "write-rules",
+          },
+        };
+        await execute(ctx);
+        const [invocation] = await invocations();
+        expect(invocation.systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+        expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+        expect(invocation.systemPrompt).not.toContain("session continuity");
+        expect(invocation.systemPrompt).not.toContain("sk-or-test-key");
+        expect(query(invocation)).not.toContain("sk-or-test-key");
+      } finally {
+        if (origHostIso !== undefined) {
+          process.env.PAPERCLIP_HERMES_HOST_ISOLATION = origHostIso;
+        } else {
+          delete process.env.PAPERCLIP_HERMES_HOST_ISOLATION;
+        }
+      }
+    });
+
+    it("forces hermesBuiltInStores false on real execute path with Mem0", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const baseCtx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+      });
+      const ctx: AdapterExecutionContext = {
+        ...baseCtx,
+        runtimeMemory: {
+          getConfig: async () => ({
+            provider: "mem0",
+            mode: "oss",
+            userId: "company",
+            agentId: "agent-synthetic",
+            llm: {
+              provider: "openai",
+              config: {
+                model: "gpt-5.4-mini",
+                api_key: "sk-openai-key-secret-9999",
+              },
+            },
+            embedder: {
+              provider: "openai",
+              config: {
+                model: "text-embedding-3-small",
+              },
+            },
+            vectorStore: {
+              provider: "pgvector",
+              config: {
+                host: "127.0.0.1",
+                port: 5432,
+                user: "tenant_user",
+                password: "Tenant_Password_123!",
+                dbname: "tenant_db",
+                sslmode: "require",
+                collectionName: "mem0_collection",
+              },
+            },
+          }),
+        } as any,
+        config: {
+          ...baseCtx.config,
+          env: {
+            ...(baseCtx.config.env as Record<string, string>),
+            OPENAI_API_KEY: "sk-openai-key-secret-9999",
+          },
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      };
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain("Mem0: save short, self-contained facts");
+      expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+      expect(invocation.systemPrompt).not.toContain("session continuity");
+      expect(invocation.systemPrompt).not.toContain("sk-openai-key-secret-9999");
+      expect(invocation.systemPrompt).not.toContain("Tenant_Password_123!");
+      expect(query(invocation)).not.toContain("sk-openai-key-secret-9999");
+      expect(query(invocation)).not.toContain("Tenant_Password_123!");
+      expect(invocation.args.join(" ")).not.toContain("sk-openai-key-secret-9999");
+      expect(invocation.args.join(" ")).not.toContain("Tenant_Password_123!");
+      expect(
+        logs.some(
+          (l) => l.stream === "stdout" && l.chunk.includes("Isolation override: disabling Hermes built-in stores guidance"),
+        ),
+      ).toBe(true);
+    });
+
+    it("retains conservative hermesBuiltInStores guidance without continuity promise on non-isolated runs without Mem0", async () => {
+      const ctx = context({
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain(
+        "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments.",
+      );
+      expect(invocation.systemPrompt).not.toContain("handle session continuity");
+      expect(invocation.systemPrompt).not.toContain("Mem0");
+      expect(invocation.systemPrompt).not.toContain("Arcana");
+      expect(invocation.systemPrompt).not.toContain("save durable facts only to available Arcana");
+      expect(invocation.systemPrompt).not.toContain("save durable facts to Arcana");
+    });
+
+    it("preserves legacy prompt byte-identical when paperclipMemoryGuidance is absent", async () => {
+      const ctx = context();
+      await execute(ctx);
+      const [invocation] = await invocations();
+      expect(invocation.systemPrompt).toContain(
+        "Memory:\n- Task progress and handoffs go in issue comments, not memory.",
+      );
+      expect(invocation.systemPrompt).not.toContain(
+        "- Task progress belongs in issue comments, not memory.",
+      );
+    });
+  });
+
+  describe("resolveMemoryGuidance unit tests (TECH-8192)", () => {
+    it("forces hermesBuiltInStores false and logs concise notice when usingIsolatedHome is true and hermesBuiltInStores is true", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+      expect(resolved).toEqual({
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: false },
+        variant: "write-rules",
+      });
+      expect(logs).toEqual([
+        {
+          stream: "stdout",
+          chunk: "[hermes] Isolation override: disabling Hermes built-in stores guidance\n",
+        },
+      ]);
+    });
+
+    it("returns capabilities unchanged and does not log override when usingIsolatedHome is true but hermesBuiltInStores is already false", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: true, arcana: false, hermesBuiltInStores: false },
+          variant: "write-rules",
+        },
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+      expect(resolved).toEqual({
+        capabilities: { mem0: true, arcana: false, hermesBuiltInStores: false },
+        variant: "write-rules",
+      });
+      expect(logs).toHaveLength(0);
+    });
+
+    it("preserves hermesBuiltInStores true when usingIsolatedHome is false", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: false });
+      expect(resolved).toEqual({
+        capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+        variant: "write-rules",
+      });
+      expect(logs).toHaveLength(0);
+    });
+
+    it("logs malformed error to stderr and returns undefined when paperclipMemoryGuidance is malformed", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: "not-a-bool" },
+          variant: "invalid-variant",
+        } as any,
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: false });
+      expect(resolved).toBeUndefined();
+      expect(logs).toHaveLength(1);
+      expect(logs[0].stream).toBe("stderr");
+      expect(logs[0].chunk).toContain("[hermes] Malformed paperclipMemoryGuidance context received");
+      expect(logs[0].chunk).not.toContain("password");
+    });
+
+    it("returns undefined without logging when paperclipMemoryGuidance is absent", async () => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = context({
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+        paperclipMemoryGuidance: undefined,
+      });
+      const resolved = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+      expect(resolved).toBeUndefined();
+      expect(logs).toHaveLength(0);
+    });
   });
 
   it("removes an obsolete instruction overlay when the bundle is removed", async () => {

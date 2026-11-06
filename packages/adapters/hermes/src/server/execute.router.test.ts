@@ -654,6 +654,28 @@ describe("local (non-isolated) Router runs", () => {
     expect(routerProbe).not.toHaveBeenCalled();
     expect(logs.map((l) => l.chunk).join("")).not.toContain("Cannot safely redact");
   });
+
+  it("forces hermesBuiltInStores false on Router runs even when host isolation is false (TECH-8192)", async () => {
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    const context = ctx({
+      env: { RAMP_ROUTER_API_KEY: ROUTER_KEY },
+      config: ROUTER,
+      logs,
+      extra: {
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      },
+    });
+    const result = await execute(context);
+    expect(result.exitCode).toBe(0);
+    const systemPrompt = captured?.env?.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? "";
+    expect(systemPrompt).toContain("Memory:\n- Task progress belongs in issue comments, not memory.");
+    expect(systemPrompt).not.toContain("Hermes built-in stores");
+    expect(systemPrompt).not.toContain("session continuity");
+    expect(systemPrompt).not.toContain("not a durable store");
+  });
 });
 
 describe("canonical Router key redaction on every run (separate from Router credential validation)", () => {

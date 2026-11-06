@@ -7,6 +7,16 @@ import path from "node:path";
 import {
   CONNECTION_INTENT_AGENT_GUIDANCE,
   MEMORY_AGENT_GUIDANCE,
+  buildMemoryAgentGuidance,
+  memoryAgentCapabilitiesSchema,
+  memoryAgentGuidanceVariantSchema,
+  memoryAgentGuidanceContextSchema,
+  parseMemoryAgentGuidanceContext,
+  parseMemoryAgentGuidanceContextResult,
+  type MemoryAgentCapabilities,
+  type MemoryAgentGuidanceVariant,
+  type MemoryAgentGuidanceContext,
+  type ParseMemoryAgentGuidanceContextResult,
   resolveMemoryHardeningFlags,
   resolveEffectiveMemoryHardeningFlags,
   mergeMemoryHardeningFlags,
@@ -18,6 +28,16 @@ export {
   resolveEffectiveMemoryHardeningFlags,
   mergeMemoryHardeningFlags,
   type MemoryHardeningFlags,
+  buildMemoryAgentGuidance,
+  memoryAgentCapabilitiesSchema,
+  memoryAgentGuidanceVariantSchema,
+  memoryAgentGuidanceContextSchema,
+  parseMemoryAgentGuidanceContext,
+  parseMemoryAgentGuidanceContextResult,
+  type MemoryAgentCapabilities,
+  type MemoryAgentGuidanceVariant,
+  type MemoryAgentGuidanceContext,
+  type ParseMemoryAgentGuidanceContextResult,
 };
 
 import { buildAgentChildBaseEnv } from "./agent-child-env.js";
@@ -237,6 +257,28 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
 // in the harness-delivered Paperclip skill rather than either default template.
 export const DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE =
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+
+export function selectMemoryAgentGuidance(
+  context: MemoryAgentGuidanceContext,
+): string {
+  return buildMemoryAgentGuidance(context);
+}
+
+export function buildPaperclipAgentPromptTemplate(
+  context: MemoryAgentGuidanceContext,
+  template = DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+): string {
+  if (!template.includes(MEMORY_AGENT_GUIDANCE)) {
+    throw new Error(
+      "buildPaperclipAgentPromptTemplate: template does not include MEMORY_AGENT_GUIDANCE",
+    );
+  }
+  const guidance = selectMemoryAgentGuidance(context);
+  return template.replace(
+    MEMORY_AGENT_GUIDANCE,
+    () => guidance,
+  );
+}
 
 export const WATCHDOG_DEFAULT_MANDATE = [
   "You are running as a task watchdog, not as the original deliverable worker.",
