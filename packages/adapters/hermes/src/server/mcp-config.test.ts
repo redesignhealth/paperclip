@@ -336,6 +336,7 @@ code_execution:
 
       expect(ALLOWED_HOST_CONFIG_KEYS.has("terminal")).toBe(false);
       expect(ALLOWED_HOST_CONFIG_KEYS.has("providers")).toBe(false);
+      expect(ALLOWED_HOST_CONFIG_KEYS.has("memory")).toBe(false);
     });
 
     it("fails closed on multi-document YAML or non-mapping input", () => {
@@ -1859,6 +1860,46 @@ print(json.dumps(data))
       expect(memAndMcp).toContain("memory:\n  provider: mem0");
       expect(memAndMcp).toContain("mcp_servers:");
       expect(memAndMcp).toContain("my_server:");
+    });
+
+    it("serializeHermesMcpYaml reflects memory hardening flag on vs off", () => {
+      const origEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+      try {
+        // Flag off: byte-identical legacy output
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        const offOutput = serializeHermesMcpYaml({}, "model: gpt-5.4", true);
+        expect(offOutput).toBe("model: gpt-5.4\n\nmemory:\n  provider: mem0\n");
+
+        // Flag on: memory_enabled: false and user_profile_enabled: false
+        process.env.PAPERCLIP_MEMORY_HARDENING = "hermes-memory-config";
+        const onOutput = serializeHermesMcpYaml({}, "model: gpt-5.4", true);
+        expect(onOutput).toBe(
+          "model: gpt-5.4\n\nmemory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n",
+        );
+      } finally {
+        if (origEnv !== undefined) {
+          process.env.PAPERCLIP_MEMORY_HARDENING = origEnv;
+        } else {
+          delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        }
+      }
+    });
+
+    it("never emits disabled_toolsets in serialized YAML", () => {
+      const output = serializeHermesMcpYaml(
+        {
+          my_server: {
+            url: "https://mcp.test",
+            headers: { Authorization: "Bearer ${TOKEN}" },
+            enabled: true,
+            skip_preflight: true,
+            tools: { resources: false, prompts: false, include: ["t1"] },
+          },
+        },
+        "model: gpt-5.4",
+        true,
+      );
+      expect(output).not.toContain("disabled_toolsets");
     });
   });
 });
