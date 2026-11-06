@@ -22,6 +22,7 @@ import {
 } from "./workspaces.js";
 import { recordLegacyWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
 import { adapterSupportsRuntimeMemory, resolveHeartbeatRuntimeMemory } from "./runtime-memory.js";
+import { buildHeartbeatMemoryGuidanceContext } from "./memory-guidance-context.js";
 import { projectToolDefinitions } from "../project-tools.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildAgentIdentityEnv, resolveEffectiveMemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
@@ -828,6 +829,23 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         runId: run.id,
         flags: hardeningFlags,
       });
+      let memoryGuidanceContext: ReturnType<typeof buildHeartbeatMemoryGuidanceContext> = undefined;
+      if (hardeningFlags?.capabilityMemoryGuidance) {
+        logger.debug(
+          {
+            companyId: agent.companyId,
+            agentId: agent.id,
+          },
+          "capability memory guidance enabled",
+        );
+        memoryGuidanceContext =
+          buildHeartbeatMemoryGuidanceContext({
+            agentMetadata: agent.metadata,
+            runtimeMemory,
+            flags: hardeningFlags,
+          });
+        adapterContext.paperclipMemoryGuidance = memoryGuidanceContext;
+      }
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
@@ -856,6 +874,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               runtimeMcp,
               runtimeTools,
               runtimeMemory,
+              paperclipMemoryGuidance: memoryGuidanceContext,
               onLog,
               onMeta: onAdapterMeta,
               onEvent: onAdapterEvent,

@@ -57,9 +57,10 @@ Status quick guide:
 ## 7. Memory Capture
 
 1. Check for new conversations since last run.
-2. Save durable learned facts (owner preferences, decisions with reason and date, lessons, procedures that worked) to Mem0. Mark inferences "(inferred)". Mem0 also saves conversation automatically.
-3. Documents and source material go to Arcana: propose them after reading `skills/paperclip/references/arcana-brain-proposals.md`.
-4. Never save secrets, credentials, PHI or PII.
+2. Retain durable facts and preferences with the why (decisions with date, lessons, procedures that worked); keep progress in issue comments, not memory, and never store secrets, credentials, personal data, PHI, or PII.
+3. When Mem0 tools are available, save durable facts and preferences with the why (decisions with date, lessons, procedures that worked) to Mem0; mark inferences "(inferred)". Search before asking again.
+4. When Arcana brain tools are available, documents and source material go to Arcana: propose them after reading `skills/paperclip/references/arcana-brain-proposals.md`.
+5. Never save secrets, credentials, PHI or PII.
 
 ## 8. Exit
 

@@ -29,7 +29,17 @@ export {
   CONNECTION_RUNTIME_TOOL_NAMES,
   CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
 } from "./connection-intent-guidance.js";
-export { MEMORY_AGENT_GUIDANCE } from "./memory-agent-guidance.js";
+export {
+  MEMORY_AGENT_GUIDANCE,
+  buildMemoryAgentGuidance,
+  memoryAgentCapabilitiesSchema,
+  memoryAgentGuidanceVariantSchema,
+  memoryAgentGuidanceContextSchema,
+  parseMemoryAgentGuidanceContext,
+  type MemoryAgentCapabilities,
+  type MemoryAgentGuidanceVariant,
+  type MemoryAgentGuidanceContext,
+} from "./memory-agent-guidance.js";
 export {
   nativeFinalizationResultSchema,
   nativeFinalizationResultV1Schema,

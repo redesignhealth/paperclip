@@ -492,6 +492,84 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(result.errorMessage).toBe("Error: provider unavailable after tool execution");
   });
 
+  it("uses buildPaperclipAgentPromptTemplate when paperclipMemoryGuidance is present in context", async () => {
+    const ctx = context({
+      paperclipMemoryGuidance: {
+        capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+        variant: "write-rules",
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(invocation.systemPrompt).toContain("Hermes built-in stores handle session continuity; do not duplicate that in Mem0.");
+    expect(invocation.systemPrompt).toContain("Task progress belongs in issue comments, not memory.");
+    expect(invocation.systemPrompt).not.toContain("Memory:\n- Task progress and handoffs go in issue comments");
+  });
+
+  it("gives typed paperclipMemoryGuidance precedence over stale nested context", async () => {
+    const ctx = context({
+      paperclipMemoryGuidance: {
+        capabilities: { mem0: false, arcana: true, hermesBuiltInStores: false },
+        variant: "write-rules",
+      },
+      context: {
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: true, arcana: false, hermesBuiltInStores: true },
+          variant: "write-rules",
+        },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    expect(invocation.systemPrompt).toContain("Arcana brain tools exist; prefer them for durable cross-run knowledge.");
+    expect(invocation.systemPrompt).not.toContain("Mem0");
+    expect(invocation.systemPrompt).not.toContain("Hermes built-in stores");
+  });
+
+  it("ignores nested context entirely when typed field is undefined", async () => {
+    const ctx = context({
+      context: {
+        paperclipMemoryGuidance: {
+          capabilities: { mem0: false, arcana: true, hermesBuiltInStores: false },
+          variant: "write-rules",
+        },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Nested context is ignored; prompt uses default template
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+    expect(invocation.systemPrompt).not.toContain("Arcana brain tools exist; prefer them for durable cross-run knowledge.");
+  });
+
+  it("does not crash prompt build when nested context is malformed", async () => {
+    const ctx = context({
+      context: {
+        paperclipMemoryGuidance: {
+          notEvenValid: true,
+          capabilities: 123,
+        },
+      },
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Falls back cleanly to default prompt template without throwing
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+  });
+
+  it("does not crash prompt build when typed paperclipMemoryGuidance is malformed", async () => {
+    const ctx = context({
+      paperclipMemoryGuidance: {
+        capabilities: null,
+        variant: "invalid-variant",
+      } as any,
+    });
+    await execute(ctx);
+    const [invocation] = await invocations();
+    // Falls back cleanly to default prompt template without throwing
+    expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
+  });
+
   it("removes an obsolete instruction overlay when the bundle is removed", async () => {
     const ctx = context();
     await execute(ctx);
