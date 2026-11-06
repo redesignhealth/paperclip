@@ -53,9 +53,7 @@ export async function resolveHeartbeatRuntimeMemory(input: {
       : "company";
 
   if (effectiveUserId === agent.id) {
-    void recordAgentScopedMemoryUse(db, agent.companyId).catch((err) => {
-      logger.debug({ companyId: agent.companyId }, "Agent-scoped memory observation recording rejected");
-    });
+    void recordAgentScopedMemoryUse(db, agent.companyId).catch(() => {});
   }
 
   if (flags.agentScopedMem0 && descriptor.scopeMigrationCompletedAt == null) {

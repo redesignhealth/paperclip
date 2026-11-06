@@ -26,7 +26,8 @@ export function resolveMemoryHardeningFlags(
     }
   ).process?.env ?? {},
 ): MemoryHardeningFlags {
-  const raw = env.PAPERCLIP_MEMORY_HARDENING?.trim();
+  const rawCandidate = env.PAPERCLIP_MEMORY_HARDENING;
+  const raw = typeof rawCandidate === "string" ? rawCandidate.trim() : undefined;
   if (!raw) {
     return ALL_OFF_FLAGS;
   }

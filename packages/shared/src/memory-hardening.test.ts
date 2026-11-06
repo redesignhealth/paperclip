@@ -285,6 +285,40 @@ describe("resolveMemoryHardeningFlags", () => {
         agentScopedMem0: true,
         capabilityMemoryGuidance: true,
       });
+
+      // Agent-only agent-scoped-mem0 enables the flag
+      const agentEnvScoped = { PAPERCLIP_MEMORY_HARDENING: "agent-scoped-mem0" };
+      expect(resolveEffectiveMemoryHardeningFlags({}, agentEnvScoped)).toEqual({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: true,
+        capabilityMemoryGuidance: false,
+      });
+
+      // Server-on agent-scoped-mem0 cannot be disabled by agent-empty
+      const serverEnvScoped = { PAPERCLIP_MEMORY_HARDENING: "agent-scoped-mem0" };
+      expect(resolveEffectiveMemoryHardeningFlags(serverEnvScoped, agentEnvEmpty)).toEqual({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: true,
+        capabilityMemoryGuidance: false,
+      });
+    });
+
+    it("defensively ignores non-string PAPERCLIP_MEMORY_HARDENING values (such as secret bindings)", () => {
+      const nonStringEnv = { PAPERCLIP_MEMORY_HARDENING: { secretId: "secret_123" } } as any;
+      expect(resolveMemoryHardeningFlags(nonStringEnv)).toEqual({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
+      expect(resolveEffectiveMemoryHardeningFlags({}, nonStringEnv)).toEqual({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+      });
     });
 
     it("fails closed if server env contains an unknown token", () => {

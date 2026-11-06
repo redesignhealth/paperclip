@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   adapterSupportsRuntimeMemory,
   resolveHeartbeatRuntimeMemory,
@@ -8,13 +8,22 @@ import * as memoryModule from "../services/company-memory-databases.js";
 import { CompanyMemoryNotReadyError } from "../services/company-memory-databases.js";
 import * as redactionModule from "../services/run-secret-redaction.js";
 import { recordAgentScopedMemoryUse } from "../services/memory-scope-observations.js";
+import { resolveEffectiveMemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
 
 describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
   const companyId = "11111111-1111-4111-8111-111111111111";
   const nonPilotCompanyId = "22222222-2222-4222-8222-222222222222";
   const agentId = "aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const runId = "rrrr1111-rrrr-4rrr-8rrr-rrrrrrrrrrrr";
-  const mockDb = {} as any;
+  const mockDb = {
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(async () => []),
+        })),
+      })),
+    })),
+  } as any;
 
   const mockDescriptor: memoryModule.CompanyMemoryDatabaseRuntimeDescriptor = {
     host: "db.example.test",
@@ -40,6 +49,10 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
       redactForRun: vi.fn(),
       findMatchingSecrets: vi.fn(async () => []),
     } as any);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("adapterSupportsRuntimeMemory returns true only for hermes_local and false for hermes_gateway or other adapters", () => {
@@ -326,56 +339,121 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
       expect(runtimeMemory!.getConfig().agentId).toBe(agentId);
     });
 
-    it("the recorder updates at most once per hour (mock db)", async () => {
-      let observedAt: Date | null = null;
-      const throttledMockDb = {
-        update: vi.fn(() => ({
-          set: vi.fn((values: { scopeMigrationAgentScopeObservedAt?: Date }) => ({
-            where: vi.fn(() => ({
-              returning: vi.fn(async () => {
-                const now = values.scopeMigrationAgentScopeObservedAt ?? new Date();
-                if (
-                  observedAt === null ||
-                  observedAt.getTime() <= now.getTime() - 60 * 60 * 1000
-                ) {
-                  observedAt = now;
-                  return [{ id: "mem-db-1" }];
-                }
-                return [];
-              }),
-            })),
-          })),
+    it("resolves flags from process.env when flags argument is omitted", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: new Date("2026-11-05T00:00:00Z"),
+          scopeMigrationMode: "copy",
         })),
-      };
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
 
-      const baseTime = new Date("2026-11-05T12:00:00Z");
+      const prevEnv = process.env.PAPERCLIP_MEMORY_HARDENING;
+      try {
+        process.env.PAPERCLIP_MEMORY_HARDENING = "agent-scoped-mem0";
+        const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+          db: mockDb,
+          agent: { id: agentId, adapterType: "hermes_local", companyId },
+          runId,
+        });
+        expect(runtimeMemory).toBeDefined();
+        expect(runtimeMemory!.getConfig().userId).toBe(agentId);
 
-      // 1. Initial observation with null observedAt -> updates
-      const updated1 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, baseTime);
-      expect(updated1).toBe(true);
-      expect(observedAt).toEqual(baseTime);
+        delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        const runtimeMemoryUnset = await resolveHeartbeatRuntimeMemory({
+          db: mockDb,
+          agent: { id: agentId, adapterType: "hermes_local", companyId },
+          runId,
+        });
+        expect(runtimeMemoryUnset).toBeDefined();
+        expect(runtimeMemoryUnset!.getConfig().userId).toBe("company");
+      } finally {
+        if (prevEnv === undefined) {
+          delete process.env.PAPERCLIP_MEMORY_HARDENING;
+        } else {
+          process.env.PAPERCLIP_MEMORY_HARDENING = prevEnv;
+        }
+      }
+    });
 
-      // 2. Second observation 30 minutes later -> throttled (no update)
-      const timePlus30Min = new Date(baseTime.getTime() + 30 * 60 * 1000);
-      const updated2 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, timePlus30Min);
-      expect(updated2).toBe(false);
-      expect(observedAt).toEqual(baseTime);
+    it("additive semantics: agent-only token enables agent scope when marker present", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: new Date("2026-11-05T00:00:00Z"),
+          scopeMigrationMode: "copy",
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
 
-      // 3. Observation 59 minutes later -> throttled (no update)
-      const timePlus59Min = new Date(baseTime.getTime() + 59 * 60 * 1000);
-      const updated3 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, timePlus59Min);
-      expect(updated3).toBe(false);
+      const serverEnv = {};
+      const agentEnv = { PAPERCLIP_MEMORY_HARDENING: "agent-scoped-mem0" };
+      const flags = resolveEffectiveMemoryHardeningFlags(serverEnv, agentEnv);
 
-      // 4. Observation 61 minutes later -> updates
-      const timePlus61Min = new Date(baseTime.getTime() + 61 * 60 * 1000);
-      const updated4 = await recordAgentScopedMemoryUse(throttledMockDb as any, companyId, timePlus61Min);
-      expect(updated4).toBe(true);
-      expect(observedAt).toEqual(timePlus61Min);
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+        flags,
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(runtimeMemory!.getConfig().userId).toBe(agentId);
+    });
+
+    it("additive semantics: server-on + agent-empty cannot disable agent scope", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          scopeMigrationCompletedAt: new Date("2026-11-05T00:00:00Z"),
+          scopeMigrationMode: "copy",
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      const serverEnv = { PAPERCLIP_MEMORY_HARDENING: "agent-scoped-mem0" };
+      const agentEnv = { PAPERCLIP_MEMORY_HARDENING: "" };
+      const flags = resolveEffectiveMemoryHardeningFlags(serverEnv, agentEnv);
+
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+        flags,
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(runtimeMemory!.getConfig().userId).toBe(agentId);
     });
 
     it("the recorder never throws into the run", async () => {
       const { logger } = await import("../middleware/logger.js");
-      const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 
       const failingDb = {
         update: vi.fn(() => ({
@@ -389,26 +467,21 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
         })),
       };
 
-      let result: boolean | undefined;
-      await expect(
-        (async () => {
-          result = await recordAgentScopedMemoryUse(failingDb as any, companyId);
-        })(),
-      ).resolves.not.toThrow();
+      const result = await recordAgentScopedMemoryUse(failingDb as any, companyId);
 
       expect(result).toBe(false);
-      expect(debugSpy).toHaveBeenCalledWith(
-        { companyId },
+      expect(warnSpy).toHaveBeenCalledWith(
+        { companyId, err: expect.any(Error) },
         expect.stringContaining("failed to record"),
       );
-      const debugCalls = debugSpy.mock.calls;
-      const relevantCall = debugCalls.find(
+      const warnCalls = warnSpy.mock.calls;
+      const relevantCall = warnCalls.find(
         ([obj]) => typeof obj === "object" && obj !== null && "companyId" in obj && (obj as any).companyId === companyId,
       );
       expect(relevantCall).toBeDefined();
-      expect(Object.keys(relevantCall![0] as object)).toEqual(["companyId"]);
+      expect(Object.keys(relevantCall![0] as object).sort()).toEqual(["companyId", "err"]);
 
-      debugSpy.mockRestore();
+      warnSpy.mockRestore();
     });
 
     it("an agent-scoped run still resolves when the recorder rejects", async () => {

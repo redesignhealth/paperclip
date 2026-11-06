@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, lt, or } from "drizzle-orm";
 import { companyMemoryDatabases, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 
@@ -9,6 +9,7 @@ export async function recordAgentScopedMemoryUse(
 ): Promise<boolean> {
   try {
     const effectiveNow = now ?? new Date();
+    const cutoff = new Date(effectiveNow.getTime() - 60 * 60 * 1000);
     const rows = await db
       .update(companyMemoryDatabases)
       .set({
@@ -20,15 +21,16 @@ export async function recordAgentScopedMemoryUse(
           isNotNull(companyMemoryDatabases.scopeMigrationCompletedAt),
           or(
             isNull(companyMemoryDatabases.scopeMigrationAgentScopeObservedAt),
-            sql`${companyMemoryDatabases.scopeMigrationAgentScopeObservedAt} < ${effectiveNow} - interval '1 hour'`,
+            lt(companyMemoryDatabases.scopeMigrationAgentScopeObservedAt, cutoff),
           ),
         ),
       )
       .returning({ id: companyMemoryDatabases.id });
 
     return rows.length > 0;
-  } catch {
-    logger.debug({ companyId }, "failed to record agent-scoped memory observation");
+  } catch (err) {
+    logger.warn({ err, companyId }, "failed to record agent-scoped memory observation");
     return false;
   }
 }
+

@@ -1077,8 +1077,8 @@ export function createPostgresCompanyMemoryDatabaseService(
       collectionName: row.collectionName,
       embeddingModel: row.embeddingModel,
       embeddingDimensions: row.embeddingDimensions,
-      scopeMigrationCompletedAt: row.scopeMigrationCompletedAt,
-      scopeMigrationMode: row.scopeMigrationMode,
+      scopeMigrationCompletedAt: row.scopeMigrationCompletedAt ?? null,
+      scopeMigrationMode: row.scopeMigrationMode ?? null,
     };
   }
 
