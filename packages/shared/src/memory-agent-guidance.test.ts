@@ -85,7 +85,7 @@ describe("buildMemoryAgentGuidance", () => {
         capabilities: { mem0: false, arcana: false, hermesBuiltInStores: true },
       },
       {
-        name: "arcana + hermesBuiltInStores (synthetic/not normally runtime-reachable; actual attached runtime MCP causes isolation)",
+        name: "arcana + hermesBuiltInStores (reachable only when Arcana marked ready but no runtime MCP attached)",
         capabilities: { mem0: false, arcana: true, hermesBuiltInStores: true },
       },
     ];
@@ -150,7 +150,7 @@ describe("buildMemoryAgentGuidance", () => {
       expect(output.endsWith("\n")).toBe(false);
     });
 
-    it("hermes and arcana enabled (synthetic/not normally runtime-reachable; actual attached runtime MCP causes isolation) includes scratch store guidance naming Arcana and not Mem0", () => {
+    it("hermes and arcana enabled (reachable only when Arcana marked ready but no runtime MCP attached) includes scratch store guidance naming Arcana and not Mem0", () => {
       const output = buildMemoryAgentGuidance({
         capabilities: { mem0: false, arcana: true, hermesBuiltInStores: true },
         variant: "write-rules",
@@ -160,6 +160,7 @@ describe("buildMemoryAgentGuidance", () => {
         "- Hermes built-in stores are scratch/local session context, not a durable store; record progress and durable outcomes in issue comments, and propose source documents to Arcana when its tools are available.",
       );
       expect(output).toContain(ARCANA_SNIPPET);
+      expect(output).toContain("skills/paperclip/references/arcana-brain-proposals.md");
       expect(output).not.toContain("Mem0");
       expect(output).not.toContain("handle session continuity");
       expect(output).not.toContain("save durable facts only to available Arcana");
@@ -179,6 +180,7 @@ describe("buildMemoryAgentGuidance", () => {
       );
       expect(output).toContain(MEM0_SNIPPET);
       expect(output).toContain(ARCANA_SNIPPET);
+      expect(output).toContain("skills/paperclip/references/arcana-brain-proposals.md");
       expect(output).not.toContain("handle session continuity");
       expect(output).not.toContain("save durable facts only to available Arcana");
       expect(output).not.toContain("save durable facts only to available Mem0/Arcana");
@@ -204,8 +206,10 @@ describe("buildMemoryAgentGuidance", () => {
         // Unavailable tools must not be mentioned anywhere
         if (!capabilities.arcana) {
           expect(output).not.toContain("Arcana");
+          expect(output).not.toContain("skills/paperclip/references/arcana-brain-proposals.md");
         } else {
           expect(output).toContain(ARCANA_SNIPPET);
+          expect(output).toContain("skills/paperclip/references/arcana-brain-proposals.md");
         }
 
         if (!capabilities.mem0) {

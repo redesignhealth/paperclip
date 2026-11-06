@@ -78,7 +78,7 @@ export function buildMemoryAgentGuidance(ctx: MemoryAgentGuidanceContext): strin
 
   if (ctx.capabilities.arcana) {
     lines.push(
-      "- Arcana brain tools exist; prefer them for durable cross-run knowledge.",
+      "- Arcana brain tools exist; use them for source documents (docs, research, specs) and propose new documents per `skills/paperclip/references/arcana-brain-proposals.md`.",
     );
   }
 

@@ -582,7 +582,9 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     });
     await execute(ctx);
     const [invocation] = await invocations();
-    expect(invocation.systemPrompt).toContain("Arcana brain tools exist; prefer them for durable cross-run knowledge.");
+    expect(invocation.systemPrompt).toContain(
+      "Arcana brain tools exist; use them for source documents (docs, research, specs) and propose new documents per `skills/paperclip/references/arcana-brain-proposals.md`.",
+    );
     expect(invocation.systemPrompt).not.toContain("save durable facts only to available Arcana");
     expect(invocation.systemPrompt).not.toContain("save durable facts to Arcana");
     expect(invocation.systemPrompt).not.toContain("Mem0");
@@ -602,7 +604,9 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     const [invocation] = await invocations();
     // Nested context is ignored; prompt uses default template
     expect(invocation.systemPrompt).toContain("Memory:\n- Task progress and handoffs go in issue comments");
-    expect(invocation.systemPrompt).not.toContain("Arcana brain tools exist; prefer them for durable cross-run knowledge.");
+    expect(invocation.systemPrompt).not.toContain(
+      "Arcana brain tools exist; use them for source documents (docs, research, specs) and propose new documents per `skills/paperclip/references/arcana-brain-proposals.md`.",
+    );
   });
 
   it("does not crash prompt build when nested context is malformed", async () => {
