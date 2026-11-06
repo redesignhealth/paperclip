@@ -15,6 +15,7 @@ import {
   buildPaperclipServerEnvironment,
   runnerE2EServerControlPaths,
 } from "./harness-env.js";
+import { resolveMemoryHardeningFlags } from "../../packages/shared/src/memory-hardening.js";
 
 function required(name: string) {
   const value = process.env[name]?.trim();
@@ -117,6 +118,19 @@ let activeRestartRequestId: string | null = null;
 function appendLog(message: string) {
   process.stderr.write(message);
   log.write(message);
+}
+
+const hasMemoryRecallExecution = executionIds.some(
+  (id) => id.startsWith("memory-recall.") || id === "memory-recall",
+);
+if (hasMemoryRecallExecution) {
+  // NOTE: This log line is test harness wrapper self-attestation of resolved memory hardening flags
+  // for the memory-recall suite (not an internal server kernel proof).
+  appendLog(
+    `[company-memory-hardening] Server resolved hardening flags (harness wrapper self-attestation): ${JSON.stringify(
+      resolveMemoryHardeningFlags(definedServerEnvironment),
+    )}\n`,
+  );
 }
 
 function shutdownRequested() {

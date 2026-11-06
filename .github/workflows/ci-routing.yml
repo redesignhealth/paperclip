@@ -57,7 +57,9 @@ jobs:
         run: |
           set -u
 
-          github_runner='ubuntu-latest'
+          # ubuntu-latest moved to 26.04 on 2026-11-04. Its uutils coreutils
+          # break the runner and server tests that copy or run /bin binaries.
+          github_runner='ubuntu-24.04'
           aws_runner='runs-on/fleet=paperclip-public-pr-x64/env=public-ci'
 
           fail_closed() {

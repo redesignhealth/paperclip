@@ -1,7 +1,10 @@
 import type { AdapterRuntimeMemoryAccess } from "@paperclipai/adapter-utils";
+import { resolveMemoryHardeningFlags, type MemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
 import { companyMemoryDatabaseService } from "../company-memory-databases.js";
+import { recordAgentScopedMemoryUse } from "../memory-scope-observations.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { HERMES_ADAPTER_TYPE } from "./run-state.js";
+import { logger } from "../../middleware/logger.js";
 
 /**
  * Only the local Hermes adapter consumes the per-company Mem0/pgvector
@@ -17,11 +20,17 @@ export function adapterSupportsRuntimeMemory(adapterType: string | null | undefi
  * adapter-facing runtime memory accessor. The password is registered with the
  * run secret redaction registry before it is handed to the adapter so that it
  * cannot leak through run logs or transcripts.
+ *
+ * When agent-scoped Mem0 hardening is active and the company has recorded a
+ * completed scope migration, userId is scoped to the agent's ID; otherwise,
+ * it defaults to "company".
  */
 export async function resolveHeartbeatRuntimeMemory(input: {
   db: any;
   agent: { id: string; adapterType: string | null | undefined; companyId: string };
   runId: string;
+  flags?: MemoryHardeningFlags;
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
 }): Promise<AdapterRuntimeMemoryAccess | undefined> {
   const { db, agent, runId } = input;
   if (!adapterSupportsRuntimeMemory(agent.adapterType)) {
@@ -36,11 +45,29 @@ export async function resolveHeartbeatRuntimeMemory(input: {
     return undefined;
   }
   await createRunSecretRedactionRegistry(db).register(agent.companyId, runId, descriptor.password);
+
+  const flags = input.flags ?? resolveMemoryHardeningFlags(input.env ?? process.env);
+  const effectiveUserId =
+    flags.agentScopedMem0 && descriptor.scopeMigrationCompletedAt != null
+      ? agent.id
+      : "company";
+
+  if (effectiveUserId === agent.id) {
+    void recordAgentScopedMemoryUse(db, agent.companyId).catch(() => {});
+  }
+
+  if (flags.agentScopedMem0 && descriptor.scopeMigrationCompletedAt == null) {
+    logger.warn(
+      { companyId: agent.companyId },
+      "Company memory has not completed agent scope migration; falling back to company user_id",
+    );
+  }
+
   return {
     getConfig: () => ({
       provider: "mem0",
       mode: "oss",
-      userId: "company",
+      userId: effectiveUserId,
       agentId: agent.id,
       llm: {
         provider: "openai",

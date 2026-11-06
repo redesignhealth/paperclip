@@ -11,6 +11,7 @@ import {
 describe("pi models", () => {
   afterEach(() => {
     delete process.env.PAPERCLIP_PI_COMMAND;
+    delete process.env.PAPERCLIP_PI_PROVIDERS;
     resetPiModelsCacheForTests();
   });
 
@@ -62,5 +63,37 @@ describe("pi models", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("merges, de-duplicates and sorts models from PAPERCLIP_PI_PROVIDERS with discovery output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "paperclip-pi-models-"));
+    const command = join(directory, "pi");
+    await writeFile(command, "#!/bin/sh\nprintf 'provider  model\\nramp-router  gpt-6-luna\\nxai  grok-4\\n'\n");
+    await chmod(command, 0o755);
+    process.env.PAPERCLIP_PI_COMMAND = command;
+    process.env.PAPERCLIP_PI_PROVIDERS = JSON.stringify({
+      "ramp-router": { models: [{ id: "gpt-6-luna" }, { id: "gpt-6.1-sol" }] },
+      "ramp-router-anthropic": { models: [{ id: "claude-sonnet-5-5" }] },
+      broken: { models: "nope" },
+    });
+    try {
+      expect((await listPiModels()).map((m) => m.id)).toEqual([
+        "ramp-router-anthropic/claude-sonnet-5-5",
+        "ramp-router/gpt-6-luna",
+        "ramp-router/gpt-6.1-sol",
+        "xai/grok-4",
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("lists configured provider models when discovery fails, and ignores invalid provider JSON", async () => {
+    process.env.PAPERCLIP_PI_COMMAND = "__paperclip_missing_pi_command__";
+    process.env.PAPERCLIP_PI_PROVIDERS = JSON.stringify({ r: { models: [{ id: "m" }] } });
+    expect((await listPiModels()).map((m) => m.id)).toEqual(["r/m"]);
+    resetPiModelsCacheForTests();
+    process.env.PAPERCLIP_PI_PROVIDERS = "not json";
+    await expect(listPiModels()).resolves.toEqual([]);
   });
 });

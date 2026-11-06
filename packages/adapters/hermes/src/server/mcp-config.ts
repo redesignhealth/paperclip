@@ -5,8 +5,17 @@ import dotenv from "dotenv";
 import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import {
+  type MemoryHardeningFlags,
+  resolveEffectiveMemoryHardeningFlags,
+} from "@paperclipai/adapter-utils/server-utils";
 import { resolveHostHermesDir, resolveHostHermesSkillsDir } from "./skills.js";
-import { type ValidatedHermesMemoryConfig, serializeMem0Json, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
+import {
+  type ValidatedHermesMemoryConfig,
+  serializeMem0Json,
+  generateHermesMemoryYaml,
+  MAX_CONFIG_STRING_LENGTH,
+} from "./memory-config.js";
 
 export interface HermesMcpServerConfig {
   url: string;
@@ -38,6 +47,7 @@ export interface PrepareHermesMcpHomeOptions {
    * the Router key only reaches Hermes's built-in Router endpoint.
    */
   canonicalRouterEndpoint?: boolean;
+  flags?: MemoryHardeningFlags;
   onWarning?: (msg: string) => void;
 }
 
@@ -57,11 +67,30 @@ export interface PreparedHermesMcpHome {
 /**
  * Hermes >= 0.21 defers MCP tools behind a `tool_search` bridge by default (`auto`), so governed
  * tools are not direct turn-1 schema entries. Paperclip already supplies a finite per-agent
- * allowlist, so isolated profiles force direct exposure (`mcp__<server>__<tool>`) for first-turn
- * reliability and auditability. Quoted string, not a bare `off`, which YAML 1.1 parsers read as
- * boolean false.
+ * allowlist, so isolated profiles with a small allowlist force direct exposure
+ * (`mcp__<server>__<tool>`) for first-turn reliability and auditability (see
+ * `resolveHermesToolSearchSetting` for large allowlists). Quoted string, not a bare `off`, which
+ * YAML 1.1 parsers read as boolean false.
  */
 export const HERMES_TOOL_SEARCH_SETTING = "off";
+
+/**
+ * Direct exposure sends every allowlisted tool schema on every request, and compaction cannot
+ * shrink that fixed cost. At ~250 tools it is ~220K tokens, above Hermes's compaction trigger
+ * (50% of a 256K window), so the run recompacts without ever getting under the threshold
+ * (TECH-8184). Above this many allowlisted tools, leave the bridge on (`auto`): Hermes then
+ * sends `tool_search`/`tool_describe`/`tool_call` plus a short manifest and loads schemas on
+ * demand. The allowlist still bounds what the bridge can reach (`tools.include` is applied at
+ * discovery, and the preflight requires the server to list exactly the allowlist).
+ */
+export const HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS = 40;
+export const HERMES_TOOL_SEARCH_BRIDGE_SETTING = "auto";
+
+export function resolveHermesToolSearchSetting(allowlistedToolCount: number): string {
+  return allowlistedToolCount > HERMES_TOOL_SEARCH_DIRECT_MAX_TOOLS
+    ? HERMES_TOOL_SEARCH_BRIDGE_SETTING
+    : HERMES_TOOL_SEARCH_SETTING;
+}
 
 /**
  * Closed allowlist of top-level keys in host `config.yaml` permitted to be inherited
@@ -398,6 +427,7 @@ export function serializeHermesMcpYaml(
   mcpServers: Record<string, HermesMcpServerConfig>,
   inheritedHostYaml = "",
   hasMemory = false,
+  flags?: MemoryHardeningFlags,
 ): string {
   const lines: string[] = [];
 
@@ -408,17 +438,20 @@ export function serializeHermesMcpYaml(
   }
 
   if (hasMemory) {
-    lines.push("memory:");
-    lines.push("  provider: mem0");
+    lines.push(generateHermesMemoryYaml(flags).trimEnd());
     lines.push("");
   }
 
   if (Object.keys(mcpServers).length > 0) {
     // Emitted by Paperclip only (host `tools` is never inherited, see ALLOWED_HOST_CONFIG_KEYS),
-    // so a host config cannot re-enable the tool_search bridge.
+    // so a host config cannot change the tool_search mode.
+    const allowlistedToolCount = Object.values(mcpServers).reduce(
+      (total, server) => total + server.tools.include.length,
+      0,
+    );
     lines.push("tools:");
     lines.push("  tool_search:");
-    lines.push(`    enabled: ${JSON.stringify(HERMES_TOOL_SEARCH_SETTING)}`);
+    lines.push(`    enabled: ${JSON.stringify(resolveHermesToolSearchSetting(allowlistedToolCount))}`);
     lines.push("");
     lines.push("mcp_servers:");
     for (const [key, server] of Object.entries(mcpServers)) {
@@ -883,19 +916,24 @@ export async function prepareHermesMcpHome(
       }
     }
 
+    const hardeningFlags = options.flags ?? resolveEffectiveMemoryHardeningFlags(
+      process.env,
+      (options.config?.env as Record<string, string | undefined>) ?? undefined,
+    );
+
     const configPath = path.join(homeDir, "config.yaml");
     const envPath = path.join(homeDir, ".env");
     let mem0JsonPath: string | undefined;
 
     if (memory) {
       mem0JsonPath = path.join(homeDir, "mem0.json");
-      const mem0Content = serializeMem0Json(memory);
+      const mem0Content = serializeMem0Json(memory, hardeningFlags);
       await fs.writeFile(mem0JsonPath, mem0Content, { mode: 0o600 });
       // Explicit hard fail on mem0.json chmod; failures abort and trigger cleanup in catch
       await fs.chmod(mem0JsonPath, 0o600);
     }
 
-    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml, Boolean(memory));
+    const yamlContent = serializeHermesMcpYaml(mcpServers, inheritedHostYaml, Boolean(memory), hardeningFlags);
     await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
     // Explicit hard fail on configPath chmod; failures abort and trigger cleanup in catch
     await fs.chmod(configPath, 0o600);

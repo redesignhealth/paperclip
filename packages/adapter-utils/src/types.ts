@@ -224,7 +224,7 @@ export interface AdapterRuntimeMcpAccess {
 export interface AdapterMem0PgvectorRuntimeMemoryConfig {
   readonly provider: "mem0";
   readonly mode: "oss";
-  readonly userId: "company";
+  readonly userId: string;
   readonly agentId: string;
   readonly llm: {
     readonly provider: "openai" | "ollama";

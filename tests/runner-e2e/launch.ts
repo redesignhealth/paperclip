@@ -10,6 +10,7 @@ import { createWriteStream } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   access,
   chmod,
@@ -38,6 +39,7 @@ import {
 import { assertEmbeddedDatabaseIsolation } from "./instance-isolation.js";
 import {
   assertSecretFree,
+  childSecretValues,
   findSecretLeakInDirectory,
   isEphemeralCodexRuntimeAuthFile,
   isEphemeralPostgresScanFile,
@@ -57,7 +59,11 @@ import {
   type MatrixExecution,
   type RunnerE2EResult,
 } from "./types.js";
-import { assertRemoteNativeEvidencePrerequisites, assertRunnerE2EPrerequisites } from "./prerequisites.js";
+import {
+  assertRemoteNativeEvidencePrerequisites,
+  assertRunnerE2EPrerequisites,
+  assertMemoryRecallPrerequisites,
+} from "./prerequisites.js";
 import { assertNativeCompletionSelection, prepareNativeCompletionPreflight, NATIVE_COMPLETION_PREFLIGHT_ENV } from "./native-completion-admission.js";
 import { assertNativeInstructionSelection, prepareNativeInstructionPreflight, NATIVE_INSTRUCTION_PREFLIGHT_ENV, NATIVE_INSTRUCTION_SUITE } from "./native-instruction-consolidation.js";
 import { prepareStockHarnessPreflight, STOCK_PREFLIGHT_ENV } from "./stock-harness-admission.js";
@@ -200,8 +206,11 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-async function loadLocalEnvironment(target: NodeJS.ProcessEnv) {
-  const contents = await readFile(localEnvPath, "utf8").catch(
+export async function loadLocalEnvironment(
+  target: NodeJS.ProcessEnv,
+  envPath = localEnvPath,
+) {
+  const contents = await readFile(envPath, "utf8").catch(
     (error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return null;
       throw error;
@@ -214,7 +223,7 @@ async function loadLocalEnvironment(target: NodeJS.ProcessEnv) {
     const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
     if (!match)
       throw new Error(
-        `Invalid ${path.basename(localEnvPath)} line ${index + 1}`,
+        `Invalid ${path.basename(envPath)} line ${index + 1}`,
       );
     if (target[match[1]] !== undefined) continue;
     let value = match[2].trim();
@@ -462,6 +471,73 @@ async function copySharedEvidence(privateRoot: string, casePrivateDir: string) {
   }
 }
 
+export function hasMemoryRecallExecution(
+  executions: readonly MatrixExecution[],
+): boolean {
+  return executions.some(
+    (candidate) =>
+      candidate.suite.id === "memory-recall" || candidate.task.flow === "memory_recall",
+  );
+}
+
+export function prepareAttemptChildEnvironment(
+  childEnv: NodeJS.ProcessEnv,
+  hasMemoryRecall: boolean,
+): NodeJS.ProcessEnv {
+  delete childEnv.DATABASE_URL;
+  delete childEnv.DATABASE_MIGRATION_URL;
+  if (!hasMemoryRecall) {
+    delete childEnv.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL;
+  }
+  return childEnv;
+}
+
+export function attemptSecretSources(
+  env: NodeJS.ProcessEnv = process.env,
+  generatedSecrets:
+    | {
+        agentJwtSecret?: string;
+        decisionSigningSecret?: string;
+        toolActionSigningSecret?: string;
+        betterAuthSecret?: string;
+      }
+    | Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  return {
+    ...Object.fromEntries(CREDENTIAL_NAMES.map((name) => [name, env[name]])),
+    ...generatedSecrets,
+    ...(env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL
+      ? { PAPERCLIP_MEMORY_ADMIN_DATABASE_URL: env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL }
+      : {}),
+  };
+}
+
+export function attemptSecretValues(
+  env: NodeJS.ProcessEnv = process.env,
+  executions: readonly MatrixExecution[] = [],
+  generatedSecrets:
+    | readonly (string | undefined | null)[]
+    | Record<string, string | undefined | null> = [],
+): string[] {
+  const extra = Array.isArray(generatedSecrets)
+    ? generatedSecrets
+    : Object.values(generatedSecrets);
+  return childSecretValues(
+    CREDENTIAL_NAMES.map((name) => env[name]),
+    env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
+    extra,
+  );
+}
+
+export function campaignSecretValues(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  return childSecretValues(
+    CREDENTIAL_NAMES.map((name) => env[name]),
+    env.PAPERCLIP_MEMORY_ADMIN_DATABASE_URL,
+  );
+}
+
 async function runAttempt(input: {
   executions: readonly MatrixExecution[];
   attempt: number;
@@ -523,14 +599,18 @@ async function runAttempt(input: {
     const decisionSigningSecret = secret(48);
     const toolActionSigningSecret = secret(48);
     const betterAuthSecret = secret(48);
-    const credentialSources = {
-      ...Object.fromEntries(CREDENTIAL_NAMES.map((name) => [name, process.env[name]])),
+    const hasMemoryRecall = hasMemoryRecallExecution(executions);
+    const credentialSources = attemptSecretSources(process.env, {
       PAPERCLIP_AGENT_JWT_SECRET: agentJwtSecret,
       PAPERCLIP_DECISION_SIGNING_SECRET: decisionSigningSecret,
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
       BETTER_AUTH_SECRET: betterAuthSecret,
-    };
-    const credentials = normalizedSecrets(Object.values(credentialSources));
+    });
+    const credentials = attemptSecretValues(
+      process.env,
+      executions,
+      credentialSources,
+    );
     attemptSecrets = credentials;
     if (installedCli) await writeFile(path.join(privateDir, "installed-cli-admission.json"), `${JSON.stringify(installedCli, null, 2)}\n`, { mode: 0o600 });
     if (installedPlugin) await writeFile(path.join(privateDir, "installed-daytona-plugin-admission.json"), `${JSON.stringify(installedPlugin, null, 2)}\n`, { mode: 0o600 });
@@ -577,8 +657,8 @@ async function runAttempt(input: {
     };
     // The database URLs are stripped here and again at the Playwright web-server
     // boundary so a developer's shell can never redirect this paid test.
-    delete childEnv.DATABASE_URL;
-    delete childEnv.DATABASE_MIGRATION_URL;
+    // Privileged admin DSN is deleted unless memory-recall is actively selected.
+    prepareAttemptChildEnvironment(childEnv, hasMemoryRecall);
 
     const playwrightArgs = [
       "test",
@@ -1035,6 +1115,7 @@ async function main() {
   }
 
   await loadLocalEnvironment(process.env);
+  assertMemoryRecallPrerequisites(executions, process.env);
   assertRemoteNativeEvidencePrerequisites(executions, process.env);
   const missingCredentials = [
     ...new Set(
@@ -1092,9 +1173,7 @@ async function main() {
     expected: executions.map((execution) => execution.id),
     results: finalResults,
   });
-  const campaignSecrets = normalizedSecrets(
-    CREDENTIAL_NAMES.map((name) => process.env[name]),
-  );
+  const campaignSecrets = campaignSecretValues(process.env);
   const safeCampaign = sanitizeJson(
     campaign,
     campaignSecrets,
@@ -1136,7 +1215,24 @@ async function main() {
   if (safeCampaign.failed > 0) process.exitCode = 1;
 }
 
-await main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+function isMainScript(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    const scriptPath = path.resolve(process.argv[1]);
+    const modulePath = fileURLToPath(import.meta.url);
+    if (scriptPath === modulePath) return true;
+    return (
+      scriptPath.endsWith("tests/runner-e2e/launch.ts") ||
+      scriptPath.endsWith("tests/runner-e2e/launch.js")
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isMainScript()) {
+  await main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

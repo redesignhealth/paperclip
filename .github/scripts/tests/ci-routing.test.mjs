@@ -241,7 +241,7 @@ const routeCases = [
   ["malformed commit SHA", { EVENT_HEAD_SHA: "invalid" }],
 ];
 
-for (const [name, env, expected = "ubuntu-latest"] of routeCases) {
+for (const [name, env, expected = "ubuntu-24.04"] of routeCases) {
   test(`runner decision: ${name}`, () => {
     assert.equal(executeStep("Validate PR identity and select runner", env).runner, expected);
   });

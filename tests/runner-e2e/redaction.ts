@@ -14,8 +14,14 @@ const SECRET_SHAPES = [
 const SENSITIVE_JSON_KEY =
   /^(?:api[-_]?key|access[-_]?token|refresh[-_]?token|auth(?:orization)?|bearer|client[-_]?secret|cookie|password|secret|token)$/i;
 
-const SAFE_SECRET_SOURCES = new Set<string>([...CREDENTIAL_NAMES, "PAPERCLIP_AGENT_JWT_SECRET",
-  "PAPERCLIP_DECISION_SIGNING_SECRET", "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "BETTER_AUTH_SECRET"]);
+const SAFE_SECRET_SOURCES = new Set<string>([
+  ...CREDENTIAL_NAMES,
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
+  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_MEMORY_ADMIN_DATABASE_URL",
+]);
 // Credential dictionaries can have account identities as keys. Only known
 // schema fields, never arbitrary JSON keys, may become diagnostic labels.
 const SAFE_SECRET_FIELDS = new Set(["tokens", "account_id", "access_token", "refresh_token", "id_token", "token",
@@ -48,9 +54,73 @@ function secretEntries(value: string | undefined): Array<{ value: string; fieldP
   return entries;
 }
 
-export function normalizedSecrets(values: readonly (string | undefined)[]) {
-  return [...new Set(values.flatMap(value => secretEntries(value).map(entry => entry.value)))].sort((left, right) => right.length - left.length);
+export function extractDsnSecrets(dsn: string | undefined): string[] {
+  if (!dsn || typeof dsn !== "string") return [];
+  const trimmed = dsn.trim();
+  if (!trimmed) return [];
+  const secrets = new Set<string>();
+
+  const addCandidate = (val: string | undefined) => {
+    if (!val || val.length < 4) return;
+    secrets.add(val);
+    try {
+      const decoded = decodeURIComponent(val);
+      if (decoded && decoded.length >= 4) {
+        secrets.add(decoded);
+      }
+    } catch {
+      // ignore URI decode error
+    }
+  };
+
+  try {
+    const parsedUrl = new URL(trimmed);
+    if (parsedUrl.password) {
+      addCandidate(parsedUrl.password);
+    }
+  } catch {
+    // Robust fallback for non-standard DSNs:
+    // Extract authority between '://' and first '/' (or end), then find password before last '@'
+    const schemeEnd = trimmed.indexOf("://");
+    const afterScheme = schemeEnd >= 0 ? trimmed.slice(schemeEnd + 3) : trimmed;
+    const pathStart = afterScheme.indexOf("/");
+    const authority = pathStart >= 0 ? afterScheme.slice(0, pathStart) : afterScheme;
+    const lastAt = authority.lastIndexOf("@");
+    if (lastAt > 0) {
+      const userinfo = authority.slice(0, lastAt);
+      const colonIdx = userinfo.indexOf(":");
+      if (colonIdx >= 0) {
+        const password = userinfo.slice(colonIdx + 1);
+        addCandidate(password);
+      }
+    }
+  }
+
+  return [...secrets].filter((s) => s.length >= 4);
 }
+
+export function normalizedSecrets(values: readonly (string | undefined | null)[]) {
+  return [...new Set(values.flatMap(value => secretEntries(value ?? undefined).map(entry => entry.value)))].sort((left, right) => right.length - left.length);
+}
+
+export function childSecretValues(
+  credentials:
+    | readonly (string | undefined | null)[]
+    | Record<string, string | undefined | null>,
+  adminDsn?: string | null,
+  extra: readonly (string | undefined | null)[] = [],
+): string[] {
+  const creds = Array.isArray(credentials) ? credentials : Object.values(credentials);
+  const rawDsn = adminDsn?.trim() || undefined;
+  const dsnSecrets = extractDsnSecrets(rawDsn);
+  return normalizedSecrets([
+    ...creds,
+    rawDsn,
+    ...dsnSecrets,
+    ...extra,
+  ]);
+}
+export const buildChildSecrets = childSecretValues;
 
 export interface SecretScanOptions {
   includeShapes?: boolean;

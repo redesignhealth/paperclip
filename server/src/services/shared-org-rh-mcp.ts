@@ -18,6 +18,7 @@
  * credentials. An archived `rh-mcp-service` connection is an org opt-out and is never re-created. No token, secret
  * value, header or upstream text is ever logged or returned: outcomes carry closed reason codes only.
  */
+import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { agents, companies, companySecrets, toolCatalogEntries, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -122,7 +123,7 @@ async function obtainToken(
   companyId: string,
   ownerEmail: string,
 ): Promise<{ ok: true; token: string; expiresAt: string | null; rotated: boolean } | { ok: false; reason: "mint_failed" | "rotate_failed" }> {
-  const fetchImpl = ctx.fetchImpl ?? fetch;
+  const fetchImpl = ctx.fetchImpl ?? tailnetAwareFetch;
   const minted = await mintRhMcpServiceCredential(config, { companyId, ownerEmail }, fetchImpl);
   if (minted.ok) return { ok: true, token: minted.boardToken, expiresAt: minted.tokenExpiresAt, rotated: false };
   if (minted.reason !== "ownership_conflict") return { ok: false, reason: "mint_failed" };
@@ -292,7 +293,7 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
     const expiresAt = parseExpiry(connection.config);
     const now = ctx.now?.() ?? new Date();
     if (expiresAt && expiresAt.getTime() - now.getTime() < SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS) {
-      const rotated = await rotateRhMcpServiceCredential(provisioner.config, { companyId }, ctx.fetchImpl ?? fetch);
+      const rotated = await rotateRhMcpServiceCredential(provisioner.config, { companyId }, ctx.fetchImpl ?? tailnetAwareFetch);
       if (!rotated.ok) return { kind: "error", reason: "rotate_failed" };
       const secretId = connection.credentialSecretRefs?.[0]?.secretId;
       if (!secretId) return { kind: "error", reason: "secret_store_failed" };

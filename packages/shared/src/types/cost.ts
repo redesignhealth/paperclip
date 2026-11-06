@@ -216,3 +216,73 @@ export interface CostByProject {
   cachedInputTokens: number;
   outputTokens: number;
 }
+
+/** Reporting-only classification of how a ledger event's token usage was obtained.
+ * `unavailable` means a receipt exists but carries no usable usage (0/0 tokens, no
+ * provider request id, no usage payload). It is never evidence of zero consumption.
+ * `measured_zero` means 0 tokens with independent evidence: a provider request id, a
+ * non-empty per-model usage payload, or provider-reported/invoiced pricing provenance.
+ * This is a heuristic, not an exact count, and it errs in both directions: it can
+ * undercount real zeros for adapters that supply none of this evidence, and it can
+ * overstate a zero when a provider reports cost but no tokens. Do not read it as a bound. */
+export type UsageAvailability = "reported" | "estimated" | "unavailable" | "measured_zero";
+
+/** Billing kind is kept separate from availability so subscription and unknown
+ * billing are never folded into metered coverage. */
+export type UsageBillingKind = "metered" | "subscription" | "unknown";
+
+export interface UsageAvailabilityTotals {
+  eventCount: number;
+  /** Events with costStatus unpriced, excluding subscription_included. */
+  unpricedEventCount: number;
+  costCentsExact: string;
+  /** Includes cache writes, excludes cache reads (those are cachedInputTokens). */
+  inputTokens: number;
+  /** Cache reads only. */
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** inputTokens + cachedInputTokens + outputTokens; cache tokens are counted once. */
+  totalTokens: number;
+}
+
+export interface UsageAvailabilityByAdapter {
+  adapterType: string;
+  /** All receipt-backed events for this adapter. */
+  eventCount: number;
+  /** (reported + estimated) / eventCount. Null when there are no events. */
+  coverageRate: number | null;
+  availability: Record<UsageAvailability, UsageAvailabilityTotals>;
+  billingKindEventCounts: Record<UsageBillingKind, number>;
+}
+
+export interface UsageAvailabilityReport {
+  companyId: string;
+  /** Receipt-backed agent ledger events only. */
+  total: UsageAvailabilityTotals;
+  /** Distinct runs behind `total`. A multi-model run yields several events. */
+  receiptRunCount: number;
+  /** Independent sum of the same ledger rows; availability subtotals must equal it. */
+  ledgerCostCentsExact: string;
+  reconciled: boolean;
+  coverageRate: number | null;
+  availability: Record<UsageAvailability, UsageAvailabilityTotals>;
+  byAdapter: UsageAvailabilityByAdapter[];
+  /** Retained from the ledger, never recomputed. */
+  pricingProvenance: Array<{ source: string; eventCount: number; costCentsExact: string }>;
+  /** Terminal runs that owe a receipt (pending or v2-projected, provider work not ruled out)
+   * but have no ledger event. Excluded from every coverage rate above. */
+  runsWithoutReceipt: {
+    total: number;
+    /** Subset still waiting for accounting to settle (late receipt possible). */
+    pendingAccounting: number;
+    byAdapter: Array<{ adapterType: string; count: number }>;
+  };
+  /** Terminal runs with no event that owe none: runs from before receipts existed, and runs
+   * that failed before any provider work. Not data loss; excluded from every rate. */
+  runsNotOwedReceipt: {
+    total: number;
+    byAdapter: Array<{ adapterType: string; count: number }>;
+  };
+  /** Human-readable statement of the token field contract. */
+  tokenSemantics: string;
+}
