@@ -356,6 +356,54 @@ matching API-key or subscription credential.
 Never put credentials in `catalog.ts`, screenshots, fixture metadata, workflow
 inputs, or a tracked env file.
 
+## Memory recall and isolation suite (explicit only)
+
+The `memory-recall` suite evaluates Mem0 persistent memory, prompt guidance, cross-agent isolation boundaries, and heartbeat noise suppression on the Hermes agent adapter (`hermes_local`). Select `--suite memory-recall`; it is manual-only and excluded from `--all`.
+
+> **WARNING: THROWAWAY DATABASE INSTANCE ONLY**
+> `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` must point to a dedicated throwaway PostgreSQL instance (such as a local disposable Docker container), **never** a shared or production database.
+> The test harness provisions temporary tenant databases and drops them during teardown (`DROP DATABASE ...`, `DROP ROLE ...`). The drop guards only verify tenant naming regex format and exact equality with fixture-derived company names, which do not isolate a run from production by themselves. Real isolation strictly requires the operator to supply an isolated throwaway database instance.
+
+### Preconditions and Environment
+
+Executing this suite requires:
+- `PAPERCLIP_MEMORY_TENANT_ISOLATION_ENABLED=true`
+- `PAPERCLIP_MEMORY_COMPANY_SCOPE=all`
+- `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` pointing to an external throwaway PostgreSQL instance (never shared or production) with `sslmode=require` query parameter and the `vector` extension preinstalled in `template1`.
+- `PAPERCLIP_E2E_MEMORY_HERMES_MODEL` naming the model ID passed to Hermes via OpenRouter (e.g. `anthropic/claude-3.5-sonnet`).
+- `OPENROUTER_API_KEY` for Hermes LLM inference.
+- `OPENAI_API_KEY` for Mem0 vector embedding generation (`text-embedding-3-small`).
+- Hermes CLI installed locally with Mem0 runtime dependencies (`mem0ai`, `psycopg`, `psycopg-binary`).
+
+### Infrastructure and Cleanup
+
+- **Database**: Embedded PostgreSQL used by other local tests lacks TLS and pgvector, so an external pgvector PostgreSQL server is required.
+- **Tenant Isolation**: Each execution cell creates an isolated company, which lazily provisions a tenant database named `pcmem_<sha256(companyId)[0:32]>` with its own dedicated unprivileged role. During flow teardown, this tenant database is dropped cleanly.
+- **Admin DSN Forwarding & Redaction**: `PAPERCLIP_MEMORY_ADMIN_DATABASE_URL` is forwarded to child test runner processes only for batches executing the `memory-recall` suite; it is stripped from child environments for all other suites. Redaction covers the exact full DSN string as well as partial DSN secrets (the extracted password); arbitrary username and host fragments are not treated as independent secrets.
+- **Provider Spend**: Cells incur real external API billing on OpenRouter and OpenAI.
+
+### Hardening Flags and Blocked Lanes
+
+- **Implemented flags on this branch**: `hermes-memory-config`, `hermes-prompt-split`.
+- **Blocked pending future tickets**:
+  - `agent-scoped-mem0` is blocked pending TECH-8191.
+  - `capability-memory-guidance` is blocked pending TECH-8192.
+  Enabling either unimplemented token in `PAPERCLIP_MEMORY_HARDENING` causes preflight and grading to fail closed with an explicit error naming the token and ticket.
+
+### Live Validation Status
+
+Nothing has been validated live yet on this branch. To validate live:
+1. Start a throwaway PostgreSQL container with pgvector and TLS per `scripts/e2e-hosted-memory-local.sh:155-180`.
+2. Configure `.env.runner-e2e.local` with the admin DSN, model, and API keys.
+3. Run one cell with flags off:
+   ```bash
+   pnpm test:e2e:runner -- --id memory-recall.memory-hermes-local.local.save-then-fresh-recall-rep-1
+   ```
+4. Run with `PAPERCLIP_MEMORY_HARDENING=hermes-memory-config`:
+   ```bash
+   PAPERCLIP_MEMORY_HARDENING=hermes-memory-config pnpm test:e2e:runner -- --id memory-recall.memory-hermes-local.local.noise-rep-1
+   ```
+
 ## Local commands
 
 Install dependencies and Chromium once. Native local cells also need the local
