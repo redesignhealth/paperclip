@@ -70,18 +70,18 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
   }
 
   const parentDir = path.dirname(resolvedOutPath);
-  try {
-    if (existsSync(parentDir)) {
-      const realParentDir = realpathSync(parentDir);
-      const simulatedTargetPath = path.resolve(realParentDir, path.basename(resolvedOutPath));
-      if (isPathInside(simulatedTargetPath, repoRoot) || isPathInside(simulatedTargetPath, realRepoRoot)) {
-        throw new Error(
-          `Refusing to write output inside repository via symlinked parent (${resolvedOutPath}). Memory exports contain sensitive content. Use an external directory such as /tmp.`,
-        );
-      }
-    }
-  } catch (err) {
-    if (err instanceof Error && err.message.startsWith("Refusing to write")) throw err;
+  if (!existsSync(parentDir)) {
+    throw new Error(
+      `Parent directory does not exist: "${parentDir}". The output parent directory must exist prior to running the sampler.`,
+    );
+  }
+
+  const realParentDir = realpathSync(parentDir);
+  const simulatedTargetPath = path.resolve(realParentDir, path.basename(resolvedOutPath));
+  if (isPathInside(simulatedTargetPath, repoRoot) || isPathInside(simulatedTargetPath, realRepoRoot)) {
+    throw new Error(
+      `Refusing to write output inside repository via symlinked parent (${resolvedOutPath}). Memory exports contain sensitive content. Use an external directory such as /tmp.`,
+    );
   }
 
   return resolvedOutPath;
@@ -152,6 +152,7 @@ export type SampleOptions = {
   redactPrefixChars?: number;
   env?: NodeJS.ProcessEnv;
   repoRoot?: string;
+  onTransaction?: (tx: any) => Promise<void> | void;
 };
 
 export type SampleResult = {
@@ -159,6 +160,7 @@ export type SampleResult = {
   totalCount: number;
   sampleCount: number;
   agentBreakdown: Array<{ agent_id: string | null; count: number }>;
+  transactionReadOnly?: string;
 };
 
 export async function sampleMem0MemoryContent(options: SampleOptions): Promise<SampleResult> {
@@ -194,10 +196,20 @@ export async function sampleMem0MemoryContent(options: SampleOptions): Promise<S
       data: string | null;
       created_at: string | null;
     }> = [];
+    let transactionReadOnly: string | undefined;
 
     // Enforce read-only mode on the reserved transaction connection for all queries
     await db.transaction(async (tx) => {
       await tx.execute(sql`SET TRANSACTION READ ONLY;`);
+
+      const readOnlyRes = (await tx.execute<{ transaction_read_only: string }>(
+        sql`SHOW transaction_read_only;`,
+      )) as unknown as Array<{ transaction_read_only: string }>;
+      transactionReadOnly = readOnlyRes[0]?.transaction_read_only;
+
+      if (options.onTransaction) {
+        await options.onTransaction(tx);
+      }
 
       const whereClause = agentFilter
         ? sql`WHERE payload->>'agent_id' = ${agentFilter}`
@@ -293,6 +305,9 @@ export async function sampleMem0MemoryContent(options: SampleOptions): Promise<S
       samples: redactedSamples,
     };
 
+    // Re-verify output path and parent realpath immediately before exclusive file creation to avoid TOCTOU
+    validateOutputPath(resolvedOutPath, repoRoot);
+
     // Mode 0600 (owner read/write only) and flag wx (exclusive new file, avoid clobbering)
     await writeFile(resolvedOutPath, JSON.stringify(exportPayload, null, 2), {
       encoding: "utf8",
@@ -312,6 +327,7 @@ export async function sampleMem0MemoryContent(options: SampleOptions): Promise<S
       totalCount,
       sampleCount: redactedSamples.length,
       agentBreakdown: breakdownRows,
+      transactionReadOnly,
     };
   } finally {
     await db.$client.end({ timeout: 1 }).catch(() => {});

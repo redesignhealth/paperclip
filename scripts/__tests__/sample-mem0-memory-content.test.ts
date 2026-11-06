@@ -120,7 +120,7 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
     assert.ok(!secrets.includes("abc"));
   });
 
-  it("refuses output paths inside the repository worktree", () => {
+  it("refuses output paths inside the repository worktree, missing parents, and symlinked parents into the repo", () => {
     const repoRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
     // Relative inside repo
@@ -136,7 +136,31 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
       /Refusing to write output inside repository/,
     );
 
-    // Outside repo (/tmp or os.tmpdir)
+    // Missing parent directory rejected
+    const missingParentOut = path.join(
+      os.tmpdir(),
+      `nonexistent-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      "out.json",
+    );
+    assert.throws(
+      () => validateOutputPath(missingParentOut, repoRoot),
+      /Parent directory does not exist/,
+    );
+
+    // Parent directory that is a symlink into the repo rejected
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem0-symlink-test-"));
+    try {
+      const symlinkParent = path.join(tmpDir, "repo-link");
+      fs.symlinkSync(repoRoot, symlinkParent, "dir");
+      assert.throws(
+        () => validateOutputPath(path.join(symlinkParent, "out.json"), repoRoot),
+        /Refusing to write output inside repository via symlinked parent/,
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    // Normal temp dir accepted
     const validOut = path.join(os.tmpdir(), `mem0-test-${Date.now()}.json`);
     const resolved = validateOutputPath(validOut, repoRoot);
     assert.equal(resolved, path.resolve(validOut));
@@ -233,7 +257,8 @@ describe("sample-mem0-memory-content integration test against fixture table", ()
 
       const testOutPath = path.join(os.tmpdir(), `mem0-e2e-out-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
 
-      // 1. Unscoped sampling (all agents)
+      // 1. Unscoped sampling (all agents) with transaction hook asserting read-only from inside sampler tx
+      let hookTxReadOnly: string | undefined;
       const result = await sampleMem0MemoryContent({
         outPath: testOutPath,
         limit: 10,
@@ -245,8 +270,16 @@ describe("sample-mem0-memory-content integration test against fixture table", ()
           ...process.env,
           TEST_SECRET_KEY: "secret_key_secret123",
         },
+        onTransaction: async (tx) => {
+          const check = (await tx.execute(sql`SHOW transaction_read_only;`)) as unknown as Array<{
+            transaction_read_only: string;
+          }>;
+          hookTxReadOnly = check[0]?.transaction_read_only;
+        },
       });
 
+      assert.equal(hookTxReadOnly, "on");
+      assert.equal(result.transactionReadOnly, "on");
       assert.equal(result.totalCount, 4);
       assert.equal(result.sampleCount, 4);
       assert.ok(fs.existsSync(testOutPath));
@@ -322,19 +355,31 @@ describe("sample-mem0-memory-content integration test against fixture table", ()
 
       fs.unlinkSync(agentOutPath);
 
-      // 4. Verify read-only transaction blocks writes on the reserved connection
+      // 4. Verify read-only transaction from inside the sampler's actual transaction:
+      // an attempted mutation inside the sampler's transaction fails closed.
+      const rejectOutPath = path.join(
+        os.tmpdir(),
+        `mem0-reject-out-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+      );
       await assert.rejects(
-        async () => {
-          await db.transaction(async (tx) => {
-            await tx.execute(sql`SET TRANSACTION READ ONLY;`);
-            await tx.execute(sql`INSERT INTO mem0_memories (id, vector, payload) VALUES ('mem-fail', '[]', '{}'::jsonb);`);
-          });
-        },
+        () =>
+          sampleMem0MemoryContent({
+            outPath: rejectOutPath,
+            limit: 5,
+            databaseUrl: fixture.connectionString,
+            tableName: "mem0_memories",
+            onTransaction: async (tx) => {
+              await tx.execute(
+                sql`INSERT INTO mem0_memories (id, vector, payload) VALUES ('mem-fail', '[]', '{}'::jsonb);`,
+              );
+            },
+          }),
         (err: any) => {
           const msg = `${err?.message ?? ""} ${err?.cause?.message ?? ""}`;
           return msg.includes("cannot execute INSERT in a read-only transaction");
         },
       );
+      assert.ok(!fs.existsSync(rejectOutPath), "output file must not be created when transaction fails");
     } finally {
       await db.$client.end({ timeout: 1 }).catch(() => {});
       await fixture.cleanup();
