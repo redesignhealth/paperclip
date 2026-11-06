@@ -116,7 +116,10 @@ export function redactSampleData(
   return `[REDACTED_${prefixLength}_CHARS]${scrubbed.slice(prefixLength)}`;
 }
 
-export function collectEnvironmentSecrets(env: NodeJS.ProcessEnv = process.env): string[] {
+export function collectEnvironmentSecrets(
+  env: NodeJS.ProcessEnv = process.env,
+  databaseUrl?: string,
+): string[] {
   const secrets = new Set<string>();
 
   for (const [key, value] of Object.entries(env)) {
@@ -132,11 +135,27 @@ export function collectEnvironmentSecrets(env: NodeJS.ProcessEnv = process.env):
       try {
         const parsed = new URL(value);
         if (parsed.password) {
-          secrets.add(decodeURIComponent(parsed.password));
+          const decoded = decodeURIComponent(parsed.password);
+          if (decoded.length >= 4) secrets.add(decoded);
+          if (parsed.password.length >= 4) secrets.add(parsed.password);
         }
       } catch {
         // Not a standard parseable URL, ignore parse failure
       }
+    }
+  }
+
+  // Also collect the password component directly from the provided database URL (e.g. from CLI options)
+  if (databaseUrl) {
+    try {
+      const parsed = new URL(databaseUrl);
+      if (parsed.password) {
+        const decoded = decodeURIComponent(parsed.password);
+        if (decoded.length >= 4) secrets.add(decoded);
+        if (parsed.password.length >= 4) secrets.add(parsed.password);
+      }
+    } catch {
+      // Not a standard parseable URL, ignore parse failure
     }
   }
 
@@ -278,10 +297,10 @@ export async function sampleMem0MemoryContent(options: SampleOptions): Promise<S
       console.log(`  - ${row.agent_id}: ${row.count}`);
     }
 
-    const envSecrets = collectEnvironmentSecrets(env);
+    const scrubSecrets = collectEnvironmentSecrets(env, databaseUrl);
     const redactedSamples = sampleRows.map((row) => {
       const rawData = String(row.data ?? "");
-      const redacted = redactSampleData(rawData, envSecrets, redactPrefixChars);
+      const redacted = redactSampleData(rawData, scrubSecrets, redactPrefixChars);
       return {
         id: row.id,
         agentId: row.agent_id,

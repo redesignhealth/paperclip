@@ -25,6 +25,21 @@ import {
 const require = createRequire(new URL("../../packages/db/package.json", import.meta.url));
 const { sql } = require("drizzle-orm");
 
+export function handleEmbeddedPostgresUnsupported(
+  support: { supported: boolean; reason?: string },
+  t?: { skip: (reason?: string) => void },
+  ciEnv: string | undefined = process.env.CI,
+): void {
+  if (support.supported) return;
+  const reason = support.reason ?? "embedded Postgres not supported";
+  if (ciEnv === "true" || ciEnv === "1") {
+    throw new Error(`Embedded Postgres is required in CI but not supported: ${reason}`);
+  }
+  if (t && typeof t.skip === "function") {
+    t.skip(reason);
+  }
+}
+
 describe("sample-mem0-memory-content unit & contract tests", () => {
   it("parses CLI flags correctly", () => {
     const argv = ["node", "script.js", "--out", "/tmp/out.json", "--limit", "25", "--table", "custom_table"];
@@ -118,6 +133,56 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
     assert.ok(secrets.includes("company_db_secret"));
     assert.ok(!secrets.includes("https://example.com/api"));
     assert.ok(!secrets.includes("abc"));
+
+    // Also extracts decoded password directly from databaseUrl even when not in env
+    const secretsWithCliUrl = collectEnvironmentSecrets(
+      {},
+      "postgres://tenant:cli_only_db_pass%21@localhost:5432/mem",
+    );
+    assert.ok(secretsWithCliUrl.includes("cli_only_db_pass!"));
+  });
+
+  it("handles embedded postgres unsupported environments by failing in CI and skipping locally", () => {
+    // 1. When supported, does nothing
+    assert.doesNotThrow(() => {
+      handleEmbeddedPostgresUnsupported({ supported: true }, undefined, "true");
+    });
+
+    // 2. When unsupported and CI=true (or 1), throws
+    assert.throws(
+      () =>
+        handleEmbeddedPostgresUnsupported(
+          { supported: false, reason: "missing binary" },
+          undefined,
+          "true",
+        ),
+      /Embedded Postgres is required in CI but not supported: missing binary/,
+    );
+    assert.throws(
+      () =>
+        handleEmbeddedPostgresUnsupported(
+          { supported: false, reason: "missing binary" },
+          undefined,
+          "1",
+        ),
+      /Embedded Postgres is required in CI but not supported: missing binary/,
+    );
+
+    // 3. When unsupported and not CI, calls t.skip
+    let skippedReason: string | undefined;
+    const mockT = {
+      skip: (reason?: string) => {
+        skippedReason = reason;
+      },
+    };
+    assert.doesNotThrow(() => {
+      handleEmbeddedPostgresUnsupported(
+        { supported: false, reason: "local missing binary" },
+        mockT,
+        undefined,
+      );
+    });
+    assert.equal(skippedReason, "local missing binary");
   });
 
   it("refuses output paths inside the repository worktree, missing parents, and symlinked parents into the repo", () => {
@@ -225,10 +290,10 @@ describe("sample-mem0-memory-content unit & contract tests", () => {
 });
 
 describe("sample-mem0-memory-content integration test against fixture table", () => {
-  it("queries real Mem0 table shape, respects read-only transaction, orders by payload created_at, applies agent filter, and cleans up connection", async () => {
+  it("queries real Mem0 table shape, respects read-only transaction, orders by payload created_at, applies agent filter, and cleans up connection", async (t) => {
     const support = await getEmbeddedPostgresTestSupport();
     if (!support.supported) {
-      console.warn("Embedded Postgres not supported in this environment; skipping integration test");
+      handleEmbeddedPostgresUnsupported(support, t);
       return;
     }
 
@@ -246,30 +311,49 @@ describe("sample-mem0-memory-content integration test against fixture table", ()
         );
       `);
 
+      // Create dedicated user with custom password to verify that options.databaseUrl
+      // password component is collected into scrub secrets and redacted, even when not in env.
+      await db.execute(sql`CREATE USER test_cli_user WITH PASSWORD 'cli_direct_pass!@#456';`);
+      await db.execute(sql`GRANT USAGE ON SCHEMA public TO test_cli_user;`);
+      await db.execute(sql`GRANT SELECT ON mem0_memories TO test_cli_user;`);
+
       // Seed test memories
       await db.execute(sql`
         INSERT INTO mem0_memories (id, vector, payload) VALUES
         ('mem-1', '[]', '{"agent_id": "agent-alpha", "user_id": "company", "data": "Alpha note 1 with secret_key_secret123", "created_at": "2026-11-05T10:00:00.000Z"}'::jsonb),
-        ('mem-2', '[]', '{"agent_id": "agent-alpha", "user_id": "company", "data": "Alpha note 2 newest entry", "created_at": "2026-11-05T12:00:00.000Z"}'::jsonb),
+        ('mem-2', '[]', '{"agent_id": "agent-alpha", "user_id": "company", "data": "Alpha note 2 newest entry with cli_direct_pass!@#456", "created_at": "2026-11-05T12:00:00.000Z"}'::jsonb),
         ('mem-3', '[]', '{"agent_id": "agent-beta", "user_id": "company", "data": "Beta note middle entry", "created_at": "2026-11-05T11:00:00.000Z"}'::jsonb),
         ('mem-4', '[]', '{"agent_id": null, "user_id": "company", "data": "Unassigned note without timestamp", "created_at": null}'::jsonb);
       `);
 
       const testOutPath = path.join(os.tmpdir(), `mem0-e2e-out-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
 
+      // Build databaseUrl with encoded password supplied directly to options, not present in env
+      const directDbUrl = new URL(fixture.connectionString);
+      directDbUrl.username = "test_cli_user";
+      directDbUrl.password = encodeURIComponent("cli_direct_pass!@#456");
+      const directDatabaseUrl = directDbUrl.toString();
+
+      const testEnv = {
+        ...process.env,
+        TEST_SECRET_KEY: "secret_key_secret123",
+      };
+      assert.ok(
+        !Object.values(testEnv).some(
+          (val) => typeof val === "string" && val.includes("cli_direct_pass!@#456"),
+        ),
+      );
+
       // 1. Unscoped sampling (all agents) with transaction hook asserting read-only from inside sampler tx
       let hookTxReadOnly: string | undefined;
       const result = await sampleMem0MemoryContent({
         outPath: testOutPath,
         limit: 10,
-        databaseUrl: fixture.connectionString,
+        databaseUrl: directDatabaseUrl,
         tableName: "mem0_memories",
         agentFilter: null,
         redactPrefixChars: 16,
-        env: {
-          ...process.env,
-          TEST_SECRET_KEY: "secret_key_secret123",
-        },
+        env: testEnv,
         onTransaction: async (tx) => {
           const check = (await tx.execute(sql`SHOW transaction_read_only;`)) as unknown as Array<{
             transaction_read_only: string;
@@ -318,6 +402,11 @@ describe("sample-mem0-memory-content integration test against fixture table", ()
       // Redaction check on mem-1: secret_key_secret123 scrubbed and prefix masked
       assert.ok(!content.samples[2].dataRedacted.includes("secret_key_secret123"));
       assert.ok(content.samples[2].dataRedacted.startsWith("[REDACTED_16_CHARS]"));
+
+      // Redaction check on mem-2: direct options.databaseUrl decoded password scrubbed even when not in env
+      assert.ok(!content.samples[0].dataRedacted.includes("cli_direct_pass!@#456"));
+      assert.ok(content.samples[0].dataRedacted.includes("***REDACTED***"));
+      assert.ok(content.samples[0].dataRedacted.startsWith("[REDACTED_16_CHARS]"));
 
       // 2. Exclusive creation: writing again to testOutPath must fail with EEXIST (wx flag)
       await assert.rejects(
