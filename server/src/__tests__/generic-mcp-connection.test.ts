@@ -693,7 +693,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     const gateway = createToolGatewayService(db, { toolActionSigningSecret: "notebook-mcp-fixture" });
     const named = await gateway.createNamedGateway({ companyId: company.id, body: { name: "Notebook MCP", profileId: profile!.id, agentId: agent!.id, issueId: issue!.id } });
     const token = await gateway.createNamedGatewayToken({ companyId: company.id, gatewayId: named.id, body: { name: "Notebook run", subjectType: "heartbeat_run", subjectId: run!.id } });
-    const descriptors = await gateway.listToolsForNamedGateway({ gatewayPublicId: named.gatewayPublicId, bearerToken: token.token });
+    const { tools: descriptors } = await gateway.listToolsForNamedGateway({ gatewayPublicId: named.gatewayPublicId, bearerToken: token.token });
     const publish = descriptors.find(tool => tool.upstreamToolName === "notebook_publish")!;
     const share = descriptors.find(tool => tool.upstreamToolName === "notebook_set_sharing")!;
     expect(descriptors.some(tool => tool.upstreamToolName === "notebook_delete_page")).toBe(false);
