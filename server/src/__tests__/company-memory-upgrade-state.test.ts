@@ -350,6 +350,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     expect(lapsed?.recoverToState).toBe("draining");
     expect(lapsed?.leaseToken).toBeNull();
     expect(lapsed?.leaseOwner).toBeNull();
+    expect(lapsed?.lastError).toBe("lease_lapsed");
 
     // reconcileLapsedUpgradeLeases is idempotent
     const reconciledCount = await reconcileLapsedUpgradeLeases(db, {
@@ -596,5 +597,73 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
         code: "INVALID_STATE",
       }),
     );
+  });
+
+  it("enforces bounded machine reason codes for lastError and rejects arbitrary strings or secrets", async () => {
+    const company = await createTestCompany();
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "error-test-worker",
+      ttlMs: 60_000,
+    });
+    expect(claim.acquired).toBe(true);
+
+    // 1. advanceState rejects raw error with DSN/secret
+    await expect(
+      advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted", {
+        lastError: "Connection failed to postgres://user:secret@db.internal:5432/corp and leaked memory: confidential data" as any,
+      }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // 2. advanceState accepts valid machine reason code from vocabulary
+    const advanced = await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted", {
+      lastError: "aborted_by_operator",
+    });
+    expect(advanced.state).toBe("aborted");
+    expect(advanced.lastError).toBe("aborted_by_operator");
+
+    // 3. updateUpgradeCounters rejects raw string and accepts valid machine code
+    const upgrade2 = await openUpgrade(db, {
+      companyId: (await createTestCompany("Co Err", "CE")).id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim2 = await claimUpgradeLease(db, {
+      upgradeId: upgrade2.id,
+      leaseOwner: "error-test-worker-2",
+      ttlMs: 60_000,
+    });
+
+    await expect(
+      updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
+        lastError: "SyntaxError: Unexpected token < in JSON at position 0" as any,
+      }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    const updatedCounters = await updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
+      lastError: "conversion_failed",
+    });
+    expect(updatedCounters.lastError).toBe("conversion_failed");
   });
 });

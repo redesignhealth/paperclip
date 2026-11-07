@@ -5,15 +5,32 @@ import {
   type UpgradeState,
 } from "@paperclipai/db";
 import { and, eq, gt, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
-import type {
-  ClaimLeaseParams,
-  ClaimLeaseResult,
-  Clock,
-  CompanyMemoryUpgradeRow,
-  LeaseHeartbeatHandle,
-  OpenUpgradeParams,
-  UpdateCountersParams,
+import {
+  UPGRADE_ERROR_CODES,
+  type ClaimLeaseParams,
+  type ClaimLeaseResult,
+  type Clock,
+  type CompanyMemoryUpgradeRow,
+  type LeaseHeartbeatHandle,
+  type OpenUpgradeParams,
+  type UpdateCountersParams,
+  type UpgradeErrorCode,
 } from "./types.js";
+
+export { UPGRADE_ERROR_CODES, type UpgradeErrorCode } from "./types.js";
+
+export function isUpgradeErrorCode(value: unknown): value is UpgradeErrorCode {
+  return typeof value === "string" && (UPGRADE_ERROR_CODES as readonly string[]).includes(value);
+}
+
+export function assertUpgradeErrorCode(value: unknown): asserts value is UpgradeErrorCode {
+  if (!isUpgradeErrorCode(value)) {
+    throw new CompanyMemoryUpgradeError(
+      `Invalid lastError reason code: "${value}". Must be a recognized UpgradeErrorCode`,
+      "INVALID_ARGUMENT",
+    );
+  }
+}
 
 export const DEFAULT_LEASE_TTL_MS = 600_000; // 10 minutes
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 120_000; // 2 minutes
@@ -334,10 +351,14 @@ export async function advanceState(
   to: UpgradeState,
   options?: {
     clock?: Clock;
-    lastError?: string | null;
+    lastError?: UpgradeErrorCode | null;
   },
 ): Promise<CompanyMemoryUpgradeRow> {
   assertValidTransition(from, to);
+
+  if (options?.lastError !== undefined && options.lastError !== null) {
+    assertUpgradeErrorCode(options.lastError);
+  }
 
   const now = options?.clock?.now() ?? new Date();
 
@@ -419,7 +440,7 @@ export async function failUpgradeLeaseLapse(
       leaseAcquiredAt: null,
       leaseExpiresAt: null,
       updatedAt: now,
-      lastError: "Lease lapsed during operation",
+      lastError: "lease_lapsed",
     })
     .where(
       and(
@@ -458,7 +479,7 @@ export async function reconcileLapsedUpgradeLeases(
       leaseAcquiredAt: null,
       leaseExpiresAt: null,
       updatedAt: now,
-      lastError: "Lease lapsed during operation",
+      lastError: "lease_lapsed",
     })
     .where(
       and(
@@ -676,6 +697,9 @@ export async function updateUpgradeCounters(
     setFields.completedAt = params.completedAt;
   }
   if (params.lastError !== undefined) {
+    if (params.lastError !== null) {
+      assertUpgradeErrorCode(params.lastError);
+    }
     setFields.lastError = params.lastError;
   }
 

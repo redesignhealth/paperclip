@@ -18,6 +18,27 @@ export const UPGRADE_LEDGER_OUTCOMES = [
 
 export type UpgradeLedgerOutcome = (typeof UPGRADE_LEDGER_OUTCOMES)[number];
 
+export const UPGRADE_ERROR_CODES = [
+  "lease_lapsed",
+  "lease_expired",
+  "lease_fenced_out",
+  "state_mismatch",
+  "migration_failed",
+  "schema_init_failed",
+  "source_read_failed",
+  "conversion_failed",
+  "embedding_failed",
+  "staging_write_failed",
+  "publish_failed",
+  "verification_failed",
+  "drain_timeout",
+  "rollback_failed",
+  "aborted_by_operator",
+  "unexpected_failure",
+] as const;
+
+export type UpgradeErrorCode = (typeof UPGRADE_ERROR_CODES)[number];
+
 export interface OpenUpgradeParams {
   companyId: string;
   converterId: string;
@@ -25,6 +46,7 @@ export interface OpenUpgradeParams {
   collectionName: string;
   embeddingModel: string;
   embeddingDimensions: number;
+  /** Operator-provided label for identification. Must not be used for raw errors or exception messages. */
   operatorLabel?: string | null;
 }
 
@@ -78,7 +100,7 @@ export interface UpdateCountersParams {
   rolledBackAt?: Date;
   completedAt?: Date;
 
-  lastError?: string | null;
+  lastError?: UpgradeErrorCode | null;
 }
 
 export interface Clock {
