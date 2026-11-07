@@ -44,7 +44,7 @@ export function isValidUuid(val: unknown): boolean {
 export function validateAndResolveTableIdentifier(
   tableName: string,
   sqlTag: typeof sql = sql,
-): { fragment: any; schema: string | null; bareTable: string } {
+): { fragment: any; schema: string | null; bareTable: string; regclassArg: string } {
   if (tableName.includes(".")) {
     const parts = tableName.split(".");
     if (parts.length !== 2 || !SAFE_IDENTIFIER_REGEX.test(parts[0]) || !SAFE_IDENTIFIER_REGEX.test(parts[1])) {
@@ -57,6 +57,7 @@ export function validateAndResolveTableIdentifier(
       fragment: sqlTag`${sqlTag.identifier(parts[0])}.${sqlTag.identifier(parts[1])}`,
       schema: parts[0],
       bareTable: parts[1],
+      regclassArg: `"${parts[0].replace(/"/g, '""')}"."${parts[1].replace(/"/g, '""')}"`,
     };
   }
 
@@ -71,6 +72,7 @@ export function validateAndResolveTableIdentifier(
     fragment: sqlTag`${sqlTag.identifier(tableName)}`,
     schema: null,
     bareTable: tableName,
+    regclassArg: `"${tableName.replace(/"/g, '""')}"`,
   };
 }
 
@@ -122,6 +124,208 @@ export function normalizeMemoryContent(text: string | null | undefined): string 
   return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+export interface CensusRowData {
+  id: string;
+  agent_id: string | null;
+  user_id: string | null;
+  data: string | null;
+  created_at: string | null;
+}
+
+export interface AgentTracking {
+  total: number;
+  noise: number;
+  textHashMap: Map<string, number>; // textHash -> count for non-noise rows
+}
+
+export interface CensusAccumulator {
+  longThreshold: number;
+  totalScannedRows: number;
+  userMap: Map<string, number>;
+  agentMap: Map<string, number>;
+  agentTracking: Map<string, AgentTracking>;
+  missingOrBlankAgentIdCount: number;
+  nonUuidAgentIdCount: number;
+  createdAtHistogram: Record<string, number>;
+  charLengths: number[];
+  totalCharLength: number;
+  longerThanThresholdCount: number;
+  noiseCandidateCount: number;
+  sensitiveCandidateCount: number;
+  sensitiveFamilyBreakdown: Record<SensitiveFamilyName, number>;
+}
+
+export function createCensusAccumulator(longThreshold: number = 500): CensusAccumulator {
+  return {
+    longThreshold,
+    totalScannedRows: 0,
+    userMap: new Map(),
+    agentMap: new Map(),
+    agentTracking: new Map(),
+    missingOrBlankAgentIdCount: 0,
+    nonUuidAgentIdCount: 0,
+    createdAtHistogram: {},
+    charLengths: [],
+    totalCharLength: 0,
+    longerThanThresholdCount: 0,
+    noiseCandidateCount: 0,
+    sensitiveCandidateCount: 0,
+    sensitiveFamilyBreakdown: {
+      privateKey: 0,
+      bearerToken: 0,
+      apiKey: 0,
+      ssn: 0,
+      creditCard: 0,
+      passwordAssignment: 0,
+    },
+  };
+}
+
+export function accumulateCensusRow(acc: CensusAccumulator, row: CensusRowData): void {
+  acc.totalScannedRows++;
+
+  // User ID aggregation
+  const rawUserId = row.user_id ? row.user_id.trim() : "";
+  const userIdKey = rawUserId || "(none)";
+  acc.userMap.set(userIdKey, (acc.userMap.get(userIdKey) ?? 0) + 1);
+
+  // Agent ID aggregation & hygiene (lowercase + trim)
+  const rawAgentId = row.agent_id ? row.agent_id.trim().toLowerCase() : "";
+  const agentKey = rawAgentId || "(none)";
+  acc.agentMap.set(agentKey, (acc.agentMap.get(agentKey) ?? 0) + 1);
+
+  if (!rawAgentId) {
+    acc.missingOrBlankAgentIdCount++;
+  } else if (!isValidUuid(rawAgentId)) {
+    acc.nonUuidAgentIdCount++;
+  }
+
+  // Created at monthly histogram
+  const rawCreatedAt = row.created_at ? row.created_at.trim() : "";
+  let monthBucket = "unparseable";
+  if (rawCreatedAt) {
+    const parsedDate = new Date(rawCreatedAt);
+    if (!isNaN(parsedDate.getTime())) {
+      const yyyy = parsedDate.getUTCFullYear();
+      const mm = String(parsedDate.getUTCMonth() + 1).padStart(2, "0");
+      monthBucket = `${yyyy}-${mm}`;
+    }
+  }
+  acc.createdAtHistogram[monthBucket] = (acc.createdAtHistogram[monthBucket] ?? 0) + 1;
+
+  // Memory text length & noise & duplicates & sensitive
+  const memoryText = row.data ?? "";
+  const textLength = memoryText.length;
+  acc.charLengths.push(textLength);
+  acc.totalCharLength += textLength;
+  if (textLength > acc.longThreshold) {
+    acc.longerThanThresholdCount++;
+  }
+
+  // Agent-level tracking for noise and non-noise duplicates
+  let tracking = acc.agentTracking.get(agentKey);
+  if (!tracking) {
+    tracking = { total: 0, noise: 0, textHashMap: new Map() };
+    acc.agentTracking.set(agentKey, tracking);
+  }
+  tracking.total++;
+
+  // Deterministic noise
+  const isNoise = classifyMemoryNoise(memoryText);
+  if (isNoise) {
+    acc.noiseCandidateCount++;
+    tracking.noise++;
+  } else {
+    // Only NON-noise rows are tracked for duplicate surplus!
+    const normalized = normalizeMemoryContent(memoryText);
+    const textHash = createHash("sha256").update(normalized).digest("hex");
+    const prevCount = tracking.textHashMap.get(textHash) ?? 0;
+    tracking.textHashMap.set(textHash, prevCount + 1);
+  }
+
+  // Sensitive detection: count only!
+  const sensitiveRes = detectSensitiveFamilies(memoryText);
+  if (sensitiveRes.isSensitive) {
+    acc.sensitiveCandidateCount++;
+    for (const [fam, hit] of Object.entries(sensitiveRes.matches) as Array<[SensitiveFamilyName, boolean]>) {
+      if (hit) {
+        acc.sensitiveFamilyBreakdown[fam]++;
+      }
+    }
+  }
+}
+
+export function finalizeCensusCounts(acc: CensusAccumulator, totalRows: number): CensusCounts {
+  let duplicateGroups = 0;
+  let surplusRows = 0;
+
+  for (const tracking of acc.agentTracking.values()) {
+    for (const count of tracking.textHashMap.values()) {
+      if (count > 1) {
+        duplicateGroups++;
+        surplusRows += count - 1;
+      }
+    }
+  }
+
+  acc.charLengths.sort((a, b) => a - b);
+  const avgLen = acc.charLengths.length > 0
+    ? Math.round((acc.totalCharLength / acc.charLengths.length) * 10) / 10
+    : 0;
+  const medianLen = acc.charLengths.length > 0
+    ? acc.charLengths[Math.floor(acc.charLengths.length * 0.5)]
+    : 0;
+  const p95Len = acc.charLengths.length > 0
+    ? acc.charLengths[Math.min(acc.charLengths.length - 1, Math.floor(acc.charLengths.length * 0.95))]
+    : 0;
+
+  const sortedUsers = Array.from(acc.userMap.entries())
+    .map(([userId, count]) => ({ userId, count }))
+    .sort((a, b) => b.count - a.count);
+
+  const topUsers = sortedUsers.slice(0, 10);
+  const longTailCount = sortedUsers.slice(10).reduce((a, b) => a + b.count, 0);
+
+  const agentBreakdown = Array.from(acc.agentMap.entries())
+    .map(([agentId, count]) => ({ agentId: agentId === "(none)" ? null : agentId, count }))
+    .sort((a, b) => b.count - a.count);
+
+  return {
+    totalRows,
+    distinctUserIds: acc.userMap.size,
+    distinctAgentIds: acc.agentMap.size,
+    userBreakdown: {
+      top: topUsers,
+      longTailCount,
+    },
+    agentBreakdown,
+    agentIdHygiene: {
+      missingOrBlankCount: acc.missingOrBlankAgentIdCount,
+      nonUuidCount: acc.nonUuidAgentIdCount,
+      totalMalformedOrMissingCount: acc.missingOrBlankAgentIdCount + acc.nonUuidAgentIdCount,
+    },
+    createdAtHistogram: acc.createdAtHistogram,
+    contentLength: {
+      average: avgLen,
+      median: medianLen,
+      p95: p95Len,
+      threshold: acc.longThreshold,
+      longerThanThresholdCount: acc.longerThanThresholdCount,
+    },
+    duplicates: {
+      duplicateGroups,
+      surplusRows,
+    },
+    noise: {
+      candidateCount: acc.noiseCandidateCount,
+    },
+    sensitive: {
+      candidateCount: acc.sensitiveCandidateCount,
+      familyBreakdown: acc.sensitiveFamilyBreakdown,
+    },
+  };
+}
+
 export interface CensusOptions {
   databaseUrl: string;
   companyId?: string | null;
@@ -130,7 +334,10 @@ export interface CensusOptions {
   format?: "text" | "json";
   tableName?: string;
   longThreshold?: number;
+  pageSize?: number;
   allowProd?: boolean;
+  /** @internal Test-only seam to bypass pgvector catalog identity check when running against embedded PG without pgvector. */
+  _internalSkipVectorIdentityCheck?: boolean;
   env?: NodeJS.ProcessEnv;
   repoRoot?: string;
   onTransaction?: (tx: any) => Promise<void> | void;
@@ -347,7 +554,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
     format = "text",
     tableName = "mem0_memories",
     longThreshold = 500,
+    pageSize: inputPageSize,
     allowProd = false,
+    _internalSkipVectorIdentityCheck = false,
     env = process.env,
     repoRoot,
     onTransaction,
@@ -414,302 +623,217 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
         }
 
         // 3. Shape introspection: introspect columns in target table
-      const columnRows = (await tx.execute<{ attname: string; formatted_type: string; typname: string }>(sql`
-        SELECT
-          a.attname,
-          format_type(a.atttypid, a.atttypmod) AS formatted_type,
-          t.typname
-        FROM pg_attribute a
-        JOIN pg_type t ON a.atttypid = t.oid
-        WHERE a.attrelid = to_regclass(${tableName})
-          AND a.attnum > 0
-          AND NOT a.attisdropped;
-      `)) as unknown as Array<{ attname: string; formatted_type: string; typname: string }>;
-
-      if (columnRows.length === 0) {
-        throw new CompanyMemoryUpgradeError(
-          `Table "${tableName}" not found or has no columns in target database.`,
-          "TABLE_NOT_FOUND",
-        );
-      }
-
-      const colMap = new Map<string, { formatted_type: string; typname: string }>();
-      for (const row of columnRows) {
-        colMap.set(row.attname, row);
-      }
-
-      // Check expected columns: id, payload, and vector/embedding
-      if (!colMap.has("id")) {
-        throw new CompanyMemoryUpgradeError(
-          `Mem0 table "${tableName}" is missing required "id" primary key column.`,
-          "SCHEMA_MISMATCH",
-        );
-      }
-
-      const payloadCol = colMap.get("payload");
-      if (!payloadCol) {
-        throw new CompanyMemoryUpgradeError(
-          `Mem0 table "${tableName}" is missing required "payload" column.`,
-          "SCHEMA_MISMATCH",
-        );
-      }
-
-      const payloadType = payloadCol.formatted_type.toLowerCase();
-      if (payloadType !== "jsonb" && payloadType !== "json") {
-        throw new CompanyMemoryUpgradeError(
-          `Mem0 table "${tableName}" payload column must be json or jsonb, found "${payloadType}".`,
-          "SCHEMA_MISMATCH",
-        );
-      }
-
-      const vectorColName = colMap.has("vector")
-        ? "vector"
-        : colMap.has("embedding")
-          ? "embedding"
-          : null;
-
-      if (!vectorColName) {
-        throw new CompanyMemoryUpgradeError(
-          `Mem0 table "${tableName}" is missing required vector/embedding column (expected "vector" or "embedding").`,
-          "SCHEMA_MISMATCH",
-        );
-      }
-
-      const vectorCol = colMap.get(vectorColName)!;
-      // Strip outer quotes from domain or type names: e.g. '"vector(1536)"' -> 'vector(1536)'
-      const cleanedVectorType = vectorCol.formatted_type.replace(/^"|"$/g, "").trim();
-
-      const vectorMatch = cleanedVectorType.match(/^vector\((\d+)\)$/i);
-      const embeddingDims = vectorMatch ? parseInt(vectorMatch[1], 10) : null;
-
-      if (embeddingDims !== 1536) {
-        throw new CompanyMemoryUpgradeError(
-          `Invalid embedding dimensions for Mem0 table "${tableName}": expected 1536, found ${embeddingDims ?? cleanedVectorType}. Upgrade target re-embeds at text-embedding-3-small (1536 dimensions).`,
-          "EMBEDDING_DIMENSIONS_MISMATCH",
-        );
-      }
-
-      // Query total row count
-      const totalCountRes = (await tx.execute<{ total: number }>(sql`
-        SELECT COUNT(*)::int AS total
-        FROM ${tenantTable.fragment};
-      `)) as unknown as Array<{ total: number }>;
-
-      const totalRows = totalCountRes[0]?.total ?? 0;
-
-      shape = {
-        table: tableName,
-        embeddingColumn: vectorColName,
-        embeddingDims: 1536,
-        embeddingType: cleanedVectorType,
-        payloadType: payloadType as "jsonb" | "json",
-        rowCount: totalRows,
-      };
-
-      // 3. Census inspection: aggregate data
-      const userMap = new Map<string, number>();
-      const agentMap = new Map<string, number>();
-      let missingOrBlankAgentIdCount = 0;
-      let nonUuidAgentIdCount = 0;
-      const createdAtHistogram: Record<string, number> = {};
-      const charLengths: number[] = [];
-      let totalCharLength = 0;
-      let longerThanThresholdCount = 0;
-      const duplicateGroupMap = new Map<string, number>();
-      let noiseCandidateCount = 0;
-      let sensitiveCandidateCount = 0;
-      const sensitiveFamilyBreakdown: Record<SensitiveFamilyName, number> = {
-        privateKey: 0,
-        bearerToken: 0,
-        apiKey: 0,
-        ssn: 0,
-        creditCard: 0,
-        passwordAssignment: 0,
-      };
-
-      // Keyset pagination: ORDER BY id LIMIT 1000
-      let lastId: string | null = null;
-      const pageSize = 1000;
-
-      while (true) {
-        const pageQuery = lastId === null
-          ? sql`
-              SELECT
-                id::text AS id,
-                payload->>'agent_id' AS agent_id,
-                payload->>'user_id' AS user_id,
-                payload->>'data' AS data,
-                payload->>'created_at' AS created_at
-              FROM ${tenantTable.fragment}
-              ORDER BY id ASC
-              LIMIT ${pageSize};
-            `
-          : sql`
-              SELECT
-                id::text AS id,
-                payload->>'agent_id' AS agent_id,
-                payload->>'user_id' AS user_id,
-                payload->>'data' AS data,
-                payload->>'created_at' AS created_at
-              FROM ${tenantTable.fragment}
-              WHERE id::text > ${lastId}
-              ORDER BY id ASC
-              LIMIT ${pageSize};
-            `;
-
-        const rows = (await tx.execute<{
-          id: string;
-          agent_id: string | null;
-          user_id: string | null;
-          data: string | null;
-          created_at: string | null;
-        }>(pageQuery)) as unknown as Array<{
-          id: string;
-          agent_id: string | null;
-          user_id: string | null;
-          data: string | null;
-          created_at: string | null;
+        const columnRows = (await tx.execute(sql`
+          SELECT
+            a.attname,
+            format_type(a.atttypid, a.atttypmod) AS formatted_type,
+            a.atttypmod,
+            t.typname,
+            t.typtype,
+            nsp.nspname AS typnamespace,
+            ext.extname AS extension_name
+          FROM pg_attribute a
+          JOIN pg_type t ON a.atttypid = t.oid
+          JOIN pg_namespace nsp ON t.typnamespace = nsp.oid
+          LEFT JOIN pg_depend dep ON dep.objid = t.oid
+            AND dep.classid = 'pg_type'::regclass
+            AND dep.deptype = 'e'
+          LEFT JOIN pg_extension ext ON dep.refobjid = ext.oid
+            AND dep.refclassid = 'pg_extension'::regclass
+          WHERE a.attrelid = to_regclass(${tenantTable.regclassArg})
+            AND a.attnum > 0
+            AND NOT a.attisdropped;
+        `)) as unknown as Array<{
+          attname: string;
+          formatted_type: string;
+          atttypmod: number;
+          typname: string;
+          typtype: string;
+          typnamespace: string;
+          extension_name: string | null;
         }>;
 
-        if (rows.length === 0) {
-          break;
+        if (columnRows.length === 0) {
+          throw new CompanyMemoryUpgradeError(
+            `Table "${tableName}" not found or has no columns in target database.`,
+            "TABLE_NOT_FOUND",
+          );
         }
 
-        for (const row of rows) {
-          lastId = row.id;
+        const colMap = new Map<string, (typeof columnRows)[number]>();
+        for (const row of columnRows) {
+          colMap.set(row.attname, row);
+        }
 
-          // User ID aggregation
-          const rawUserId = row.user_id ? row.user_id.trim() : "";
-          const userIdKey = rawUserId || "(none)";
-          userMap.set(userIdKey, (userMap.get(userIdKey) ?? 0) + 1);
+        // Check expected columns: id, payload, and vector/embedding
+        const idCol = colMap.get("id");
+        if (!idCol) {
+          throw new CompanyMemoryUpgradeError(
+            `Mem0 table "${tableName}" is missing required "id" primary key column.`,
+            "SCHEMA_MISMATCH",
+          );
+        }
 
-          // Agent ID aggregation & hygiene
-          const rawAgentId = row.agent_id ? row.agent_id.trim() : "";
-          if (!rawAgentId) {
-            missingOrBlankAgentIdCount++;
-            agentMap.set("(none)", (agentMap.get("(none)") ?? 0) + 1);
-          } else {
-            agentMap.set(rawAgentId, (agentMap.get(rawAgentId) ?? 0) + 1);
-            if (!isValidUuid(rawAgentId)) {
-              nonUuidAgentIdCount++;
-            }
+        const idType = idCol.typname.toLowerCase();
+        if (idType !== "uuid" && idType !== "text") {
+          throw new CompanyMemoryUpgradeError(
+            `Mem0 table "${tableName}" primary key column "id" must be type uuid or text, found "${idCol.formatted_type}".`,
+            "SCHEMA_MISMATCH",
+          );
+        }
+        const isUuidId = idType === "uuid";
+
+        const payloadCol = colMap.get("payload");
+        if (!payloadCol) {
+          throw new CompanyMemoryUpgradeError(
+            `Mem0 table "${tableName}" is missing required "payload" column.`,
+            "SCHEMA_MISMATCH",
+          );
+        }
+
+        const payloadType = payloadCol.formatted_type.toLowerCase();
+        if (payloadType !== "jsonb" && payloadType !== "json") {
+          throw new CompanyMemoryUpgradeError(
+            `Mem0 table "${tableName}" payload column must be json or jsonb, found "${payloadType}".`,
+            "SCHEMA_MISMATCH",
+          );
+        }
+
+        const vectorColName = colMap.has("vector")
+          ? "vector"
+          : colMap.has("embedding")
+            ? "embedding"
+            : null;
+
+        if (!vectorColName) {
+          throw new CompanyMemoryUpgradeError(
+            `Mem0 table "${tableName}" is missing required vector/embedding column (expected "vector" or "embedding").`,
+            "SCHEMA_MISMATCH",
+          );
+        }
+
+        const vectorCol = colMap.get(vectorColName)!;
+
+        if (!_internalSkipVectorIdentityCheck) {
+          const isVectorBaseType = vectorCol.typtype === "b";
+          const isVectorTypeName = vectorCol.typname.toLowerCase() === "vector";
+          const isOwningExtensionVector = vectorCol.extension_name === "vector";
+
+          if (!isVectorBaseType || !isVectorTypeName || !isOwningExtensionVector) {
+            throw new CompanyMemoryUpgradeError(
+              `Mem0 table "${tableName}" column "${vectorColName}" is not a valid pgvector column (typtype="${vectorCol.typtype}", typname="${vectorCol.typname}", extension="${vectorCol.extension_name ?? 'none'}"). Real pgvector extension type required.`,
+              "NOT_PGVECTOR",
+            );
           }
 
-          // Created at monthly histogram
-          const rawCreatedAt = row.created_at ? row.created_at.trim() : "";
-          let monthBucket = "unparseable";
-          if (rawCreatedAt) {
-            const parsedDate = new Date(rawCreatedAt);
-            if (!isNaN(parsedDate.getTime())) {
-              const yyyy = parsedDate.getUTCFullYear();
-              const mm = String(parsedDate.getUTCMonth() + 1).padStart(2, "0");
-              monthBucket = `${yyyy}-${mm}`;
-            }
-          }
-          createdAtHistogram[monthBucket] = (createdAtHistogram[monthBucket] ?? 0) + 1;
+          // Corroborate pg_extension has vector
+          const extRows = (await tx.execute(sql`
+            SELECT count(*)::int AS count
+            FROM pg_extension
+            WHERE extname = 'vector';
+          `)) as unknown as Array<{ count: number }>;
 
-          // Memory text length & noise & duplicates & sensitive
-          const memoryText = row.data ?? "";
-          const textLength = memoryText.length;
-          charLengths.push(textLength);
-          totalCharLength += textLength;
-          if (textLength > longThreshold) {
-            longerThanThresholdCount++;
-          }
-
-          // Deterministic noise
-          if (classifyMemoryNoise(memoryText)) {
-            noiseCandidateCount++;
-          }
-
-          // Duplicate candidate: normalized text SHA-256 grouped per agent
-          const normalized = normalizeMemoryContent(memoryText);
-          const textHash = createHash("sha256").update(normalized).digest("hex");
-          const agentKey = rawAgentId || "(none)";
-          const dupKey = `${agentKey}:${textHash}`;
-          duplicateGroupMap.set(dupKey, (duplicateGroupMap.get(dupKey) ?? 0) + 1);
-
-          // Sensitive detection: count only!
-          const sensitiveRes = detectSensitiveFamilies(memoryText);
-          if (sensitiveRes.isSensitive) {
-            sensitiveCandidateCount++;
-            for (const [fam, hit] of Object.entries(sensitiveRes.matches) as Array<[SensitiveFamilyName, boolean]>) {
-              if (hit) {
-                sensitiveFamilyBreakdown[fam]++;
-              }
-            }
+          if ((extRows[0]?.count ?? 0) === 0) {
+            throw new CompanyMemoryUpgradeError(
+              `Target database is missing required "vector" extension.`,
+              "NOT_PGVECTOR",
+            );
           }
         }
-      }
 
-      // Compute duplicate groups and surplus rows
-      let duplicateGroups = 0;
-      let surplusRows = 0;
-      for (const count of duplicateGroupMap.values()) {
-        if (count > 1) {
-          duplicateGroups++;
-          surplusRows += count - 1;
+        // Allow schema-qualified type like extensions.vector(1536)
+        // In production, no quote-stripping (.replace(/^"|"$/g, "")) is performed.
+        // Test-only seam (_internalSkipVectorIdentityCheck) strips test domain quotes on embedded PG.
+        const cleanedVectorType = _internalSkipVectorIdentityCheck
+          ? vectorCol.formatted_type.trim().replace(/^"|"$/g, "")
+          : vectorCol.formatted_type.trim();
+        const vectorMatch = cleanedVectorType.match(/^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?vector\((\d+)\)$/i);
+        const embeddingDims = vectorMatch ? parseInt(vectorMatch[1], 10) : null;
+
+        if (embeddingDims !== 1536) {
+          throw new CompanyMemoryUpgradeError(
+            `Invalid embedding dimensions for Mem0 table "${tableName}": expected 1536, found ${embeddingDims ?? cleanedVectorType}. Upgrade target re-embeds at text-embedding-3-small (1536 dimensions).`,
+            "EMBEDDING_DIMENSIONS_MISMATCH",
+          );
         }
-      }
 
-      // Compute character length percentiles
-      charLengths.sort((a, b) => a - b);
-      const avgLen = charLengths.length > 0 ? Math.round((totalCharLength / charLengths.length) * 10) / 10 : 0;
-      const medianLen = charLengths.length > 0
-        ? charLengths[Math.floor(charLengths.length * 0.5)]
-        : 0;
-      const p95Len = charLengths.length > 0
-        ? charLengths[Math.min(charLengths.length - 1, Math.floor(charLengths.length * 0.95))]
-        : 0;
+        // Query total row count
+        const totalCountRes = (await tx.execute(sql`
+          SELECT COUNT(*)::int AS total
+          FROM ${tenantTable.fragment};
+        `)) as unknown as Array<{ total: number }>;
 
-      // User breakdown: top 10 + long tail
-      const sortedUsers = Array.from(userMap.entries())
-        .map(([userId, count]) => ({ userId, count }))
-        .sort((a, b) => b.count - a.count);
+        const totalRows = totalCountRes[0]?.total ?? 0;
 
-      const topUsers = sortedUsers.slice(0, 10);
-      const longTailCount = sortedUsers.slice(10).reduce((acc, curr) => acc + curr.count, 0);
+        shape = {
+          table: tableName,
+          embeddingColumn: vectorColName,
+          embeddingDims: 1536,
+          embeddingType: cleanedVectorType,
+          payloadType: payloadType as "jsonb" | "json",
+          rowCount: totalRows,
+        };
 
-      // Agent breakdown
-      const agentBreakdown = Array.from(agentMap.entries())
-        .map(([agentId, count]) => ({ agentId: agentId === "(none)" ? null : agentId, count }))
-        .sort((a, b) => b.count - a.count);
+        // 4. Census inspection: aggregate data via pure accumulator
+        const accumulator = createCensusAccumulator(longThreshold);
+        let lastId: string | null = null;
+        const pageSize = inputPageSize && inputPageSize > 0 ? inputPageSize : 1000;
 
-      counts = {
-        totalRows,
-        distinctUserIds: userMap.size,
-        distinctAgentIds: agentMap.size,
-        userBreakdown: {
-          top: topUsers,
-          longTailCount,
-        },
-        agentBreakdown,
-        agentIdHygiene: {
-          missingOrBlankCount: missingOrBlankAgentIdCount,
-          nonUuidCount: nonUuidAgentIdCount,
-          totalMalformedOrMissingCount: missingOrBlankAgentIdCount + nonUuidAgentIdCount,
-        },
-        createdAtHistogram,
-        contentLength: {
-          average: avgLen,
-          median: medianLen,
-          p95: p95Len,
-          threshold: longThreshold,
-          longerThanThresholdCount,
-        },
-        duplicates: {
-          duplicateGroups,
-          surplusRows,
-        },
-        noise: {
-          candidateCount: noiseCandidateCount,
-        },
-        sensitive: {
-          candidateCount: sensitiveCandidateCount,
-          familyBreakdown: sensitiveFamilyBreakdown,
-        },
-      };
-    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+        while (true) {
+          const pageQuery = lastId === null
+            ? sql`
+                SELECT
+                  id::text AS id,
+                  payload->>'agent_id' AS agent_id,
+                  payload->>'user_id' AS user_id,
+                  payload->>'data' AS data,
+                  payload->>'created_at' AS created_at
+                FROM ${tenantTable.fragment}
+                ORDER BY id ASC
+                LIMIT ${pageSize};
+              `
+            : isUuidId
+              ? sql`
+                  SELECT
+                    id::text AS id,
+                    payload->>'agent_id' AS agent_id,
+                    payload->>'user_id' AS user_id,
+                    payload->>'data' AS data,
+                    payload->>'created_at' AS created_at
+                  FROM ${tenantTable.fragment}
+                  WHERE id > ${lastId}::uuid
+                  ORDER BY id ASC
+                  LIMIT ${pageSize};
+                `
+              : sql`
+                  SELECT
+                    id::text AS id,
+                    payload->>'agent_id' AS agent_id,
+                    payload->>'user_id' AS user_id,
+                    payload->>'data' AS data,
+                    payload->>'created_at' AS created_at
+                  FROM ${tenantTable.fragment}
+                  WHERE id > ${lastId}::text
+                  ORDER BY id ASC
+                  LIMIT ${pageSize};
+                `;
+
+          const rows = (await tx.execute(pageQuery)) as unknown as Array<CensusRowData>;
+
+          if (rows.length === 0) {
+            break;
+          }
+
+          for (const row of rows) {
+            lastId = row.id;
+            accumulateCensusRow(accumulator, row);
+          }
+        }
+
+        counts = finalizeCensusCounts(accumulator, totalRows);
+      },
+      { isolationLevel: "repeatable read", accessMode: "read only" },
+    );
 
     const populatedShape = shape as ShapeIntrospectionResult | null;
     const populatedCounts = counts as CensusCounts | null;

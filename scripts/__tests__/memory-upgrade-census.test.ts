@@ -25,6 +25,9 @@ import {
   validateAndResolveTableIdentifier,
   validateDatabaseUrl,
   validateOutputPath,
+  createCensusAccumulator,
+  accumulateCensusRow,
+  finalizeCensusCounts,
 } from "../../server/src/services/company-memory-upgrade/census.js";
 import {
   main as runMemoryUpgradeCli,
@@ -514,6 +517,121 @@ describe("validation, path, and CLI flags unit tests", () => {
   });
 });
 
+describe("pure census accumulator unit tests (database-free)", () => {
+  it("accumulates rows and computes all aggregates, percentiles, hygiene, and disjoint quality signals", () => {
+    const acc = createCensusAccumulator(50);
+
+    const validAgent1 = "11111111-1111-4111-8111-111111111111";
+    const validAgent2 = "22222222-2222-4222-8222-222222222222";
+
+    const rows = [
+      // Substantive rows for agent 1
+      {
+        id: "1",
+        agent_id: validAgent1,
+        user_id: "user-1",
+        data: "Remember that the user likes dark mode in their editor configuration.",
+        created_at: "2026-01-15T10:00:00.000Z",
+      },
+      // Duplicate of row 1 (normalized identical)
+      {
+        id: "2",
+        agent_id: validAgent1,
+        user_id: "user-1",
+        data: "  remember that the user likes dark mode in their editor configuration.  ",
+        created_at: "2026-01-20T12:00:00.000Z",
+      },
+      // Noise row for agent 1 (should NOT be counted in duplicate surplus)
+      {
+        id: "3",
+        agent_id: validAgent1,
+        user_id: "user-2",
+        data: "test",
+        created_at: "2026-02-01T08:00:00.000Z",
+      },
+      // Another identical noise row for agent 1 (still noise, not duplicate surplus)
+      {
+        id: "4",
+        agent_id: validAgent1,
+        user_id: "user-2",
+        data: "test",
+        created_at: "2026-02-05T09:00:00.000Z",
+      },
+      // Sensitive pattern row (API key)
+      {
+        id: "5",
+        agent_id: validAgent2,
+        user_id: "user-2",
+        data: "Production API key is sk-1234567890abcdef1234567890abcdef for OpenAI.",
+        created_at: "2026-03-01T15:00:00.000Z",
+      },
+      // Malformed agent ID
+      {
+        id: "6",
+        agent_id: "malformed-agent-id",
+        user_id: "user-3",
+        data: "Some note from malformed agent.",
+        created_at: "2026-03-10T16:00:00.000Z",
+      },
+      // Blank agent ID
+      {
+        id: "7",
+        agent_id: "   ",
+        user_id: "user-3",
+        data: "Another note with blank agent ID.",
+        created_at: "invalid-date",
+      },
+      // Null agent ID
+      {
+        id: "8",
+        agent_id: null,
+        user_id: null,
+        data: "Note with null agent and null user.",
+        created_at: null,
+      },
+    ];
+
+    for (const r of rows) {
+      accumulateCensusRow(acc, r);
+    }
+
+    const counts = finalizeCensusCounts(acc, rows.length);
+
+    assert.equal(counts.totalRows, 8);
+    assert.equal(counts.distinctUserIds, 4); // user-1, user-2, user-3, (none)
+    assert.equal(counts.distinctAgentIds, 4); // validAgent1, validAgent2, malformed-agent-id, (none)
+
+    // Hygiene
+    assert.equal(counts.agentIdHygiene.missingOrBlankCount, 2); // rows 7, 8
+    assert.equal(counts.agentIdHygiene.nonUuidCount, 1); // row 6
+    assert.equal(counts.agentIdHygiene.totalMalformedOrMissingCount, 3);
+
+    // Histogram
+    assert.equal(counts.createdAtHistogram["2026-01"], 2);
+    assert.equal(counts.createdAtHistogram["2026-02"], 2);
+    assert.equal(counts.createdAtHistogram["2026-03"], 2);
+    assert.equal(counts.createdAtHistogram["unparseable"], 2); // invalid-date, null
+
+    // Quality signals
+    assert.equal(counts.noise.candidateCount, 2); // rows 3, 4 ("test")
+    // Duplicate surplus: row 1 and 2 are identical normalized substantive rows -> 1 group, 1 surplus
+    // Noise rows 3 and 4 must NOT be added to duplicate surplus
+    assert.equal(counts.duplicates.duplicateGroups, 1);
+    assert.equal(counts.duplicates.surplusRows, 1);
+
+    // Sensitive
+    assert.equal(counts.sensitive.candidateCount, 1);
+    assert.equal(counts.sensitive.familyBreakdown.apiKey, 1);
+
+    // Length
+    assert.ok(counts.contentLength.average > 0);
+    assert.ok(counts.contentLength.median > 0);
+    assert.ok(counts.contentLength.p95 > 0);
+    assert.equal(counts.contentLength.threshold, 50);
+    assert.ok(counts.contentLength.longerThanThresholdCount > 0);
+  });
+});
+
 describe("census integration tests against embedded Postgres fixture", () => {
   it("enforces strict privilege preflight on tenant and control-plane connections", async (t) => {
     const support = await getEmbeddedPostgresTestSupport();
@@ -565,6 +683,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
             databaseUrl: tenantOkUrl.toString(),
             controlPlaneUrl: fixture.connectionString, // superuser CP connection
             companyId: "00000000-0000-4000-8000-000000000001",
+            _internalSkipVectorIdentityCheck: true,
           }),
         (err: any) => {
           assert.equal(err.code, "SUPERUSER_REJECTED");
@@ -656,6 +775,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
       const plainReport = await runCensus({
         databaseUrl: tenantPlainUrl.toString(),
         companyId: "00000000-0000-4000-8000-000000000001",
+        _internalSkipVectorIdentityCheck: true,
       });
       assert.ok(plainReport.readOnly);
     } finally {
@@ -664,7 +784,53 @@ describe("census integration tests against embedded Postgres fixture", () => {
     }
   });
 
-  it("rejects table with missing expected columns and invalid embedding dimensions", async (t) => {
+  it("inverts fake fixture: CREATE DOMAIN vector(1536) AS text is rejected with NOT_PGVECTOR", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_fake_vector_rejected");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      // Running census without _internalSkipVectorIdentityCheck must reject fake domain!
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUrl.toString(),
+            companyId: "00000000-0000-4000-8000-000000000001",
+          }),
+        (err: any) => {
+          assert.equal(err.code, "NOT_PGVECTOR");
+          assert.ok(err.message.includes("not a valid pgvector column"));
+          return true;
+        },
+      );
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("rejects table with invalid id column type, missing payload, or invalid dimensions", async (t) => {
     const support = await getEmbeddedPostgresTestSupport();
     if (!support.supported) {
       handleEmbeddedPostgresUnsupported(support, t);
@@ -675,6 +841,9 @@ describe("census integration tests against embedded Postgres fixture", () => {
     const adminDb = createDb(fixture.connectionString);
 
     try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`CREATE DOMAIN "vector(768)" AS text;`);
+
       // Create non-superuser tenant role
       await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
       await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
@@ -683,11 +852,11 @@ describe("census integration tests against embedded Postgres fixture", () => {
       tenantUrl.username = "tenant_checker";
       tenantUrl.password = "pass123";
 
-      // 1. Missing payload column
+      // 1. Missing payload column -> SCHEMA_MISMATCH
       await adminDb.execute(sql`
         CREATE TABLE bad_table_1 (
           id TEXT PRIMARY KEY,
-          vector TEXT
+          vector "vector(1536)"
         );
       `);
       await adminDb.execute(sql`GRANT SELECT ON bad_table_1 TO tenant_checker;`);
@@ -698,37 +867,254 @@ describe("census integration tests against embedded Postgres fixture", () => {
             databaseUrl: tenantUrl.toString(),
             tableName: "bad_table_1",
             companyId: "00000000-0000-4000-8000-000000000001",
+            _internalSkipVectorIdentityCheck: true,
           }),
-        (err: Error) => {
+        (err: any) => {
+          assert.equal(err.code, "SCHEMA_MISMATCH");
           assert.ok(err.message.includes('missing required "payload" column'));
           return true;
         },
       );
 
-      // 2. Invalid embedding dimensions (e.g. 768 instead of 1536)
+      // 2. Declared id column is integer (not uuid or text) -> SCHEMA_MISMATCH naming integer
       await adminDb.execute(sql`
-        CREATE DOMAIN "vector(768)" AS text;
-        CREATE TABLE bad_table_2 (
-          id TEXT PRIMARY KEY,
-          vector "vector(768)",
+        CREATE TABLE bad_table_id_int (
+          id INTEGER PRIMARY KEY,
+          vector "vector(1536)",
           payload JSONB NOT NULL
         );
       `);
-      await adminDb.execute(sql`GRANT SELECT ON bad_table_2 TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON bad_table_id_int TO tenant_checker;`);
 
       await assert.rejects(
         () =>
           runCensus({
             databaseUrl: tenantUrl.toString(),
-            tableName: "bad_table_2",
+            tableName: "bad_table_id_int",
             companyId: "00000000-0000-4000-8000-000000000001",
+            _internalSkipVectorIdentityCheck: true,
           }),
-        (err: Error) => {
-          assert.ok(err.message.includes("Invalid embedding dimensions for Mem0 table"));
+        (err: any) => {
+          assert.equal(err.code, "SCHEMA_MISMATCH");
+          assert.ok(err.message.includes('primary key column "id" must be type uuid or text'));
+          assert.ok(err.message.includes("integer"));
+          return true;
+        },
+      );
+
+      // 3. Invalid embedding dimensions (768 instead of 1536) -> EMBEDDING_DIMENSIONS_MISMATCH
+      await adminDb.execute(sql`
+        CREATE TABLE bad_table_dims (
+          id TEXT PRIMARY KEY,
+          vector "vector(768)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`GRANT SELECT ON bad_table_dims TO tenant_checker;`);
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUrl.toString(),
+            tableName: "bad_table_dims",
+            companyId: "00000000-0000-4000-8000-000000000001",
+            _internalSkipVectorIdentityCheck: true,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "EMBEDDING_DIMENSIONS_MISMATCH");
           assert.ok(err.message.includes("expected 1536, found 768"));
           return true;
         },
       );
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("introspects mixed-case and schema-qualified mixed-case table names via properly quoted to_regclass", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_mixed_case");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+
+      // 1. Bare mixed-case table: "Mem0_MixedCase"
+      await adminDb.execute(sql`
+        CREATE TABLE "Mem0_MixedCase" (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`GRANT SELECT ON "Mem0_MixedCase" TO tenant_checker;`);
+
+      // 2. Schema-qualified mixed-case table: "Custom_Schema"."Mem0_Custom_Case"
+      await adminDb.execute(sql`CREATE SCHEMA "Custom_Schema";`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA "Custom_Schema" TO tenant_checker;`);
+      await adminDb.execute(sql`
+        CREATE TABLE "Custom_Schema"."Mem0_Custom_Case" (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`GRANT SELECT ON "Custom_Schema"."Mem0_Custom_Case" TO tenant_checker;`);
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      const report1 = await runCensus({
+        databaseUrl: tenantUrl.toString(),
+        tableName: "Mem0_MixedCase",
+        companyId: "00000000-0000-4000-8000-000000000001",
+        _internalSkipVectorIdentityCheck: true,
+      });
+      assert.equal(report1.shapeIntrospection.table, "Mem0_MixedCase");
+
+      const report2 = await runCensus({
+        databaseUrl: tenantUrl.toString(),
+        tableName: "Custom_Schema.Mem0_Custom_Case",
+        companyId: "00000000-0000-4000-8000-000000000001",
+        _internalSkipVectorIdentityCheck: true,
+      });
+      assert.equal(report2.shapeIntrospection.table, "Custom_Schema.Mem0_Custom_Case");
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("paginates with native cursor crossing page boundaries with no skipped or repeated rows", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_pagination");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id UUID PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      // Insert 5 rows with UUID keys
+      const rowIds = [
+        "11111111-1111-4111-8111-000000000001",
+        "11111111-1111-4111-8111-000000000002",
+        "11111111-1111-4111-8111-000000000003",
+        "11111111-1111-4111-8111-000000000004",
+        "11111111-1111-4111-8111-000000000005",
+      ];
+
+      for (let i = 0; i < rowIds.length; i++) {
+        await adminDb.execute(sql`
+          INSERT INTO mem0_memories (id, vector, payload)
+          VALUES (${rowIds[i]}::uuid, '[]', ${JSON.stringify({
+            agent_id: "00000000-0000-4000-8000-000000000001",
+            user_id: `user-${i + 1}`,
+            data: `Substantive preference ${i + 1}`,
+          })}::jsonb);
+        `);
+      }
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      // Run census with pageSize = 2 to force crossing 3 page boundaries
+      const report = await runCensus({
+        databaseUrl: tenantUrl.toString(),
+        companyId: "00000000-0000-4000-8000-000000000001",
+        pageSize: 2,
+        _internalSkipVectorIdentityCheck: true,
+      });
+
+      assert.equal(report.census.totalRows, 5);
+      assert.equal(report.census.distinctUserIds, 5);
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("completes full census pipeline without modifying database or executing writes", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_no_writes");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`
+        INSERT INTO mem0_memories (id, vector, payload) VALUES
+        ('mem-1', '[]', '{"agent_id": "00000000-0000-4000-8000-000000000001", "data": "Sample preference"}'::jsonb);
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      // Snapshot database state before running census
+      const rowsBefore = (await adminDb.execute<{ count: number }>(sql`
+        SELECT COUNT(*)::int AS count FROM mem0_memories;
+      `)) as unknown as Array<{ count: number }>;
+      const tablesBefore = (await adminDb.execute<{ table_name: string }>(sql`
+        SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;
+      `)) as unknown as Array<{ table_name: string }>;
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      const report = await runCensus({
+        databaseUrl: tenantUrl.toString(),
+        companyId: "00000000-0000-4000-8000-000000000001",
+        _internalSkipVectorIdentityCheck: true,
+      });
+
+      assert.equal(report.readOnly, true);
+      assert.equal(report.census.totalRows, 1);
+
+      // Verify database state after running census: zero writes, zero DDL, zero modifications!
+      const rowsAfter = (await adminDb.execute<{ count: number }>(sql`
+        SELECT COUNT(*)::int AS count FROM mem0_memories;
+      `)) as unknown as Array<{ count: number }>;
+      const tablesAfter = (await adminDb.execute<{ table_name: string }>(sql`
+        SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;
+      `)) as unknown as Array<{ table_name: string }>;
+
+      assert.equal(rowsAfter[0].count, rowsBefore[0].count);
+      assert.deepEqual(tablesAfter, tablesBefore);
     } finally {
       await adminDb.$client.end({ timeout: 1 });
       await fixture.cleanup();
@@ -840,6 +1226,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
         databaseUrl: tenantUrl.toString(),
         tableName: "mem0_memories",
         companyId: "00000000-0000-4000-8000-000000000001",
+        _internalSkipVectorIdentityCheck: true,
         onTransaction: async () => {
           await adminDb.execute(sql`
             INSERT INTO mem0_memories (id, vector, payload)
@@ -940,6 +1327,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
             databaseUrl: tenantUserUrl.toString(),
             controlPlaneUrl: cpUserUrl.toString(),
             companyId: companyB, // not in companies table
+            _internalSkipVectorIdentityCheck: true,
           }),
         (err: any) => {
           assert.equal(err.code, "COMPANY_NOT_FOUND");
@@ -954,6 +1342,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
             databaseUrl: tenantUserUrl.toString(),
             controlPlaneUrl: cpUserUrl.toString(),
             companyId: companyA,
+            _internalSkipVectorIdentityCheck: true,
           }),
         (err: any) => {
           assert.equal(err.code, "COMPANY_BINDING_MISMATCH");
@@ -974,6 +1363,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
             databaseUrl: tenantUserUrl.toString(),
             controlPlaneUrl: cpUserUrl.toString(),
             companyId: companyA,
+            _internalSkipVectorIdentityCheck: true,
           }),
         (err: any) => {
           assert.equal(err.code, "COMPANY_BINDING_MISMATCH");
@@ -993,6 +1383,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
       const inferredReport = await runCensus({
         databaseUrl: tenantUserUrl.toString(),
         controlPlaneUrl: cpUserUrl.toString(),
+        _internalSkipVectorIdentityCheck: true,
       });
       assert.equal(inferredReport.company.id, companyA);
       assert.equal(inferredReport.company.verification, "control-plane-verified");
@@ -1009,6 +1400,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
           runCensus({
             databaseUrl: tenantUserUrl.toString(),
             controlPlaneUrl: cpUserUrl.toString(),
+            _internalSkipVectorIdentityCheck: true,
           }),
         (err: any) => {
           assert.equal(err.code, "COMPANY_BINDING_MISMATCH");
@@ -1208,6 +1600,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
         companyId: testCompanyId,
         outputPath: tmpOutPath,
         format: "json",
+        _internalSkipVectorIdentityCheck: true,
       });
 
       // 4. Verify shape introspection
@@ -1318,6 +1711,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
             companyId: testCompanyId,
             outputPath: tmpOutPath,
             format: "json",
+            _internalSkipVectorIdentityCheck: true,
           }),
         (err: any) => err.code === "EEXIST",
       );
@@ -1328,6 +1722,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
       const unverifiedReport = await runCensus({
         databaseUrl: tenantDsn,
         companyId: testCompanyId,
+        _internalSkipVectorIdentityCheck: true,
       });
 
       assert.equal(unverifiedReport.routing.status, "unverified");
@@ -1342,6 +1737,37 @@ describe("census integration tests against embedded Postgres fixture", () => {
       await cpAdminDb.$client.end({ timeout: 1 });
       await tenantFixture.cleanup();
       await cpFixture.cleanup();
+    }
+  });
+
+  it("executes full-stack census against real vector(1536) in live pgvector Docker", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGVECTOR_TESTS !== "true" }, async () => {
+    // This test runs exclusively when live Docker PostgreSQL with pgvector is configured.
+    // It asserts that the real pgvector catalog identity check passes with no _internalSkipVectorIdentityCheck.
+    const dockerDsn = process.env.PAPERCLIP_TEST_DOCKER_PGVECTOR_URL;
+    if (!dockerDsn) return;
+
+    const dockerDb = createDb(dockerDsn);
+    try {
+      await dockerDb.execute(sql`CREATE EXTENSION IF NOT EXISTS vector;`);
+      await dockerDb.execute(sql`
+        CREATE TABLE IF NOT EXISTS docker_mem0_real_vector (
+          id UUID PRIMARY KEY,
+          vector vector(1536),
+          payload JSONB NOT NULL
+        );
+      `);
+
+      const report = await runCensus({
+        databaseUrl: dockerDsn,
+        tableName: "docker_mem0_real_vector",
+        companyId: "00000000-0000-4000-8000-000000000001",
+        // Note: _internalSkipVectorIdentityCheck is NOT passed here! Production contract verified!
+      });
+
+      assert.equal(report.shapeIntrospection.embeddingDims, 1536);
+      assert.equal(report.readOnly, true);
+    } finally {
+      await dockerDb.$client.end({ timeout: 1 });
     }
   });
 });
