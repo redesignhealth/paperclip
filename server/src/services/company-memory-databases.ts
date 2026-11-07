@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull, lt, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import postgres from "postgres";

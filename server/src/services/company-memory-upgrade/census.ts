@@ -124,6 +124,22 @@ export function normalizeMemoryContent(text: string | null | undefined): string 
   return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+export function redactPayloadIdentifier(val: string | null | undefined, allowCompany: boolean = false): string | null {
+  if (val === null || val === undefined) return null;
+  const trimmed = val.trim();
+  if (!trimmed) return null;
+  if (trimmed === "(none)") return "(none)";
+  const lower = trimmed.toLowerCase();
+  if (isValidUuid(lower)) {
+    return lower;
+  }
+  if (allowCompany && lower === "company") {
+    return "company";
+  }
+  const hash12 = createHash("sha256").update(trimmed).digest("hex").slice(0, 12);
+  return `sha256:${hash12} (len ${trimmed.length})`;
+}
+
 export interface CensusRowData {
   id: string;
   agent_id: string | null;
@@ -279,15 +295,27 @@ export function finalizeCensusCounts(acc: CensusAccumulator, totalRows: number):
     ? acc.charLengths[Math.min(acc.charLengths.length - 1, Math.floor(acc.charLengths.length * 0.95))]
     : 0;
 
-  const sortedUsers = Array.from(acc.userMap.entries())
+  const sanitizedUserMap = new Map<string, number>();
+  for (const [userId, count] of acc.userMap.entries()) {
+    const safeUserId = redactPayloadIdentifier(userId, true) ?? "(none)";
+    sanitizedUserMap.set(safeUserId, (sanitizedUserMap.get(safeUserId) ?? 0) + count);
+  }
+
+  const sortedUsers = Array.from(sanitizedUserMap.entries())
     .map(([userId, count]) => ({ userId, count }))
     .sort((a, b) => b.count - a.count);
 
   const topUsers = sortedUsers.slice(0, 10);
   const longTailCount = sortedUsers.slice(10).reduce((a, b) => a + b.count, 0);
 
-  const agentBreakdown = Array.from(acc.agentMap.entries())
-    .map(([agentId, count]) => ({ agentId: agentId === "(none)" ? null : agentId, count }))
+  const sanitizedAgentMap = new Map<string | null, number>();
+  for (const [agentId, count] of acc.agentMap.entries()) {
+    const safeAgentId = agentId === "(none)" ? null : redactPayloadIdentifier(agentId, false);
+    sanitizedAgentMap.set(safeAgentId, (sanitizedAgentMap.get(safeAgentId) ?? 0) + count);
+  }
+
+  const agentBreakdown = Array.from(sanitizedAgentMap.entries())
+    .map(([agentId, count]) => ({ agentId, count }))
     .sort((a, b) => b.count - a.count);
 
   return {
@@ -341,6 +369,8 @@ export interface CensusOptions {
   embeddingUsdPerMillion?: number;
   /** @internal Test-only seam to bypass pgvector catalog identity check when running against embedded PG without pgvector. */
   _internalSkipVectorIdentityCheck?: boolean;
+  /** @internal Test-only seam to override database and user identity to simulate empty/null results. */
+  _internalDatabaseIdentityOverride?: { database?: string | null; user?: string | null };
   env?: NodeJS.ProcessEnv;
   repoRoot?: string;
   onTransaction?: (tx: any) => Promise<void> | void;
@@ -575,11 +605,14 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
     longThreshold = 500,
     pageSize: inputPageSize,
     allowProd = false,
-    _internalSkipVectorIdentityCheck = false,
+    _internalSkipVectorIdentityCheck: inputSkipVector = false,
     env = process.env,
     repoRoot,
     onTransaction,
   } = options;
+
+  const _internalSkipVectorIdentityCheck =
+    inputSkipVector || env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY === "true";
 
   if (inputCompanyId !== undefined && inputCompanyId !== null) {
     if (!isValidUuid(inputCompanyId)) {
@@ -627,8 +660,20 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
           SELECT current_database()::text AS current_database, current_user::text AS current_user;
         `)) as unknown as Array<{ current_database: string; current_user: string }>;
 
-        currentDatabase = dbInfoRows[0]?.current_database ?? "";
-        currentUser = dbInfoRows[0]?.current_user ?? "";
+        if (options._internalDatabaseIdentityOverride) {
+          currentDatabase = (options._internalDatabaseIdentityOverride.database ?? "").trim();
+          currentUser = (options._internalDatabaseIdentityOverride.user ?? "").trim();
+        } else {
+          currentDatabase = (dbInfoRows[0]?.current_database ?? "").trim();
+          currentUser = (dbInfoRows[0]?.current_user ?? "").trim();
+        }
+
+        if (!currentDatabase || !currentUser) {
+          throw new CompanyMemoryUpgradeError(
+            "Unable to determine current database and user identity from tenant connection.",
+            "DATABASE_IDENTITY_UNAVAILABLE",
+          );
+        }
 
         const pcmemPattern = /^pcmem_[0-9a-f]{32}$/;
         if (pcmemPattern.test(currentDatabase) && inputCompanyId) {
@@ -802,38 +847,38 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
           const pageQuery = lastId === null
             ? sql`
                 SELECT
-                  id::text AS id,
-                  payload->>'agent_id' AS agent_id,
-                  payload->>'user_id' AS user_id,
-                  payload->>'data' AS data,
-                  payload->>'created_at' AS created_at
-                FROM ${tenantTable.fragment}
-                ORDER BY id ASC
+                  t.id::text AS id,
+                  t.payload->>'agent_id' AS agent_id,
+                  t.payload->>'user_id' AS user_id,
+                  t.payload->>'data' AS data,
+                  t.payload->>'created_at' AS created_at
+                FROM ${tenantTable.fragment} t
+                ORDER BY t.id ASC
                 LIMIT ${pageSize};
               `
             : isUuidId
               ? sql`
                   SELECT
-                    id::text AS id,
-                    payload->>'agent_id' AS agent_id,
-                    payload->>'user_id' AS user_id,
-                    payload->>'data' AS data,
-                    payload->>'created_at' AS created_at
-                  FROM ${tenantTable.fragment}
-                  WHERE id > ${lastId}::uuid
-                  ORDER BY id ASC
+                    t.id::text AS id,
+                    t.payload->>'agent_id' AS agent_id,
+                    t.payload->>'user_id' AS user_id,
+                    t.payload->>'data' AS data,
+                    t.payload->>'created_at' AS created_at
+                  FROM ${tenantTable.fragment} t
+                  WHERE t.id > ${lastId}::uuid
+                  ORDER BY t.id ASC
                   LIMIT ${pageSize};
                 `
               : sql`
                   SELECT
-                    id::text AS id,
-                    payload->>'agent_id' AS agent_id,
-                    payload->>'user_id' AS user_id,
-                    payload->>'data' AS data,
-                    payload->>'created_at' AS created_at
-                  FROM ${tenantTable.fragment}
-                  WHERE id > ${lastId}::text
-                  ORDER BY id ASC
+                    t.id::text AS id,
+                    t.payload->>'agent_id' AS agent_id,
+                    t.payload->>'user_id' AS user_id,
+                    t.payload->>'data' AS data,
+                    t.payload->>'created_at' AS created_at
+                  FROM ${tenantTable.fragment} t
+                  WHERE t.id > ${lastId}::text
+                  ORDER BY t.id ASC
                   LIMIT ${pageSize};
                 `;
 
@@ -1101,8 +1146,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
                 unroutableRowsCount += tracking.total;
                 unroutableBreakdown.malformed_agent_id.rowCount += tracking.total;
                 unroutableBreakdown.malformed_agent_id.distinctAgentCount++;
-                unroutableBreakdown.malformed_agent_id.agentIds.push(agentKey);
-                unroutableIds.add(agentKey);
+                const safeMalformedKey = redactPayloadIdentifier(agentKey, false)!;
+                unroutableBreakdown.malformed_agent_id.agentIds.push(safeMalformedKey);
+                unroutableIds.add(safeMalformedKey);
                 continue;
               }
 
@@ -1112,8 +1158,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
                 unroutableRowsCount += tracking.total;
                 unroutableBreakdown.unknown_agent.rowCount += tracking.total;
                 unroutableBreakdown.unknown_agent.distinctAgentCount++;
-                unroutableBreakdown.unknown_agent.agentIds.push(agentKey);
-                unroutableIds.add(agentKey);
+                const safeKey = redactPayloadIdentifier(agentKey, false)!;
+                unroutableBreakdown.unknown_agent.agentIds.push(safeKey);
+                unroutableIds.add(safeKey);
                 continue;
               }
 
@@ -1122,8 +1169,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
                 unroutableRowsCount += tracking.total;
                 unroutableBreakdown.non_memory_adapter.rowCount += tracking.total;
                 unroutableBreakdown.non_memory_adapter.distinctAgentCount++;
-                unroutableBreakdown.non_memory_adapter.agentIds.push(agentKey);
-                unroutableIds.add(agentKey);
+                const safeKey = redactPayloadIdentifier(agentKey, false)!;
+                unroutableBreakdown.non_memory_adapter.agentIds.push(safeKey);
+                unroutableIds.add(safeKey);
                 continue;
               }
 
@@ -1132,8 +1180,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
                 unroutableRowsCount += tracking.total;
                 unroutableBreakdown.terminated.rowCount += tracking.total;
                 unroutableBreakdown.terminated.distinctAgentCount++;
-                unroutableBreakdown.terminated.agentIds.push(agentKey);
-                unroutableIds.add(agentKey);
+                const safeKey = redactPayloadIdentifier(agentKey, false)!;
+                unroutableBreakdown.terminated.agentIds.push(safeKey);
+                unroutableIds.add(safeKey);
                 continue;
               }
 
@@ -1142,31 +1191,39 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
                 unroutableRowsCount += tracking.total;
                 unroutableBreakdown.pending_approval.rowCount += tracking.total;
                 unroutableBreakdown.pending_approval.distinctAgentCount++;
-                unroutableBreakdown.pending_approval.agentIds.push(agentKey);
-                unroutableIds.add(agentKey);
+                const safeKey = redactPayloadIdentifier(agentKey, false)!;
+                unroutableBreakdown.pending_approval.agentIds.push(safeKey);
+                unroutableIds.add(safeKey);
                 continue;
               }
 
-              if (cpAgent.status === "paused" || cpAgent.paused_at !== null) {
+              const isInvokable = INVOKABLE_AGENT_STATUSES.has(cpAgent.status);
+              const isPausedStatus = cpAgent.status === "paused";
+
+              if (!isInvokable && !isPausedStatus) {
+                unroutableAgentsCount++;
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.unknown_status.rowCount += tracking.total;
+                unroutableBreakdown.unknown_status.distinctAgentCount++;
+                const safeKey = redactPayloadIdentifier(agentKey, false)!;
+                unroutableBreakdown.unknown_status.agentIds.push(safeKey);
+                unroutableIds.add(safeKey);
+                caveats.push(`CAVEAT: Agent "${safeKey}" has unrecognized status "${cpAgent.status}". Classified as unroutable.`);
+                continue;
+              }
+
+              if (isPausedStatus || cpAgent.paused_at !== null) {
                 pausedAgentsCount++;
                 pausedRowsCount += tracking.total;
                 rowsToConvert += agentEligible;
                 noiseRowsInRoutable += tracking.noise;
                 duplicateSurplusInRoutable += agentSurplus;
-              } else if (INVOKABLE_AGENT_STATUSES.has(cpAgent.status)) {
+              } else {
                 routableAgentsCount++;
                 routableRowsCount += tracking.total;
                 rowsToConvert += agentEligible;
                 noiseRowsInRoutable += tracking.noise;
                 duplicateSurplusInRoutable += agentSurplus;
-              } else {
-                unroutableAgentsCount++;
-                unroutableRowsCount += tracking.total;
-                unroutableBreakdown.unknown_status.rowCount += tracking.total;
-                unroutableBreakdown.unknown_status.distinctAgentCount++;
-                unroutableBreakdown.unknown_status.agentIds.push(agentKey);
-                unroutableIds.add(agentKey);
-                caveats.push(`CAVEAT: Agent "${agentKey}" has unrecognized status "${cpAgent.status}". Classified as unroutable.`);
               }
             }
 
@@ -1232,8 +1289,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
           unroutableRowsCount += tracking.total;
           unroutableBreakdown.malformed_agent_id.rowCount += tracking.total;
           unroutableBreakdown.malformed_agent_id.distinctAgentCount++;
-          unroutableBreakdown.malformed_agent_id.agentIds.push(agentKey);
-          unroutableIds.add(agentKey);
+          const safeMalformedKey = redactPayloadIdentifier(agentKey, false)!;
+          unroutableBreakdown.malformed_agent_id.agentIds.push(safeMalformedKey);
+          unroutableIds.add(safeMalformedKey);
         } else {
           // In unverified/provisional mode, syntactically valid agents are treated as provisional upper-bound candidates
           rowsToConvert += agentEligible;

@@ -14,6 +14,7 @@ import {
   formatCensusTextReport,
   runCensus,
 } from "../server/src/services/company-memory-upgrade/census.js";
+import { CompanyMemoryUpgradeError } from "../server/src/services/company-memory-upgrade/types.js";
 
 export const STUB_SUBCOMMANDS = new Set([
   "sweep",
@@ -25,7 +26,13 @@ export const STUB_SUBCOMMANDS = new Set([
   "status",
 ]);
 
-export const ALLOWED_CENSUS_FLAGS = new Set([
+export const BOOLEAN_FLAGS = new Set([
+  "--prod",
+  "--help",
+  "-h",
+]);
+
+export const VALUE_FLAGS = new Set([
   "--database-url",
   "--company",
   "--control-plane-url",
@@ -37,9 +44,11 @@ export const ALLOWED_CENSUS_FLAGS = new Set([
   "--chat-input-usd-per-mtok",
   "--chat-output-usd-per-mtok",
   "--embedding-usd-per-mtok",
-  "--prod",
-  "--help",
-  "-h",
+]);
+
+export const ALLOWED_CENSUS_FLAGS = new Set([
+  ...BOOLEAN_FLAGS,
+  ...VALUE_FLAGS,
 ]);
 
 export function parseFlagValue(name: string, argv: string[]): string | null {
@@ -47,15 +56,21 @@ export function parseFlagValue(name: string, argv: string[]): string | null {
     const arg = argv[i];
     if (arg === name) {
       const next = argv[i + 1];
-      if (!next || next.startsWith("-")) {
-        return null;
+      if (!next || next.startsWith("--")) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '${name}' requires a usable value.`,
+          "INVALID_ARGUMENT",
+        );
       }
       return next;
     }
     if (arg.startsWith(`${name}=`)) {
       const val = arg.slice(name.length + 1);
-      if (!val || val.startsWith("-")) {
-        return null;
+      if (!val || val.startsWith("--")) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '${name}' requires a usable value.`,
+          "INVALID_ARGUMENT",
+        );
       }
       return val;
     }
@@ -64,24 +79,71 @@ export function parseFlagValue(name: string, argv: string[]): string | null {
 }
 
 export function hasBooleanFlag(name: string, argv: string[]): boolean {
-  return argv.includes(name);
+  for (const arg of argv) {
+    if (arg === name) return true;
+    if (arg.startsWith(`${name}=`)) {
+      throw new CompanyMemoryUpgradeError(
+        `Boolean flag '${name}' does not take a value.`,
+        "INVALID_ARGUMENT",
+      );
+    }
+  }
+  return false;
 }
 
 export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>): void {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg.startsWith("-")) {
-      const flagName = arg.split("=")[0];
+    if (arg.startsWith("--")) {
+      const [flagName, ...rest] = arg.split("=");
       if (!allowedFlags.has(flagName)) {
-        throw new Error(`Unknown option '${flagName}'. Only read-only census options are accepted.`);
+        throw new CompanyMemoryUpgradeError(
+          `Unknown option '${flagName}'. Only read-only census options are accepted.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      if (BOOLEAN_FLAGS.has(flagName)) {
+        if (rest.length > 0) {
+          throw new CompanyMemoryUpgradeError(
+            `Boolean flag '${flagName}' does not take a value.`,
+            "INVALID_ARGUMENT",
+          );
+        }
+      } else if (VALUE_FLAGS.has(flagName)) {
+        if (rest.length > 0) {
+          const val = rest.join("=");
+          if (!val || val.startsWith("--")) {
+            throw new CompanyMemoryUpgradeError(
+              `Flag '${flagName}' requires a usable value.`,
+              "INVALID_ARGUMENT",
+            );
+          }
+        } else {
+          const next = argv[i + 1];
+          if (!next || next.startsWith("--")) {
+            throw new CompanyMemoryUpgradeError(
+              `Flag '${flagName}' requires a usable value.`,
+              "INVALID_ARGUMENT",
+            );
+          }
+          i++;
+        }
+      }
+    } else if (arg.startsWith("-")) {
+      if (!allowedFlags.has(arg)) {
+        throw new CompanyMemoryUpgradeError(
+          `Unknown option '${arg}'. Only read-only census options are accepted.`,
+          "INVALID_ARGUMENT",
+        );
       }
     }
   }
 }
 
 export async function runCensusCli(argv: string[]): Promise<number> {
-  if (hasBooleanFlag("--help", argv) || hasBooleanFlag("-h", argv)) {
-    console.log(`
+  try {
+    if (hasBooleanFlag("--help", argv) || hasBooleanFlag("-h", argv)) {
+      console.log(`
 Usage: pnpm memory:upgrade census --database-url <tenant-dsn> [options]
 
 Strictly read-only preflight census and conversion budget inspection.
@@ -109,95 +171,104 @@ Options:
                                and will not trigger this gate.
   --help, -h                   Show this help message
 `);
-    return 0;
-  }
+      return 0;
+    }
 
-  validateNoUnknownFlags(argv, ALLOWED_CENSUS_FLAGS);
+    validateNoUnknownFlags(argv, ALLOWED_CENSUS_FLAGS);
 
-  const databaseUrl =
-    parseFlagValue("--database-url", argv) ??
-    process.env.COMPANY_MEMORY_DATABASE_URL ??
-    null;
+    const databaseUrl =
+      parseFlagValue("--database-url", argv) ??
+      process.env.COMPANY_MEMORY_DATABASE_URL ??
+      null;
 
-  if (!databaseUrl) {
-    console.error(
-      "Error: Refusing to run census without explicit tenant --database-url (or COMPANY_MEMORY_DATABASE_URL env var).",
-    );
-    return 1;
-  }
-
-  const companyId = parseFlagValue("--company", argv);
-  const controlPlaneUrl =
-    parseFlagValue("--control-plane-url", argv) ??
-    process.env.CONTROL_PLANE_DATABASE_URL ??
-    null;
-
-  const outputPath =
-    parseFlagValue("--output", argv) ??
-    parseFlagValue("--out", argv) ??
-    null;
-
-  const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
-  if (rawFormat !== "text" && rawFormat !== "json") {
-    console.error(`Error: Invalid --format "${rawFormat}". Must be "text" or "json".`);
-    return 1;
-  }
-  const format = rawFormat as "text" | "json";
-
-  const tableName = parseFlagValue("--table", argv) ?? "mem0_memories";
-
-  const longThresholdStr = parseFlagValue("--long-threshold", argv);
-  let longThreshold = 500;
-  if (longThresholdStr !== null) {
-    longThreshold = parseInt(longThresholdStr, 10);
-    if (!Number.isInteger(longThreshold) || longThreshold <= 0 || String(longThreshold) !== longThresholdStr.trim()) {
-      console.error(`Error: Invalid --long-threshold "${longThresholdStr}". Must be a positive integer.`);
+    if (!databaseUrl) {
+      console.error(
+        "Error: Refusing to run census without explicit tenant --database-url (or COMPANY_MEMORY_DATABASE_URL env var).",
+      );
       return 1;
     }
-  }
 
-  const allowProd = hasBooleanFlag("--prod", argv);
+    const companyId = parseFlagValue("--company", argv);
+    const controlPlaneUrl =
+      parseFlagValue("--control-plane-url", argv) ??
+      process.env.CONTROL_PLANE_DATABASE_URL ??
+      null;
 
-  function parseOptionalPrice(flagName: string, envVal: string | undefined): number | undefined {
-    const raw = parseFlagValue(flagName, argv) ?? envVal ?? null;
-    if (raw === null) return undefined;
-    const num = parseFloat(raw);
-    if (!Number.isFinite(num) || Number.isNaN(num) || num < 0) {
-      throw new Error(`Invalid ${flagName} "${raw}". Must be a non-negative number.`);
+    const outputPath =
+      parseFlagValue("--output", argv) ??
+      parseFlagValue("--out", argv) ??
+      null;
+
+    const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
+    if (rawFormat !== "text" && rawFormat !== "json") {
+      console.error(`Error: Invalid --format "${rawFormat}". Must be "text" or "json".`);
+      return 1;
     }
-    return num;
+    const format = rawFormat as "text" | "json";
+
+    const tableName = parseFlagValue("--table", argv) ?? "mem0_memories";
+
+    const longThresholdStr = parseFlagValue("--long-threshold", argv);
+    let longThreshold = 500;
+    if (longThresholdStr !== null) {
+      longThreshold = parseInt(longThresholdStr, 10);
+      if (!Number.isInteger(longThreshold) || longThreshold <= 0 || String(longThreshold) !== longThresholdStr.trim()) {
+        console.error(`Error: Invalid --long-threshold "${longThresholdStr}". Must be a positive integer.`);
+        return 1;
+      }
+    }
+
+    const allowProd = hasBooleanFlag("--prod", argv);
+
+    function parseOptionalPrice(flagName: string, envVal: string | undefined): number | undefined {
+      const raw = parseFlagValue(flagName, argv) ?? envVal ?? null;
+      if (raw === null) return undefined;
+      const num = parseFloat(raw);
+      if (!Number.isFinite(num) || Number.isNaN(num) || num < 0) {
+        throw new CompanyMemoryUpgradeError(
+          `Invalid ${flagName} "${raw}". Must be a non-negative number.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return num;
+    }
+
+    const chatInputUsdPerMillion = parseOptionalPrice("--chat-input-usd-per-mtok", process.env.CHAT_INPUT_USD_PER_MTOK);
+    const chatOutputUsdPerMillion = parseOptionalPrice("--chat-output-usd-per-mtok", process.env.CHAT_OUTPUT_USD_PER_MTOK);
+    const embeddingUsdPerMillion = parseOptionalPrice("--embedding-usd-per-mtok", process.env.EMBEDDING_USD_PER_MTOK);
+
+    const report = await runCensus({
+      databaseUrl,
+      companyId,
+      controlPlaneUrl,
+      outputPath,
+      format,
+      tableName,
+      longThreshold,
+      allowProd,
+      chatInputUsdPerMillion,
+      chatOutputUsdPerMillion,
+      embeddingUsdPerMillion,
+      env: process.env,
+    });
+
+    if (outputPath) {
+      const resolvedPath = path.resolve(process.cwd(), outputPath);
+      console.error(`Census report written to ${resolvedPath} (mode 0600, exclusive create).`);
+    } else {
+      if (format === "json") {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatCensusTextReport(report));
+      }
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Error: ${message}`);
+    return 1;
   }
-
-  const chatInputUsdPerMillion = parseOptionalPrice("--chat-input-usd-per-mtok", process.env.CHAT_INPUT_USD_PER_MTOK);
-  const chatOutputUsdPerMillion = parseOptionalPrice("--chat-output-usd-per-mtok", process.env.CHAT_OUTPUT_USD_PER_MTOK);
-  const embeddingUsdPerMillion = parseOptionalPrice("--embedding-usd-per-mtok", process.env.EMBEDDING_USD_PER_MTOK);
-
-  const report = await runCensus({
-    databaseUrl,
-    companyId,
-    controlPlaneUrl,
-    outputPath,
-    format,
-    tableName,
-    longThreshold,
-    allowProd,
-    chatInputUsdPerMillion,
-    chatOutputUsdPerMillion,
-    embeddingUsdPerMillion,
-    env: process.env,
-  });
-
-  if (outputPath) {
-    console.error(`Census report written to ${outputPath} (mode 0600, exclusive create).`);
-  }
-
-  if (format === "json") {
-    console.log(JSON.stringify(report, null, 2));
-  } else {
-    console.log(formatCensusTextReport(report));
-  }
-
-  return 0;
 }
 
 export async function main(argv: string[] = process.argv): Promise<number> {
@@ -219,7 +290,12 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     return 1;
   }
 
-  console.error(`Error: Unknown subcommand '${subcommand}'.`);
+  if (/^[a-z-]+$/.test(subcommand)) {
+    console.error(`Error: Unknown subcommand '${subcommand}'.`);
+  } else {
+    console.error("Error: Unknown subcommand.");
+  }
+  console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
   console.error("Available subcommands: census");
   return 1;
 }

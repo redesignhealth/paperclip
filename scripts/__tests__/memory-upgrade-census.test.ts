@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -33,7 +34,9 @@ import {
 } from "../../server/src/services/company-memory-upgrade/census.js";
 import {
   main as runMemoryUpgradeCli,
+  runCensusCli,
   parseFlagValue,
+  hasBooleanFlag,
   validateNoUnknownFlags,
   ALLOWED_CENSUS_FLAGS,
 } from "../memory-upgrade.js";
@@ -115,11 +118,9 @@ describe("classifyMemoryNoise pure unit tests", () => {
       "asdf",
       "qwerty",
       "foo",
-      "bar",
       "baz",
       "foobar",
       "n/a",
-      "na",
       "null",
       "nil",
       "undefined",
@@ -132,6 +133,10 @@ describe("classifyMemoryNoise pure unit tests", () => {
       assert.equal(classifyMemoryNoise(p), true, `Expected "${p}" to be noise`);
       assert.equal(classifyMemoryNoise(`  ${p.toUpperCase()}!  `), true, `Expected uppercase punctuated "${p}" to be noise`);
     }
+
+    assert.equal(classifyMemoryNoise("bar"), false, 'Expected "bar" NOT to be noise');
+    assert.equal(classifyMemoryNoise("na"), false, 'Expected "na" NOT to be noise');
+    assert.equal(classifyMemoryNoise("no"), true, 'Expected "no" to be noise');
   });
 
   it("classifies bare greetings and acknowledgments as noise", () => {
@@ -240,9 +245,9 @@ describe("estimateConversionBudget unit tests", () => {
   it("produces zero cost and zero time for zero rows", () => {
     const budget = estimateConversionBudget({
       totalRows: 0,
-      noiseRows: 0,
+      noiseRowsInRoutable: 0,
       unroutableRows: 0,
-      duplicateSurplusRows: 0,
+      duplicateSurplusInRoutable: 0,
       averageTextLength: 0,
     });
 
@@ -318,17 +323,17 @@ describe("estimateConversionBudget unit tests", () => {
   it("exhibits cost monotonicity with increasing rows", () => {
     const b1 = estimateConversionBudget({
       totalRows: 500,
-      noiseRows: 0,
+      noiseRowsInRoutable: 0,
       unroutableRows: 0,
-      duplicateSurplusRows: 0,
+      duplicateSurplusInRoutable: 0,
       averageTextLength: 100,
     });
 
     const b2 = estimateConversionBudget({
       totalRows: 1000,
-      noiseRows: 0,
+      noiseRowsInRoutable: 0,
       unroutableRows: 0,
-      duplicateSurplusRows: 0,
+      duplicateSurplusInRoutable: 0,
       averageTextLength: 100,
     });
 
@@ -340,17 +345,17 @@ describe("estimateConversionBudget unit tests", () => {
   it("exhibits token and cost monotonicity with increasing text length", () => {
     const bShort = estimateConversionBudget({
       totalRows: 1000,
-      noiseRows: 0,
+      noiseRowsInRoutable: 0,
       unroutableRows: 0,
-      duplicateSurplusRows: 0,
+      duplicateSurplusInRoutable: 0,
       averageTextLength: 50,
     });
 
     const bLong = estimateConversionBudget({
       totalRows: 1000,
-      noiseRows: 0,
+      noiseRowsInRoutable: 0,
       unroutableRows: 0,
-      duplicateSurplusRows: 0,
+      duplicateSurplusInRoutable: 0,
       averageTextLength: 800,
     });
 
@@ -432,6 +437,26 @@ describe("estimateConversionBudget unit tests", () => {
       () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, chatInputUsdPerMillion: -0.5 }),
       /Invalid budget input "chatInputUsdPerMillion": must be a finite non-negative number/,
     );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, chatRpmCap: 0 }),
+      (err: any) => err.code === "INVALID_ARGUMENT" && /must be a finite positive number/.test(err.message),
+    );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, chatRpmCap: -10 }),
+      (err: any) => err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, chatTpmCap: NaN }),
+      (err: any) => err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, embeddingRpmCap: 0 }),
+      (err: any) => err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, embeddingTpmCap: -1 }),
+      (err: any) => err.code === "INVALID_ARGUMENT",
+    );
   });
 
   it("preserves full precision internally and formats tiny runs properly without showing $0.0000", () => {
@@ -490,7 +515,10 @@ describe("estimateConversionBudget unit tests", () => {
   it("formats human duration string properly", () => {
     assert.equal(formatDurationHuman(0), "0s");
     assert.equal(formatDurationHuman(45), "45s");
+    assert.equal(formatDurationHuman(59.4), "59s");
+    assert.equal(formatDurationHuman(59.6), "1m");
     assert.equal(formatDurationHuman(60), "1m");
+    assert.equal(formatDurationHuman(119.6), "2m");
     assert.equal(formatDurationHuman(125), "2m 5s");
   });
 });
@@ -639,10 +667,59 @@ describe("validation, path, and CLI flags unit tests", () => {
     // Supports space-separated --flag value
     assert.equal(parseFlagValue("--table", ["--table", "my_table"]), "my_table");
 
-    // Rejects values starting with -
-    assert.equal(parseFlagValue("--table", ["--table", "-v"]), null);
-    assert.equal(parseFlagValue("--table", ["--table", "--flag"]), null);
-    assert.equal(parseFlagValue("--table", ["--table=-x"]), null);
+    // Single-dash value passed through to validator
+    assert.equal(parseFlagValue("--table", ["--table", "-v"]), "-v");
+    assert.equal(parseFlagValue("--table", ["--table=-x"]), "-x");
+    assert.equal(parseFlagValue("--long-threshold", ["--long-threshold", "-5"]), "-5");
+
+    // Value flag present without usable value (missing, next starts with --, or empty =) throws hard INVALID_ARGUMENT error
+    assert.throws(
+      () => parseFlagValue("--table", ["--table"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
+    assert.throws(
+      () => parseFlagValue("--table", ["--table", "--flag"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
+    assert.throws(
+      () => parseFlagValue("--table", ["--table="]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
+    assert.throws(
+      () => parseFlagValue("--table", ["--table=--flag"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
+
+    // --database-url --prod must fail, NOT silently fall back to env var
+    const prevEnv = process.env.COMPANY_MEMORY_DATABASE_URL;
+    process.env.COMPANY_MEMORY_DATABASE_URL = "postgres://usr:pw@localhost:5432/from_env";
+    try {
+      assert.throws(
+        () => parseFlagValue("--database-url", ["--database-url", "--prod"]),
+        (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--database-url"),
+      );
+    } finally {
+      if (prevEnv !== undefined) {
+        process.env.COMPANY_MEMORY_DATABASE_URL = prevEnv;
+      } else {
+        delete process.env.COMPANY_MEMORY_DATABASE_URL;
+      }
+    }
+
+    // Boolean flags with =... rejected with clear error
+    assert.throws(
+      () => hasBooleanFlag("--prod", ["--prod=1"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("Boolean flag '--prod' does not take a value"),
+    );
+    assert.throws(
+      () => validateNoUnknownFlags(["--prod=true"], ALLOWED_CENSUS_FLAGS),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("Boolean flag '--prod' does not take a value"),
+    );
+
+    // Negative numeric values are passed to numeric validator, which rejects with numeric error, not unknown-flag error
+    assert.doesNotThrow(() => {
+      validateNoUnknownFlags(["--long-threshold", "-5"], ALLOWED_CENSUS_FLAGS);
+    });
 
     // Unknown option rejected and error echoes ONLY flag name (never raw value containing DSN/password)
     assert.throws(
@@ -679,10 +756,39 @@ describe("validation, path, and CLI flags unit tests", () => {
       assert.equal(exitStatus, 1);
       assert.ok(stderrLogged.includes("Subcommand 'status' is not implemented yet."));
 
+      // Subcommand matching /^[a-z-]+$/ echoes subcommand name
       stderrLogged = "";
       const exitUnknown = await runMemoryUpgradeCli(["node", "memory-upgrade.ts", "bogus"]);
       assert.equal(exitUnknown, 1);
-      assert.ok(stderrLogged.includes("Unknown subcommand 'bogus'"));
+      assert.ok(stderrLogged.includes("Unknown subcommand 'bogus'."));
+
+      // Subcommand omitted entirely prints usage without echoing args[0]
+      stderrLogged = "";
+      const exitMissing = await runMemoryUpgradeCli(["node", "memory-upgrade.ts"]);
+      assert.equal(exitMissing, 1);
+      assert.ok(stderrLogged.includes("Usage: pnpm memory:upgrade <subcommand> [options]"));
+
+      // Subcommand not matching /^[a-z-]+$/ (e.g. DSN with secret credentials) does NOT echo args[0]
+      stderrLogged = "";
+      const exitDsn = await runMemoryUpgradeCli(["node", "memory-upgrade.ts", "postgres://usr:secret_pass_leak@host:5432/db"]);
+      assert.equal(exitDsn, 1);
+      assert.ok(stderrLogged.includes("Error: Unknown subcommand."));
+      assert.ok(!stderrLogged.includes("secret_pass_leak"));
+      assert.ok(!stderrLogged.includes("postgres://"));
+
+      // Negative long threshold fails with numeric error instead of unknown option
+      stderrLogged = "";
+      const exitNegativeNumeric = await runMemoryUpgradeCli([
+        "node",
+        "memory-upgrade.ts",
+        "census",
+        "--database-url",
+        "postgres://usr:pw@localhost:5432/db",
+        "--long-threshold",
+        "-5",
+      ]);
+      assert.equal(exitNegativeNumeric, 1);
+      assert.ok(stderrLogged.includes('Invalid --long-threshold "-5". Must be a positive integer.'));
     } finally {
       console.error = origError;
     }
@@ -1223,6 +1329,26 @@ describe("census integration tests against embedded Postgres fixture", () => {
 
       assert.equal(report.census.totalRows, 5);
       assert.equal(report.census.distinctUserIds, 5);
+
+      // Verify keyset query orders on native column t.id with index scan rather than alias sort
+      const explainRows = (await adminDb.execute<{ "QUERY PLAN": string }>(sql`
+        EXPLAIN SELECT
+          t.id::text AS id,
+          t.payload->>'agent_id' AS agent_id
+        FROM mem0_memories t
+        WHERE t.id > ${rowIds[1]}::uuid
+        ORDER BY t.id ASC
+        LIMIT 2;
+      `)) as unknown as Array<{ "QUERY PLAN": string }>;
+      const plan = explainRows.map((r) => r["QUERY PLAN"]).join("\n");
+      assert.ok(
+        plan.includes("Index Scan") || plan.includes("mem0_memories_pkey"),
+        `Expected plan to use native index scan, got: ${plan}`,
+      );
+      assert.ok(
+        !plan.includes("Sort"),
+        `Expected no explicit Sort node when keyset orders on native PK column, got: ${plan}`,
+      );
     } finally {
       await adminDb.$client.end({ timeout: 1 });
       await fixture.cleanup();
@@ -1832,9 +1958,10 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.equal(report.routing.counts.rows.unroutable, 7);
 
       // Unroutable breakdown by named reason (C3)
+      const expectedMalformedHash = `sha256:${createHash("sha256").update("malformed-agent-id-123").digest("hex").slice(0, 12)} (len 22)`;
       assert.equal(report.routing.unroutableBreakdown.missing_agent_id.rowCount, 1);
       assert.equal(report.routing.unroutableBreakdown.malformed_agent_id.rowCount, 1);
-      assert.deepEqual(report.routing.unroutableBreakdown.malformed_agent_id.agentIds, ["malformed-agent-id-123"]);
+      assert.deepEqual(report.routing.unroutableBreakdown.malformed_agent_id.agentIds, [expectedMalformedHash]);
       assert.equal(report.routing.unroutableBreakdown.unknown_agent.rowCount, 1);
       assert.deepEqual(report.routing.unroutableBreakdown.unknown_agent.agentIds, [unknownAgentId]);
       assert.equal(report.routing.unroutableBreakdown.non_memory_adapter.rowCount, 2); // claude + hermes_gateway
@@ -1849,7 +1976,8 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.ok(report.routing.unroutableAgentIds.includes(terminatedHermesAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes(nonHermesAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes(unknownAgentId));
-      assert.ok(report.routing.unroutableAgentIds.includes("malformed-agent-id-123"));
+      assert.ok(report.routing.unroutableAgentIds.includes(expectedMalformedHash));
+      assert.ok(!report.routing.unroutableAgentIds.includes("malformed-agent-id-123"));
       assert.ok(report.routing.unroutableAgentIds.includes(hermesGatewayAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes(pendingApprovalHermesAgentId));
 
@@ -1884,6 +2012,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
         "Claude agent conversation memory",
         "Memory from agent that does not exist",
         "extensive memory specification",
+        "malformed-agent-id-123",
       ];
 
       for (const phrase of sensitiveMemories) {
@@ -1950,19 +2079,30 @@ describe("census integration tests against embedded Postgres fixture", () => {
     if (!dockerDsn) return;
 
     const dockerDb = createDb(dockerDsn);
+    const roleName = `docker_census_${Date.now()}`;
+    const tableName = `docker_mem0_real_vector_${Date.now()}`;
     try {
       await dockerDb.execute(sql`CREATE EXTENSION IF NOT EXISTS vector;`);
-      await dockerDb.execute(sql`
-        CREATE TABLE IF NOT EXISTS docker_mem0_real_vector (
+      await dockerDb.execute(sql.raw(`
+        CREATE ROLE ${roleName} WITH LOGIN PASSWORD 'docker_pass_123' NOSUPERUSER NOBYPASSRLS;
+        CREATE TABLE ${tableName} (
           id UUID PRIMARY KEY,
           vector vector(1536),
           payload JSONB NOT NULL
         );
-      `);
+        GRANT CONNECT ON DATABASE current_database() TO ${roleName};
+        GRANT USAGE ON SCHEMA public TO ${roleName};
+        GRANT SELECT ON ${tableName} TO ${roleName};
+      `));
+
+      const parsed = new URL(dockerDsn);
+      parsed.username = roleName;
+      parsed.password = "docker_pass_123";
+      const nonSuperuserDsn = parsed.toString();
 
       const report = await runCensus({
-        databaseUrl: dockerDsn,
-        tableName: "docker_mem0_real_vector",
+        databaseUrl: nonSuperuserDsn,
+        tableName,
         companyId: "00000000-0000-4000-8000-000000000001",
         // Note: _internalSkipVectorIdentityCheck is NOT passed here! Production contract verified!
       });
@@ -1970,7 +2110,334 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.equal(report.shapeIntrospection.embeddingDims, 1536);
       assert.equal(report.readOnly, true);
     } finally {
+      try {
+        await dockerDb.execute(sql.raw(`
+          DROP TABLE IF EXISTS ${tableName};
+          DROP ROLE IF EXISTS ${roleName};
+        `));
+      } catch {}
       await dockerDb.$client.end({ timeout: 1 });
+    }
+  });
+
+  it("never echoes payload-controlled strings verbatim (redacts emails, sentences, and malformed IDs in user_id and agent_id)", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_redaction");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      const emailAgent = "leak-agent-contact@company.example";
+      const sentenceAgent = "This is a sentence of private memory text that leaked into the agent_id column.";
+      const emailUser = "leak-user-email@domain.test";
+      const sentenceUser = "This is a sentence of private memory text that leaked into the user_id column.";
+      const canonicalUuidAgent = "00000000-0000-4000-8000-000000000001";
+
+      await adminDb.execute(sql`
+        INSERT INTO mem0_memories (id, vector, payload) VALUES
+        ('mem-1', '[]', ${JSON.stringify({
+          agent_id: emailAgent,
+          user_id: emailUser,
+          data: "Memory row with email in agent_id and user_id.",
+        })}::jsonb),
+        ('mem-2', '[]', ${JSON.stringify({
+          agent_id: sentenceAgent,
+          user_id: sentenceUser,
+          data: "Memory row with memory sentence in agent_id and user_id.",
+        })}::jsonb),
+        ('mem-3', '[]', ${JSON.stringify({
+          agent_id: canonicalUuidAgent,
+          user_id: "company",
+          data: "Valid canonical agent and company user_id.",
+        })}::jsonb);
+      `);
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      const report = await runCensus({
+        databaseUrl: tenantUrl.toString(),
+        companyId: "00000000-0000-4000-8000-000000000001",
+        _internalSkipVectorIdentityCheck: true,
+      });
+
+      const jsonOutput = JSON.stringify(report, null, 2);
+      const textOutput = formatCensusTextReport(report);
+
+      // Assert payload-controlled dirty strings NEVER appear verbatim in JSON or text output
+      assert.ok(!jsonOutput.includes(emailAgent), "emailAgent must not appear in JSON report");
+      assert.ok(!textOutput.includes(emailAgent), "emailAgent must not appear in text report");
+      assert.ok(!jsonOutput.includes(sentenceAgent), "sentenceAgent must not appear in JSON report");
+      assert.ok(!textOutput.includes(sentenceAgent), "sentenceAgent must not appear in text report");
+      assert.ok(!jsonOutput.includes(emailUser), "emailUser must not appear in JSON report");
+      assert.ok(!textOutput.includes(emailUser), "emailUser must not appear in text report");
+      assert.ok(!jsonOutput.includes(sentenceUser), "sentenceUser must not appear in JSON report");
+      assert.ok(!textOutput.includes(sentenceUser), "sentenceUser must not appear in text report");
+
+      // Canonical UUID and literal "company" MAY appear as-is
+      assert.ok(jsonOutput.includes(canonicalUuidAgent));
+      assert.ok(textOutput.includes(canonicalUuidAgent));
+      assert.ok(jsonOutput.includes('"company"'));
+      assert.ok(textOutput.includes("company"));
+
+      // Verify non-reversible hash labels appear
+      const emailAgentHash = `sha256:${createHash("sha256").update(emailAgent).digest("hex").slice(0, 12)} (len ${emailAgent.length})`;
+      const sentenceUserHash = `sha256:${createHash("sha256").update(sentenceUser).digest("hex").slice(0, 12)} (len ${sentenceUser.length})`;
+      assert.ok(jsonOutput.includes(emailAgentHash));
+      assert.ok(textOutput.includes(emailAgentHash));
+      assert.ok(jsonOutput.includes(sentenceUserHash));
+      assert.ok(textOutput.includes(sentenceUserHash));
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("classifies agent with unknown status and stale paused_at as unknown_status (unroutable), never routable_but_paused", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const tenantFixture = await startEmbeddedPostgresTestDatabase("test_census_stale_paused_tenant");
+    const cpFixture = await startEmbeddedPostgresTestDatabase("test_census_stale_paused_cp");
+    const tenantAdminDb = createDb(tenantFixture.connectionString);
+    const cpAdminDb = createDb(cpFixture.connectionString);
+
+    const testCompanyId = "00000000-0000-4000-8000-000000000001";
+    const stalePausedAgentId = "22222222-2222-4222-8222-222222222222";
+
+    try {
+      await cpAdminDb.execute(sql`
+        INSERT INTO companies (id, name, issue_prefix) VALUES (${testCompanyId}::uuid, 'Acme Test Corp', 'ACME');
+      `);
+      await cpAdminDb.execute(sql`
+        INSERT INTO agents (id, company_id, name, adapter_type, status, paused_at) VALUES
+        (${stalePausedAgentId}::uuid, ${testCompanyId}::uuid, 'Stale Paused Agent', 'hermes_local', 'experimental_unknown_status', now());
+      `);
+
+      const parsedTenantUrl = new URL(tenantFixture.connectionString);
+      const tenantDbName = parsedTenantUrl.pathname.replace(/^\//, "");
+
+      await cpAdminDb.execute(sql`
+        INSERT INTO company_memory_databases (company_id, database_name, database_role, host, status)
+        VALUES (${testCompanyId}::uuid, ${tenantDbName}, 'pcmem_tenant_role', '127.0.0.1', 'ready');
+      `);
+      await cpAdminDb.execute(sql`CREATE ROLE cp_reader WITH LOGIN PASSWORD 'cp_pw_secret' NOSUPERUSER NOBYPASSRLS;`);
+      await cpAdminDb.execute(sql`GRANT USAGE ON SCHEMA public TO cp_reader;`);
+      await cpAdminDb.execute(sql`GRANT SELECT ON companies, agents, company_memory_databases TO cp_reader;`);
+
+      const cpUserUrl = new URL(cpFixture.connectionString);
+      cpUserUrl.username = "cp_reader";
+      cpUserUrl.password = "cp_pw_secret";
+      const cpDsn = cpUserUrl.toString();
+
+      await tenantAdminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await tenantAdminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await tenantAdminDb.execute(sql`CREATE ROLE pcmem_tenant_role WITH LOGIN PASSWORD 'tenant_pw_secret' NOSUPERUSER NOBYPASSRLS;`);
+      await tenantAdminDb.execute(sql`GRANT USAGE ON SCHEMA public TO pcmem_tenant_role;`);
+      await tenantAdminDb.execute(sql`GRANT SELECT ON mem0_memories TO pcmem_tenant_role;`);
+      await tenantAdminDb.execute(sql`
+        INSERT INTO mem0_memories (id, vector, payload) VALUES
+        ('mem-1', '[]', ${JSON.stringify({
+          agent_id: stalePausedAgentId,
+          user_id: "user-1",
+          data: "Memory for agent with unknown status and stale paused_at.",
+        })}::jsonb);
+      `);
+
+      const tenantUserUrl = new URL(tenantFixture.connectionString);
+      tenantUserUrl.username = "pcmem_tenant_role";
+      tenantUserUrl.password = "tenant_pw_secret";
+      const tenantDsn = tenantUserUrl.toString();
+
+      const report = await runCensus({
+        databaseUrl: tenantDsn,
+        controlPlaneUrl: cpDsn,
+        companyId: testCompanyId,
+        _internalSkipVectorIdentityCheck: true,
+      });
+
+      // Must be classified as unknown_status (unroutable), NEVER routable_but_paused!
+      assert.equal(report.routing.counts.agents.routable_but_paused, 0);
+      assert.equal(report.routing.counts.rows.routable_but_paused, 0);
+      assert.equal(report.routing.counts.agents.routable, 0);
+      assert.equal(report.routing.counts.agents.unroutable, 1);
+      assert.equal(report.routing.counts.rows.unroutable, 1);
+
+      assert.equal(report.routing.unroutableBreakdown.unknown_status.distinctAgentCount, 1);
+      assert.equal(report.routing.unroutableBreakdown.unknown_status.rowCount, 1);
+      assert.deepEqual(report.routing.unroutableBreakdown.unknown_status.agentIds, [stalePausedAgentId]);
+
+      assert.ok(
+        report.caveats.some(
+          (c) =>
+            c.includes(stalePausedAgentId) &&
+            c.includes("experimental_unknown_status") &&
+            c.includes("unrecognized status"),
+        ),
+      );
+    } finally {
+      await tenantAdminDb.$client.end({ timeout: 1 });
+      await cpAdminDb.$client.end({ timeout: 1 });
+      await tenantFixture.cleanup();
+      await cpFixture.cleanup();
+    }
+  });
+
+  it("fails closed with DATABASE_IDENTITY_UNAVAILABLE when database or user identity is empty or null", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_empty_identity");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUrl.toString(),
+            companyId: "00000000-0000-4000-8000-000000000001",
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: "", user: "" },
+          }),
+        (err: any) => err.code === "DATABASE_IDENTITY_UNAVAILABLE",
+      );
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUrl.toString(),
+            companyId: "00000000-0000-4000-8000-000000000001",
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: "some_db", user: "   " },
+          }),
+        (err: any) => err.code === "DATABASE_IDENTITY_UNAVAILABLE",
+      );
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("when --output is supplied, prints only notice to stderr and keeps stdout completely empty", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_cli_output");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      const tmpOut = path.join(os.tmpdir(), `test-cli-out-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+
+      let stdoutLogged = "";
+      let stderrLogged = "";
+      const origLog = console.log;
+      const origError = console.error;
+      console.log = (msg: string) => {
+        stdoutLogged += `${msg}\n`;
+      };
+      console.error = (msg: string) => {
+        stderrLogged += `${msg}\n`;
+      };
+
+      process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY = "true";
+      try {
+        const exitCode = await runCensusCli([
+          "--database-url",
+          tenantUrl.toString(),
+          "--company",
+          "00000000-0000-4000-8000-000000000001",
+          "--output",
+          tmpOut,
+          "--format",
+          "json",
+        ]);
+
+        assert.equal(exitCode, 0);
+        // stdout MUST be completely empty!
+        assert.equal(stdoutLogged, "", "stdout must be empty when --output is supplied");
+        // stderr MUST contain the notice with resolved path
+        assert.ok(
+          stderrLogged.includes(`Census report written to ${path.resolve(tmpOut)}`),
+          `Expected stderr to include resolved path notice, got: ${stderrLogged}`,
+        );
+        // File must exist with mode 0600
+        assert.ok(fs.existsSync(tmpOut));
+        assert.equal(fs.statSync(tmpOut).mode & 0o777, 0o600);
+      } finally {
+        delete process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY;
+        console.log = origLog;
+        console.error = origError;
+        try {
+          fs.unlinkSync(tmpOut);
+        } catch {}
+      }
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
     }
   });
 });

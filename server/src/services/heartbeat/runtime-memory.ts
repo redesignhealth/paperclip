@@ -6,13 +6,11 @@ import {
   UnsupportedMemoryEmbeddingError,
   UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   isUnsupportedMemoryEmbeddingError,
-} from "../company-memory-constants.js";
-import { recordAgentScopedMemoryUse } from "../memory-scope-observations.js";
-import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
-import {
   HERMES_ADAPTER_TYPE,
   adapterSupportsRuntimeMemory,
 } from "../company-memory-constants.js";
+import { recordAgentScopedMemoryUse } from "../memory-scope-observations.js";
+import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { logger } from "../../middleware/logger.js";
 
 export {

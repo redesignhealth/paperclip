@@ -66,9 +66,6 @@ export interface BudgetEstimateInput {
   unroutableRows?: number;
   noiseRowsInRoutable?: number;
   duplicateSurplusInRoutable?: number;
-  // Legacy input fields support
-  noiseRows?: number;
-  duplicateSurplusRows?: number;
   averageTextLength: number;
   basis?: "verified" | "provisional";
   bound?: "exact" | "upper_bound";
@@ -136,8 +133,10 @@ export interface ConversionBudgetEstimate {
 
 export function formatDurationHuman(seconds: number): string {
   if (seconds <= 0) return "0s";
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
+  const totalSeconds = Math.round(seconds);
+  if (totalSeconds <= 0) return "0s";
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
   if (m === 0) {
     return `${s}s`;
   }
@@ -148,6 +147,15 @@ function assertValidBudgetNumber(val: unknown, name: string): void {
   if (typeof val !== "number" || !Number.isFinite(val) || Number.isNaN(val) || val < 0) {
     throw new CompanyMemoryUpgradeError(
       `Invalid budget input "${name}": must be a finite non-negative number, found ${val}.`,
+      "INVALID_ARGUMENT",
+    );
+  }
+}
+
+function assertValidRateCap(val: unknown, name: string): void {
+  if (typeof val !== "number" || !Number.isFinite(val) || Number.isNaN(val) || val <= 0) {
+    throw new CompanyMemoryUpgradeError(
+      `Invalid budget input "${name}": must be a finite positive number, found ${val}.`,
       "INVALID_ARGUMENT",
     );
   }
@@ -166,16 +174,18 @@ export function estimateConversionBudget(input: BudgetEstimateInput): Conversion
   if (input.unroutableRows !== undefined) assertValidBudgetNumber(input.unroutableRows, "unroutableRows");
   if (input.noiseRowsInRoutable !== undefined) assertValidBudgetNumber(input.noiseRowsInRoutable, "noiseRowsInRoutable");
   if (input.duplicateSurplusInRoutable !== undefined) assertValidBudgetNumber(input.duplicateSurplusInRoutable, "duplicateSurplusInRoutable");
-  if (input.noiseRows !== undefined) assertValidBudgetNumber(input.noiseRows, "noiseRows");
-  if (input.duplicateSurplusRows !== undefined) assertValidBudgetNumber(input.duplicateSurplusRows, "duplicateSurplusRows");
   if (input.chatInputUsdPerMillion !== undefined) assertValidBudgetNumber(input.chatInputUsdPerMillion, "chatInputUsdPerMillion");
   if (input.chatOutputUsdPerMillion !== undefined) assertValidBudgetNumber(input.chatOutputUsdPerMillion, "chatOutputUsdPerMillion");
   if (input.embeddingUsdPerMillion !== undefined) assertValidBudgetNumber(input.embeddingUsdPerMillion, "embeddingUsdPerMillion");
+  if (input.chatRpmCap !== undefined) assertValidRateCap(input.chatRpmCap, "chatRpmCap");
+  if (input.chatTpmCap !== undefined) assertValidRateCap(input.chatTpmCap, "chatTpmCap");
+  if (input.embeddingRpmCap !== undefined) assertValidRateCap(input.embeddingRpmCap, "embeddingRpmCap");
+  if (input.embeddingTpmCap !== undefined) assertValidRateCap(input.embeddingTpmCap, "embeddingTpmCap");
 
   let rowsToConvert = input.rowsToConvert;
   const unroutableRows = input.unroutableRows ?? 0;
-  const noiseRowsInRoutable = input.noiseRowsInRoutable ?? input.noiseRows ?? 0;
-  const duplicateSurplusInRoutable = input.duplicateSurplusInRoutable ?? input.duplicateSurplusRows ?? 0;
+  const noiseRowsInRoutable = input.noiseRowsInRoutable ?? 0;
+  const duplicateSurplusInRoutable = input.duplicateSurplusInRoutable ?? 0;
 
   if (rowsToConvert === undefined) {
     rowsToConvert = Math.max(0, totalRows - noiseRowsInRoutable - unroutableRows - duplicateSurplusInRoutable);
