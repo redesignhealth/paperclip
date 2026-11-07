@@ -4792,6 +4792,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       try {
         const wakeRun = await enqueueWakeup(candidate.agentId, {
+          allowRunCoalescing: false,
           source: candidate.source as WakeupOptions["source"],
           triggerDetail: (candidate.triggerDetail ??
             "system") as WakeupOptions["triggerDetail"],

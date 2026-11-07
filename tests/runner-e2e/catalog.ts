@@ -1,6 +1,7 @@
 import { caseHandoffTask, caseHandoffDefinitionDigest } from "./case-handoffs-cases.js";
 import { caseReceiptTask, caseReceiptDefinitionDigest, CASE_RECEIPT_BUDGET_CENTS, CASE_RECEIPT_MAX_TURNS, CASE_RECEIPT_RUN_TIMEOUT_MS } from "./case-receipt-cases.js";
 import { TASK_WORKSPACES_SUITE, taskWorkspaceTask, taskWorkspaceProfile, taskWorkspaceDefinitionDigest } from "./task-workspaces-cases.js";
+import { automaticRepositoryTask, automaticRepositoryDigest } from "./automatic-repository.js";
 import { nativeActiveStopTasks } from "./native-active-stop-tasks.js";
 import { piControlTasks } from "./pi-controls-cases.js";
 import { cursorNativeTasks } from "./cursor-native-cases.js";
@@ -1241,6 +1242,16 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     expectedMatrixSize: 3,
     definitionMetadata: { version: 1, definitionDigest: taskWorkspaceDefinitionDigest(), scheduling: "explicit-only", providerTurns: 3,
       attempts: 1, budgetMonthlyCents: 1000, project: "none", cwd: "unconfigured-task-default", oracle: "public-file-download-and-host-nested-git", remoteLifecycle: "per_turn" },
+  },
+  {
+    id: "automatic-repository", label: "Automatic repository continuation", manualOnly: true,
+    description: "A projectless user request stages its managed repository, continues automatically, and delivers independently verified downloaded bytes.",
+    groups: [], profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(taskWorkspaceProfile).map(productionDefaultHireProfile),
+    environments: runnerEnvironments, tasks: [automaticRepositoryTask], expectedMatrixSize: 4,
+    definitionMetadata: { version: 1, definitionDigest: automaticRepositoryDigest(), scheduling: "explicit-only",
+      providerTurns: 2, attempts: 1, budgetMonthlyCents: 1000, project: "none", instructions: "production-default",
+      surface: "paperclip", oracle: "registered-download-and-independent-checkout", remoteLifecycle: "per_turn" },
   },
   {
     id: "pi-controls", label: "Pi active controls", manualOnly: true,

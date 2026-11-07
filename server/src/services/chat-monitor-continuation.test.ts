@@ -196,6 +196,15 @@ if (!support.supported) console.warn(`Monitor publication database unavailable: 
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.source.id))).toHaveLength(1);
   });
 
+  it("retains conversation provenance when the admitted dispatch owns the deferred outbox run binding", async () => {
+    const f = await continuedTaskFixture();
+    await db.update(agentWakeupRequests).set({ runId: null }).where(eq(agentWakeupRequests.id, f.continuationWake.id));
+    expect(await f.bindings()).toEqual(await f.bindings(f.source.id));
+    expect(await f.bindings()).toHaveLength(1);
+    await db.update(agentWakeupRequests).set({ runId: f.source.id }).where(eq(agentWakeupRequests.id, f.continuationWake.id));
+    expect(await f.bindings()).toEqual([]);
+  });
+
   it("selects the continued chat run's completed answer over an earlier bookkeeping comment", async () => {
     const f = await continuedTaskFixture();
     const authorization = isChatOriginPublicationCandidate(f.successor.contextSnapshot)

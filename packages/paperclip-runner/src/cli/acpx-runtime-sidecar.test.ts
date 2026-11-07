@@ -317,10 +317,10 @@ describe("qualified ACPX runtime sidecar", () => {
     }
   });
 
-  it.each([true, false])("resolves an omitted continuation before the production sidecar validator only with a saved monitor: %s", async eligible => {
+  it.each([["monitor", true], ["monitor", false], ["same_agent", true], ["same_agent", false]] as const)("resolves an omitted continuation before the production sidecar validator with saved %s authority=%s", async (kind, eligible) => {
     const raw = { reportedWorkDisposition: "yielded", summary: "The review fix is published.", evidence: [], verification: [],
       completionClaim: { contractRevision: "1", objectiveSatisfied: false, criteria: [], remainingWork: [{ description: "Wait for checks.", blocksCompletion: true }] } };
-    const continuation = { kind: "monitor", summary: "Wait for the saved task monitor.", idempotencyKey: "task-monitor:task:deadline" };
+    const continuation = { kind, summary: "Continue from saved task state.", idempotencyKey: "saved:task:receipt" };
     const tools = new Map<string, any>(), emitted: any[] = [];
     const handler = loadWaitForTool({ tools, emitted, validate: validatePrpStructuredRunResult });
     const commands = loadActualToolCommands(tools);

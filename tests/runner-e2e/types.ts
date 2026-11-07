@@ -20,6 +20,7 @@ export type RunnerTaskWorkMode = "standard" | "planning" | "ask";
 export type RunnerTaskFlow =
   | "case_handoff"
   | "task_workspaces"
+  | "automatic_repository"
   | "repository_skills"
   | "provider_connection"
   | "plan_task_guidance"
