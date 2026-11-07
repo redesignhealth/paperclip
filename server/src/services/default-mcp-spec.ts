@@ -240,12 +240,67 @@ export function connectionHealthColumns<S extends string>(
 }
 
 /**
- * RH Google MCP tools switched on at first consent. Every name only reads. The server's own `isReadOnly` flag is NOT
- * used: it marks 95 of 121 tools read-only, including ones that change data (`manage_drive_access`,
- * `modify_gmail_message_labels`, `modify_sheet_values`, `manage_event`, `run_script_function`, `export_doc_to_pdf`,
- * `draft_gmail_message`). Anything not listed here stays quarantined until the owner reviews it.
+ * Reviewed writes that start on at first consent: drafts (never sent), Gmail label tagging, Docs/Sheets/Slides/Forms
+ * edits, Drive file writes, and comments. Reviewed 2026-11-06. The rule is "off only for real danger": sending,
+ * deleting (including tools that delete through an `action` argument: `manage_gmail_label`, `manage_task`,
+ * `manage_task_list`, `manage_contact*`), sharing and publishing, calendar invites and RSVPs, Gmail filters, and Apps
+ * Script execution or deployment stay off. Activation is per tool name, so a tool that multiplexes a delete is never
+ * listed. `manage_conditional_formatting` also accepts a delete action but only removes a formatting rule, never data.
+ * `update_drive_file` is NOT listed: it can move a file to the trash (`trashed`) and change who can share it.
+ * `modify_gmail_message_labels` and `batch_modify_gmail_message_labels` can add the `TRASH` or `SPAM` label (the batch
+ * tool across many messages in one call); they are kept on so agents can tag mail.
+ */
+export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
+  "draft_gmail_message",
+  "create_doc",
+  "modify_doc_text",
+  "find_and_replace_doc",
+  "insert_doc_elements",
+  "update_doc_headers_footers",
+  "batch_update_doc",
+  "create_table_with_data",
+  "update_paragraph_style",
+  "insert_doc_tab",
+  "update_doc_tab",
+  "create_spreadsheet",
+  "create_sheet",
+  "modify_sheet_values",
+  "format_sheet_range",
+  "manage_conditional_formatting",
+  "batch_modify_gmail_message_labels",
+  "batch_update_form",
+  "batch_update_presentation",
+  "copy_drive_file",
+  "create_document_from_markdown",
+  "create_drive_file",
+  "create_drive_file_base64",
+  "create_drive_folder",
+  "create_form",
+  "create_presentation",
+  "create_reaction",
+  "debug_table_structure",
+  "download_chat_attachment",
+  "export_doc_to_pdf",
+  "generate_trigger_code",
+  "import_to_google_doc",
+  "insert_doc_image",
+  "manage_document_comment",
+  "manage_presentation_comment",
+  "manage_spreadsheet_comment",
+  "modify_gmail_message_labels",
+]);
+
+/**
+ * RH Google MCP tools switched on at first consent: every read tool, plus the reviewed low-risk writes in
+ * `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`. The server's own `isReadOnly` flag is NOT used: it marks 95 of 121 tools read-only,
+ * including ones that change data (`manage_drive_access`, `modify_gmail_message_labels`, `modify_sheet_values`,
+ * `manage_event`, `run_script_function`, `export_doc_to_pdf`, `draft_gmail_message`). Anything not listed here
+ * (sending, deleting, sharing and publishing, event invites, filters, scripts, contact, label-object and task
+ * management) stays quarantined
+ * until the owner enables it in Permissions. See doc/connections/TOOL-ENABLEMENT-RUNBOOK.md.
  */
 export const RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS: readonly string[] = Object.freeze([
+  ...RH_GOOGLE_MCP_SAFE_WRITE_TOOLS,
   // Calendar
   "get_events",
   "list_calendars",

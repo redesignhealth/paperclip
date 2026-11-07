@@ -47,6 +47,7 @@ import { defaultMcpBackoffMs } from "../services/default-mcp-setup.js";
 import {
   DEFAULT_MCP_SPEC as GOOGLE_DEFAULT_SPEC,
   RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS,
+  RH_GOOGLE_MCP_SAFE_WRITE_TOOLS,
   initialActiveToolsForPersonalInstance,
   installsOnExistingAgentsOnConnect,
 } from "../services/default-mcp-spec.js";
@@ -1147,22 +1148,30 @@ describe("installByDefault", () => {
 });
 
 describe("RH Google MCP first-consent defaults", () => {
-  // Only names that read. The server's readOnlyHint is wrong for many tools (manage_drive_access, modify_sheet_values,
-  // run_script_function ...), so this is a name-shape guard on the curated list, not a trust in that flag.
+  // Outside the reviewed safe writes, only names that read. The server's readOnlyHint is wrong for many tools
+  // (manage_drive_access, modify_sheet_values, run_script_function ...), so this is a name-shape guard on the curated
+  // list, not a trust in that flag.
   const READ_SHAPE = /^(get|list|search|read|query|check|inspect|svc_get|svc_list|svc_read)_/;
-  const KNOWN_MUTATORS = [
-    "manage_drive_access", "modify_sheet_values", "modify_gmail_message_labels", "manage_event", "respond_to_event",
-    "run_script_function", "copy_drive_file", "draft_gmail_message", "export_doc_to_pdf", "send_gmail_message",
-    "create_doc", "batch_update_doc", "set_drive_file_permissions", "delete_script_project", "find_and_replace_doc",
-    "format_sheet_range", "import_to_google_doc", "insert_doc_elements", "generate_trigger_code",
+  // Dangerous tools must stay off by default; an owner enables them in Permissions.
+  const DANGEROUS = [
+    "send_gmail_message", "send_message", "manage_drive_access", "set_drive_file_permissions", "set_publish_settings",
+    "get_drive_shareable_link", "manage_gmail_filter", "manage_event", "respond_to_event", "create_event_with_zoom",
+    "run_script_function", "create_script_project", "update_script_content", "manage_deployment", "delete_script_project",
+    "create_version", "delete_doc_tab", "manage_contact", "manage_contacts_batch", "manage_contact_group",
+    // Multiplex a delete through an `action` argument, so enabling the tool name enables the delete.
+    "manage_gmail_label", "manage_task", "manage_task_list",
+    // Can move a file to the trash (`trashed`) and change who can share it.
+    "update_drive_file",
   ];
 
-  it("lists only read-shaped tool names, none duplicated, and none of the known mutators", () => {
+  it("lists read-shaped names plus the reviewed safe writes, none duplicated, and none of the dangerous tools", () => {
     const names = [...RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS];
     expect(names.length).toBeGreaterThan(40);
     expect(new Set(names).size).toBe(names.length);
-    for (const name of names) expect(name, name).toMatch(READ_SHAPE);
-    for (const name of KNOWN_MUTATORS) expect(names).not.toContain(name);
+    for (const name of names) {
+      if (!RH_GOOGLE_MCP_SAFE_WRITE_TOOLS.includes(name)) expect(name, name).toMatch(READ_SHAPE);
+    }
+    for (const name of DANGEROUS) expect(names).not.toContain(name);
     // May create an "anyone with the link" permission depending on the server, so it is not switched on by default.
     expect(names).not.toContain("get_drive_shareable_link");
   });
@@ -1175,6 +1184,8 @@ describe("RH Google MCP first-consent defaults", () => {
     const google = initialActiveToolsForPersonalInstance(personal("rh-google-mcp"));
     expect(google?.has("get_events")).toBe(true);
     expect(google?.has("manage_drive_access")).toBe(false);
+    expect(google?.has("send_gmail_message")).toBe(false);
+    expect(google?.has("modify_sheet_values")).toBe(true);
     expect(installsOnExistingAgentsOnConnect(personal("rh-google-mcp"))).toBe(true);
     // RH MCP keeps its own ceiling-based activation and does not auto-install.
     expect(initialActiveToolsForPersonalInstance(personal("rh-mcp"))?.has("mdm_get_granola_note")).toBe(true);

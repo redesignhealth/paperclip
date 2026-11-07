@@ -11,9 +11,20 @@ import { LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import { requestedRunCancellation } from "../run-cancellation.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
 import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from "./run-preparation.js";
+import {
+  UnsupportedMemoryEmbeddingError,
+  UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+} from "../company-memory-constants.js";
+import { classifyContinuationFailure } from "../recovery/service.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
-import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
+import {
+  createHeartbeatRunCompletion,
+  isConfigurationIncompleteFailedRun,
+  type CompleteHeartbeatRunInput,
+  type FailHeartbeatRunInput,
+  type HeartbeatRunCompletionDependencies,
+} from "./run-completion.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
@@ -314,6 +325,39 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
   });
 
+  it("maps UnsupportedMemoryEmbeddingError to dedicated non-retryable error code with safe diagnostics and keeps agent idle", async () => {
+    const f = await fixture();
+    const failure = f.failure(new UnsupportedMemoryEmbeddingError(f.agent.companyId, "text-embedding-3-large", 3072));
+    await f.completion.failRun(failure);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "failed", errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE });
+    expect(run.error).toContain(f.agent.companyId);
+    expect(run.error).toContain("text-embedding-3-large");
+    expect(run.error).toContain("3072");
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
+      f.agent.id,
+      "failed",
+      run.error,
+      expect.objectContaining({ keepIdleOnFailure: true }),
+    );
+  });
+
+  it("maps name-only deserialized UnsupportedMemoryEmbeddingError without code to dedicated non-retryable error code", async () => {
+    const f = await fixture();
+    const nameOnlyErr = new Error("Unsupported company memory embedding configuration");
+    nameOnlyErr.name = "UnsupportedMemoryEmbeddingError";
+    const failure = f.failure(nameOnlyErr);
+    await f.completion.failRun(failure);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "failed", errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE });
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
+      f.agent.id,
+      "failed",
+      run.error,
+      expect.objectContaining({ keepIdleOnFailure: true }),
+    );
+  });
+
   it("still records failure and releases issue ownership when log finalization and progress flushing fail", async () => {
     const f = await fixture();
     f.deps.runLogStore.finalize.mockRejectedValueOnce(new Error("log unavailable"));
@@ -341,6 +385,58 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();
     expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
+  });
+
+  it("maps UnsupportedMemoryEmbeddingError in setup path to dedicated non-retryable error code, keeps agent idle, and suppresses comment policy", async () => {
+    const f = await fixture();
+    const err = new UnsupportedMemoryEmbeddingError(f.agent.companyId, "text-embedding-3-large", 3072);
+    await f.completion.failRunSetup(f.setup(err));
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({
+      status: "failed",
+      errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+    });
+    expect(run.error).toContain(f.agent.companyId);
+    expect(run.error).toContain("text-embedding-3-large");
+    expect(run.error).toContain("3072");
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
+      f.agent.id,
+      "failed",
+      run.error,
+      expect.objectContaining({ keepIdleOnFailure: true }),
+    );
+    expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();
+    expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
+
+    const classification = classifyContinuationFailure(run as never);
+    expect(classification).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+    });
+  });
+
+  it("maps name-only deserialized UnsupportedMemoryEmbeddingError in setup path to dedicated non-retryable error code and keeps agent idle", async () => {
+    const f = await fixture();
+    const nameOnlyErr = new Error("Unsupported company memory embedding configuration");
+    nameOnlyErr.name = "UnsupportedMemoryEmbeddingError";
+    await f.completion.failRunSetup(f.setup(nameOnlyErr));
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({
+      status: "failed",
+      errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
+    });
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(
+      f.agent.id,
+      "failed",
+      run.error,
+      expect.objectContaining({ keepIdleOnFailure: true }),
+    );
+
+    const classification = classifyContinuationFailure(run as never);
+    expect(classification).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+    });
   });
 
   it("retains the default branch needed to repair an unresolved workspace base ref", async () => {
@@ -390,5 +486,21 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect(f.deps.setWakeupStatus).not.toHaveBeenCalled();
     expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
+  describe("isConfigurationIncompleteFailedRun", () => {
+    it("identifies runs with configuration incomplete, model not found, or unsupported memory embedding error codes", () => {
+      expect(isConfigurationIncompleteFailedRun({ errorCode: "configuration_incomplete" })).toBe(true);
+      expect(isConfigurationIncompleteFailedRun({ errorCode: "model_not_found" })).toBe(true);
+      expect(isConfigurationIncompleteFailedRun({ errorCode: UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE })).toBe(true);
+    });
+
+    it("returns false for non-matching or null runs", () => {
+      expect(isConfigurationIncompleteFailedRun(null)).toBe(false);
+      expect(isConfigurationIncompleteFailedRun(undefined)).toBe(false);
+      expect(isConfigurationIncompleteFailedRun({ errorCode: null })).toBe(false);
+      expect(isConfigurationIncompleteFailedRun({ errorCode: "adapter_failed" })).toBe(false);
+      expect(isConfigurationIncompleteFailedRun({ errorCode: "timeout" })).toBe(false);
+    });
   });
 });

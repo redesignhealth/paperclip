@@ -6,7 +6,7 @@ import type { SshRemoteExecutionSpec } from "./ssh.js";
 import type { AdapterExecutionTarget } from "./execution-target.js";
 import type { RuntimeStatusSink } from "./runtime-progress.js";
 import type { AdapterExecutionPhaseSink } from "./execution-phase.js";
-import type { ExecutionContinuationEnvelope, NativeFinalizationResult } from "@paperclipai/shared";
+import type { ExecutionContinuationEnvelope, NativeFinalizationResult, MemoryAgentGuidanceContext } from "@paperclipai/shared";
 
 export interface AdapterAgent {
   id: string;
@@ -324,6 +324,7 @@ export interface AdapterExecutionContext {
   runtimeMcp?: AdapterRuntimeMcpAccess;
   runtimeTools?: AdapterRuntimeToolAccess;
   runtimeMemory?: AdapterRuntimeMemoryAccess;
+  paperclipMemoryGuidance?: MemoryAgentGuidanceContext;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;

@@ -119,7 +119,9 @@ The `company_memory_databases.status` column supports the following states:
 5. Outside the database transaction, `ALTER ROLE "pcmem_r_<hex32>" WITH PASSWORD '<verifier>'` is executed.
 6. The new credentials are authenticated against the database.
 7. A short fenced transaction activates the pending secret version to `status = 'current'`, demotes the previous version to `'archived'`, advances `secret_version`, updates `last_rotated_at`, advances `credential_epoch`, and clears pending metadata.
-8. If runtime `resolveRuntimeConfig` encounters an in-flight rotation or pending secret, it automatically attempts recovery or fails closed; it **never** returns a stale credential. If rotation fails prior to staging the pending verifier, the row retains its `ready` status rather than being wedged in `failed`.
+8. Runtime `resolveRuntimeConfig` enforces a strict validation-before-secrets policy: the embedding allowlist check executes immediately upon loading the row, before any rotation convergence, credential rotation, or secret reads.
+   - For rows with valid, supported embeddings, if `resolveRuntimeConfig` encounters an in-flight rotation (`operation = 'rotate'`) or pending secret version, it attempts convergence via `rotateCredential`; it **never** returns a stale credential. If rotation fails prior to staging the pending verifier, the row retains its `ready` status rather than being wedged in `failed`.
+   - **Unsupported embedding rows skip rotation convergence**: If a row has an unsupported embedding model or dimensions, `resolveRuntimeConfig` fails closed immediately with `UnsupportedMemoryEmbeddingError` (non-retryable, `maxAttempts: 0`) without attempting rotation convergence. A row mid-rotation (`operation = 'rotate'` or `pendingSecretVersion`) with unsupported embedding fields will remain pending until repaired via a verified operator plan. Do not advise blind field edits or blind manual rotation triggers, and do not claim automatic recovery always occurs for such rows.
 
 ---
 
@@ -285,6 +287,67 @@ To isolate Mem0 memories per agent rather than sharing a global `"company"` scop
   - **Hourly Throttle**: To prevent database write amplification on every heartbeat run, updates to `scope_migration_agent_scope_observed_at` are throttled in the database query to at most once per hour (`lt(scopeMigrationAgentScopeObservedAt, cutoff)`).
   - **Observation, Not Cutover Verification**: This column is runtime telemetry evidence that an agent-scoped run was observed in the wild. It is NOT proof that all historical memories were migrated, that cutover verification succeeded, or that the run executed successfully.
   - **No Hand Edits**: Operators must not manually edit or clear `scope_migration_agent_scope_observed_at`.
+
+### 5.5 Changing the Embedding Model (TECH-8193)
+
+The external Hermes Mem0 OSS backend inspects the vector column dimension on start and, if it differs from the configured embedding dims, executes `DROP TABLE IF EXISTS <collection>` inside `suppress(Exception)`. A configuration change of embedding model or dimensions without a coordinated data migration will silently delete a company's memories.
+
+To guard against silent data loss, Paperclip enforces an **explicit, unconditional** fail-closed allowlist check (`SUPPORTED_COMPANY_MEMORY_EMBEDDINGS`) in `resolveRuntimeConfig` before any credentials leave the heartbeat service. If a row's `(embedding_model, embedding_dimensions)` pair is not present in the allowlist, the run fails closed immediately with `UnsupportedMemoryEmbeddingError` (non-retryable, `maxAttempts: 0`). The runtime does not perform automatic model conversions, data migrations, or recovery for unsupported pairs.
+
+#### Invariants & Operational Rules
+- **Explicit guard is unconditional**: The allowlist check executes before any rotation convergence or secret dispatch. Any company record whose embedding pair is not explicitly present in `SUPPORTED_COMPANY_MEMORY_EMBEDDINGS` fails closed on every run.
+- **Never just edit configuration or replace allowlist in place**: Matching against `SUPPORTED_COMPANY_MEMORY_EMBEDDINGS` is exact. Because the allowlist defines supported pairs, replacing an existing entry before all companies are migrated will immediately fail closed all unmigrated companies.
+- **Provisioner default must be supported by allowlist**: Shipping a provisioner default change (`DEFAULT_COMPANY_MEMORY_EMBEDDING` in `@paperclipai/db`) without the pair being present in the allowlist will cause every newly provisioned company run to fail closed immediately.
+- **Safe Expand/Contract Requirement**: Changing the embedding model cannot be done in a single breaking deploy. It requires a multi-phase expand/contract rollout across code and data.
+- **pgvector dimension limits**: Note that `text-embedding-3-large` at 3072 dimensions exceeds `pgvector`'s 2000-dimension HNSW indexing limit for `vector` columns (PostgreSQL `pgvector` limits HNSW indexes to 2000 dimensions).
+
+#### Preflight Census Requirement
+Before ANY deployment that introduces the embedding guard, modifies `SUPPORTED_COMPANY_MEMORY_EMBEDDINGS`, or alters `DEFAULT_COMPANY_MEMORY_EMBEDDING`, operators **must** run a read-only census on the Paperclip control-plane database to inspect existing model/dimension pairs and identify any unsupported rows:
+
+```sql
+-- 1. Grouped census: count existing embedding pairs across all tenant records
+SELECT embedding_model, embedding_dimensions, count(*)
+FROM company_memory_databases
+GROUP BY embedding_model, embedding_dimensions;
+
+-- 2. Identify unsupported or unexpected rows relative to target allowlist
+-- Example: when allowlist expects ('text-embedding-3-small', 1536)
+SELECT id, company_id, embedding_model, embedding_dimensions, status
+FROM company_memory_databases
+WHERE (embedding_model, embedding_dimensions) NOT IN (
+    ('text-embedding-3-small', 1536)
+);
+```
+
+If the census reveals any rows with unsupported pairs or unexpected NULL values, deployment must not proceed until those rows are investigated and remediated.
+
+#### Safe Expand/Contract Migration Procedure
+Transitioning to a new embedding model or dimension must follow a multi-phase expand/contract lifecycle. The runtime does not support arbitrary live migrations; all data transitions require planned offline cutovers with operator verification. Never execute arbitrary or automatic production actions.
+
+1. **Phase 1: Census and Expand Allowlist (Code Deploy)**
+   - Run the read-only preflight census query above to verify the current state of all tenant records.
+   - Deploy a code update that **expands** `SUPPORTED_COMPANY_MEMORY_EMBEDDINGS` to contain **BOTH** the old and new `(model, dimensions)` pairs.
+   - **Never replace the old entry before migration**: Both pairs must remain simultaneously valid in the running service so that existing companies continue serving traffic while new target collections are prepared.
+   - At this stage, the provisioner default (`DEFAULT_COMPANY_MEMORY_EMBEDDING`) may remain on the old model, or be switched in coordination once the dual-allowlist is live.
+
+2. **Phase 2: Offline Re-Embedding & Atomic Per-Company Swap (Data Migration)**
+   - Because concurrent writes during active runs bypass control-plane locks, re-embedding must be performed under a **verified offline/quiesced cutover** per company (e.g., setting the tenant database role to `NOLOGIN` and draining active backends, matching §5.4 offline cutover guarantees).
+   - Take a full per-tenant logical dump (`pg_dump -Fc`) of the affected memory database before touching any tables.
+   - Create a new collection table (e.g., `<collection>_v2`) in the tenant database with the target vector dimensions.
+   - Read existing memory records from the old collection and re-embed memory text from `payload->>'data'` using the new embedding model into the new collection table.
+   - **Atomically swap per company**: In a single database transaction on the control plane, update `collection_name`, `embedding_model`, and `embedding_dimensions` together on the `company_memory_databases` row to point to the new collection table with its matching model and dimensions. Updating collection name without updating model/dimensions causes Hermes Mem0 to drop the new table on dimension mismatch.
+   - Re-enable tenant access (`ALTER ROLE ... LOGIN`) and verify run execution.
+   - **Retain old collection**: Retain the legacy collection table in the tenant database until the migration is fully verified, soaked, and rollback/retention requirements are satisfied.
+
+3. **Phase 3: Coordinated Provisioner Default Switch (Code Deploy)**
+   - Update the provisioner default (`DEFAULT_COMPANY_MEMORY_EMBEDDING` in `@paperclipai/db`) to the new embedding pair.
+   - This phase occurs in a coordinated phase only while `SUPPORTED_COMPANY_MEMORY_EMBEDDINGS` still supports **both** old and new pairs, ensuring that any companies newly provisioned under the old default prior to deploy remain fully valid and accounted for until the default switches.
+   - Run the preflight census again to confirm newly provisioned rows and existing migrated rows align with expectations.
+
+4. **Phase 4: Contract Allowlist (Code Deploy)**
+   - Run the read-only census query. Confirm that the count of rows consuming the old embedding pair is **exactly zero** (`count = 0`).
+   - Confirm that all operational verification, retention periods, and rollback windows for the old collections have elapsed.
+   - Deploy a follow-up code change that removes the old `(model, dimensions)` entry from `SUPPORTED_COMPANY_MEMORY_EMBEDDINGS`, contracting the allowlist back to the active pair(s).
 
 ---
 
