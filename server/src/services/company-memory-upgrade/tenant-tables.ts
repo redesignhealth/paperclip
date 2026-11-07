@@ -71,15 +71,16 @@ export async function ensureUpgradeTables(
   // 2. Audit and progress ledger recording decisions for every source legacy memory
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_ledger" (
-      "source_id" uuid PRIMARY KEY,
       "upgrade_id" uuid NOT NULL,
+      "source_id" uuid NOT NULL,
       "source_content_sha256" text NOT NULL,
       "agent_id" uuid,
       "outcome" text NOT NULL,
       "reason_code" text,
       "output_ids" uuid[] NOT NULL DEFAULT '{}',
       "created_at" timestamp with time zone NOT NULL DEFAULT now(),
-      "updated_at" timestamp with time zone NOT NULL DEFAULT now()
+      "updated_at" timestamp with time zone NOT NULL DEFAULT now(),
+      PRIMARY KEY ("upgrade_id", "source_id")
     );
   `);
 
@@ -88,18 +89,20 @@ export async function ensureUpgradeTables(
     ON "paperclip_memory_upgrade_ledger" ("upgrade_id", "outcome");
   `);
 
-  // 3. Deduplication registry per agent to avoid redundant memory publications
+  // 3. Deduplication registry per agent to avoid redundant memory publications within an upgrade
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_dedupe" (
+      "upgrade_id" uuid NOT NULL,
       "agent_id" uuid NOT NULL,
       "data_sha256" text NOT NULL,
       "output_id" uuid NOT NULL,
       "created_at" timestamp with time zone NOT NULL DEFAULT now()
     );
+
   `);
 
   await sql.unsafe(`
     CREATE UNIQUE INDEX IF NOT EXISTS "pmu_dedupe_uq"
-    ON "paperclip_memory_upgrade_dedupe" ("agent_id", "data_sha256");
+    ON "paperclip_memory_upgrade_dedupe" ("upgrade_id", "agent_id", "data_sha256");
   `);
 }
