@@ -1,4 +1,5 @@
 import type postgres from "postgres";
+import { CompanyMemoryUpgradeError } from "./state-machine.js";
 import { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome } from "./types.js";
 
 export { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome };
@@ -13,6 +14,19 @@ export { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome };
  * Any other value is rejected to prevent SQL injection when interpolating the type name into DDL.
  */
 export const VECTOR_TYPE_ALLOWLIST_REGEX = /^(?:vector\(\d{1,5}\)|text)$/i;
+
+export function isValidVectorType(vectorType: string): boolean {
+  const normalized = vectorType.trim();
+  if (normalized.toLowerCase() === "text") {
+    return true;
+  }
+  const match = normalized.match(/^vector\((\d{1,5})\)$/i);
+  if (!match) {
+    return false;
+  }
+  const dim = Number.parseInt(match[1], 10);
+  return dim >= 1 && dim <= 16000 && String(dim) === match[1];
+}
 
 export interface SqlClient {
   unsafe(query: string, args?: unknown[]): Promise<unknown>;
@@ -42,14 +56,16 @@ export async function ensureUpgradeTables(
   vectorType: string,
 ): Promise<void> {
   const normalizedVectorType = vectorType.trim();
-  if (!VECTOR_TYPE_ALLOWLIST_REGEX.test(normalizedVectorType)) {
-    throw new Error(
-      `Invalid vectorType: "${vectorType}". Must match ^(?:vector\\(\\d{1,5}\\)|text)$`,
+  if (!isValidVectorType(normalizedVectorType)) {
+    throw new CompanyMemoryUpgradeError(
+      "Invalid vectorType: must be text or vector(N) with 1 <= N <= 16000",
+      "INVALID_ARGUMENT",
     );
   }
 
-  // 1. Staging table for converted agent-scoped memories
-  await sql.unsafe(`
+  const outcomesList = UPGRADE_LEDGER_OUTCOMES.map((o) => `'${o}'`).join(", ");
+
+  const ddl = `
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_staging" (
       "upgrade_id" uuid NOT NULL,
       "source_id" uuid NOT NULL,
@@ -61,15 +77,10 @@ export async function ensureUpgradeTables(
       "published_at" timestamp with time zone,
       "created_at" timestamp with time zone NOT NULL DEFAULT now()
     );
-  `);
 
-  await sql.unsafe(`
     CREATE INDEX IF NOT EXISTS "pmu_staging_src_idx"
     ON "paperclip_memory_upgrade_staging" ("upgrade_id", "source_id");
-  `);
 
-  // 2. Audit and progress ledger recording decisions for every source legacy memory
-  await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_ledger" (
       "upgrade_id" uuid NOT NULL,
       "source_id" uuid NOT NULL,
@@ -80,17 +91,13 @@ export async function ensureUpgradeTables(
       "output_ids" uuid[] NOT NULL DEFAULT '{}',
       "created_at" timestamp with time zone NOT NULL DEFAULT now(),
       "updated_at" timestamp with time zone NOT NULL DEFAULT now(),
-      PRIMARY KEY ("upgrade_id", "source_id")
+      PRIMARY KEY ("upgrade_id", "source_id"),
+      CONSTRAINT "pmu_ledger_outcome_check" CHECK ("outcome" IN (${outcomesList}))
     );
-  `);
 
-  await sql.unsafe(`
     CREATE INDEX IF NOT EXISTS "pmu_ledger_outcome_idx"
     ON "paperclip_memory_upgrade_ledger" ("upgrade_id", "outcome");
-  `);
 
-  // 3. Deduplication registry per agent to avoid redundant memory publications within an upgrade
-  await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_dedupe" (
       "upgrade_id" uuid NOT NULL,
       "agent_id" uuid NOT NULL,
@@ -99,10 +106,15 @@ export async function ensureUpgradeTables(
       "created_at" timestamp with time zone NOT NULL DEFAULT now()
     );
 
-  `);
-
-  await sql.unsafe(`
     CREATE UNIQUE INDEX IF NOT EXISTS "pmu_dedupe_uq"
     ON "paperclip_memory_upgrade_dedupe" ("upgrade_id", "agent_id", "data_sha256");
-  `);
+  `;
+
+  if ("begin" in sql && typeof (sql as any).begin === "function") {
+    await (sql as any).begin(async (tx: SqlClient) => {
+      await tx.unsafe(ddl);
+    });
+  } else {
+    await sql.unsafe(ddl);
+  }
 }

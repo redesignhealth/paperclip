@@ -103,10 +103,6 @@ export interface UpdateCountersParams {
   // Timestamps to record
   markedAt?: Date;
   drainConfirmedAt?: Date;
-  verifiedAt?: Date;
-  prunedAt?: Date;
-  rolledBackAt?: Date;
-  completedAt?: Date;
 
   lastError?: UpgradeErrorCode | null;
 }

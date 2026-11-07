@@ -43,11 +43,11 @@ export const companyMemoryUpgrades = pgTable(
     supersededCount: integer("superseded_count").notNull().default(0),
     sourceDeletedCount: integer("source_deleted_count").notNull().default(0),
 
-    // Bigint counters (default 0, not null)
-    llmInputTokens: bigint("llm_input_tokens", { mode: "number" }).notNull().default(0),
-    llmOutputTokens: bigint("llm_output_tokens", { mode: "number" }).notNull().default(0),
-    embeddingTokens: bigint("embedding_tokens", { mode: "number" }).notNull().default(0),
-    estimatedCostNanodollars: bigint("estimated_cost_nanodollars", { mode: "number" }).notNull().default(0),
+    // Bigint counters (default 0n, not null)
+    llmInputTokens: bigint("llm_input_tokens", { mode: "bigint" }).notNull().default(0n),
+    llmOutputTokens: bigint("llm_output_tokens", { mode: "bigint" }).notNull().default(0n),
+    embeddingTokens: bigint("embedding_tokens", { mode: "bigint" }).notNull().default(0n),
+    estimatedCostNanodollars: bigint("estimated_cost_nanodollars", { mode: "bigint" }).notNull().default(0n),
 
     // Timestamps (nullable)
     markedAt: timestamp("marked_at", { withTimezone: true }),

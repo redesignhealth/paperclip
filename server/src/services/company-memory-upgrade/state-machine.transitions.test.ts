@@ -3,6 +3,7 @@ import {
   CompanyMemoryUpgradeError,
   assertUpgradeErrorCode,
   assertValidTransition,
+  isUpgradeErrorCode,
   isValidTransition,
   VALID_TRANSITIONS,
 } from "./state-machine.js";
@@ -14,38 +15,50 @@ describe("state-machine transitions", () => {
       // Sweeping
       ["sweeping", "flipping"],
       ["sweeping", "aborted"],
-      ["sweeping", "needs_recovery"],
 
       // Flipping
       ["flipping", "draining"],
       ["flipping", "sweeping"],
-      ["flipping", "needs_recovery"],
 
       // Draining
       ["draining", "verified"],
       ["draining", "rolled_back"],
-      ["draining", "needs_recovery"],
 
       // Verified
       ["verified", "pruning"],
       ["verified", "rolled_back"],
-      ["verified", "needs_recovery"],
 
       // Pruning
       ["pruning", "completed"],
-      ["pruning", "needs_recovery"],
-
-      // Needs recovery
-      ["needs_recovery", "sweeping"],
-      ["needs_recovery", "flipping"],
-      ["needs_recovery", "draining"],
-      ["needs_recovery", "verified"],
-      ["needs_recovery", "pruning"],
     ];
 
     for (const [from, to] of validPairs) {
       expect(isValidTransition(from, to), `Transition from ${from} to ${to} should be valid`).toBe(true);
       expect(() => assertValidTransition(from, to)).not.toThrow();
+    }
+  });
+
+  it("rejects generic transitions into and out of needs_recovery", () => {
+    const activeStates: UpgradeState[] = ["sweeping", "flipping", "draining", "verified", "pruning"];
+
+    for (const state of activeStates) {
+      // Entry to needs_recovery is reserved for dedicated lapse helpers
+      expect(isValidTransition(state, "needs_recovery")).toBe(false);
+      expect(() => assertValidTransition(state, "needs_recovery")).toThrowError(
+        expect.objectContaining({
+          name: "CompanyMemoryUpgradeError",
+          code: "ILLEGAL_TRANSITION",
+        }),
+      );
+
+      // Generic exit from needs_recovery is reserved for recoverUpgrade
+      expect(isValidTransition("needs_recovery", state)).toBe(false);
+      expect(() => assertValidTransition("needs_recovery", state)).toThrowError(
+        expect.objectContaining({
+          name: "CompanyMemoryUpgradeError",
+          code: "ILLEGAL_TRANSITION",
+        }),
+      );
     }
   });
 
@@ -120,6 +133,35 @@ describe("state-machine transitions", () => {
     );
   });
 
+  it("never echoes from, to, or recoverToState in transition error messages", () => {
+    let err1: Error | undefined;
+    try {
+      assertValidTransition("sweeping", "rolled_back");
+    } catch (e: any) {
+      err1 = e;
+    }
+    expect(err1?.message).not.toContain("sweeping");
+    expect(err1?.message).not.toContain("rolled_back");
+
+    let err2: Error | undefined;
+    try {
+      assertValidTransition("pruning", "rolled_back");
+    } catch (e: any) {
+      err2 = e;
+    }
+    expect(err2?.message).not.toContain("pruning");
+    expect(err2?.message).not.toContain("rolled_back");
+
+    let err3: Error | undefined;
+    try {
+      assertValidTransition("needs_recovery", "sweeping", "draining");
+    } catch (e: any) {
+      err3 = e;
+    }
+    expect(err3?.message).not.toContain("sweeping");
+    expect(err3?.message).not.toContain("draining");
+  });
+
   it("exhaustively tests all state pairs against the transition table", () => {
     for (const from of UPGRADE_STATES) {
       for (const to of UPGRADE_STATES) {
@@ -140,6 +182,17 @@ describe("state-machine transitions", () => {
         }
       }
     }
+  });
+
+  describe("isUpgradeErrorCode", () => {
+    it("returns true for all valid error codes and false for invalid", () => {
+      expect(isUpgradeErrorCode("lease_lapsed")).toBe(true);
+      expect(isUpgradeErrorCode("conversion_failed")).toBe(true);
+      expect(isUpgradeErrorCode("not_a_code")).toBe(false);
+      expect(isUpgradeErrorCode(null)).toBe(false);
+      expect(isUpgradeErrorCode(123)).toBe(false);
+      expect(isUpgradeErrorCode(undefined)).toBe(false);
+    });
   });
 
   describe("assertUpgradeErrorCode", () => {

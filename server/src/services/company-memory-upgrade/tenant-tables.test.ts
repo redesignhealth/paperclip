@@ -7,9 +7,11 @@ import {
 } from "../../__tests__/helpers/embedded-postgres.js";
 import {
   ensureUpgradeTables,
+  isValidVectorType,
   UPGRADE_LEDGER_OUTCOMES,
   VECTOR_TYPE_ALLOWLIST_REGEX,
 } from "./tenant-tables.js";
+import { CompanyMemoryUpgradeError } from "./state-machine.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = support.supported ? describe : describe.skip;
@@ -34,26 +36,55 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     await tempDb?.cleanup();
   });
 
-  it("validates vectorType with strict allowlist regex", () => {
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("text")).toBe(true);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("vector(1536)")).toBe(true);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("vector(384)")).toBe(true);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("vector(3072)")).toBe(true);
+  it("validates vectorType with dimension bounds 1..16000 and literal text", () => {
+    expect(isValidVectorType("text")).toBe(true);
+    expect(isValidVectorType("vector(1)")).toBe(true);
+    expect(isValidVectorType("vector(1536)")).toBe(true);
+    expect(isValidVectorType("vector(384)")).toBe(true);
+    expect(isValidVectorType("vector(3072)")).toBe(true);
+    expect(isValidVectorType("vector(16000)")).toBe(true);
+
+    // Dimension out of bounds (1..16000)
+    expect(isValidVectorType("vector(0)")).toBe(false);
+    expect(isValidVectorType("vector(16001)")).toBe(false);
+    expect(isValidVectorType("vector(99999)")).toBe(false);
 
     // Invalid types rejected
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("varchar")).toBe(false);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("jsonb")).toBe(false);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("text; DROP TABLE users;")).toBe(false);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("vector(1536); DROP TABLE users;")).toBe(false);
-    expect(VECTOR_TYPE_ALLOWLIST_REGEX.test("vector(notanumber)")).toBe(false);
+    expect(isValidVectorType("varchar")).toBe(false);
+    expect(isValidVectorType("jsonb")).toBe(false);
+    expect(isValidVectorType("text; DROP TABLE users;")).toBe(false);
+    expect(isValidVectorType("vector(1536); DROP TABLE users;")).toBe(false);
+    expect(isValidVectorType("vector(notanumber)")).toBe(false);
   });
 
-  it("rejects invalid vectorType when executing ensureUpgradeTables", async () => {
-    await expect(ensureUpgradeTables(sql, "invalid_type")).rejects.toThrowError(
-      /Invalid vectorType/,
+  it("rejects invalid vectorType without echoing input in error message", async () => {
+    const maliciousInput = "vector(1536); DROP TABLE secret_tokens; -- s3cret";
+
+    let caughtErr: Error | undefined;
+    try {
+      await ensureUpgradeTables(sql, maliciousInput);
+    } catch (e: any) {
+      caughtErr = e;
+    }
+
+    expect(caughtErr).toBeDefined();
+    expect(caughtErr).toBeInstanceOf(CompanyMemoryUpgradeError);
+    expect((caughtErr as CompanyMemoryUpgradeError).code).toBe("INVALID_ARGUMENT");
+    expect(caughtErr!.message).not.toContain("s3cret");
+    expect(caughtErr!.message).not.toContain("secret_tokens");
+    expect(caughtErr!.message).not.toContain(maliciousInput);
+
+    await expect(ensureUpgradeTables(sql, "vector(0)")).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "INVALID_ARGUMENT",
+      }),
     );
-    await expect(ensureUpgradeTables(sql, "text; DROP TABLE users;")).rejects.toThrowError(
-      /Invalid vectorType/,
+    await expect(ensureUpgradeTables(sql, "vector(16001)")).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "INVALID_ARGUMENT",
+      }),
     );
   });
 
@@ -273,5 +304,35 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
         )
       `,
     ).rejects.toMatchObject({ code: "23505" });
+  });
+
+  it("enforces database CHECK constraint on ledger outcome", async () => {
+    await ensureUpgradeTables(sql, "text");
+
+    const upgradeId = randomUUID();
+    const sourceId = randomUUID();
+
+    // Valid outcome from UPGRADE_LEDGER_OUTCOMES succeeds
+    await expect(
+      sql`
+        INSERT INTO paperclip_memory_upgrade_ledger (
+          upgrade_id, source_id, source_content_sha256, outcome, output_ids
+        ) VALUES (
+          ${upgradeId}, ${sourceId}, 'hash-valid', 'published', '{}'
+        )
+      `,
+    ).resolves.toBeDefined();
+
+    // Invalid outcome fails with CHECK constraint violation (23514)
+    const invalidSourceId = randomUUID();
+    await expect(
+      sql`
+        INSERT INTO paperclip_memory_upgrade_ledger (
+          upgrade_id, source_id, source_content_sha256, outcome, output_ids
+        ) VALUES (
+          ${upgradeId}, ${invalidSourceId}, 'hash-invalid', 'invented_opaque_outcome', '{}'
+        )
+      `,
+    ).rejects.toMatchObject({ code: "23514" });
   });
 });

@@ -80,7 +80,6 @@ export {
 } from "./company-scope.js";
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
-export { companyMemoryUpgrades, UPGRADE_STATES, type UpgradeState } from "./schema/company_memory_upgrades.js";
 export * from "./schema/index.js";
 
 export { signalDatabaseWork, subscribeDatabaseWork, databaseWorkPending, reconcileDatabaseWork } from "./work-signals.js";

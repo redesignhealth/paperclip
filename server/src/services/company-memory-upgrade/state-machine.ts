@@ -69,15 +69,15 @@ export class CompanyMemoryUpgradeError extends Error {
  * - Rollback is strictly refused at/after 'pruning' (hard error).
  */
 export const VALID_TRANSITIONS: Readonly<Record<UpgradeState, ReadonlySet<UpgradeState>>> = {
-  sweeping: new Set(["flipping", "aborted", "needs_recovery"]),
-  flipping: new Set(["draining", "sweeping", "needs_recovery"]),
-  draining: new Set(["verified", "rolled_back", "needs_recovery"]),
-  verified: new Set(["pruning", "rolled_back", "needs_recovery"]),
-  pruning: new Set(["completed", "needs_recovery"]),
+  sweeping: new Set(["flipping", "aborted"]),
+  flipping: new Set(["draining", "sweeping"]),
+  draining: new Set(["verified", "rolled_back"]),
+  verified: new Set(["pruning", "rolled_back"]),
+  pruning: new Set(["completed"]),
   completed: new Set([]),
   rolled_back: new Set([]),
   aborted: new Set([]),
-  needs_recovery: new Set(["sweeping", "flipping", "draining", "verified", "pruning"]),
+  needs_recovery: new Set([]),
 };
 
 export const ACTIVE_PRE_LAPSE_STATES: ReadonlySet<UpgradeState> = new Set([
@@ -88,6 +88,34 @@ export const ACTIVE_PRE_LAPSE_STATES: ReadonlySet<UpgradeState> = new Set([
   "pruning",
 ]);
 
+export function isValidRecoveryTransition(
+  recoverToState: UpgradeState | null | undefined,
+  to: UpgradeState,
+): boolean {
+  if (!recoverToState || !ACTIVE_PRE_LAPSE_STATES.has(recoverToState)) {
+    return false;
+  }
+  return to === recoverToState;
+}
+
+export function assertValidRecoveryTransition(
+  recoverToState: UpgradeState | null | undefined,
+  to: UpgradeState,
+): void {
+  if (!recoverToState || !ACTIVE_PRE_LAPSE_STATES.has(recoverToState)) {
+    throw new CompanyMemoryUpgradeError(
+      "Cannot recover upgrade: invalid or missing recover_to_state",
+      "INVALID_RECOVERY",
+    );
+  }
+  if (to !== recoverToState) {
+    throw new CompanyMemoryUpgradeError(
+      "Illegal state transition: recovery from needs_recovery must transition to recorded prior state",
+      "ILLEGAL_TRANSITION",
+    );
+  }
+}
+
 export function isValidTransition(
   from: UpgradeState,
   to: UpgradeState,
@@ -97,7 +125,7 @@ export function isValidTransition(
     return false;
   }
   if (from === "needs_recovery" && recoverToState !== undefined && recoverToState !== null) {
-    return to === recoverToState;
+    return isValidRecoveryTransition(recoverToState, to);
   }
   return VALID_TRANSITIONS[from]?.has(to) ?? false;
 }
@@ -109,25 +137,20 @@ export function assertValidTransition(
 ): void {
   if (to === "rolled_back" && (from === "pruning" || from === "completed")) {
     throw new CompanyMemoryUpgradeError(
-      `Rollback refused: cannot roll back upgrade from state "${from}"`,
+      "Rollback refused: cannot roll back upgrade from current state",
       "ROLLBACK_REFUSED",
     );
   }
 
   if (from === "needs_recovery" && recoverToState !== undefined && recoverToState !== null) {
-    if (to !== recoverToState) {
-      throw new CompanyMemoryUpgradeError(
-        `Illegal state transition: recovery from "needs_recovery" must transition to recorded prior state "${recoverToState}", not "${to}"`,
-        "ILLEGAL_TRANSITION",
-      );
-    }
+    assertValidRecoveryTransition(recoverToState, to);
     return;
   }
 
   const allowed = VALID_TRANSITIONS[from];
   if (!allowed || !allowed.has(to)) {
     throw new CompanyMemoryUpgradeError(
-      `Illegal state transition from "${from}" to "${to}"`,
+      "Illegal state transition",
       "ILLEGAL_TRANSITION",
     );
   }
@@ -257,6 +280,7 @@ export async function renewUpgradeLease(
         eq(companyMemoryUpgrades.id, id),
         eq(companyMemoryUpgrades.leaseToken, leaseToken),
         gt(companyMemoryUpgrades.leaseExpiresAt, now),
+        inArray(companyMemoryUpgrades.state, Array.from(ACTIVE_PRE_LAPSE_STATES)),
       ),
     )
     .returning({ id: companyMemoryUpgrades.id });
@@ -300,12 +324,29 @@ export function startLeaseHeartbeat(
   let lost = false;
   let running = true;
   let activeRenewal: Promise<void> | null = null;
+  let timer: NodeJS.Timeout | null = null;
+  let onLostInvoked = false;
+
+  function notifyLost(): void {
+    lost = true;
+    running = false;
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+    if (!onLostInvoked) {
+      onLostInvoked = true;
+      try {
+        options.onLost?.();
+      } catch {
+        // Defensive: prevent user callback errors from causing unhandled rejections
+      }
+    }
+  }
 
   // Check expiry before starting and report lost/stop if already expired
   if (nowMs >= knownExpiresAtMs) {
-    lost = true;
-    running = false;
-    options.onLost?.();
+    notifyLost();
     return {
       isLost: () => true,
       getKnownExpiresAtMs: () => knownExpiresAtMs,
@@ -321,28 +362,28 @@ export function startLeaseHeartbeat(
 
   async function performRenewal(): Promise<void> {
     if (!running || lost) return;
+    let renewalSucceeded = false;
     try {
       const res = await renewUpgradeLease(db, id, leaseToken, { ttlMs, clock });
-      if (!res.renewed || !res.expiresAt) {
-        lost = true;
-        running = false;
-        options.onLost?.();
-      } else {
+      if (res.renewed && res.expiresAt) {
         knownExpiresAtMs = res.expiresAt.getTime();
+        renewalSucceeded = true;
       }
     } catch {
       // Fail closed
-      lost = true;
-      running = false;
-      options.onLost?.();
+    }
+    if (!renewalSucceeded) {
+      notifyLost();
     }
   }
 
-  const timer = setInterval(() => {
+  timer = setInterval(() => {
     if (activeRenewal) return;
-    activeRenewal = performRenewal().finally(() => {
-      activeRenewal = null;
-    });
+    activeRenewal = performRenewal()
+      .catch(() => {})
+      .finally(() => {
+        activeRenewal = null;
+      });
   }, intervalMs);
   timer.unref?.();
 
@@ -351,8 +392,7 @@ export function startLeaseHeartbeat(
     getKnownExpiresAtMs: () => knownExpiresAtMs,
     assertActive: () => {
       if (lost || clock.now().getTime() >= knownExpiresAtMs) {
-        lost = true;
-        running = false;
+        notifyLost();
         throw new CompanyMemoryUpgradeError(
           "Upgrade lease lost or expired during operation",
           "LEASE_FENCED_OUT",
@@ -361,7 +401,10 @@ export function startLeaseHeartbeat(
     },
     stop: async () => {
       running = false;
-      clearInterval(timer);
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
       if (activeRenewal) {
         await activeRenewal.catch(() => {});
       }
@@ -390,6 +433,7 @@ export async function advanceState(
   }
 
   const now = options?.clock?.now() ?? new Date();
+  const isTerminal = to === "completed" || to === "rolled_back" || to === "aborted";
 
   const [updated] = await db
     .update(companyMemoryUpgrades)
@@ -400,6 +444,14 @@ export async function advanceState(
       ...(to === "rolled_back" ? { rolledBackAt: now } : {}),
       ...(to === "verified" ? { verifiedAt: now } : {}),
       ...(to === "pruning" ? { prunedAt: now } : {}),
+      ...(isTerminal
+        ? {
+            leaseToken: null,
+            leaseOwner: null,
+            leaseAcquiredAt: null,
+            leaseExpiresAt: null,
+          }
+        : {}),
       ...(options?.lastError !== undefined ? { lastError: options.lastError } : {}),
     })
     .where(
@@ -423,7 +475,7 @@ export async function advanceState(
     }
     if (existing.state !== from) {
       throw new CompanyMemoryUpgradeError(
-        `State mismatch for upgrade ${id}: expected "${from}", found "${existing.state}"`,
+        `State mismatch for upgrade ${id}: current state does not match expected state`,
         "STATE_MISMATCH",
       );
     }
@@ -455,9 +507,11 @@ export async function advanceState(
 export async function failUpgradeLeaseLapse(
   db: Db,
   id: string,
-  options?: { clock?: Clock },
+  options?: { clock?: Clock; ttlMs?: number },
 ): Promise<CompanyMemoryUpgradeRow | null> {
   const now = options?.clock?.now() ?? new Date();
+  const ttlMs = options?.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+  const staleCreatedAt = new Date(now.getTime() - ttlMs);
 
   const [lapsed] = await db
     .update(companyMemoryUpgrades)
@@ -474,14 +528,14 @@ export async function failUpgradeLeaseLapse(
     .where(
       and(
         eq(companyMemoryUpgrades.id, id),
-        lte(companyMemoryUpgrades.leaseExpiresAt, now),
-        inArray(companyMemoryUpgrades.state, [
-          "sweeping",
-          "flipping",
-          "draining",
-          "verified",
-          "pruning",
-        ]),
+        or(
+          lte(companyMemoryUpgrades.leaseExpiresAt, now),
+          and(
+            isNull(companyMemoryUpgrades.leaseExpiresAt),
+            lte(companyMemoryUpgrades.createdAt, staleCreatedAt),
+          ),
+        ),
+        inArray(companyMemoryUpgrades.state, Array.from(ACTIVE_PRE_LAPSE_STATES)),
       ),
     )
     .returning();
@@ -494,9 +548,11 @@ export async function failUpgradeLeaseLapse(
  */
 export async function reconcileLapsedUpgradeLeases(
   db: Db,
-  options?: { clock?: Clock },
+  options?: { clock?: Clock; ttlMs?: number },
 ): Promise<number> {
   const now = options?.clock?.now() ?? new Date();
+  const ttlMs = options?.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+  const staleCreatedAt = new Date(now.getTime() - ttlMs);
 
   const rows = await db
     .update(companyMemoryUpgrades)
@@ -512,14 +568,14 @@ export async function reconcileLapsedUpgradeLeases(
     })
     .where(
       and(
-        lte(companyMemoryUpgrades.leaseExpiresAt, now),
-        inArray(companyMemoryUpgrades.state, [
-          "sweeping",
-          "flipping",
-          "draining",
-          "verified",
-          "pruning",
-        ]),
+        or(
+          lte(companyMemoryUpgrades.leaseExpiresAt, now),
+          and(
+            isNull(companyMemoryUpgrades.leaseExpiresAt),
+            lte(companyMemoryUpgrades.createdAt, staleCreatedAt),
+          ),
+        ),
+        inArray(companyMemoryUpgrades.state, Array.from(ACTIVE_PRE_LAPSE_STATES)),
       ),
     )
     .returning({ id: companyMemoryUpgrades.id });
@@ -551,7 +607,7 @@ export async function recoverUpgrade(
 
   if (existing.state !== "needs_recovery") {
     throw new CompanyMemoryUpgradeError(
-      `Cannot recover upgrade ${id}: current state is "${existing.state}", expected "needs_recovery"`,
+      `Cannot recover upgrade ${id}: current state is not needs_recovery`,
       "INVALID_RECOVERY",
     );
   }
@@ -559,12 +615,12 @@ export async function recoverUpgrade(
   const priorState = existing.recoverToState as UpgradeState | null;
   if (!priorState || !ACTIVE_PRE_LAPSE_STATES.has(priorState)) {
     throw new CompanyMemoryUpgradeError(
-      `Cannot recover upgrade ${id}: invalid or missing recover_to_state "${existing.recoverToState}"`,
+      `Cannot recover upgrade ${id}: invalid or missing recover_to_state`,
       "INVALID_RECOVERY",
     );
   }
 
-  assertValidTransition("needs_recovery", priorState, priorState);
+  assertValidRecoveryTransition(priorState, priorState);
 
   const now = options?.clock?.now() ?? new Date();
   const ttlMs = options?.ttlMs ?? DEFAULT_LEASE_TTL_MS;
@@ -600,29 +656,40 @@ export async function recoverUpgrade(
   return recovered;
 }
 
+export const MAX_INT32 = 2_147_483_647;
+export const MAX_INT64 = 9_223_372_036_854_775_807n;
+
 function validateIntegerDelta(fieldName: string, value: unknown): number | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > MAX_INT32
+  ) {
     const detail =
       typeof value !== "number"
         ? `received type ${typeof value}`
         : !Number.isSafeInteger(value)
           ? "received non-integer"
-          : "received negative";
+          : value < 0
+            ? "received negative"
+            : "exceeds maximum 32-bit integer";
     throw new CompanyMemoryUpgradeError(
-      `Invalid delta for "${fieldName}": must be a nonnegative safe integer (${detail})`,
+      `Invalid delta for "${fieldName}": must be a nonnegative 32-bit integer (${detail})`,
       "INVALID_ARGUMENT",
     );
   }
   return value;
 }
 
-function validateBigIntDelta(fieldName: string, value: unknown): number | bigint | undefined {
+function validateBigIntDelta(fieldName: string, value: unknown): bigint | undefined {
   if (value === undefined) return undefined;
   if (typeof value === "bigint") {
-    if (value < 0n) {
+    if (value < 0n || value > MAX_INT64) {
+      const detail = value < 0n ? "received negative" : "exceeds maximum 64-bit integer";
       throw new CompanyMemoryUpgradeError(
-        `Invalid delta for "${fieldName}": must be a nonnegative bigint (received negative)`,
+        `Invalid delta for "${fieldName}": must be a nonnegative 64-bit integer (${detail})`,
         "INVALID_ARGUMENT",
       );
     }
@@ -636,7 +703,7 @@ function validateBigIntDelta(fieldName: string, value: unknown): number | bigint
         "INVALID_ARGUMENT",
       );
     }
-    return value;
+    return BigInt(value);
   }
   throw new CompanyMemoryUpgradeError(
     `Invalid delta for "${fieldName}": must be a nonnegative safe integer or bigint (received type ${typeof value})`,
@@ -707,16 +774,16 @@ export async function updateUpgradeCounters(
     setFields.sourceDeletedCount = sql`${companyMemoryUpgrades.sourceDeletedCount} + ${sourceDeletedCount}`;
   }
 
-  if (llmInputTokens !== undefined && (typeof llmInputTokens === "bigint" ? llmInputTokens > 0n : llmInputTokens > 0)) {
+  if (llmInputTokens !== undefined && llmInputTokens > 0n) {
     setFields.llmInputTokens = sql`${companyMemoryUpgrades.llmInputTokens} + ${llmInputTokens}`;
   }
-  if (llmOutputTokens !== undefined && (typeof llmOutputTokens === "bigint" ? llmOutputTokens > 0n : llmOutputTokens > 0)) {
+  if (llmOutputTokens !== undefined && llmOutputTokens > 0n) {
     setFields.llmOutputTokens = sql`${companyMemoryUpgrades.llmOutputTokens} + ${llmOutputTokens}`;
   }
-  if (embeddingTokens !== undefined && (typeof embeddingTokens === "bigint" ? embeddingTokens > 0n : embeddingTokens > 0)) {
+  if (embeddingTokens !== undefined && embeddingTokens > 0n) {
     setFields.embeddingTokens = sql`${companyMemoryUpgrades.embeddingTokens} + ${embeddingTokens}`;
   }
-  if (estimatedCostNanodollars !== undefined && (typeof estimatedCostNanodollars === "bigint" ? estimatedCostNanodollars > 0n : estimatedCostNanodollars > 0)) {
+  if (estimatedCostNanodollars !== undefined && estimatedCostNanodollars > 0n) {
     setFields.estimatedCostNanodollars = sql`${companyMemoryUpgrades.estimatedCostNanodollars} + ${estimatedCostNanodollars}`;
   }
 
@@ -725,18 +792,6 @@ export async function updateUpgradeCounters(
   }
   if (params.drainConfirmedAt !== undefined) {
     setFields.drainConfirmedAt = params.drainConfirmedAt;
-  }
-  if (params.verifiedAt !== undefined) {
-    setFields.verifiedAt = params.verifiedAt;
-  }
-  if (params.prunedAt !== undefined) {
-    setFields.prunedAt = params.prunedAt;
-  }
-  if (params.rolledBackAt !== undefined) {
-    setFields.rolledBackAt = params.rolledBackAt;
-  }
-  if (params.completedAt !== undefined) {
-    setFields.completedAt = params.completedAt;
   }
   if (params.lastError !== undefined) {
     if (params.lastError !== null) {
@@ -767,6 +822,12 @@ export async function updateUpgradeCounters(
     if (!existing) {
       throw new CompanyMemoryUpgradeError(`Upgrade ${id} not found`, "UPGRADE_NOT_FOUND");
     }
+    if (!ACTIVE_PRE_LAPSE_STATES.has(existing.state as UpgradeState)) {
+      throw new CompanyMemoryUpgradeError(
+        `Cannot update counters for upgrade ${id}: invalid state`,
+        "INVALID_STATE",
+      );
+    }
     if (existing.leaseToken !== leaseToken) {
       throw new CompanyMemoryUpgradeError(
         `Lease token mismatch for upgrade ${id}`,
@@ -777,12 +838,6 @@ export async function updateUpgradeCounters(
       throw new CompanyMemoryUpgradeError(
         `Lease expired for upgrade ${id}`,
         "LEASE_EXPIRED",
-      );
-    }
-    if (!ACTIVE_PRE_LAPSE_STATES.has(existing.state as UpgradeState)) {
-      throw new CompanyMemoryUpgradeError(
-        `Cannot update counters for upgrade ${id} in state "${existing.state}"`,
-        "INVALID_STATE",
       );
     }
     throw new CompanyMemoryUpgradeError(
