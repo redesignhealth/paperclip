@@ -9,7 +9,6 @@ import {
   ensureUpgradeTables,
   isValidVectorType,
   UPGRADE_LEDGER_OUTCOMES,
-  VECTOR_TYPE_ALLOWLIST_REGEX,
 } from "./tenant-tables.js";
 import { CompanyMemoryUpgradeError } from "./state-machine.js";
 

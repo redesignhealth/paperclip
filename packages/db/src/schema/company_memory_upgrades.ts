@@ -16,6 +16,14 @@ export const UPGRADE_STATES = [
 
 export type UpgradeState = (typeof UPGRADE_STATES)[number];
 
+export const TERMINAL_UPGRADE_STATES = [
+  "completed",
+  "rolled_back",
+  "aborted",
+] as const;
+
+export type TerminalUpgradeState = (typeof TERMINAL_UPGRADE_STATES)[number];
+
 export const companyMemoryUpgrades = pgTable(
   "company_memory_upgrades",
   {

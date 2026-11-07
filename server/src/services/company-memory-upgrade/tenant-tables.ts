@@ -4,17 +4,6 @@ import { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome } from "./types.js";
 
 export { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome };
 
-/**
- * Strict allowlist for vector column types.
- *
- * Supported formats:
- * - pgvector syntax: `vector(N)` where N is 1 to 5 digits (e.g. `vector(1536)`)
- * - literal `text`: permitted strictly for test harnesses lacking pgvector (e.g. embedded-postgres)
- *
- * Any other value is rejected to prevent SQL injection when interpolating the type name into DDL.
- */
-export const VECTOR_TYPE_ALLOWLIST_REGEX = /^(?:vector\(\d{1,5}\)|text)$/i;
-
 export function isValidVectorType(vectorType: string): boolean {
   const normalized = vectorType.trim();
   if (normalized.toLowerCase() === "text") {

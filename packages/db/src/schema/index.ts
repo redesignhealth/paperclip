@@ -219,7 +219,13 @@ export { chatGitHubConfigurations, chatGitHubRegistrations, chatGitHubReviews } 
 export { aiConnectionDefaults } from "./ai_connection_defaults.js";
 export { aiProviderDefaults } from "./ai_provider_defaults.js";
 export { companyMemoryDatabases, DEFAULT_COMPANY_MEMORY_EMBEDDING } from "./company_memory_databases.js";
-export { companyMemoryUpgrades, UPGRADE_STATES, type UpgradeState } from "./company_memory_upgrades.js";
+export {
+  companyMemoryUpgrades,
+  UPGRADE_STATES,
+  TERMINAL_UPGRADE_STATES,
+  type UpgradeState,
+  type TerminalUpgradeState,
+} from "./company_memory_upgrades.js";
 export * from "./email.js";
 export { announcementDismissals, announcementPublications } from "./announcement_dismissals.js";
 export { chatTaskHandoffs, chatCompletionDeliveries } from "./chat_completion_deliveries.js";

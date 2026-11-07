@@ -305,21 +305,62 @@ export function startLeaseHeartbeat(
   options: StartLeaseHeartbeatOptions,
 ): LeaseHeartbeatHandle {
   const clock = options.clock ?? { now: () => new Date() };
-  const intervalMs = options.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
-  const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS;
 
-  const nowMs = clock.now().getTime();
   let knownExpiresAtMs: number =
     options.initialExpiresAt instanceof Date
       ? options.initialExpiresAt.getTime()
       : options.initialExpiresAt;
 
-  if (typeof knownExpiresAtMs !== "number" || Number.isNaN(knownExpiresAtMs)) {
+  if (
+    typeof knownExpiresAtMs !== "number" ||
+    !Number.isFinite(knownExpiresAtMs) ||
+    knownExpiresAtMs <= 0
+  ) {
     throw new CompanyMemoryUpgradeError(
-      "initialExpiresAt must be a valid Date or numeric timestamp",
+      "initialExpiresAt must be a valid finite positive Date or timestamp",
       "INVALID_ARGUMENT",
     );
   }
+
+  const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+  if (typeof ttlMs !== "number" || !Number.isFinite(ttlMs) || ttlMs <= 0) {
+    throw new CompanyMemoryUpgradeError(
+      "ttlMs must be a finite positive number",
+      "INVALID_ARGUMENT",
+    );
+  }
+
+  let intervalMs: number;
+  if (options.intervalMs !== undefined) {
+    if (
+      typeof options.intervalMs !== "number" ||
+      !Number.isFinite(options.intervalMs) ||
+      options.intervalMs <= 0
+    ) {
+      throw new CompanyMemoryUpgradeError(
+        "intervalMs must be a finite positive number",
+        "INVALID_ARGUMENT",
+      );
+    }
+    if (options.intervalMs >= ttlMs) {
+      throw new CompanyMemoryUpgradeError(
+        "Heartbeat intervalMs must be less than ttlMs",
+        "INVALID_ARGUMENT",
+      );
+    }
+    intervalMs = options.intervalMs;
+  } else {
+    const sensibleIntervalMs = Math.floor(ttlMs / 3);
+    intervalMs = Math.min(DEFAULT_HEARTBEAT_INTERVAL_MS, sensibleIntervalMs);
+    if (intervalMs <= 0 || intervalMs >= ttlMs) {
+      throw new CompanyMemoryUpgradeError(
+        "ttlMs is too short for heartbeat interval",
+        "INVALID_ARGUMENT",
+      );
+    }
+  }
+
+  const nowMs = clock.now().getTime();
 
   let lost = false;
   let running = true;
@@ -372,6 +413,7 @@ export function startLeaseHeartbeat(
     } catch {
       // Fail closed
     }
+    if (!running || lost) return;
     if (!renewalSucceeded) {
       notifyLost();
     }
@@ -440,10 +482,14 @@ export async function advanceState(
     .set({
       state: to,
       updatedAt: now,
-      ...(to === "completed" ? { completedAt: now } : {}),
+      ...(to === "completed"
+        ? {
+            completedAt: now,
+            ...(from === "pruning" ? { prunedAt: now } : {}),
+          }
+        : {}),
       ...(to === "rolled_back" ? { rolledBackAt: now } : {}),
       ...(to === "verified" ? { verifiedAt: now } : {}),
-      ...(to === "pruning" ? { prunedAt: now } : {}),
       ...(isTerminal
         ? {
             leaseToken: null,
@@ -632,6 +678,7 @@ export async function recoverUpgrade(
     .set({
       state: priorState,
       recoverToState: null,
+      lastError: null,
       leaseToken: newToken,
       leaseOwner: newOwner,
       leaseAcquiredAt: now,
@@ -642,6 +689,7 @@ export async function recoverUpgrade(
       and(
         eq(companyMemoryUpgrades.id, id),
         eq(companyMemoryUpgrades.state, "needs_recovery"),
+        eq(companyMemoryUpgrades.recoverToState, priorState),
       ),
     )
     .returning();

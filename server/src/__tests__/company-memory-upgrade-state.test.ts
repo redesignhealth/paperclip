@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   companies,
@@ -299,7 +299,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
       "pruning",
     );
     expect(pruning.state).toBe("pruning");
-    expect(pruning.prunedAt).toBeDefined();
+    expect(pruning.prunedAt).toBeNull();
 
     // advance pruning -> completed
     const completed = await advanceState(
@@ -311,6 +311,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     );
     expect(completed.state).toBe("completed");
     expect(completed.completedAt).toBeDefined();
+    expect(completed.prunedAt).toBeDefined();
   });
 
   it("handles lease lapse to needs_recovery and recovers back to prior state", async () => {
@@ -861,6 +862,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     expect(recovered.state).toBe("sweeping");
     expect(recovered.leaseOwner).toBe("crash-recovery-worker");
     expect(recovered.leaseToken).toBeDefined();
+    expect(recovered.lastError).toBeNull();
   });
 
   it("handles throwing onLost callback defensively without unhandled rejection and stops interval", async () => {
@@ -919,7 +921,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     await expect(runningHb.stop()).resolves.toBeUndefined();
   });
 
-  it("deletes companyMemoryUpgrades rows during company deletion without FK restrict violation", async () => {
+  it("refuses company deletion while non-terminal upgrade exists, and deletes terminal audit rows on completion", async () => {
     const company = await createTestCompany("Delete Co", "DC");
     const upgrade = await openUpgrade(db, {
       companyId: company.id,
@@ -931,7 +933,41 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     });
     expect(upgrade.id).toBeDefined();
 
-    // deleteCompany purges companyMemoryUpgrades before deleting company
+    // 1. Refuses deletion while active in 'sweeping'
+    await expect(deleteCompany(db, company.id)).rejects.toThrow(
+      /Cannot delete company: memory upgrade .* is active in state "sweeping"/,
+    );
+
+    // Verify company and upgrade rows remain intact
+    const [coStillThere] = await db.select().from(companies).where(sql`id = ${company.id}`);
+    expect(coStillThere).toBeDefined();
+
+    // 2. Claim lease and advance to 'pruning' (still non-terminal)
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "prune-tester",
+      ttlMs: 60_000,
+    });
+    expect(claim.acquired).toBe(true);
+    await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "flipping");
+    await advanceState(db, upgrade.id, claim.leaseToken!, "flipping", "draining");
+    await advanceState(db, upgrade.id, claim.leaseToken!, "draining", "verified");
+    const pruning = await advanceState(db, upgrade.id, claim.leaseToken!, "verified", "pruning");
+    expect(pruning.state).toBe("pruning");
+    expect(pruning.prunedAt).toBeNull();
+
+    // Still refuses deletion while in 'pruning'
+    await expect(deleteCompany(db, company.id)).rejects.toThrow(
+      /Cannot delete company: memory upgrade .* is active in state "pruning"/,
+    );
+
+    // 3. Advance to 'completed' (terminal state)
+    const completed = await advanceState(db, upgrade.id, claim.leaseToken!, "pruning", "completed");
+    expect(completed.state).toBe("completed");
+    expect(completed.prunedAt).toBeDefined();
+    expect(completed.completedAt).toBeDefined();
+
+    // 4. Deletion succeeds and cleans up terminal audit row
     const deleted = await deleteCompany(db, company.id);
     expect(deleted).toMatchObject({ id: company.id });
 
@@ -948,6 +984,338 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
       .from(companies)
       .where(sql`id = ${company.id}`);
     expect(companyRow).toBeUndefined();
+  });
+
+  it("advanceState leaves prunedAt null during pruning and on crash, setting it only on completion", async () => {
+    const company = await createTestCompany("Co Prune Crash", "CPC");
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "prune-crash-worker",
+      ttlMs: 60_000,
+    });
+    await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "flipping");
+    await advanceState(db, upgrade.id, claim.leaseToken!, "flipping", "draining");
+    await advanceState(db, upgrade.id, claim.leaseToken!, "draining", "verified");
+    const pruning = await advanceState(db, upgrade.id, claim.leaseToken!, "verified", "pruning");
+    expect(pruning.state).toBe("pruning");
+    expect(pruning.prunedAt).toBeNull();
+
+    // Simulate crash/lease lapse in pruning:
+    const lapsed = await failUpgradeLeaseLapse(db, upgrade.id, {
+      clock: { now: () => new Date(Date.now() + 120_000) },
+    });
+    expect(lapsed).not.toBeNull();
+    expect(lapsed!.state).toBe("needs_recovery");
+    expect(lapsed!.recoverToState).toBe("pruning");
+    expect(lapsed!.prunedAt).toBeNull();
+
+    // Recover back to pruning:
+    const recovered = await recoverUpgrade(db, upgrade.id, "recovery-worker");
+    expect(recovered.state).toBe("pruning");
+    expect(recovered.prunedAt).toBeNull();
+    expect(recovered.lastError).toBeNull();
+
+    // Finally complete from pruning -> prunedAt and completedAt are set:
+    const completed = await advanceState(db, upgrade.id, recovered.leaseToken!, "pruning", "completed");
+    expect(completed.state).toBe("completed");
+    expect(completed.prunedAt).toBeDefined();
+    expect(completed.completedAt).toBeDefined();
+  });
+
+  it("recoverUpgrade enforces CAS on recoverToState and clears lastError on recovery", async () => {
+    const company = await createTestCompany("Co CAS", "CCAS");
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    // Put upgrade into needs_recovery with prior state 'sweeping' and lastError 'lease_lapsed'
+    await db
+      .update(companyMemoryUpgrades)
+      .set({
+        state: "needs_recovery",
+        recoverToState: "sweeping",
+        lastError: "lease_lapsed",
+      })
+      .where(sql`id = ${upgrade.id}`);
+
+    // Simulate concurrent recovery where two workers race:
+    const [p1, p2] = await Promise.allSettled([
+      recoverUpgrade(db, upgrade.id, "worker-1"),
+      recoverUpgrade(db, upgrade.id, "worker-2"),
+    ]);
+
+    const succeeded = [p1, p2].filter((p) => p.status === "fulfilled");
+    const failed = [p1, p2].filter((p) => p.status === "rejected");
+    expect(succeeded.length).toBe(1);
+    expect(failed.length).toBe(1);
+
+    const winner = (succeeded[0] as PromiseFulfilledResult<any>).value;
+    expect(winner.state).toBe("sweeping");
+    expect(winner.lastError).toBeNull();
+    expect(winner.recoverToState).toBeNull();
+
+    const loserErr = (failed[0] as PromiseRejectedResult).reason;
+    expect(loserErr).toBeInstanceOf(CompanyMemoryUpgradeError);
+    expect(["CAS_FAILED", "INVALID_RECOVERY"]).toContain(loserErr.code);
+
+    // Directly verify CAS condition on recoverToState:
+    await db
+      .update(companyMemoryUpgrades)
+      .set({
+        state: "needs_recovery",
+        recoverToState: "draining",
+        lastError: "lease_lapsed",
+      })
+      .where(sql`id = ${upgrade.id}`);
+
+    const staleSelectDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "select") {
+          return (...args: any[]) => {
+            const selectBuilder = (target as any).select(...args);
+            return {
+              from: (...fromArgs: any[]) => {
+                const pgSelect = selectBuilder.from(...fromArgs);
+                return {
+                  where: async (...whereArgs: any[]) => {
+                    const rows = await pgSelect.where(...whereArgs);
+                    return rows.map((r: any) => ({ ...r, recoverToState: "sweeping" }));
+                  },
+                };
+              },
+            };
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    await expect(
+      recoverUpgrade(staleSelectDb, upgrade.id, "worker-race"),
+    ).rejects.toThrowError(
+      expect.objectContaining({ code: "CAS_FAILED" }),
+    );
+  });
+
+  it("validates heartbeat timing arguments and stops in-flight renewal cleanly without invoking onLost", async () => {
+    const company = await createTestCompany("Co HB Timers", "CHBT");
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "hb-timer-worker",
+      ttlMs: 30_000,
+    });
+
+    const now = Date.now();
+
+    // 1. Invalid initialExpiresAt
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: 0,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: -100,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: Number.NaN,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    // 2. Invalid ttlMs
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        ttlMs: 0,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        ttlMs: -10,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        ttlMs: Number.POSITIVE_INFINITY,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    // ttlMs too short (< 3ms so floor(ttlMs / 3) <= 0)
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 2,
+        ttlMs: 2,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    // 3. Invalid intervalMs
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        intervalMs: 0,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        intervalMs: -50,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    // Explicit intervalMs >= ttlMs
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        ttlMs: 30_000,
+        intervalMs: 30_000,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    expect(() =>
+      startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+        initialExpiresAt: now + 30_000,
+        ttlMs: 30_000,
+        intervalMs: 40_000,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+
+    // 4. In-flight renewal during clean stop() does NOT invoke onLost
+    let onLostCalled = false;
+    let resolveRenewal!: (value: any) => void;
+    const renewalPending = new Promise((resolve) => {
+      resolveRenewal = resolve;
+    });
+
+    const slowDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return (...args: any[]) => {
+            const updateBuilder = (target as any).update(...args);
+            return {
+              set: (...setArgs: any[]) => {
+                const pgUpdate = updateBuilder.set(...setArgs);
+                return {
+                  where: (...whereArgs: any[]) => {
+                    return {
+                      returning: async () => {
+                        await renewalPending;
+                        return [];
+                      },
+                    };
+                  },
+                };
+              },
+            };
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const hb = startLeaseHeartbeat(slowDb, upgrade.id, claim.leaseToken!, {
+      initialExpiresAt: now + 100_000,
+      intervalMs: 10,
+      ttlMs: 30_000,
+      onLost: () => {
+        onLostCalled = true;
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 25));
+
+    const stopPromise = hb.stop();
+    resolveRenewal(null);
+    await stopPromise;
+
+    expect(onLostCalled).toBe(false);
+
+    // 5. Short TTL defaults to min(DEFAULT, floor(ttlMs / 3)) interval deterministically
+    vi.useFakeTimers();
+    try {
+      let renewalsCount = 0;
+      const fakeClock = {
+        currentTime: new Date("2026-05-01T12:00:00Z"),
+        now: () => fakeClock.currentTime,
+      };
+      const mockDb = new Proxy(db, {
+        get(target, prop, receiver) {
+          if (prop === "update") {
+            return (...args: any[]) => {
+              const b = (target as any).update(...args);
+              return {
+                set: (...setArgs: any[]) => {
+                  const s = b.set(...setArgs);
+                  return {
+                    where: (...whereArgs: any[]) => ({
+                      returning: async () => {
+                        renewalsCount++;
+                        return [{ id: upgrade.id }];
+                      },
+                    }),
+                  };
+                },
+              };
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+
+      const hbShort = startLeaseHeartbeat(mockDb, upgrade.id, claim.leaseToken!, {
+        clock: fakeClock,
+        initialExpiresAt: new Date(fakeClock.currentTime.getTime() + 30_000),
+        ttlMs: 30_000, // interval defaults to floor(30_000 / 3) = 10_000 ms
+      });
+
+      expect(renewalsCount).toBe(0);
+
+      // Advance by 9.9s -> interval 10s has not fired yet
+      await vi.advanceTimersByTimeAsync(9_900);
+      expect(renewalsCount).toBe(0);
+
+      // Advance past 10s -> interval 10s fires renewal
+      await vi.advanceTimersByTimeAsync(200);
+      expect(renewalsCount).toBe(1);
+
+      // Advance another 10s -> fires 2nd renewal
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(renewalsCount).toBe(2);
+
+      await hbShort.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("recoverUpgrade rejects not found, invalid state, and missing prior state", async () => {

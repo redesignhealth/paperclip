@@ -46,6 +46,7 @@ import {
   routines,
   companyMemoryDatabases,
   companyMemoryUpgrades,
+  TERMINAL_UPGRADE_STATES,
 } from "@paperclipai/db";
 
 /**
@@ -99,6 +100,33 @@ export async function deleteCompany(db: Db, id: string) {
         if (!existing) return null;
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
         await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
+
+        // Check for in-progress memory upgrades under row lock.
+        // Selecting upgrade rows FOR NO KEY UPDATE ensures concurrent state advances,
+        // lease claims, or renewals wait on this transaction and cannot race with deletion.
+        // If any non-terminal upgrade exists (e.g. sweeping, flipping, draining,
+        // verified, pruning, or needs_recovery), refuse deletion to prevent data loss or
+        // leaving orphaned tenant tables/leases.
+        const upgradeRows = await tx
+          .select({
+            id: companyMemoryUpgrades.id,
+            state: companyMemoryUpgrades.state,
+          })
+          .from(companyMemoryUpgrades)
+          .where(eq(companyMemoryUpgrades.companyId, id))
+          .for("no key update");
+
+        const activeUpgrade = upgradeRows.find(
+          (row) => !(TERMINAL_UPGRADE_STATES as readonly string[]).includes(row.state),
+        );
+        if (activeUpgrade) {
+          throw new Error(
+            `Cannot delete company: memory upgrade "${activeUpgrade.id}" is active in state "${activeUpgrade.state}". Non-terminal upgrades must complete, roll back, or abort before company deletion.`,
+          );
+        }
+
+        // Terminal upgrade rows are audit/ledger records and are only deleted as part
+        // of final company deletion once verified that no active upgrade is running.
         await tx.delete(companyMemoryUpgrades).where(eq(companyMemoryUpgrades.companyId, id));
         await agentObservabilityService(tx as unknown as Db).removeForCompanyDeletion(id);
         // Finance can reference costs and both can reference runs. Incidents
