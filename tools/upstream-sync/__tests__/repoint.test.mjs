@@ -132,7 +132,7 @@ test("repoint: descendant accepted, non-descendant rejected, audited, guard stil
     assert.equal(audit.run_ref, "RED-874-test");
     assert.ok(new Date(audit.created_at).getTime() >= before - 5000);
     // The ledger audit trail records the same change, attributed to the same run.
-    const ev = (await admin.query(`SELECT * FROM upstream_sync_events WHERE upstream_sha=$1 AND operation='update' AND 'integration_sha' = ANY(changed_columns)`, [fx.U1])).rows;
+    const ev = (await admin.query(`SELECT * FROM upstream_sync_events WHERE upstream_sha=$1 AND operation='update' AND 'integration_sha' = ANY(changed_columns) AND old_values->>'integration_sha' = $2`, [fx.U1, OLD])).rows;
     assert.equal(ev.length, 1);
     assert.equal(ev[0].new_values.integration_sha, M);
     assert.equal(ev[0].actor, LOGIN);
