@@ -1160,6 +1160,8 @@ describe("RH Google MCP first-consent defaults", () => {
     "create_version", "delete_doc_tab", "manage_contact", "manage_contacts_batch", "manage_contact_group",
     // Multiplex a delete through an `action` argument, so enabling the tool name enables the delete.
     "manage_gmail_label", "manage_task", "manage_task_list",
+    // Can move a file to the trash (`trashed`) and change who can share it.
+    "update_drive_file",
   ];
 
   it("lists read-shaped names plus the reviewed safe writes, none duplicated, and none of the dangerous tools", () => {

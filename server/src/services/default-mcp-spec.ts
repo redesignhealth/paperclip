@@ -246,7 +246,9 @@ export function connectionHealthColumns<S extends string>(
  * `manage_task_list`, `manage_contact*`), sharing and publishing, calendar invites and RSVPs, Gmail filters, and Apps
  * Script execution or deployment stay off. Activation is per tool name, so a tool that multiplexes a delete is never
  * listed. `manage_conditional_formatting` also accepts a delete action but only removes a formatting rule, never data.
- * `modify_gmail_message_labels` can add the `TRASH` or `SPAM` label; it is kept on so agents can tag mail.
+ * `update_drive_file` is NOT listed: it can move a file to the trash (`trashed`) and change who can share it.
+ * `modify_gmail_message_labels` and `batch_modify_gmail_message_labels` can add the `TRASH` or `SPAM` label (the batch
+ * tool across many messages in one call); they are kept on so agents can tag mail.
  */
 export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
   "draft_gmail_message",
@@ -286,7 +288,6 @@ export const RH_GOOGLE_MCP_SAFE_WRITE_TOOLS: readonly string[] = Object.freeze([
   "manage_presentation_comment",
   "manage_spreadsheet_comment",
   "modify_gmail_message_labels",
-  "update_drive_file",
 ]);
 
 /**

@@ -123,7 +123,8 @@ people, and running code. Dangerous tools stay off by default and owners can ena
 
 - **Off by default, enable only with a reason:**
   - Sending: `send_gmail_message`, `send_message` (Chat).
-  - Deleting, or deleting through an `action` argument: `delete_script_project`, `delete_doc_tab`, `manage_gmail_label`,
+  - Deleting, or deleting through an argument: `update_drive_file` (`trashed`, and it changes sharing),
+    `delete_script_project`, `delete_doc_tab`, `manage_gmail_label`,
     `manage_task`, `manage_task_list`, `manage_contact`, `manage_contacts_batch`, `manage_contact_group`.
   - Sharing and publishing: `manage_drive_access`, `set_drive_file_permissions`, `set_publish_settings`,
     `get_drive_shareable_link`.
@@ -133,7 +134,7 @@ people, and running code. Dangerous tools stay off by default and owners can ena
     `manage_deployment`, `create_version`.
 - **On at first connect (`RH_GOOGLE_MCP_SAFE_WRITE_TOOLS`):** `draft_gmail_message`, Gmail label tagging
   (`modify_gmail_message_labels`, `batch_modify_gmail_message_labels`), Docs, Sheets, Slides and Forms edit and create
-  tools, Drive file writes (`create_drive_file`, `update_drive_file`, `copy_drive_file`, `export_doc_to_pdf`, ...), and
+  tools, Drive file writes (`create_drive_file`, `copy_drive_file`, `export_doc_to_pdf`, ...), and
   comment tools.
 - **Known trade-off:** the label tools need `gmail.modify`, which also lets a call add the `TRASH` or `SPAM` label, so
   they are not strictly "tags only". They are on so agents can tag mail.
