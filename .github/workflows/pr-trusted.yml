@@ -32,9 +32,11 @@ jobs:
     needs: [gate]
     # Deliberately off in this fork. ci-routing.yml's planner resolves the merge diff via
     #   git fetch https://github.com/paperclipai/paperclip.git "$EVENT_MERGE_SHA"
-    # A fork merge SHA is not in that repository, so the planner always hits its `fallback`
-    # and `gate.outputs.plan` is always ''. Every dependent job then uses its full fallback
-    # matrix, which is the behaviour this fork wants today. Leading
+    # This fork shares paperclipai/paperclip's GitHub object store, so that fetch is
+    # nondeterministic rather than reliably missing. ci-routing.yml now fails the planner
+    # closed on repository identity instead, so `gate.outputs.plan` is always ''. Every
+    # dependent job then uses its full fallback matrix, which is the behaviour this fork
+    # wants today. Leading
     # `vars.CI_VITEST_SELECTION == 'enabled'` turns the upstream default-on switch into
     # opt-in, so the skip is an intentional decision rather than an accident of an empty
     # plan. `ci / Select Vitest files` is allow-listed as an expected skip in

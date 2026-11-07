@@ -103,6 +103,7 @@ any new fork patch; remove one when the patch is upstreamed.
 - `.github/workflows/auto-approve-job.yml`
 - `.github/workflows/gate-tests.yml`
 - `.github/workflows/pr-trusted.yml`
+- `.github/workflows/ci-routing.yml`
 - `.github/rulesets/`
 - `.github/scripts/`
 - `docs/merge-policy.md`

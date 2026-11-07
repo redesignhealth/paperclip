@@ -367,3 +367,17 @@ test("plan step falls back when head SHA is invalid", () => {
     EVENT_HEAD_SHA: "not-a-sha",
   }), { plan: "" });
 });
+
+test("plan step stays off outside the upstream repository", () => {
+  assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+    FULL_CI: "true",
+    EVENT_REPOSITORY: "redesignhealth/paperclip",
+  }), { plan: "" });
+});
+
+test("plan step stays off when the repository is unknown", () => {
+  assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+    FULL_CI: "true",
+    EVENT_REPOSITORY: "",
+  }), { plan: "" });
+});
