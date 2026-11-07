@@ -42,17 +42,39 @@ export const CONVERSION_BUDGET_CONSTANTS = {
   defaultConcurrency: 2,
 } as const;
 
+export interface ConversionReconciliationBreakdown {
+  totalRows: number;
+  rowsToConvert: number;
+  unroutableRows: number;
+  noiseRowsInRoutable: number;
+  duplicateSurplusInRoutable: number;
+}
+
 export interface BudgetEstimateInput {
   totalRows: number;
-  noiseRows: number;
-  unroutableRows: number;
-  duplicateSurplusRows: number;
+  rowsToConvert?: number;
+  unroutableRows?: number;
+  noiseRowsInRoutable?: number;
+  duplicateSurplusInRoutable?: number;
+  // Legacy input fields support
+  noiseRows?: number;
+  duplicateSurplusRows?: number;
   averageTextLength: number;
+  basis?: "verified" | "provisional";
+  bound?: "exact" | "upper_bound";
+  boundDescription?: string;
+  chatInputUsdPerMillion?: number;
+  chatOutputUsdPerMillion?: number;
+  embeddingUsdPerMillion?: number;
 }
 
 export interface ConversionBudgetEstimate {
   isEstimate: true;
+  basis: "verified" | "provisional";
+  bound?: "exact" | "upper_bound";
+  boundDescription: string;
   rowsToConvert: number;
+  breakdown: ConversionReconciliationBreakdown;
   subtractions: {
     totalRows: number;
     noiseRows: number;
@@ -105,16 +127,33 @@ export function formatDurationHuman(seconds: number): string {
 export function estimateConversionBudget(input: BudgetEstimateInput): ConversionBudgetEstimate {
   const {
     totalRows,
-    noiseRows,
-    unroutableRows,
-    duplicateSurplusRows,
     averageTextLength,
   } = input;
 
-  const rowsToConvert = Math.max(
-    0,
-    totalRows - noiseRows - unroutableRows - duplicateSurplusRows,
+  let rowsToConvert = input.rowsToConvert;
+  const unroutableRows = input.unroutableRows ?? 0;
+  const noiseRowsInRoutable = input.noiseRowsInRoutable ?? input.noiseRows ?? 0;
+  const duplicateSurplusInRoutable = input.duplicateSurplusInRoutable ?? input.duplicateSurplusRows ?? 0;
+
+  if (rowsToConvert === undefined) {
+    rowsToConvert = Math.max(0, totalRows - noiseRowsInRoutable - unroutableRows - duplicateSurplusInRoutable);
+  }
+
+  const basis = input.basis ?? "verified";
+  const bound = input.bound ?? (basis === "verified" ? "exact" : "upper_bound");
+  const boundDescription = input.boundDescription ?? (
+    basis === "verified"
+      ? "Exact conversion volume verified against control plane agent routing."
+      : "Upper bound estimate: assumes all syntactically valid agents are routable."
   );
+
+  const breakdown: ConversionReconciliationBreakdown = {
+    totalRows,
+    rowsToConvert,
+    unroutableRows,
+    noiseRowsInRoutable,
+    duplicateSurplusInRoutable,
+  };
 
   const sourceTokensPerRow = Math.max(
     0,
@@ -156,12 +195,16 @@ export function estimateConversionBudget(input: BudgetEstimateInput): Conversion
 
   return {
     isEstimate: true,
+    basis,
+    bound,
+    boundDescription,
     rowsToConvert,
+    breakdown,
     subtractions: {
       totalRows,
-      noiseRows,
+      noiseRows: noiseRowsInRoutable,
       unroutableRows,
-      duplicateSurplusRows,
+      duplicateSurplusRows: duplicateSurplusInRoutable,
     },
     tokenModel: {
       fixedInputPerRow: CONVERSION_BUDGET_CONSTANTS.fixedInputTokensPerRow,

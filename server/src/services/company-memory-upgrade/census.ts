@@ -361,6 +361,21 @@ export interface AgentRoutingClassification {
   reason?: string;
 }
 
+export type UnroutableReason =
+  | "missing_agent_id"
+  | "malformed_agent_id"
+  | "unknown_agent"
+  | "non_memory_adapter"
+  | "terminated"
+  | "pending_approval"
+  | "unknown_status";
+
+export interface UnroutableReasonSummary {
+  rowCount: number;
+  distinctAgentCount: number;
+  agentIds: string[];
+}
+
 export interface RoutingReadinessResult {
   status: "verified" | "unverified";
   caveat?: string;
@@ -376,6 +391,7 @@ export interface RoutingReadinessResult {
       unroutable: number | null;
     };
   };
+  unroutableBreakdown: Record<UnroutableReason, UnroutableReasonSummary>;
   unroutableAgentIds: string[];
 }
 
@@ -589,11 +605,11 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
 
   let currentDatabase = "";
   let currentUser = "";
+  let shape: ShapeIntrospectionResult | null = null;
+  let counts: CensusCounts | null = null;
+  let accumulator: CensusAccumulator | null = null;
 
   try {
-    let shape: ShapeIntrospectionResult | null = null;
-    let counts: CensusCounts | null = null;
-
     await tenantDb.transaction(
       async (tx) => {
         // 1. Role preflight on tenant connection (executes first query and establishes transaction snapshot)
@@ -775,7 +791,7 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
         };
 
         // 4. Census inspection: aggregate data via pure accumulator
-        const accumulator = createCensusAccumulator(longThreshold);
+        accumulator = createCensusAccumulator(longThreshold);
         let lastId: string | null = null;
         const pageSize = inputPageSize && inputPageSize > 0 ? inputPageSize : 1000;
 
@@ -837,26 +853,53 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
 
     const populatedShape = shape as ShapeIntrospectionResult | null;
     const populatedCounts = counts as CensusCounts | null;
+    const populatedAccumulator = accumulator as CensusAccumulator | null;
 
-    if (!populatedShape || !populatedCounts) {
+    if (!populatedShape || !populatedCounts || !populatedAccumulator) {
       throw new CompanyMemoryUpgradeError(
         "Census transaction completed without populating shape or counts.",
         "UNEXPECTED_FAILURE",
       );
     }
 
-    // 4. Routing readiness verification
+    // 5. Routing readiness & disjoint conversion accounting
+    const unroutableBreakdown: Record<UnroutableReason, UnroutableReasonSummary> = {
+      missing_agent_id: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+      malformed_agent_id: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+      unknown_agent: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+      non_memory_adapter: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+      terminated: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+      pending_approval: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+      unknown_status: { rowCount: 0, distinctAgentCount: 0, agentIds: [] },
+    };
+
+    let routableAgentsCount = 0;
+    let pausedAgentsCount = 0;
+    let unroutableAgentsCount = 0;
+
+    let routableRowsCount = 0;
+    let pausedRowsCount = 0;
+    let unroutableRowsCount = 0;
+
+    let rowsToConvert = 0;
+    let noiseRowsInRoutable = 0;
+    let duplicateSurplusInRoutable = 0;
+
+    const unroutableIds = new Set<string>();
+
+    let resolvedCompanyId = inputCompanyId ?? null;
+    let resolvedCompanyName: string | null = null;
+    let companyVerification: "control-plane-verified" | "derived-name-verified" | "operator-asserted" | "unbound" = "unbound";
+
     let routingResult: RoutingReadinessResult = {
       status: "unverified",
       counts: {
         agents: { routable: null, routable_but_paused: null, unroutable: null },
         rows: { routable: null, routable_but_paused: null, unroutable: null },
       },
+      unroutableBreakdown,
       unroutableAgentIds: [],
     };
-    let resolvedCompanyId = inputCompanyId ?? null;
-    let resolvedCompanyName: string | null = null;
-    let companyVerification: "control-plane-verified" | "derived-name-verified" | "operator-asserted" | "unbound" = "unbound";
 
     if (controlPlaneUrl) {
       const parsedControlPlaneUrl = validateDatabaseUrl(controlPlaneUrl, env, { allowProd });
@@ -1030,72 +1073,102 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
 
             const cpAgentMap = new Map<string, (typeof agentRows)[number]>();
             for (const a of agentRows) {
-              cpAgentMap.set(a.id, a);
+              cpAgentMap.set(a.id.trim().toLowerCase(), a);
             }
 
-            let routableAgentsCount = 0;
-            let pausedAgentsCount = 0;
-            let unroutableAgentsCount = 0;
+            for (const [agentKey, tracking] of populatedAccumulator.agentTracking.entries()) {
+              let agentSurplus = 0;
+              for (const count of tracking.textHashMap.values()) {
+                if (count > 1) {
+                  agentSurplus += count - 1;
+                }
+              }
+              const agentEligible = tracking.total - tracking.noise - agentSurplus;
 
-            let routableRowsCount = 0;
-            let pausedRowsCount = 0;
-            let unroutableRowsCount = 0;
-
-            const unroutableIds = new Set<string>();
-
-            for (const breakdown of populatedCounts.agentBreakdown) {
-              const aid = breakdown.agentId;
-              const rowCount = breakdown.count;
-
-              if (!aid || !isValidUuid(aid)) {
+              if (agentKey === "(none)") {
                 unroutableAgentsCount++;
-                unroutableRowsCount += rowCount;
-                if (aid) unroutableIds.add(aid);
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.missing_agent_id.rowCount += tracking.total;
+                unroutableBreakdown.missing_agent_id.distinctAgentCount++;
                 continue;
               }
 
-              const cpAgent = cpAgentMap.get(aid);
+              if (!isValidUuid(agentKey)) {
+                unroutableAgentsCount++;
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.malformed_agent_id.rowCount += tracking.total;
+                unroutableBreakdown.malformed_agent_id.distinctAgentCount++;
+                unroutableBreakdown.malformed_agent_id.agentIds.push(agentKey);
+                unroutableIds.add(agentKey);
+                continue;
+              }
+
+              const cpAgent = cpAgentMap.get(agentKey);
               if (!cpAgent) {
                 unroutableAgentsCount++;
-                unroutableRowsCount += rowCount;
-                unroutableIds.add(aid);
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.unknown_agent.rowCount += tracking.total;
+                unroutableBreakdown.unknown_agent.distinctAgentCount++;
+                unroutableBreakdown.unknown_agent.agentIds.push(agentKey);
+                unroutableIds.add(agentKey);
                 continue;
               }
 
-              const isHermes = adapterSupportsRuntimeMemory(cpAgent.adapter_type);
-              if (!isHermes) {
+              if (!adapterSupportsRuntimeMemory(cpAgent.adapter_type)) {
                 unroutableAgentsCount++;
-                unroutableRowsCount += rowCount;
-                unroutableIds.add(aid);
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.non_memory_adapter.rowCount += tracking.total;
+                unroutableBreakdown.non_memory_adapter.distinctAgentCount++;
+                unroutableBreakdown.non_memory_adapter.agentIds.push(agentKey);
+                unroutableIds.add(agentKey);
                 continue;
               }
 
               if (cpAgent.status === "terminated") {
                 unroutableAgentsCount++;
-                unroutableRowsCount += rowCount;
-                unroutableIds.add(aid);
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.terminated.rowCount += tracking.total;
+                unroutableBreakdown.terminated.distinctAgentCount++;
+                unroutableBreakdown.terminated.agentIds.push(agentKey);
+                unroutableIds.add(agentKey);
                 continue;
               }
 
               if (cpAgent.status === "pending_approval") {
                 unroutableAgentsCount++;
-                unroutableRowsCount += rowCount;
-                unroutableIds.add(aid);
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.pending_approval.rowCount += tracking.total;
+                unroutableBreakdown.pending_approval.distinctAgentCount++;
+                unroutableBreakdown.pending_approval.agentIds.push(agentKey);
+                unroutableIds.add(agentKey);
                 continue;
               }
 
               if (cpAgent.status === "paused" || cpAgent.paused_at !== null) {
                 pausedAgentsCount++;
-                pausedRowsCount += rowCount;
+                pausedRowsCount += tracking.total;
+                rowsToConvert += agentEligible;
+                noiseRowsInRoutable += tracking.noise;
+                duplicateSurplusInRoutable += agentSurplus;
               } else if (INVOKABLE_AGENT_STATUSES.has(cpAgent.status)) {
                 routableAgentsCount++;
-                routableRowsCount += rowCount;
+                routableRowsCount += tracking.total;
+                rowsToConvert += agentEligible;
+                noiseRowsInRoutable += tracking.noise;
+                duplicateSurplusInRoutable += agentSurplus;
               } else {
                 unroutableAgentsCount++;
-                unroutableRowsCount += rowCount;
-                unroutableIds.add(aid);
-                caveats.push(`CAVEAT: Agent "${aid}" has unrecognized status "${cpAgent.status}". Classified as unroutable.`);
+                unroutableRowsCount += tracking.total;
+                unroutableBreakdown.unknown_status.rowCount += tracking.total;
+                unroutableBreakdown.unknown_status.distinctAgentCount++;
+                unroutableBreakdown.unknown_status.agentIds.push(agentKey);
+                unroutableIds.add(agentKey);
+                caveats.push(`CAVEAT: Agent "${agentKey}" has unrecognized status "${cpAgent.status}". Classified as unroutable.`);
               }
+            }
+
+            for (const summary of Object.values(unroutableBreakdown)) {
+              summary.agentIds.sort();
             }
 
             routingResult = {
@@ -1112,6 +1185,7 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
                   unroutable: unroutableRowsCount,
                 },
               },
+              unroutableBreakdown,
               unroutableAgentIds: Array.from(unroutableIds).sort(),
             };
           },
@@ -1136,17 +1210,37 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
         companyVerification = "unbound";
       }
 
-      const unroutableIds = new Set<string>();
-      let unroutableRowCount = 0;
-      let unroutableAgentsCount = 0;
-
-      for (const breakdown of populatedCounts.agentBreakdown) {
-        const aid = breakdown.agentId;
-        if (!aid || !isValidUuid(aid)) {
-          unroutableAgentsCount++;
-          unroutableRowCount += breakdown.count;
-          if (aid) unroutableIds.add(aid);
+      for (const [agentKey, tracking] of populatedAccumulator.agentTracking.entries()) {
+        let agentSurplus = 0;
+        for (const count of tracking.textHashMap.values()) {
+          if (count > 1) {
+            agentSurplus += count - 1;
+          }
         }
+        const agentEligible = tracking.total - tracking.noise - agentSurplus;
+
+        if (agentKey === "(none)") {
+          unroutableAgentsCount++;
+          unroutableRowsCount += tracking.total;
+          unroutableBreakdown.missing_agent_id.rowCount += tracking.total;
+          unroutableBreakdown.missing_agent_id.distinctAgentCount++;
+        } else if (!isValidUuid(agentKey)) {
+          unroutableAgentsCount++;
+          unroutableRowsCount += tracking.total;
+          unroutableBreakdown.malformed_agent_id.rowCount += tracking.total;
+          unroutableBreakdown.malformed_agent_id.distinctAgentCount++;
+          unroutableBreakdown.malformed_agent_id.agentIds.push(agentKey);
+          unroutableIds.add(agentKey);
+        } else {
+          // In unverified/provisional mode, syntactically valid agents are treated as provisional upper-bound candidates
+          rowsToConvert += agentEligible;
+          noiseRowsInRoutable += tracking.noise;
+          duplicateSurplusInRoutable += agentSurplus;
+        }
+      }
+
+      for (const summary of Object.values(unroutableBreakdown)) {
+        summary.agentIds.sort();
       }
 
       routingResult = {
@@ -1161,9 +1255,10 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
           rows: {
             routable: null,
             routable_but_paused: null,
-            unroutable: unroutableRowCount,
+            unroutable: unroutableRowsCount,
           },
         },
+        unroutableBreakdown,
         unroutableAgentIds: Array.from(unroutableIds).sort(),
       };
     }
@@ -1176,18 +1271,20 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
       };
     }
 
-    // 5. Budget estimate
-    // Unroutable rows: if verified, use verified unroutable row count; if unverified, use malformed/missing agent rows
-    const unroutableRowsForBudget = routingResult.status === "verified"
-      ? (routingResult.counts.rows.unroutable ?? 0)
-      : populatedCounts.agentIdHygiene.totalMalformedOrMissingCount;
-
+    // 6. Conversion budget estimate
+    const isProvisional = routingResult.status === "unverified" || companyVerification === "unbound";
     const budgetEstimate = estimateConversionBudget({
       totalRows: populatedCounts.totalRows,
-      noiseRows: populatedCounts.noise.candidateCount,
-      unroutableRows: unroutableRowsForBudget,
-      duplicateSurplusRows: populatedCounts.duplicates.surplusRows,
+      rowsToConvert,
+      unroutableRows: unroutableRowsCount,
+      noiseRowsInRoutable,
+      duplicateSurplusInRoutable,
       averageTextLength: populatedCounts.contentLength.average,
+      basis: isProvisional ? "provisional" : "verified",
+      bound: isProvisional ? "upper_bound" : "exact",
+      boundDescription: isProvisional
+        ? "Upper bound estimate: assumes all syntactically valid agents are routable and excludes only known unroutable hygiene rows, noise, and duplicate surplus."
+        : "Exact conversion volume verified against control plane agent routing and active memory adapters.",
     });
 
     if (routingResult.status === "unverified") {
@@ -1327,14 +1424,29 @@ export function formatCensusTextReport(report: CensusReport): string {
     lines.push(`  - ${report.routing.caveat}`);
     lines.push(`  - Unroutable Hygiene Rows:    ${report.routing.counts.rows.unroutable?.toLocaleString()} rows`);
   }
+  lines.push("  - Unroutable Reasons Breakdown:");
+  for (const [reason, s] of Object.entries(report.routing.unroutableBreakdown)) {
+    if (s.rowCount > 0 || s.distinctAgentCount > 0) {
+      lines.push(`      * ${reason}: ${s.rowCount.toLocaleString()} rows (${s.distinctAgentCount} agents${s.agentIds.length > 0 ? `: [ ${s.agentIds.join(", ")} ]` : ""})`);
+    }
+  }
   if (report.routing.unroutableAgentIds.length > 0) {
-    lines.push(`  - Unroutable Agent IDs:       [ ${report.routing.unroutableAgentIds.join(", ")} ]`);
+    lines.push(`  - All Unroutable Agent IDs:   [ ${report.routing.unroutableAgentIds.join(", ")} ]`);
   }
   lines.push("");
 
-  lines.push("--- ESTIMATED CONVERSION BUDGET (ESTIMATE ONLY) ---");
+  if (report.budget.basis === "provisional") {
+    lines.push("================================================================================");
+    lines.push("*** PROVISIONAL BUDGET ESTIMATE (UNVERIFIED ROUTING OR UNBOUND COMPANY) ***");
+    lines.push(`  * BASIS: PROVISIONAL (${report.budget.bound?.toUpperCase() ?? "UPPER_BOUND"})`);
+    lines.push(`  * ${report.budget.boundDescription}`);
+    lines.push("================================================================================");
+  } else {
+    lines.push("--- ESTIMATED CONVERSION BUDGET (VERIFIED ROUTING) ---");
+    lines.push(`  * BASIS: VERIFIED (${report.budget.bound?.toUpperCase() ?? "EXACT"})`);
+  }
   lines.push(`  - Rows to Convert:            ${report.budget.rowsToConvert.toLocaleString()} rows`);
-  lines.push(`    (total: ${report.budget.subtractions.totalRows} - noise: ${report.budget.subtractions.noiseRows} - unroutable: ${report.budget.subtractions.unroutableRows} - duplicates: ${report.budget.subtractions.duplicateSurplusRows})`);
+  lines.push(`    Breakdown: total (${report.budget.breakdown.totalRows}) = rowsToConvert (${report.budget.breakdown.rowsToConvert}) + unroutable (${report.budget.breakdown.unroutableRows}) + noiseInRoutable (${report.budget.breakdown.noiseRowsInRoutable}) + duplicateSurplusInRoutable (${report.budget.breakdown.duplicateSurplusInRoutable})`);
   lines.push(`  - Chat Input Tokens:          ~${report.budget.estimatedTokens.chatInput.toLocaleString()} tokens`);
   lines.push(`  - Chat Output Tokens:         ~${report.budget.estimatedTokens.chatOutput.toLocaleString()} tokens`);
   lines.push(`  - Embedding Tokens:           ~${report.budget.estimatedTokens.embeddingTotal.toLocaleString()} tokens`);

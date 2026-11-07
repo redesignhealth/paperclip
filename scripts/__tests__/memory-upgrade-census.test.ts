@@ -238,21 +238,66 @@ describe("estimateConversionBudget unit tests", () => {
     assert.equal(budget.isEstimate, true);
   });
 
-  it("subtraction formula correctly subtracts noise, unroutable, and duplicates", () => {
+  it("reconciliation breakdown correctly accounts for disjoint rows and supports legacy subtractions", () => {
     const budget = estimateConversionBudget({
       totalRows: 1000,
-      noiseRows: 100,
+      rowsToConvert: 700,
       unroutableRows: 150,
-      duplicateSurplusRows: 50,
+      noiseRowsInRoutable: 100,
+      duplicateSurplusInRoutable: 50,
       averageTextLength: 120,
     });
 
-    // 1000 - 100 - 150 - 50 = 700
     assert.equal(budget.rowsToConvert, 700);
+    assert.equal(budget.breakdown.totalRows, 1000);
+    assert.equal(budget.breakdown.rowsToConvert, 700);
+    assert.equal(budget.breakdown.unroutableRows, 150);
+    assert.equal(budget.breakdown.noiseRowsInRoutable, 100);
+    assert.equal(budget.breakdown.duplicateSurplusInRoutable, 50);
+
+    // Exact reconciliation
+    assert.equal(
+      budget.breakdown.rowsToConvert +
+        budget.breakdown.unroutableRows +
+        budget.breakdown.noiseRowsInRoutable +
+        budget.breakdown.duplicateSurplusInRoutable,
+      budget.breakdown.totalRows,
+    );
+
+    // Legacy subtractions compatibility
     assert.equal(budget.subtractions.totalRows, 1000);
     assert.equal(budget.subtractions.noiseRows, 100);
     assert.equal(budget.subtractions.unroutableRows, 150);
     assert.equal(budget.subtractions.duplicateSurplusRows, 50);
+  });
+
+  it("handles overlap matrix where rows are simultaneously noise, duplicate, and unroutable", () => {
+    // Overlap matrix scenario:
+    // If a simple 3-way subtraction were used:
+    // total(10) - noise(4) - unroutable(6) - duplicates(4) would equal -4!
+    // With disjoint accounting:
+    // unroutable: 6 rows (including 2 that are noise and 2 that are duplicates)
+    // noiseInRoutable: 2 rows (including 1 duplicate of noise that is NOT counted in duplicate surplus)
+    // duplicateSurplusInRoutable: 1 row (duplicate of substantive row)
+    // rowsToConvert: 1 row (the 1 unique substantive row)
+    // Total = 1 + 6 + 2 + 1 = 10!
+    const budget = estimateConversionBudget({
+      totalRows: 10,
+      rowsToConvert: 1,
+      unroutableRows: 6,
+      noiseRowsInRoutable: 2,
+      duplicateSurplusInRoutable: 1,
+      averageTextLength: 80,
+    });
+
+    assert.equal(budget.rowsToConvert, 1);
+    assert.equal(
+      budget.breakdown.rowsToConvert +
+        budget.breakdown.unroutableRows +
+        budget.breakdown.noiseRowsInRoutable +
+        budget.breakdown.duplicateSurplusInRoutable,
+      10,
+    );
   });
 
   it("exhibits cost monotonicity with increasing rows", () => {
@@ -1659,6 +1704,20 @@ describe("census integration tests against embedded Postgres fixture", () => {
       // Unroutable rows: mem-06, mem-07, mem-08, mem-09, mem-10, mem-13, mem-14 -> 7 rows
       assert.equal(report.routing.counts.rows.unroutable, 7);
 
+      // Unroutable breakdown by named reason (C3)
+      assert.equal(report.routing.unroutableBreakdown.missing_agent_id.rowCount, 1);
+      assert.equal(report.routing.unroutableBreakdown.malformed_agent_id.rowCount, 1);
+      assert.deepEqual(report.routing.unroutableBreakdown.malformed_agent_id.agentIds, ["malformed-agent-id-123"]);
+      assert.equal(report.routing.unroutableBreakdown.unknown_agent.rowCount, 1);
+      assert.deepEqual(report.routing.unroutableBreakdown.unknown_agent.agentIds, [unknownAgentId]);
+      assert.equal(report.routing.unroutableBreakdown.non_memory_adapter.rowCount, 2); // claude + hermes_gateway
+      assert.deepEqual(report.routing.unroutableBreakdown.non_memory_adapter.agentIds, [nonHermesAgentId, hermesGatewayAgentId].sort());
+      assert.equal(report.routing.unroutableBreakdown.terminated.rowCount, 1);
+      assert.deepEqual(report.routing.unroutableBreakdown.terminated.agentIds, [terminatedHermesAgentId]);
+      assert.equal(report.routing.unroutableBreakdown.pending_approval.rowCount, 1);
+      assert.deepEqual(report.routing.unroutableBreakdown.pending_approval.agentIds, [pendingApprovalHermesAgentId]);
+      assert.equal(report.routing.unroutableBreakdown.unknown_status.rowCount, 0);
+
       // Unroutable agent IDs listed (ids only)
       assert.ok(report.routing.unroutableAgentIds.includes(terminatedHermesAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes(nonHermesAgentId));
@@ -1668,8 +1727,22 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.ok(report.routing.unroutableAgentIds.includes(pendingApprovalHermesAgentId));
 
       // 7. Budget estimate verification
-      // rowsToConvert = total (14) - noise (2) - unroutable (7) - duplicates (1) = 4
+      // Exact reconciliation: rowsToConvert(4) + unroutable(7) + noiseInRoutable(2) + duplicateSurplusInRoutable(1) = 14
       assert.equal(report.budget.rowsToConvert, 4);
+      assert.equal(report.budget.basis, "verified");
+      assert.equal(report.budget.bound, "exact");
+      assert.equal(report.budget.breakdown.rowsToConvert, 4);
+      assert.equal(report.budget.breakdown.unroutableRows, 7);
+      assert.equal(report.budget.breakdown.noiseRowsInRoutable, 2);
+      assert.equal(report.budget.breakdown.duplicateSurplusInRoutable, 1);
+      assert.equal(report.budget.breakdown.totalRows, 14);
+      assert.equal(
+        report.budget.breakdown.rowsToConvert +
+          report.budget.breakdown.unroutableRows +
+          report.budget.breakdown.noiseRowsInRoutable +
+          report.budget.breakdown.duplicateSurplusInRoutable,
+        14,
+      );
       assert.ok(report.budget.estimatedCostUsd.total > 0);
       assert.ok(report.budget.estimatedWallClock.seconds > 0);
 
@@ -1727,11 +1800,14 @@ describe("census integration tests against embedded Postgres fixture", () => {
 
       assert.equal(unverifiedReport.routing.status, "unverified");
       assert.equal(unverifiedReport.company.verification, "unbound");
+      assert.equal(unverifiedReport.budget.basis, "provisional");
+      assert.equal(unverifiedReport.budget.bound, "upper_bound");
       assert.ok(unverifiedReport.routing.caveat?.includes("Control plane URL was not provided"));
 
-      // Text summary loudly warns about unverified routing
+      // Text summary loudly warns about unverified routing and renders provisional estimate banner
       const unverifiedSummary = formatCensusTextReport(unverifiedReport);
       assert.ok(unverifiedSummary.includes("ROUTING UNVERIFIED"));
+      assert.ok(unverifiedSummary.includes("PROVISIONAL BUDGET ESTIMATE"));
     } finally {
       await tenantAdminDb.$client.end({ timeout: 1 });
       await cpAdminDb.$client.end({ timeout: 1 });
