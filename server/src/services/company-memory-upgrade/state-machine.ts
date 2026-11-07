@@ -13,11 +13,12 @@ import {
   type CompanyMemoryUpgradeRow,
   type LeaseHeartbeatHandle,
   type OpenUpgradeParams,
+  type StartLeaseHeartbeatOptions,
   type UpdateCountersParams,
   type UpgradeErrorCode,
 } from "./types.js";
 
-export { UPGRADE_ERROR_CODES, type UpgradeErrorCode } from "./types.js";
+export { UPGRADE_ERROR_CODES, type StartLeaseHeartbeatOptions, type UpgradeErrorCode } from "./types.js";
 
 export function isUpgradeErrorCode(value: unknown): value is UpgradeErrorCode {
   return typeof value === "string" && (UPGRADE_ERROR_CODES as readonly string[]).includes(value);
@@ -269,44 +270,71 @@ export async function renewUpgradeLease(
 
 /**
  * Starts a background heartbeat timer to periodically renew the upgrade lease.
+ * Requires the claimed lease expiry (`initialExpiresAt`).
+ * If the lease is already expired when starting, immediately marks the heartbeat
+ * as lost and stops without starting periodic timers.
  */
 export function startLeaseHeartbeat(
   db: Db,
   id: string,
   leaseToken: string,
-  options?: {
-    initialExpiresAt?: Date | number;
-    intervalMs?: number;
-    ttlMs?: number;
-    onLost?: () => void;
-  },
+  options: StartLeaseHeartbeatOptions,
 ): LeaseHeartbeatHandle {
-  const intervalMs = options?.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
-  const ttlMs = options?.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+  const clock = options.clock ?? { now: () => new Date() };
+  const intervalMs = options.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+
+  const nowMs = clock.now().getTime();
+  let knownExpiresAtMs: number =
+    options.initialExpiresAt instanceof Date
+      ? options.initialExpiresAt.getTime()
+      : options.initialExpiresAt;
+
+  if (typeof knownExpiresAtMs !== "number" || Number.isNaN(knownExpiresAtMs)) {
+    throw new CompanyMemoryUpgradeError(
+      "initialExpiresAt must be a valid Date or numeric timestamp",
+      "INVALID_ARGUMENT",
+    );
+  }
+
   let lost = false;
   let running = true;
   let activeRenewal: Promise<void> | null = null;
-  let knownExpiresAtMs: number =
-    options?.initialExpiresAt instanceof Date
-      ? options.initialExpiresAt.getTime()
-      : typeof options?.initialExpiresAt === "number"
-      ? options.initialExpiresAt
-      : Date.now() + ttlMs;
+
+  // Check expiry before starting and report lost/stop if already expired
+  if (nowMs >= knownExpiresAtMs) {
+    lost = true;
+    running = false;
+    options.onLost?.();
+    return {
+      isLost: () => true,
+      getKnownExpiresAtMs: () => knownExpiresAtMs,
+      assertActive: () => {
+        throw new CompanyMemoryUpgradeError(
+          "Upgrade lease lost or expired during operation",
+          "LEASE_FENCED_OUT",
+        );
+      },
+      stop: async () => {},
+    };
+  }
 
   async function performRenewal(): Promise<void> {
     if (!running || lost) return;
     try {
-      const res = await renewUpgradeLease(db, id, leaseToken, { ttlMs });
+      const res = await renewUpgradeLease(db, id, leaseToken, { ttlMs, clock });
       if (!res.renewed || !res.expiresAt) {
         lost = true;
-        options?.onLost?.();
+        running = false;
+        options.onLost?.();
       } else {
         knownExpiresAtMs = res.expiresAt.getTime();
       }
     } catch {
       // Fail closed
       lost = true;
-      options?.onLost?.();
+      running = false;
+      options.onLost?.();
     }
   }
 
@@ -319,11 +347,12 @@ export function startLeaseHeartbeat(
   timer.unref?.();
 
   return {
-    isLost: () => lost || Date.now() >= knownExpiresAtMs,
+    isLost: () => lost || clock.now().getTime() >= knownExpiresAtMs,
     getKnownExpiresAtMs: () => knownExpiresAtMs,
     assertActive: () => {
-      if (lost || Date.now() >= knownExpiresAtMs) {
+      if (lost || clock.now().getTime() >= knownExpiresAtMs) {
         lost = true;
+        running = false;
         throw new CompanyMemoryUpgradeError(
           "Upgrade lease lost or expired during operation",
           "LEASE_FENCED_OUT",

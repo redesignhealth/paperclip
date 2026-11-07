@@ -183,6 +183,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     expect(claim.acquired).toBe(true);
 
     const heartbeat = startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+      initialExpiresAt: claim.leaseExpiresAt!,
       intervalMs: 100,
       ttlMs: 30_000,
     });
@@ -665,5 +666,66 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
       lastError: "conversion_failed",
     });
     expect(updatedCounters.lastError).toBe("conversion_failed");
+  });
+
+  it("startLeaseHeartbeat handles normal heartbeat and immediately stops/reports lost on expired initial lease", async () => {
+    const company = await createTestCompany();
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "heartbeat-regression-worker",
+      ttlMs: 30_000,
+    });
+    expect(claim.acquired).toBe(true);
+
+    // 1. Expired initial lease: already expired before heartbeat starts
+    let onLostCalled = false;
+    const expiredHeartbeat = startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+      initialExpiresAt: new Date(Date.now() - 5_000), // 5 seconds in the past
+      intervalMs: 50,
+      ttlMs: 30_000,
+      onLost: () => {
+        onLostCalled = true;
+      },
+    });
+
+    expect(onLostCalled).toBe(true);
+    expect(expiredHeartbeat.isLost()).toBe(true);
+    expect(() => expiredHeartbeat.assertActive()).toThrowError(
+      expect.objectContaining({
+        code: "LEASE_FENCED_OUT",
+      }),
+    );
+    await expiredHeartbeat.stop();
+
+    // 2. Normal heartbeat with claimed expiry runs and reports active
+    let normalLostCalled = false;
+    const normalHeartbeat = startLeaseHeartbeat(db, upgrade.id, claim.leaseToken!, {
+      initialExpiresAt: claim.leaseExpiresAt!,
+      intervalMs: 50,
+      ttlMs: 30_000,
+      onLost: () => {
+        normalLostCalled = true;
+      },
+    });
+
+    expect(normalLostCalled).toBe(false);
+    expect(normalHeartbeat.isLost()).toBe(false);
+    expect(() => normalHeartbeat.assertActive()).not.toThrow();
+
+    // Allow background interval renewal to run once
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(normalHeartbeat.isLost()).toBe(false);
+    expect(normalLostCalled).toBe(false);
+
+    await normalHeartbeat.stop();
   });
 });

@@ -73,6 +73,14 @@ export interface LeaseHeartbeatHandle {
   getKnownExpiresAtMs(): number;
 }
 
+export interface StartLeaseHeartbeatOptions {
+  initialExpiresAt: Date | number;
+  intervalMs?: number;
+  ttlMs?: number;
+  onLost?: () => void;
+  clock?: Clock;
+}
+
 export interface UpdateCountersParams {
   // Integer counter deltas
   sweepCount?: number;
