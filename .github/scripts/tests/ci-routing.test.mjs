@@ -32,6 +32,10 @@ test("routing exports placement, stack scope, and task plan to callers", () => {
 const githubStub = `#!/usr/bin/env bash
 set -Eeuo pipefail
 
+if [[ -n "\${TEST_STUB_CALL_LOG:-}" ]]; then
+  printf 'gh %s\\n' "$*" >> "$TEST_STUB_CALL_LOG"
+fi
+
 jq_filter=""
 endpoint=""
 while [[ $# -gt 0 ]]; do
@@ -366,4 +370,55 @@ test("plan step falls back when head SHA is invalid", () => {
     FULL_CI: "true",
     EVENT_HEAD_SHA: "not-a-sha",
   }), { plan: "" });
+});
+
+function withCallLog(run) {
+  const directory = mkdtempSync(path.join(tmpdir(), "paperclip-routing-call-log-"));
+  const log = path.join(directory, "calls.log");
+  writeFileSync(log, "");
+  try {
+    return run(log);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("plan step stays off outside the upstream repository", () => {
+  withCallLog((log) => {
+    assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+      FULL_CI: "true",
+      EVENT_REPOSITORY: "redesignhealth/paperclip",
+      TEST_STUB_CALL_LOG: log,
+    }), { plan: "" });
+    assert.equal(readFileSync(log, "utf8"), "", "guard must reject the fork repository before calling gh");
+  });
+});
+
+test("plan step stays off when the repository is unknown", () => {
+  withCallLog((log) => {
+    assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+      FULL_CI: "true",
+      EVENT_REPOSITORY: "",
+      TEST_STUB_CALL_LOG: log,
+    }), { plan: "" });
+    assert.equal(readFileSync(log, "utf8"), "", "guard must reject an empty repository before calling gh");
+  });
+});
+
+test("plan step is not blocked for every repository (positive control)", () => {
+  withCallLog((log) => {
+    assert.deepEqual(executeStep("Plan affected CI tasks from trusted definitions", {
+      FULL_CI: "true",
+      EVENT_REPOSITORY: "paperclipai/paperclip",
+      EVENT_HEAD_SHA: "1111111111111111111111111111111111111111",
+      EVENT_MERGE_SHA: "2222222222222222222222222222222222222222",
+      TEST_STUB_CALL_LOG: log,
+    }), { plan: "" });
+    assert.notEqual(
+      readFileSync(log, "utf8"),
+      "",
+      "the upstream repository must still reach gh (it later falls back because " +
+        "ci-plan.mjs is not stubbed offline here), proving the guard does not block every repository",
+    );
+  });
 });
