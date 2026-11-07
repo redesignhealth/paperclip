@@ -829,9 +829,7 @@ describe("AppDefinition catalog", () => {
   it("ships Granola as a personal-only hosted MCP sign-in with reads first", () => {
     const granola = getAppStoreDefinition("granola")!;
     expect(granola).toBeTruthy();
-    // No bundled Granola mark yet: it uses the shared generic sign-in
-    // placeholder until the brand icon lands in its own reviewed change.
-    expect(granola.branding).toEqual({ logoUrl: "/brands/apps/oauth-generic.svg" });
+    expect(granola.branding).toEqual({ logoUrl: "/brands/apps/granola.png" });
     expect(granola.redirectConstraints).toBe("https-or-loopback-http");
     expect(getAppDefinitionForUrl("https://mcp.granola.ai/mcp")?.slug).toBe("granola");
     expect(granola.methods).toHaveLength(1);
