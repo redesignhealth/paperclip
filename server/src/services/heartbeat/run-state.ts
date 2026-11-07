@@ -861,7 +861,8 @@ export function normalizeSessionParams(
 export type RunSessionOutcome =
   "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
-export const HERMES_ADAPTER_TYPE = "hermes_local";
+import { HERMES_ADAPTER_TYPE } from "../company-memory-constants.js";
+export { HERMES_ADAPTER_TYPE };
 
 const HERMES_SESSION_ID_REGEX =
   /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;

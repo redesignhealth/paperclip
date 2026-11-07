@@ -398,7 +398,7 @@ describe("validation, path, and CLI flags unit tests", () => {
   });
 
   it("validates database URL and enforces prod gate against remote hosts", () => {
-    // Localhost allowed without env var
+    // Localhost allowed without env var or --prod flag
     assert.doesNotThrow(() => {
       validateDatabaseUrl("postgres://usr:pw@localhost:5432/db", {});
     });
@@ -406,18 +406,78 @@ describe("validation, path, and CLI flags unit tests", () => {
       validateDatabaseUrl("postgres://usr:pw@127.0.0.1:5432/db", {});
     });
 
-    // Remote host rejected without MEMORY_UPGRADE_ALLOW_PROD=1
+    // Remote host rejected without both --prod flag and env var (names both)
     assert.throws(
       () => validateDatabaseUrl("postgres://usr:pw@rds.example.internal:5432/db", {}),
-      /Refusing to connect to non-local host 'rds.example.internal' without MEMORY_UPGRADE_ALLOW_PROD=1 environment variable/,
+      (err: any) => {
+        assert.equal(err.code, "PROD_GUARD_ENFORCED");
+        assert.ok(err.message.includes("without --prod flag and MEMORY_UPGRADE_ALLOW_PROD=1 environment variable"));
+        return true;
+      },
     );
 
-    // Remote host allowed when MEMORY_UPGRADE_ALLOW_PROD=1
+    // Remote host with env set but missing --prod flag (names missing --prod flag)
+    assert.throws(
+      () =>
+        validateDatabaseUrl(
+          "postgres://usr:pw@rds.example.internal:5432/db",
+          { MEMORY_UPGRADE_ALLOW_PROD: "1" },
+          { allowProd: false },
+        ),
+      (err: any) => {
+        assert.equal(err.code, "PROD_GUARD_ENFORCED");
+        assert.ok(err.message.includes("without --prod flag."));
+        return true;
+      },
+    );
+
+    // Remote host with --prod flag set but missing env var (names missing MEMORY_UPGRADE_ALLOW_PROD=1)
+    assert.throws(
+      () =>
+        validateDatabaseUrl(
+          "postgres://usr:pw@rds.example.internal:5432/db",
+          {},
+          { allowProd: true },
+        ),
+      (err: any) => {
+        assert.equal(err.code, "PROD_GUARD_ENFORCED");
+        assert.ok(err.message.includes("without MEMORY_UPGRADE_ALLOW_PROD=1 environment variable."));
+        return true;
+      },
+    );
+
+    // Remote host allowed when BOTH --prod flag and MEMORY_UPGRADE_ALLOW_PROD=1 are set
     assert.doesNotThrow(() => {
-      validateDatabaseUrl("postgres://usr:pw@rds.example.internal:5432/db", {
-        MEMORY_UPGRADE_ALLOW_PROD: "1",
-      });
+      validateDatabaseUrl(
+        "postgres://usr:pw@rds.example.internal:5432/db",
+        { MEMORY_UPGRADE_ALLOW_PROD: "1" },
+        { allowProd: true },
+      );
     });
+  });
+
+  it("validates CLI flag parsing hygiene", () => {
+    // Supports --flag=value
+    assert.equal(parseFlagValue("--table", ["--table=my_table"]), "my_table");
+    assert.equal(parseFlagValue("--company", ["--company=11111111-1111-4111-8111-111111111111"]), "11111111-1111-4111-8111-111111111111");
+
+    // Supports space-separated --flag value
+    assert.equal(parseFlagValue("--table", ["--table", "my_table"]), "my_table");
+
+    // Rejects values starting with -
+    assert.equal(parseFlagValue("--table", ["--table", "-v"]), null);
+    assert.equal(parseFlagValue("--table", ["--table", "--flag"]), null);
+    assert.equal(parseFlagValue("--table", ["--table=-x"]), null);
+
+    // Unknown option rejected and error echoes ONLY flag name (never raw value containing DSN/password)
+    assert.throws(
+      () => validateNoUnknownFlags(["--bad-dsn=postgres://usr:secret_pass_123@host:5432/db"], ALLOWED_CENSUS_FLAGS),
+      (err: Error) => {
+        assert.ok(err.message.includes("Unknown option '--bad-dsn'"));
+        assert.ok(!err.message.includes("secret_pass_123"));
+        return true;
+      },
+    );
   });
 
   it("validates CLI flag rejection for unknown options and stub subcommands", async () => {
@@ -455,28 +515,151 @@ describe("validation, path, and CLI flags unit tests", () => {
 });
 
 describe("census integration tests against embedded Postgres fixture", () => {
-  it("rejects superuser connection in preflight check", async (t) => {
+  it("enforces strict privilege preflight on tenant and control-plane connections", async (t) => {
     const support = await getEmbeddedPostgresTestSupport();
     if (!support.supported) {
       handleEmbeddedPostgresUnsupported(support, t);
       return;
     }
 
-    const fixture = await startEmbeddedPostgresTestDatabase("test_census_superuser");
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_privileges");
+    const adminDb = createDb(fixture.connectionString);
+
     try {
-      // Connecting as default 'postgres' (which is rolsuper = true)
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+
+      // 1. Direct superuser rejected on tenant (default 'postgres' role)
       await assert.rejects(
         () =>
           runCensus({
             databaseUrl: fixture.connectionString,
             companyId: "00000000-0000-4000-8000-000000000001",
           }),
-        (err: Error) => {
-          assert.ok(err.message.includes("is a superuser. Dedicated non-superuser tenant role required."));
+        (err: any) => {
+          assert.equal(err.code, "SUPERUSER_REJECTED");
+          assert.ok(err.message.includes("is a superuser"));
           return true;
         },
       );
+
+      // Create regular unprivileged tenant role for testing control plane rejection
+      await adminDb.execute(sql`CREATE ROLE tenant_ok WITH LOGIN PASSWORD 'pass' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_ok;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_ok;`);
+
+      const tenantOkUrl = new URL(fixture.connectionString);
+      tenantOkUrl.username = "tenant_ok";
+      tenantOkUrl.password = "pass";
+
+      // 2. Direct superuser rejected on control plane
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantOkUrl.toString(),
+            controlPlaneUrl: fixture.connectionString, // superuser CP connection
+            companyId: "00000000-0000-4000-8000-000000000001",
+          }),
+        (err: any) => {
+          assert.equal(err.code, "SUPERUSER_REJECTED");
+          assert.ok(err.message.includes("control-plane database is a superuser"));
+          return true;
+        },
+      );
+
+      // 3. Direct BYPASSRLS rejected
+      await adminDb.execute(sql`CREATE ROLE tenant_bypass WITH LOGIN PASSWORD 'pass' NOSUPERUSER BYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_bypass;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_bypass;`);
+
+      const tenantBypassUrl = new URL(fixture.connectionString);
+      tenantBypassUrl.username = "tenant_bypass";
+      tenantBypassUrl.password = "pass";
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantBypassUrl.toString(),
+            companyId: "00000000-0000-4000-8000-000000000001",
+          }),
+        (err: any) => {
+          assert.equal(err.code, "BYPASSRLS_REJECTED");
+          return true;
+        },
+      );
+
+      // 4. Inherited superuser via GRANT rejected
+      await adminDb.execute(sql`CREATE ROLE admin_group WITH SUPERUSER;`);
+      await adminDb.execute(sql`CREATE ROLE tenant_inherited WITH LOGIN PASSWORD 'pass' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT admin_group TO tenant_inherited;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_inherited;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_inherited;`);
+
+      const tenantInheritedUrl = new URL(fixture.connectionString);
+      tenantInheritedUrl.username = "tenant_inherited";
+      tenantInheritedUrl.password = "pass";
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantInheritedUrl.toString(),
+            companyId: "00000000-0000-4000-8000-000000000001",
+          }),
+        (err: any) => {
+          assert.equal(err.code, "SUPERUSER_REJECTED");
+          assert.ok(err.message.includes("admin_group"));
+          return true;
+        },
+      );
+
+      // 5. NOINHERIT BYPASSRLS membership variant rejected
+      await adminDb.execute(sql`CREATE ROLE sec_group WITH BYPASSRLS;`);
+      await adminDb.execute(sql`CREATE ROLE tenant_noinherit WITH LOGIN PASSWORD 'pass' NOSUPERUSER NOBYPASSRLS NOINHERIT;`);
+      await adminDb.execute(sql`GRANT sec_group TO tenant_noinherit;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_noinherit;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_noinherit;`);
+
+      const tenantNoinheritUrl = new URL(fixture.connectionString);
+      tenantNoinheritUrl.username = "tenant_noinherit";
+      tenantNoinheritUrl.password = "pass";
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantNoinheritUrl.toString(),
+            companyId: "00000000-0000-4000-8000-000000000001",
+          }),
+        (err: any) => {
+          assert.equal(err.code, "BYPASSRLS_REJECTED");
+          assert.ok(err.message.includes("sec_group"));
+          return true;
+        },
+      );
+
+      // 6. Plain group passes preflight check without false positive (negative control)
+      await adminDb.execute(sql`CREATE ROLE plain_group;`);
+      await adminDb.execute(sql`CREATE ROLE tenant_plain WITH LOGIN PASSWORD 'pass' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT plain_group TO tenant_plain;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_plain;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_plain;`);
+
+      const tenantPlainUrl = new URL(fixture.connectionString);
+      tenantPlainUrl.username = "tenant_plain";
+      tenantPlainUrl.password = "pass";
+
+      const plainReport = await runCensus({
+        databaseUrl: tenantPlainUrl.toString(),
+        companyId: "00000000-0000-4000-8000-000000000001",
+      });
+      assert.ok(plainReport.readOnly);
     } finally {
+      await adminDb.$client.end({ timeout: 1 });
       await fixture.cleanup();
     }
   });
@@ -587,6 +770,13 @@ describe("census integration tests against embedded Postgres fixture", () => {
             tableName: "mem0_memories",
             companyId: "00000000-0000-4000-8000-000000000001",
             onTransaction: async (tx) => {
+              // Verify transaction isolation settings are applied by drizzle transaction config
+              const settings = (await tx.execute<{ iso: string; ro: string }>(sql`
+                SELECT current_setting('transaction_isolation') AS iso, current_setting('transaction_read_only') AS ro;
+              `)) as unknown as Array<{ iso: string; ro: string }>;
+              assert.equal(settings[0].iso, "repeatable read");
+              assert.equal(settings[0].ro, "on");
+
               // Attempt mutation inside read-only transaction
               await tx.execute(sql`
                 INSERT INTO mem0_memories (id, vector, payload)
@@ -611,6 +801,229 @@ describe("census integration tests against embedded Postgres fixture", () => {
     }
   });
 
+  it("preserves snapshot consistency during concurrent write from separate connection", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_concurrent_snapshot");
+    const adminDb = createDb(fixture.connectionString);
+
+    try {
+      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await adminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+      // Seed initial 2 rows
+      await adminDb.execute(sql`
+        INSERT INTO mem0_memories (id, vector, payload) VALUES
+        ('row-1', '[]', '{"agent_id": "11111111-1111-4111-8111-111111111111", "data": "initial 1"}'::jsonb),
+        ('row-2', '[]', '{"agent_id": "11111111-1111-4111-8111-111111111111", "data": "initial 2"}'::jsonb);
+      `);
+
+      const tenantUrl = new URL(fixture.connectionString);
+      tenantUrl.username = "tenant_checker";
+      tenantUrl.password = "pass123";
+
+      // During onTransaction hook, insert a 3rd row from adminDb (separate connection/transaction)
+      const report = await runCensus({
+        databaseUrl: tenantUrl.toString(),
+        tableName: "mem0_memories",
+        companyId: "00000000-0000-4000-8000-000000000001",
+        onTransaction: async () => {
+          await adminDb.execute(sql`
+            INSERT INTO mem0_memories (id, vector, payload)
+            VALUES ('row-3', '[]', '{"agent_id": "11111111-1111-4111-8111-111111111111", "data": "concurrent 3"}'::jsonb);
+          `);
+        },
+      });
+
+      // Repeatable read snapshot guarantees that census observes only the initial 2 rows
+      assert.equal(report.shapeIntrospection.rowCount, 2);
+      assert.equal(report.census.totalRows, 2);
+    } finally {
+      await adminDb.$client.end({ timeout: 1 });
+      await fixture.cleanup();
+    }
+  });
+
+  it("enforces fail-closed company-to-DSN binding and error codes", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
+    }
+
+    const tenantFixture = await startEmbeddedPostgresTestDatabase("test_census_binding_tenant");
+    const cpFixture = await startEmbeddedPostgresTestDatabase("test_census_binding_cp");
+
+    const tenantAdminDb = createDb(tenantFixture.connectionString);
+    const cpAdminDb = createDb(cpFixture.connectionString);
+
+    const companyA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const companyB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    try {
+      await tenantAdminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+      await tenantAdminDb.execute(sql`
+        CREATE TABLE mem0_memories (
+          id TEXT PRIMARY KEY,
+          vector "vector(1536)",
+          payload JSONB NOT NULL
+        );
+      `);
+      await tenantAdminDb.execute(sql`CREATE ROLE tenant_role WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+      await tenantAdminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_role;`);
+      await tenantAdminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_role;`);
+
+      await cpAdminDb.execute(sql`CREATE ROLE cp_reader WITH LOGIN PASSWORD 'cp_pass' NOSUPERUSER NOBYPASSRLS;`);
+      await cpAdminDb.execute(sql`GRANT USAGE ON SCHEMA public TO cp_reader;`);
+      await cpAdminDb.execute(sql`GRANT SELECT ON companies, agents, company_memory_databases TO cp_reader;`);
+
+      await cpAdminDb.execute(sql`
+        INSERT INTO companies (id, name, issue_prefix) VALUES (${companyA}::uuid, 'Company A', 'COMA');
+      `);
+
+      const parsedTenantUrl = new URL(tenantFixture.connectionString);
+      const tenantDbName = parsedTenantUrl.pathname.replace(/^\//, "");
+
+      const tenantUserUrl = new URL(tenantFixture.connectionString);
+      tenantUserUrl.username = "tenant_role";
+      tenantUserUrl.password = "pass123";
+
+      const cpUserUrl = new URL(cpFixture.connectionString);
+      cpUserUrl.username = "cp_reader";
+      cpUserUrl.password = "cp_pass";
+
+      // 1. Invalid UUID for --company throws INVALID_ARGUMENT
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUserUrl.toString(),
+            companyId: "invalid-uuid-string",
+          }),
+        (err: any) => {
+          assert.equal(err.code, "INVALID_ARGUMENT");
+          assert.ok(err.message.includes("Must be a valid UUID"));
+          return true;
+        },
+      );
+
+      // 2. TABLE_NOT_FOUND when target table does not exist
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUserUrl.toString(),
+            tableName: "non_existent_table",
+            companyId: companyA,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "TABLE_NOT_FOUND");
+          return true;
+        },
+      );
+
+      // 3. COMPANY_NOT_FOUND when company does not exist in control plane
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUserUrl.toString(),
+            controlPlaneUrl: cpUserUrl.toString(),
+            companyId: companyB, // not in companies table
+          }),
+        (err: any) => {
+          assert.equal(err.code, "COMPANY_NOT_FOUND");
+          return true;
+        },
+      );
+
+      // 4. COMPANY_BINDING_MISMATCH when company_memory_databases has no record for companyA
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUserUrl.toString(),
+            controlPlaneUrl: cpUserUrl.toString(),
+            companyId: companyA,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "COMPANY_BINDING_MISMATCH");
+          assert.ok(err.message.includes("No company_memory_databases record found"));
+          return true;
+        },
+      );
+
+      // 5. COMPANY_BINDING_MISMATCH when control plane record specifies wrong database_name or database_role
+      await cpAdminDb.execute(sql`
+        INSERT INTO company_memory_databases (company_id, database_name, database_role, host, status)
+        VALUES (${companyA}::uuid, 'other_db_name', 'tenant_role', '127.0.0.1', 'ready');
+      `);
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUserUrl.toString(),
+            controlPlaneUrl: cpUserUrl.toString(),
+            companyId: companyA,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "COMPANY_BINDING_MISMATCH");
+          assert.ok(err.message.includes("binding mismatch"));
+          return true;
+        },
+      );
+
+      // Fix control plane record to match tenantDbName and tenant_role
+      await cpAdminDb.execute(sql`
+        UPDATE company_memory_databases
+        SET database_name = ${tenantDbName}, database_role = 'tenant_role'
+        WHERE company_id = ${companyA}::uuid;
+      `);
+
+      // 6. Successful inference via company_memory_databases when --company is omitted
+      const inferredReport = await runCensus({
+        databaseUrl: tenantUserUrl.toString(),
+        controlPlaneUrl: cpUserUrl.toString(),
+      });
+      assert.equal(inferredReport.company.id, companyA);
+      assert.equal(inferredReport.company.verification, "control-plane-verified");
+
+      // 7. Inference fails with COMPANY_BINDING_MISMATCH if database_role does not match currentUser
+      await cpAdminDb.execute(sql`
+        UPDATE company_memory_databases
+        SET database_role = 'mismatched_role'
+        WHERE company_id = ${companyA}::uuid;
+      `);
+
+      await assert.rejects(
+        () =>
+          runCensus({
+            databaseUrl: tenantUserUrl.toString(),
+            controlPlaneUrl: cpUserUrl.toString(),
+          }),
+        (err: any) => {
+          assert.equal(err.code, "COMPANY_BINDING_MISMATCH");
+          assert.ok(err.message.includes("specifies role \"mismatched_role\""));
+          return true;
+        },
+      );
+    } finally {
+      await tenantAdminDb.$client.end({ timeout: 1 });
+      await cpAdminDb.$client.end({ timeout: 1 });
+      await tenantFixture.cleanup();
+      await cpFixture.cleanup();
+    }
+  });
+
   it("accurately reports all census counts, routing readiness, budget, and contains NO memory text in output", async (t) => {
     const support = await getEmbeddedPostgresTestSupport();
     if (!support.supported) {
@@ -632,6 +1045,8 @@ describe("census integration tests against embedded Postgres fixture", () => {
     const terminatedHermesAgentId = "44444444-4444-4444-8444-444444444444";
     const nonHermesAgentId = "55555555-5555-4555-8555-555555555555";
     const unknownAgentId = "66666666-6666-4666-8666-666666666666";
+    const hermesGatewayAgentId = "77777777-7777-4777-8777-777777777777";
+    const pendingApprovalHermesAgentId = "88888888-8888-4888-8888-888888888888";
 
     try {
       // 1. Seed Control Plane fixture tables (companies, agents, company_memory_databases are migrated)
@@ -644,7 +1059,9 @@ describe("census integration tests against embedded Postgres fixture", () => {
         (${routableHermesAgentId}::uuid, ${testCompanyId}::uuid, 'Hermes Worker 1', 'hermes_local', 'idle', NULL),
         (${pausedHermesAgentId}::uuid, ${testCompanyId}::uuid, 'Hermes Paused', 'hermes_local', 'paused', now()),
         (${terminatedHermesAgentId}::uuid, ${testCompanyId}::uuid, 'Hermes Fired', 'hermes_local', 'terminated', NULL),
-        (${nonHermesAgentId}::uuid, ${testCompanyId}::uuid, 'Claude Process', 'claude_local', 'idle', NULL);
+        (${nonHermesAgentId}::uuid, ${testCompanyId}::uuid, 'Claude Process', 'claude_local', 'idle', NULL),
+        (${hermesGatewayAgentId}::uuid, ${testCompanyId}::uuid, 'Hermes Gateway Agent', 'hermes_gateway', 'idle', NULL),
+        (${pendingApprovalHermesAgentId}::uuid, ${testCompanyId}::uuid, 'Hermes Pending Approval', 'hermes_local', 'pending_approval', NULL);
       `);
 
       // Extract tenant db name from fixture connection string
@@ -652,9 +1069,19 @@ describe("census integration tests against embedded Postgres fixture", () => {
       const tenantDbName = parsedTenantUrl.pathname.replace(/^\//, "");
 
       await cpAdminDb.execute(sql`
-        INSERT INTO company_memory_databases (company_id, database_name, database_role, host)
-        VALUES (${testCompanyId}::uuid, ${tenantDbName}, 'pcmem_tenant_role', '127.0.0.1');
+        INSERT INTO company_memory_databases (company_id, database_name, database_role, host, status)
+        VALUES (${testCompanyId}::uuid, ${tenantDbName}, 'pcmem_tenant_role', '127.0.0.1', 'ready');
       `);
+
+      // Create dedicated non-superuser role for control plane preflight
+      await cpAdminDb.execute(sql`CREATE ROLE cp_reader WITH LOGIN PASSWORD 'cp_pw_secret' NOSUPERUSER NOBYPASSRLS;`);
+      await cpAdminDb.execute(sql`GRANT USAGE ON SCHEMA public TO cp_reader;`);
+      await cpAdminDb.execute(sql`GRANT SELECT ON companies, agents, company_memory_databases TO cp_reader;`);
+
+      const cpUserUrl = new URL(cpFixture.connectionString);
+      cpUserUrl.username = "cp_reader";
+      cpUserUrl.password = "cp_pw_secret";
+      const cpDsn = cpUserUrl.toString();
 
       // 2. Setup Tenant Database
       await tenantAdminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
@@ -749,6 +1176,18 @@ describe("census integration tests against embedded Postgres fixture", () => {
           user_id: "user-01",
           data: "hello world!",
           created_at: "2026-11-05T19:00:00.000Z",
+        })}::jsonb),
+        ('mem-13', '[]', ${JSON.stringify({
+          agent_id: hermesGatewayAgentId,
+          user_id: "user-05",
+          data: "Hermes gateway adapter memory row.",
+          created_at: "2026-11-06T20:00:00.000Z",
+        })}::jsonb),
+        ('mem-14', '[]', ${JSON.stringify({
+          agent_id: pendingApprovalHermesAgentId,
+          user_id: "user-05",
+          data: "Pending approval agent memory row.",
+          created_at: "2026-11-07T21:00:00.000Z",
         })}::jsonb);
       `);
 
@@ -765,7 +1204,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
       // 3. Execute runCensus with control plane URL
       const report = await runCensus({
         databaseUrl: tenantDsn,
-        controlPlaneUrl: cpFixture.connectionString,
+        controlPlaneUrl: cpDsn,
         companyId: testCompanyId,
         outputPath: tmpOutPath,
         format: "json",
@@ -775,11 +1214,11 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.equal(report.shapeIntrospection.table, "mem0_memories");
       assert.equal(report.shapeIntrospection.embeddingDims, 1536);
       assert.equal(report.shapeIntrospection.payloadType, "jsonb");
-      assert.equal(report.shapeIntrospection.rowCount, 12);
+      assert.equal(report.shapeIntrospection.rowCount, 14);
 
       // 5. Verify aggregates & counts
-      assert.equal(report.census.totalRows, 12);
-      assert.equal(report.census.distinctUserIds, 4); // user-01, user-02, user-03, user-04
+      assert.equal(report.census.totalRows, 14);
+      assert.equal(report.census.distinctUserIds, 5); // user-01, user-02, user-03, user-04, user-05
 
       // Hygiene counts
       assert.equal(report.census.agentIdHygiene.missingOrBlankCount, 1); // mem-10
@@ -790,7 +1229,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.equal(report.census.createdAtHistogram["2026-08"], 2); // mem-08, mem-09
       assert.equal(report.census.createdAtHistogram["2026-09"], 2); // mem-06, mem-07
       assert.equal(report.census.createdAtHistogram["2026-10"], 2); // mem-01, mem-02
-      assert.equal(report.census.createdAtHistogram["2026-11"], 5); // mem-03, mem-04, mem-05, mem-11, mem-12
+      assert.equal(report.census.createdAtHistogram["2026-11"], 7); // mem-03, mem-04, mem-05, mem-11, mem-12, mem-13, mem-14
       assert.equal(report.census.createdAtHistogram["unparseable"], 1); // mem-10
 
       // Length statistics
@@ -813,27 +1252,30 @@ describe("census integration tests against embedded Postgres fixture", () => {
 
       // 6. Routing readiness verification
       assert.equal(report.routing.status, "verified");
+      assert.equal(report.company.verification, "control-plane-verified");
       assert.equal(report.routing.counts.agents.routable, 1); // routableHermesAgentId
       assert.equal(report.routing.counts.agents.routable_but_paused, 1); // pausedHermesAgentId
-      // Unroutable agents: terminated (mem-06), non-hermes (mem-07), unknown (mem-08), malformed (mem-09), missing (mem-10) -> 5
-      assert.equal(report.routing.counts.agents.unroutable, 5);
+      // Unroutable agents: terminated (mem-06), non-hermes (mem-07), unknown (mem-08), malformed (mem-09), missing (mem-10), hermesGateway (mem-13), pendingApproval (mem-14) -> 7
+      assert.equal(report.routing.counts.agents.unroutable, 7);
 
       // Rows by routing class:
       // Routable agent rows: mem-01, mem-02, mem-03, mem-04, mem-11, mem-12 -> 6 rows
       assert.equal(report.routing.counts.rows.routable, 6);
       // Paused agent rows: mem-05 -> 1 row
       assert.equal(report.routing.counts.rows.routable_but_paused, 1);
-      // Unroutable rows: mem-06, mem-07, mem-08, mem-09, mem-10 -> 5 rows
-      assert.equal(report.routing.counts.rows.unroutable, 5);
+      // Unroutable rows: mem-06, mem-07, mem-08, mem-09, mem-10, mem-13, mem-14 -> 7 rows
+      assert.equal(report.routing.counts.rows.unroutable, 7);
 
       // Unroutable agent IDs listed (ids only)
       assert.ok(report.routing.unroutableAgentIds.includes(terminatedHermesAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes(nonHermesAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes(unknownAgentId));
       assert.ok(report.routing.unroutableAgentIds.includes("malformed-agent-id-123"));
+      assert.ok(report.routing.unroutableAgentIds.includes(hermesGatewayAgentId));
+      assert.ok(report.routing.unroutableAgentIds.includes(pendingApprovalHermesAgentId));
 
       // 7. Budget estimate verification
-      // rowsToConvert = total (12) - noise (2) - unroutable (5) - duplicates (1) = 4
+      // rowsToConvert = total (14) - noise (2) - unroutable (7) - duplicates (1) = 4
       assert.equal(report.budget.rowsToConvert, 4);
       assert.ok(report.budget.estimatedCostUsd.total > 0);
       assert.ok(report.budget.estimatedWallClock.seconds > 0);
@@ -872,7 +1314,7 @@ describe("census integration tests against embedded Postgres fixture", () => {
         () =>
           runCensus({
             databaseUrl: tenantDsn,
-            controlPlaneUrl: cpFixture.connectionString,
+            controlPlaneUrl: cpDsn,
             companyId: testCompanyId,
             outputPath: tmpOutPath,
             format: "json",
@@ -882,14 +1324,14 @@ describe("census integration tests against embedded Postgres fixture", () => {
 
       fs.unlinkSync(tmpOutPath);
 
-      // 10. Verification without control plane URL: requires company and marks unverified
+      // 10. Verification without control plane URL: requires company and marks unverified and unbound
       const unverifiedReport = await runCensus({
         databaseUrl: tenantDsn,
         companyId: testCompanyId,
       });
 
       assert.equal(unverifiedReport.routing.status, "unverified");
-      assert.equal(unverifiedReport.company.verification, "operator-asserted");
+      assert.equal(unverifiedReport.company.verification, "unbound");
       assert.ok(unverifiedReport.routing.caveat?.includes("Control plane URL was not provided"));
 
       // Text summary loudly warns about unverified routing

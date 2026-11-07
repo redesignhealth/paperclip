@@ -40,10 +40,24 @@ export const ALLOWED_CENSUS_FLAGS = new Set([
 ]);
 
 export function parseFlagValue(name: string, argv: string[]): string | null {
-  const index = argv.indexOf(name);
-  if (index < 0) return null;
-  const value = argv[index + 1];
-  return value && !value.startsWith("--") ? value : null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === name) {
+      const next = argv[i + 1];
+      if (!next || next.startsWith("-")) {
+        return null;
+      }
+      return next;
+    }
+    if (arg.startsWith(`${name}=`)) {
+      const val = arg.slice(name.length + 1);
+      if (!val || val.startsWith("-")) {
+        return null;
+      }
+      return val;
+    }
+  }
+  return null;
 }
 
 export function hasBooleanFlag(name: string, argv: string[]): boolean {
@@ -56,7 +70,7 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
     if (arg.startsWith("-")) {
       const flagName = arg.split("=")[0];
       if (!allowedFlags.has(flagName)) {
-        throw new Error(`Unknown option '${arg}'. Only read-only census options are accepted.`);
+        throw new Error(`Unknown option '${flagName}'. Only read-only census options are accepted.`);
       }
     }
   }
@@ -83,7 +97,10 @@ Options:
   --table <name>               Target Mem0 collection table name (default: "mem0_memories")
   --long-threshold <number>    Character length threshold for long memory rows (default: 500)
   --prod                       Flag required when target host is non-localhost alongside
-                               MEMORY_UPGRADE_ALLOW_PROD=1 environment variable
+                               MEMORY_UPGRADE_ALLOW_PROD=1 environment variable.
+                               Host locality is not proof of environment. A production database
+                               reached over an SSH tunnel or port-forward presents as a local host
+                               and will not trigger this gate.
   --help, -h                   Show this help message
 `);
     return 0;
@@ -133,6 +150,8 @@ Options:
     }
   }
 
+  const allowProd = hasBooleanFlag("--prod", argv);
+
   const report = await runCensus({
     databaseUrl,
     companyId,
@@ -141,11 +160,12 @@ Options:
     format,
     tableName,
     longThreshold,
+    allowProd,
     env: process.env,
   });
 
   if (outputPath) {
-    console.log(`Census report written to ${outputPath} (mode 0600, exclusive create).`);
+    console.error(`Census report written to ${outputPath} (mode 0600, exclusive create).`);
   }
 
   if (format === "json") {

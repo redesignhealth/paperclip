@@ -14,7 +14,12 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDb } from "@paperclipai/db";
+import { INVOKABLE_AGENT_STATUSES } from "@paperclipai/shared";
 import { sql } from "drizzle-orm";
+import {
+  adapterSupportsRuntimeMemory,
+  deriveCompanyMemoryDatabaseNames,
+} from "../company-memory-constants.js";
 import {
   classifyMemoryNoise,
 } from "./classify-noise.js";
@@ -30,10 +35,10 @@ import {
 import { CompanyMemoryUpgradeError } from "./types.js";
 
 const SAFE_IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function isValidUuid(val: unknown): boolean {
-  return typeof val === "string" && UUID_REGEX.test(val);
+  return typeof val === "string" && UUID_REGEX.test(val.trim());
 }
 
 export function validateAndResolveTableIdentifier(
@@ -125,6 +130,7 @@ export interface CensusOptions {
   format?: "text" | "json";
   tableName?: string;
   longThreshold?: number;
+  allowProd?: boolean;
   env?: NodeJS.ProcessEnv;
   repoRoot?: string;
   onTransaction?: (tx: any) => Promise<void> | void;
@@ -214,7 +220,7 @@ export interface CensusReport {
   company: {
     id: string;
     name?: string | null;
-    verification: "control-plane-verified" | "operator-asserted";
+    verification: "control-plane-verified" | "derived-name-verified" | "operator-asserted" | "unbound";
   };
   shapeIntrospection: ShapeIntrospectionResult;
   census: CensusCounts;
@@ -223,7 +229,11 @@ export interface CensusReport {
   caveats: string[];
 }
 
-export function validateDatabaseUrl(urlString: string, env: NodeJS.ProcessEnv = process.env): URL {
+export function validateDatabaseUrl(
+  urlString: string,
+  env: NodeJS.ProcessEnv = process.env,
+  options: { allowProd?: boolean } = {},
+): URL {
   if (!urlString || typeof urlString !== "string" || !urlString.trim()) {
     throw new CompanyMemoryUpgradeError(
       "Invalid database URL: URL must be a non-empty string.",
@@ -243,15 +253,89 @@ export function validateDatabaseUrl(urlString: string, env: NodeJS.ProcessEnv = 
 
   // Remote database prod gate:
   const host = parsed.hostname;
-  const isLocal = host === "localhost" || host === "127.0.0.1";
-  if (!isLocal && env.MEMORY_UPGRADE_ALLOW_PROD !== "1") {
-    throw new CompanyMemoryUpgradeError(
-      `Refusing to connect to non-local host '${host}' without MEMORY_UPGRADE_ALLOW_PROD=1 environment variable.`,
-      "PROD_GUARD_ENFORCED",
-    );
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  if (!isLocal) {
+    const hasProdFlag = Boolean(options.allowProd);
+    const hasProdEnv = env.MEMORY_UPGRADE_ALLOW_PROD === "1";
+    if (!hasProdFlag && !hasProdEnv) {
+      throw new CompanyMemoryUpgradeError(
+        `Refusing to connect to non-local host '${host}' without --prod flag and MEMORY_UPGRADE_ALLOW_PROD=1 environment variable.`,
+        "PROD_GUARD_ENFORCED",
+      );
+    }
+    if (!hasProdFlag) {
+      throw new CompanyMemoryUpgradeError(
+        `Refusing to connect to non-local host '${host}' without --prod flag.`,
+        "PROD_GUARD_ENFORCED",
+      );
+    }
+    if (!hasProdEnv) {
+      throw new CompanyMemoryUpgradeError(
+        `Refusing to connect to non-local host '${host}' without MEMORY_UPGRADE_ALLOW_PROD=1 environment variable.`,
+        "PROD_GUARD_ENFORCED",
+      );
+    }
   }
 
   return parsed;
+}
+
+export async function assertNonSuperuserAndRestrictedRole(
+  tx: any,
+  connectionLabel: "tenant" | "control-plane",
+): Promise<void> {
+  const roleRows = (await tx.execute(sql`
+    SELECT
+      r.rolname,
+      r.rolsuper,
+      r.rolbypassrls,
+      r.rolcreaterole,
+      r.rolreplication,
+      (r.rolname = current_user) AS is_self,
+      pg_has_role(current_user, r.oid, 'MEMBER') AS is_member
+    FROM pg_roles r
+    WHERE (
+      r.rolname = current_user
+      OR pg_has_role(current_user, r.oid, 'MEMBER')
+    )
+    AND (
+      r.rolsuper
+      OR r.rolbypassrls
+      OR r.rolcreaterole
+      OR r.rolreplication
+      OR r.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_all_settings')
+    );
+  `)) as unknown as Array<{
+    rolname: string;
+    rolsuper: boolean;
+    rolbypassrls: boolean;
+    rolcreaterole: boolean;
+    rolreplication: boolean;
+    is_self: boolean;
+    is_member: boolean;
+  }>;
+
+  if (roleRows.length > 0) {
+    const superOffender = roleRows.find((r) => r.rolsuper);
+    if (superOffender) {
+      throw new CompanyMemoryUpgradeError(
+        `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database is a superuser or member of superuser role '${superOffender.rolname}'. Dedicated non-superuser role required.`,
+        "SUPERUSER_REJECTED",
+      );
+    }
+    const bypassOffender = roleRows.find((r) => r.rolbypassrls);
+    if (bypassOffender) {
+      throw new CompanyMemoryUpgradeError(
+        `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database has or inherits BYPASSRLS privilege from role '${bypassOffender.rolname}'. Dedicated role required.`,
+        "BYPASSRLS_REJECTED",
+      );
+    }
+    const offender = roleRows[0];
+    throw new CompanyMemoryUpgradeError(
+      `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database has excessive privilege or membership in role '${offender.rolname}'. Dedicated restricted role required.`,
+      "EXCESSIVE_PRIVILEGE_REJECTED",
+    );
+  }
 }
 
 export async function runCensus(options: CensusOptions): Promise<CensusReport> {
@@ -263,12 +347,22 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
     format = "text",
     tableName = "mem0_memories",
     longThreshold = 500,
+    allowProd = false,
     env = process.env,
     repoRoot,
     onTransaction,
   } = options;
 
-  const parsedTenantUrl = validateDatabaseUrl(databaseUrl, env);
+  if (inputCompanyId !== undefined && inputCompanyId !== null) {
+    if (!isValidUuid(inputCompanyId)) {
+      throw new CompanyMemoryUpgradeError(
+        `Invalid --company "${inputCompanyId}". Must be a valid UUID.`,
+        "INVALID_ARGUMENT",
+      );
+    }
+  }
+
+  const parsedTenantUrl = validateDatabaseUrl(databaseUrl, env, { allowProd });
   const tenantDbName = parsedTenantUrl.pathname.replace(/^\//, "");
   const tenantTable = validateAndResolveTableIdentifier(tableName, sql);
 
@@ -276,50 +370,50 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
     validateOutputPath(outputPath, repoRoot);
   }
 
+  const caveats: string[] = [
+    "READ-ONLY RUN: No data was written, modified, or migrated.",
+    "Host locality is not proof of environment. A production database reached over an SSH tunnel or port-forward presents as a local host and will not trigger this gate.",
+  ];
+
   // Preflight connection to tenant database: single connection, read-only
   const tenantDb = createDb(databaseUrl, { maxConnections: 1 });
 
+  let currentDatabase = "";
+  let currentUser = "";
+
   try {
-    let roleCheck: { rolsuper: boolean; rolbypassrls: boolean } | null = null;
     let shape: ShapeIntrospectionResult | null = null;
     let counts: CensusCounts | null = null;
 
-    await tenantDb.transaction(async (tx) => {
-      await tx.execute(sql`SET TRANSACTION READ ONLY;`);
+    await tenantDb.transaction(
+      async (tx) => {
+        // 1. Role preflight on tenant connection (executes first query and establishes transaction snapshot)
+        await assertNonSuperuserAndRestrictedRole(tx, "tenant");
 
-      if (onTransaction) {
-        await onTransaction(tx);
-      }
+        if (onTransaction) {
+          await onTransaction(tx);
+        }
 
-      // 1. Role preflight: query pg_roles for current_user
-      const roleRows = (await tx.execute<{ rolsuper: boolean; rolbypassrls: boolean }>(sql`
-        SELECT rolsuper, rolbypassrls
-        FROM pg_roles
-        WHERE rolname = current_user;
-      `)) as unknown as Array<{ rolsuper: boolean; rolbypassrls: boolean }>;
+        // 2. Fetch current_database() and current_user
+        const dbInfoRows = (await tx.execute<{ current_database: string; current_user: string }>(sql`
+          SELECT current_database()::text AS current_database, current_user::text AS current_user;
+        `)) as unknown as Array<{ current_database: string; current_user: string }>;
 
-      if (!roleRows[0]) {
-        throw new CompanyMemoryUpgradeError(
-          "Preflight check failed: Unable to query pg_roles for current_user.",
-          "PREFLIGHT_FAILED",
-        );
-      }
+        currentDatabase = dbInfoRows[0]?.current_database ?? "";
+        currentUser = dbInfoRows[0]?.current_user ?? "";
 
-      roleCheck = roleRows[0];
-      if (roleCheck.rolsuper) {
-        throw new CompanyMemoryUpgradeError(
-          `Refusing to run memory upgrade census: connecting role '${parsedTenantUrl.username || "current_user"}' is a superuser. Dedicated non-superuser tenant role required.`,
-          "SUPERUSER_REJECTED",
-        );
-      }
-      if (roleCheck.rolbypassrls) {
-        throw new CompanyMemoryUpgradeError(
-          `Refusing to run memory upgrade census: connecting role '${parsedTenantUrl.username || "current_user"}' has BYPASSRLS privilege. Dedicated tenant role required.`,
-          "BYPASSRLS_REJECTED",
-        );
-      }
+        const pcmemPattern = /^pcmem_[0-9a-f]{32}$/;
+        if (pcmemPattern.test(currentDatabase) && inputCompanyId) {
+          const derived = deriveCompanyMemoryDatabaseNames(inputCompanyId);
+          if (currentDatabase !== derived.databaseName || currentUser !== derived.databaseRole) {
+            throw new CompanyMemoryUpgradeError(
+              `Company binding mismatch: tenant database "${currentDatabase}" and role "${currentUser}" do not match expected derived database "${derived.databaseName}" and role "${derived.databaseRole}" for company "${inputCompanyId}".`,
+              "COMPANY_BINDING_MISMATCH",
+            );
+          }
+        }
 
-      // 2. Shape introspection: introspect columns in target table
+        // 3. Shape introspection: introspect columns in target table
       const columnRows = (await tx.execute<{ attname: string; formatted_type: string; typname: string }>(sql`
         SELECT
           a.attname,
@@ -560,7 +654,7 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
 
       // Compute character length percentiles
       charLengths.sort((a, b) => a - b);
-      const avgLen = totalRows > 0 ? Math.round((totalCharLength / totalRows) * 10) / 10 : 0;
+      const avgLen = charLengths.length > 0 ? Math.round((totalCharLength / charLengths.length) * 10) / 10 : 0;
       const medianLen = charLengths.length > 0
         ? charLengths[Math.floor(charLengths.length * 0.5)]
         : 0;
@@ -615,7 +709,7 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
           familyBreakdown: sensitiveFamilyBreakdown,
         },
       };
-    });
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
 
     const populatedShape = shape as ShapeIntrospectionResult | null;
     const populatedCounts = counts as CensusCounts | null;
@@ -638,162 +732,267 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
     };
     let resolvedCompanyId = inputCompanyId ?? null;
     let resolvedCompanyName: string | null = null;
-    let companyVerification: "control-plane-verified" | "operator-asserted" = "operator-asserted";
-
-    const observedAgentIds = new Set<string>();
-    for (const b of populatedCounts.agentBreakdown) {
-      if (b.agentId) {
-        observedAgentIds.add(b.agentId);
-      }
-    }
+    let companyVerification: "control-plane-verified" | "derived-name-verified" | "operator-asserted" | "unbound" = "unbound";
 
     if (controlPlaneUrl) {
-      const parsedControlPlaneUrl = validateDatabaseUrl(controlPlaneUrl, env);
+      const parsedControlPlaneUrl = validateDatabaseUrl(controlPlaneUrl, env, { allowProd });
       const cpDb = createDb(controlPlaneUrl, { maxConnections: 1 });
 
       try {
-        await cpDb.transaction(async (cpTx) => {
-          await cpTx.execute(sql`SET TRANSACTION READ ONLY;`);
+        await cpDb.transaction(
+          async (cpTx) => {
+            await assertNonSuperuserAndRestrictedRole(cpTx, "control-plane");
 
-          // Verify or resolve company ID
-          if (resolvedCompanyId) {
-            const compRows = (await cpTx.execute<{ id: string; name: string }>(sql`
-              SELECT id::text AS id, name
-              FROM companies
-              WHERE id = ${resolvedCompanyId}::uuid;
-            `)) as unknown as Array<{ id: string; name: string }>;
+            // Verify or resolve company ID
+            if (resolvedCompanyId) {
+              const compRows = (await cpTx.execute<{ id: string; name: string }>(sql`
+                SELECT id::text AS id, name
+                FROM companies
+                WHERE id = ${resolvedCompanyId}::uuid;
+              `)) as unknown as Array<{ id: string; name: string }>;
 
-            if (!compRows[0]) {
-              throw new CompanyMemoryUpgradeError(
-                `Company "${resolvedCompanyId}" not found in control plane database.`,
-                "COMPANY_NOT_FOUND",
-              );
-            }
-            resolvedCompanyName = compRows[0].name;
-            companyVerification = "control-plane-verified";
-          } else {
-            // Attempt to resolve company from company_memory_databases
-            const memDbRows = (await cpTx.execute<{ company_id: string; company_name: string | null }>(sql`
-              SELECT
-                cmd.company_id::text AS company_id,
-                c.name AS company_name
-              FROM company_memory_databases cmd
-              LEFT JOIN companies c ON cmd.company_id = c.id
-              WHERE cmd.database_name = ${tenantDbName}
-              LIMIT 1;
-            `)) as unknown as Array<{ company_id: string; company_name: string | null }>;
+              if (!compRows[0]) {
+                throw new CompanyMemoryUpgradeError(
+                  `Company "${resolvedCompanyId}" not found in control plane database.`,
+                  "COMPANY_NOT_FOUND",
+                );
+              }
+              resolvedCompanyName = compRows[0].name;
 
-            if (memDbRows[0]) {
-              resolvedCompanyId = memDbRows[0].company_id;
-              resolvedCompanyName = memDbRows[0].company_name;
+              const memDbRows = (await cpTx.execute<{
+                id: string;
+                company_id: string;
+                database_name: string;
+                database_role: string;
+                host: string;
+                port: number | null;
+                status: string;
+              }>(sql`
+                SELECT
+                  id::text AS id,
+                  company_id::text AS company_id,
+                  database_name,
+                  database_role,
+                  host,
+                  port,
+                  status
+                FROM company_memory_databases
+                WHERE company_id = ${resolvedCompanyId}::uuid
+                LIMIT 1;
+              `)) as unknown as Array<{
+                id: string;
+                company_id: string;
+                database_name: string;
+                database_role: string;
+                host: string;
+                port: number | null;
+                status: string;
+              }>;
+
+              if (!memDbRows[0]) {
+                throw new CompanyMemoryUpgradeError(
+                  `No company_memory_databases record found for company "${resolvedCompanyId}".`,
+                  "COMPANY_BINDING_MISMATCH",
+                );
+              }
+
+              const memRow = memDbRows[0];
+              if (memRow.database_name !== currentDatabase || memRow.database_role !== currentUser) {
+                throw new CompanyMemoryUpgradeError(
+                  `Company memory database binding mismatch: control-plane record specifies database "${memRow.database_name}" and role "${memRow.database_role}", but connected tenant is database "${currentDatabase}" and role "${currentUser}".`,
+                  "COMPANY_BINDING_MISMATCH",
+                );
+              }
+
+              if (memRow.status !== "ready") {
+                caveats.push(`CAVEAT: Company memory database record status is "${memRow.status}" (expected "ready").`);
+              }
+
+              if (
+                parsedTenantUrl.hostname !== memRow.host ||
+                (memRow.port && parsedTenantUrl.port && parseInt(parsedTenantUrl.port, 10) !== memRow.port)
+              ) {
+                caveats.push(
+                  `Advisory: Tenant connection endpoint (${parsedTenantUrl.hostname}:${parsedTenantUrl.port || 5432}) differs from control plane registration (${memRow.host}:${memRow.port || 5432}). Host locality is advisory due to possible port-forwarding or SSH tunnels.`,
+                );
+              }
+
               companyVerification = "control-plane-verified";
             } else {
-              throw new CompanyMemoryUpgradeError(
-                `Unable to infer company ID for memory database "${tenantDbName}". Please supply --company <uuid>.`,
-                "INVALID_ARGUMENT",
-              );
-            }
-          }
+              // Attempt to resolve company from company_memory_databases by database_name
+              const memDbRows = (await cpTx.execute<{
+                company_id: string;
+                database_name: string;
+                database_role: string;
+                host: string;
+                port: number | null;
+                status: string;
+                company_name: string | null;
+              }>(sql`
+                SELECT
+                  cmd.company_id::text AS company_id,
+                  cmd.database_name,
+                  cmd.database_role,
+                  cmd.host,
+                  cmd.port,
+                  cmd.status,
+                  c.name AS company_name
+                FROM company_memory_databases cmd
+                LEFT JOIN companies c ON cmd.company_id = c.id
+                WHERE cmd.database_name = ${currentDatabase};
+              `)) as unknown as Array<{
+                company_id: string;
+                database_name: string;
+                database_role: string;
+                host: string;
+                port: number | null;
+                status: string;
+                company_name: string | null;
+              }>;
 
-          // Query company agents
-          const agentRows = (await cpTx.execute<{
-            id: string;
-            name: string;
-            adapter_type: string;
-            status: string;
-            paused_at: string | null;
-          }>(sql`
-            SELECT
-              id::text AS id,
-              name,
-              adapter_type,
-              status,
-              paused_at::text AS paused_at
-            FROM agents
-            WHERE company_id = ${resolvedCompanyId}::uuid;
-          `)) as unknown as Array<{
-            id: string;
-            name: string;
-            adapter_type: string;
-            status: string;
-            paused_at: string | null;
-          }>;
+              if (memDbRows.length === 0) {
+                throw new CompanyMemoryUpgradeError(
+                  `Unable to infer company ID for memory database "${currentDatabase}". Please supply --company <uuid>.`,
+                  "INVALID_ARGUMENT",
+                );
+              }
+              if (memDbRows.length > 1) {
+                throw new CompanyMemoryUpgradeError(
+                  `Ambiguous company mapping: multiple company_memory_databases records found for "${currentDatabase}". Please supply --company <uuid>.`,
+                  "INVALID_ARGUMENT",
+                );
+              }
 
-          const cpAgentMap = new Map<string, (typeof agentRows)[number]>();
-          for (const a of agentRows) {
-            cpAgentMap.set(a.id, a);
-          }
+              const inferredRow = memDbRows[0];
+              if (inferredRow.database_role !== currentUser) {
+                throw new CompanyMemoryUpgradeError(
+                  `Company memory database binding mismatch: control-plane record specifies role "${inferredRow.database_role}" for database "${currentDatabase}", but connected user is "${currentUser}".`,
+                  "COMPANY_BINDING_MISMATCH",
+                );
+              }
 
-          let routableAgentsCount = 0;
-          let pausedAgentsCount = 0;
-          let unroutableAgentsCount = 0;
+              if (inferredRow.status !== "ready") {
+                caveats.push(`CAVEAT: Company memory database record status is "${inferredRow.status}" (expected "ready").`);
+              }
 
-          let routableRowsCount = 0;
-          let pausedRowsCount = 0;
-          let unroutableRowsCount = 0;
-
-          const unroutableIds = new Set<string>();
-
-          for (const breakdown of populatedCounts.agentBreakdown) {
-            const aid = breakdown.agentId;
-            const rowCount = breakdown.count;
-
-            if (!aid || !isValidUuid(aid)) {
-              unroutableAgentsCount++;
-              unroutableRowsCount += rowCount;
-              if (aid) unroutableIds.add(aid);
-              continue;
-            }
-
-            const cpAgent = cpAgentMap.get(aid);
-            if (!cpAgent) {
-              unroutableAgentsCount++;
-              unroutableRowsCount += rowCount;
-              unroutableIds.add(aid);
-              continue;
+              resolvedCompanyId = inferredRow.company_id;
+              resolvedCompanyName = inferredRow.company_name;
+              companyVerification = "control-plane-verified";
             }
 
-            const isHermes = cpAgent.adapter_type.toLowerCase().startsWith("hermes");
-            if (!isHermes) {
-              unroutableAgentsCount++;
-              unroutableRowsCount += rowCount;
-              unroutableIds.add(aid);
-              continue;
+            // Query company agents
+            const agentRows = (await cpTx.execute<{
+              id: string;
+              name: string;
+              adapter_type: string;
+              status: string;
+              paused_at: string | null;
+            }>(sql`
+              SELECT
+                id::text AS id,
+                name,
+                adapter_type,
+                status,
+                paused_at::text AS paused_at
+              FROM agents
+              WHERE company_id = ${resolvedCompanyId}::uuid;
+            `)) as unknown as Array<{
+              id: string;
+              name: string;
+              adapter_type: string;
+              status: string;
+              paused_at: string | null;
+            }>;
+
+            const cpAgentMap = new Map<string, (typeof agentRows)[number]>();
+            for (const a of agentRows) {
+              cpAgentMap.set(a.id, a);
             }
 
-            if (cpAgent.status === "terminated") {
-              unroutableAgentsCount++;
-              unroutableRowsCount += rowCount;
-              unroutableIds.add(aid);
-              continue;
+            let routableAgentsCount = 0;
+            let pausedAgentsCount = 0;
+            let unroutableAgentsCount = 0;
+
+            let routableRowsCount = 0;
+            let pausedRowsCount = 0;
+            let unroutableRowsCount = 0;
+
+            const unroutableIds = new Set<string>();
+
+            for (const breakdown of populatedCounts.agentBreakdown) {
+              const aid = breakdown.agentId;
+              const rowCount = breakdown.count;
+
+              if (!aid || !isValidUuid(aid)) {
+                unroutableAgentsCount++;
+                unroutableRowsCount += rowCount;
+                if (aid) unroutableIds.add(aid);
+                continue;
+              }
+
+              const cpAgent = cpAgentMap.get(aid);
+              if (!cpAgent) {
+                unroutableAgentsCount++;
+                unroutableRowsCount += rowCount;
+                unroutableIds.add(aid);
+                continue;
+              }
+
+              const isHermes = adapterSupportsRuntimeMemory(cpAgent.adapter_type);
+              if (!isHermes) {
+                unroutableAgentsCount++;
+                unroutableRowsCount += rowCount;
+                unroutableIds.add(aid);
+                continue;
+              }
+
+              if (cpAgent.status === "terminated") {
+                unroutableAgentsCount++;
+                unroutableRowsCount += rowCount;
+                unroutableIds.add(aid);
+                continue;
+              }
+
+              if (cpAgent.status === "pending_approval") {
+                unroutableAgentsCount++;
+                unroutableRowsCount += rowCount;
+                unroutableIds.add(aid);
+                continue;
+              }
+
+              if (cpAgent.status === "paused" || cpAgent.paused_at !== null) {
+                pausedAgentsCount++;
+                pausedRowsCount += rowCount;
+              } else if (INVOKABLE_AGENT_STATUSES.has(cpAgent.status)) {
+                routableAgentsCount++;
+                routableRowsCount += rowCount;
+              } else {
+                unroutableAgentsCount++;
+                unroutableRowsCount += rowCount;
+                unroutableIds.add(aid);
+                caveats.push(`CAVEAT: Agent "${aid}" has unrecognized status "${cpAgent.status}". Classified as unroutable.`);
+              }
             }
 
-            if (cpAgent.status === "paused" || cpAgent.paused_at !== null) {
-              pausedAgentsCount++;
-              pausedRowsCount += rowCount;
-            } else {
-              routableAgentsCount++;
-              routableRowsCount += rowCount;
-            }
-          }
-
-          routingResult = {
-            status: "verified",
-            counts: {
-              agents: {
-                routable: routableAgentsCount,
-                routable_but_paused: pausedAgentsCount,
-                unroutable: unroutableAgentsCount,
+            routingResult = {
+              status: "verified",
+              counts: {
+                agents: {
+                  routable: routableAgentsCount,
+                  routable_but_paused: pausedAgentsCount,
+                  unroutable: unroutableAgentsCount,
+                },
+                rows: {
+                  routable: routableRowsCount,
+                  routable_but_paused: pausedRowsCount,
+                  unroutable: unroutableRowsCount,
+                },
               },
-              rows: {
-                routable: routableRowsCount,
-                routable_but_paused: pausedRowsCount,
-                unroutable: unroutableRowsCount,
-              },
-            },
-            unroutableAgentIds: Array.from(unroutableIds).sort(),
-          };
-        });
+              unroutableAgentIds: Array.from(unroutableIds).sort(),
+            };
+          },
+          { isolationLevel: "repeatable read", accessMode: "read only" },
+        );
       } finally {
         await cpDb.$client.end({ timeout: 1 }).catch(() => {});
       }
@@ -804,6 +1003,13 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
           "Refusing to run census without --company <uuid> when control plane URL is not provided.",
           "INVALID_ARGUMENT",
         );
+      }
+
+      const pcmemPattern = /^pcmem_[0-9a-f]{32}$/;
+      if (pcmemPattern.test(currentDatabase)) {
+        companyVerification = "derived-name-verified";
+      } else {
+        companyVerification = "unbound";
       }
 
       const unroutableIds = new Set<string>();
@@ -838,6 +1044,14 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
       };
     }
 
+    if (companyVerification === "unbound") {
+      routingResult = {
+        ...routingResult,
+        status: "unverified",
+        caveat: routingResult.caveat ?? "Company binding is unbound; agent routing readiness cannot be verified.",
+      };
+    }
+
     // 5. Budget estimate
     // Unroutable rows: if verified, use verified unroutable row count; if unverified, use malformed/missing agent rows
     const unroutableRowsForBudget = routingResult.status === "verified"
@@ -852,15 +1066,24 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
       averageTextLength: populatedCounts.contentLength.average,
     });
 
+    if (routingResult.status === "unverified") {
+      caveats.push(
+        "ROUTING UNVERIFIED: Control plane URL was not provided or company binding is unbound. Agent existence and routing status could not be verified.",
+      );
+    } else {
+      caveats.push("ROUTING VERIFIED: Agent routing verified against control plane.");
+    }
+    caveats.push("BUDGET ESTIMATE: Costs and durations are planning estimates based on standard rate tiers and token models.");
+
     const report: CensusReport = {
       schemaVersion: "1.0",
       generatedAt: new Date().toISOString(),
       readOnly: true,
       tenantDatabase: {
-        databaseName: tenantDbName,
+        databaseName: currentDatabase || tenantDbName,
         host: parsedTenantUrl.hostname,
         port: parseInt(parsedTenantUrl.port || "5432", 10),
-        user: parsedTenantUrl.username || "current_user",
+        user: currentUser || parsedTenantUrl.username || "current_user",
       },
       company: {
         id: resolvedCompanyId!,
@@ -871,22 +1094,16 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
       census: populatedCounts,
       routing: routingResult,
       budget: budgetEstimate,
-      caveats: [
-        "READ-ONLY RUN: No data was written, modified, or migrated.",
-        routingResult!.status === "unverified"
-          ? "ROUTING UNVERIFIED: Control plane URL was not provided. Agent existence and routing status could not be verified."
-          : "ROUTING VERIFIED: Agent routing verified against control plane.",
-        "BUDGET ESTIMATE: Costs and durations are planning estimates based on standard rate tiers and token models.",
-      ],
+      caveats,
     };
 
     if (outputPath) {
-      validateOutputPath(outputPath, repoRoot);
+      const resolvedOutPath = validateOutputPath(outputPath, repoRoot);
       const outputText = format === "json"
         ? JSON.stringify(report, null, 2)
         : formatCensusTextReport(report);
 
-      await writeFile(outputPath, outputText, {
+      await writeFile(resolvedOutPath, outputText, {
         encoding: "utf8",
         mode: 0o600,
         flag: "wx",
