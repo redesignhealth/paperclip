@@ -445,6 +445,9 @@ jobs:
       - name: Verify Mem0 memory content sampler test coverage
         run: pnpm run test:sample-mem0-memory-content
 
+      - name: Verify Mem0 memory upgrade census test coverage
+        run: pnpm run test:memory-upgrade-census
+
       - name: Upload CI profile timings
         continue-on-error: true
         if: always() && env.PAPERCLIP_CI_PROFILE == 'true'
