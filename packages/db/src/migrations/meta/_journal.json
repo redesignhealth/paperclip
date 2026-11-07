@@ -2696,6 +2696,13 @@
       "when": 1794023859400,
       "tag": "0386_minor_clea",
       "breakpoints": true
+    },
+    {
+      "idx": 387,
+      "version": "7",
+      "when": 1794053588872,
+      "tag": "0387_upstream_sync_integration_repoint",
+      "breakpoints": true
     }
   ]
 }
