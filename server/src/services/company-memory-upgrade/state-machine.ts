@@ -1,11 +1,15 @@
 import { randomUUID } from "node:crypto";
 import {
   companyMemoryUpgrades,
+  TERMINAL_UPGRADE_STATES,
   type Db,
   type UpgradeState,
 } from "@paperclipai/db";
 import { and, eq, gt, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { logger } from "../../middleware/logger.js";
+import { assertCompanyAcceptsMemoryWork } from "./admission.js";
 import {
+  CompanyMemoryUpgradeError,
   UPGRADE_ERROR_CODES,
   type ClaimLeaseParams,
   type ClaimLeaseResult,
@@ -18,7 +22,7 @@ import {
   type UpgradeErrorCode,
 } from "./types.js";
 
-export { UPGRADE_ERROR_CODES, type StartLeaseHeartbeatOptions, type UpgradeErrorCode } from "./types.js";
+export { CompanyMemoryUpgradeError, UPGRADE_ERROR_CODES, type StartLeaseHeartbeatOptions, type UpgradeErrorCode } from "./types.js";
 
 export function isUpgradeErrorCode(value: unknown): value is UpgradeErrorCode {
   return typeof value === "string" && (UPGRADE_ERROR_CODES as readonly string[]).includes(value);
@@ -35,16 +39,6 @@ export function assertUpgradeErrorCode(value: unknown): asserts value is Upgrade
 
 export const DEFAULT_LEASE_TTL_MS = 600_000; // 10 minutes
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 120_000; // 2 minutes
-
-export class CompanyMemoryUpgradeError extends Error {
-  readonly code: string;
-
-  constructor(message: string, code: string) {
-    super(message);
-    this.name = "CompanyMemoryUpgradeError";
-    this.code = code;
-  }
-}
 
 /**
  * Total state transition rules for live Mem0 company memory upgrades.
@@ -157,7 +151,12 @@ export function assertValidTransition(
 }
 
 /**
- * Inserts a new memory upgrade record in 'sweeping' state.
+ * Opens a new memory upgrade record in 'sweeping' state.
+ *
+ * Opens its own database transaction to acquire transaction-scoped admission locks;
+ * callers must not nest this inside an outer transaction.
+ *
+ * Ensures the company exists and is not undergoing deletion before inserting.
  * The partial unique index enforces at most one active upgrade per company.
  */
 export async function openUpgrade(
@@ -166,39 +165,42 @@ export async function openUpgrade(
   options?: { clock?: Clock },
 ): Promise<CompanyMemoryUpgradeRow> {
   const now = options?.clock?.now() ?? new Date();
-  try {
-    const [inserted] = await db
-      .insert(companyMemoryUpgrades)
-      .values({
-        companyId: params.companyId,
-        state: "sweeping",
-        converterId: params.converterId,
-        converterVersion: params.converterVersion,
-        collectionName: params.collectionName,
-        embeddingModel: params.embeddingModel,
-        embeddingDimensions: params.embeddingDimensions,
-        operatorLabel: params.operatorLabel ?? null,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-    return inserted;
-  } catch (error: any) {
-    const cause = error?.cause ?? error;
-    if (
-      cause?.code === "23505" ||
-      cause?.constraint === "company_memory_upgrades_active_uq" ||
-      cause?.constraint_name === "company_memory_upgrades_active_uq" ||
-      String(error?.message).includes("company_memory_upgrades_active_uq") ||
-      String(cause?.message).includes("company_memory_upgrades_active_uq")
-    ) {
-      throw new CompanyMemoryUpgradeError(
-        `An active memory upgrade is already in progress for company ${params.companyId}`,
-        "ACTIVE_UPGRADE_EXISTS",
-      );
+  return await db.transaction(async (tx) => {
+    await assertCompanyAcceptsMemoryWork(tx, params.companyId);
+    try {
+      const [inserted] = await tx
+        .insert(companyMemoryUpgrades)
+        .values({
+          companyId: params.companyId,
+          state: "sweeping",
+          converterId: params.converterId,
+          converterVersion: params.converterVersion,
+          collectionName: params.collectionName,
+          embeddingModel: params.embeddingModel,
+          embeddingDimensions: params.embeddingDimensions,
+          operatorLabel: params.operatorLabel ?? null,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      return inserted;
+    } catch (error: any) {
+      const cause = error?.cause ?? error;
+      if (
+        cause?.code === "23505" ||
+        cause?.constraint === "company_memory_upgrades_active_uq" ||
+        cause?.constraint_name === "company_memory_upgrades_active_uq" ||
+        String(error?.message).includes("company_memory_upgrades_active_uq") ||
+        String(cause?.message).includes("company_memory_upgrades_active_uq")
+      ) {
+        throw new CompanyMemoryUpgradeError(
+          `An active memory upgrade is already in progress for company ${params.companyId}`,
+          "ACTIVE_UPGRADE_EXISTS",
+        );
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
 }
 
 /**
@@ -413,7 +415,10 @@ export function startLeaseHeartbeat(
     } catch {
       // Fail closed
     }
-    if (!running || lost) return;
+    if (!renewalSucceeded) {
+      lost = true;
+    }
+    if (!running) return;
     if (!renewalSucceeded) {
       notifyLost();
     }
@@ -475,7 +480,7 @@ export async function advanceState(
   }
 
   const now = options?.clock?.now() ?? new Date();
-  const isTerminal = to === "completed" || to === "rolled_back" || to === "aborted";
+  const isTerminal = (TERMINAL_UPGRADE_STATES as readonly string[]).includes(to);
 
   const [updated] = await db
     .update(companyMemoryUpgrades)
@@ -667,6 +672,13 @@ export async function recoverUpgrade(
   }
 
   assertValidRecoveryTransition(priorState, priorState);
+
+  if (existing.lastError) {
+    logger.info(
+      { upgradeId: id, priorLastError: existing.lastError },
+      "Recovering upgrade; clearing prior lastError",
+    );
+  }
 
   const now = options?.clock?.now() ?? new Date();
   const ttlMs = options?.ttlMs ?? DEFAULT_LEASE_TTL_MS;

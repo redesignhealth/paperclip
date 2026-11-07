@@ -39,6 +39,16 @@ export const UPGRADE_ERROR_CODES = [
 
 export type UpgradeErrorCode = (typeof UPGRADE_ERROR_CODES)[number];
 
+export class CompanyMemoryUpgradeError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "CompanyMemoryUpgradeError";
+    this.code = code;
+  }
+}
+
 export interface OpenUpgradeParams {
   companyId: string;
   converterId: string;

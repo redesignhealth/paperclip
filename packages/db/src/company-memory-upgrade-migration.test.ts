@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
 import { afterEach, describe, expect, it } from "vitest";
+import { TERMINAL_UPGRADE_STATES } from "./schema/company_memory_upgrades.js";
 import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   getEmbeddedPostgresTestSupport,
@@ -294,5 +295,29 @@ describePostgres("company memory upgrade migration", () => {
     });
     expect(rowsB).toHaveLength(1);
     expect(rowsB[0].id).toBe(upgradeB.id);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("has deletion_started_at column on companies and partial index predicates matching TERMINAL_UPGRADE_STATES", async () => {
+    const { sql } = await setup();
+    const columns = await sql`
+      SELECT column_name, data_type, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'companies' AND column_name = 'deletion_started_at'
+    `;
+    expect(columns).toHaveLength(1);
+    expect(columns[0].column_name).toBe("deletion_started_at");
+    expect(columns[0].is_nullable).toBe("YES");
+
+    const indexRows = await sql`
+      SELECT indexname, indexdef
+      FROM pg_indexes
+      WHERE tablename = 'company_memory_upgrades' AND indexname IN ('company_memory_upgrades_active_uq', 'company_memory_upgrades_lease_idx')
+    `;
+    expect(indexRows.length).toBe(2);
+    for (const row of indexRows) {
+      for (const termState of TERMINAL_UPGRADE_STATES) {
+        expect(row.indexdef).toContain(termState);
+      }
+    }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 });

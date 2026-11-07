@@ -310,8 +310,8 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
       "completed",
     );
     expect(completed.state).toBe("completed");
-    expect(completed.completedAt).toBeDefined();
-    expect(completed.prunedAt).toBeDefined();
+    expect(completed.completedAt).toBeInstanceOf(Date);
+    expect(completed.prunedAt).toBeInstanceOf(Date);
   });
 
   it("handles lease lapse to needs_recovery and recovers back to prior state", async () => {
@@ -964,8 +964,8 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     // 3. Advance to 'completed' (terminal state)
     const completed = await advanceState(db, upgrade.id, claim.leaseToken!, "pruning", "completed");
     expect(completed.state).toBe("completed");
-    expect(completed.prunedAt).toBeDefined();
-    expect(completed.completedAt).toBeDefined();
+    expect(completed.prunedAt).toBeInstanceOf(Date);
+    expect(completed.completedAt).toBeInstanceOf(Date);
 
     // 4. Deletion succeeds and cleans up terminal audit row
     const deleted = await deleteCompany(db, company.id);
@@ -1027,8 +1027,8 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     // Finally complete from pruning -> prunedAt and completedAt are set:
     const completed = await advanceState(db, upgrade.id, recovered.leaseToken!, "pruning", "completed");
     expect(completed.state).toBe("completed");
-    expect(completed.prunedAt).toBeDefined();
-    expect(completed.completedAt).toBeDefined();
+    expect(completed.prunedAt).toBeInstanceOf(Date);
+    expect(completed.completedAt).toBeInstanceOf(Date);
   });
 
   it("recoverUpgrade enforces CAS on recoverToState and clears lastError on recovery", async () => {
@@ -1259,6 +1259,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     await stopPromise;
 
     expect(onLostCalled).toBe(false);
+    expect(hb.isLost()).toBe(true);
 
     // 5. Short TTL defaults to min(DEFAULT, floor(ttlMs / 3)) interval deterministically
     vi.useFakeTimers();

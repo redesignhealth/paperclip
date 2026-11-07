@@ -2,7 +2,14 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { agentObservabilityService } from "./agent-observability.js";
 import { withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
 import type { Db } from "@paperclipai/db";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
+import { conflict } from "../errors.js";
+import { logger } from "../middleware/logger.js";
+import {
+  acquireCompanyMemoryAdmissionLock,
+  findActiveUpgrade,
+  lockCompanyForMemoryAdmission,
+} from "./company-memory-upgrade/admission.js";
 import { companyMemoryDatabaseService } from "./company-memory-databases.js";
 import { createAgentLifecycle, processAgentLifecycle } from "./agent-lifecycle.js";
 import { agentLifecycleCompanyDeletion } from "../modules/agent-lifecycle/company-deletion.js";
@@ -83,51 +90,115 @@ async function deprovisionCompanyMemoryBeforeDelete(db: Db, id: string) {
   }
 }
 
-export async function deleteCompany(db: Db, id: string) {
-  await deprovisionCompanyMemoryBeforeDelete(db, id);
-  const lifecycle = createAgentLifecycle(db);
-  const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, id));
-  for (const agent of companyAgents) {
-    await lifecycle.terminateAgent(agent.id);
-    await processAgentLifecycle(db, agent.id);
+export type CompanyDeletionAdmissionResult =
+  | { admitted: true }
+  | { admitted: false; reason: "company_not_found" };
+
+export async function admitCompanyDeletion(
+  db: Db,
+  id: string,
+): Promise<CompanyDeletionAdmissionResult> {
+  return await db.transaction(async (tx) => {
+    await acquireCompanyMemoryAdmissionLock(tx, id);
+    const company = await lockCompanyForMemoryAdmission(tx, id);
+    if (!company) {
+      return { admitted: false, reason: "company_not_found" };
+    }
+
+    const activeUpgrade = await findActiveUpgrade(tx, id);
+    if (activeUpgrade) {
+      throw conflict(
+        `Cannot delete company: memory upgrade "${activeUpgrade.id}" is active in state "${activeUpgrade.state}". Non-terminal upgrades must complete, roll back, or abort before company deletion.`,
+        {
+          code: "company_memory_upgrade_active",
+          upgradeId: activeUpgrade.id,
+          state: activeUpgrade.state,
+        },
+      );
+    }
+
+    const priorDeletionStartedAt = company.deletionStartedAt;
+    const resumed = priorDeletionStartedAt !== null && priorDeletionStartedAt !== undefined;
+    if (resumed) {
+      const ageMs = Date.now() - new Date(priorDeletionStartedAt).getTime();
+      logger.warn(
+        { companyId: id, ageMs, deletionStartedAt: priorDeletionStartedAt },
+        `Resuming company deletion with existing deletion intent (age ${ageMs}ms)`,
+      );
+    }
+
+    await tx
+      .update(companies)
+      .set({
+        deletionStartedAt: sql`coalesce(${companies.deletionStartedAt}, now())`,
+      })
+      .where(eq(companies.id, id));
+
+    return { admitted: true };
+  });
+}
+
+export async function clearCompanyDeletionIntent(db: Db, id: string): Promise<void> {
+  try {
+    await db
+      .update(companies)
+      .set({ deletionStartedAt: null })
+      .where(eq(companies.id, id));
+  } catch (err) {
+    logger.error(
+      { err, companyId: id },
+      "Failed to clear company deletion intent after deletion failure",
+    );
   }
-  return withAccountHomeSecretMutationLock(undefined, id, () => db.transaction(async (tx) => {
-        // Exclude accounting writers before taking child locks. KEY SHARE must
-        // remain compatible: native writers can already hold a child row while
-        // saving a company-scoped result. FOR UPDATE would deadlock that save.
-        const [existing] = await tx.select({ id: companies.id }).from(companies)
-          .where(eq(companies.id, id)).for("no key update");
-        if (!existing) return null;
-        await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
-        await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
+}
 
-        // Check for in-progress memory upgrades under row lock.
-        // Selecting upgrade rows FOR NO KEY UPDATE ensures concurrent state advances,
-        // lease claims, or renewals wait on this transaction and cannot race with deletion.
-        // If any non-terminal upgrade exists (e.g. sweeping, flipping, draining,
-        // verified, pruning, or needs_recovery), refuse deletion to prevent data loss or
-        // leaving orphaned tenant tables/leases.
-        const upgradeRows = await tx
-          .select({
-            id: companyMemoryUpgrades.id,
-            state: companyMemoryUpgrades.state,
-          })
-          .from(companyMemoryUpgrades)
-          .where(eq(companyMemoryUpgrades.companyId, id))
-          .for("no key update");
+export async function deleteCompany(db: Db, id: string) {
+  const admission = await admitCompanyDeletion(db, id);
+  if (!admission.admitted) {
+    return null;
+  }
 
-        const activeUpgrade = upgradeRows.find(
-          (row) => !(TERMINAL_UPGRADE_STATES as readonly string[]).includes(row.state),
+  try {
+    await deprovisionCompanyMemoryBeforeDelete(db, id);
+    const lifecycle = createAgentLifecycle(db);
+    const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, id));
+    for (const agent of companyAgents) {
+      await lifecycle.terminateAgent(agent.id);
+      await processAgentLifecycle(db, agent.id);
+    }
+    return await withAccountHomeSecretMutationLock(undefined, id, () => db.transaction(async (tx) => {
+      // Advisory lock must be acquired as first statement of participating transaction.
+      await acquireCompanyMemoryAdmissionLock(tx, id);
+
+      // Exclude accounting writers before taking child locks. KEY SHARE must
+      // remain compatible: native writers can already hold a child row while
+      // saving a company-scoped result. FOR UPDATE would deadlock that save.
+      const [existing] = await tx.select({ id: companies.id }).from(companies)
+        .where(eq(companies.id, id)).for("no key update");
+      if (!existing) return null;
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
+      await tx.delete(companyMemoryDatabases).where(eq(companyMemoryDatabases.companyId, id));
+
+      // Check for in-progress memory upgrades under row lock (defence-in-depth).
+      const activeUpgrade = await findActiveUpgrade(tx, id);
+      if (activeUpgrade) {
+        logger.error(
+          { companyId: id, upgradeId: activeUpgrade.id, state: activeUpgrade.state },
+          "Invariant violation: active memory upgrade found during final company deletion transaction",
         );
-        if (activeUpgrade) {
-          throw new Error(
-            `Cannot delete company: memory upgrade "${activeUpgrade.id}" is active in state "${activeUpgrade.state}". Non-terminal upgrades must complete, roll back, or abort before company deletion.`,
-          );
-        }
+        throw conflict(
+          `Cannot delete company: memory upgrade "${activeUpgrade.id}" is active in state "${activeUpgrade.state}". Non-terminal upgrades must complete, roll back, or abort before company deletion.`,
+          {
+            code: "company_memory_upgrade_active",
+            upgradeId: activeUpgrade.id,
+            state: activeUpgrade.state,
+          },
+        );
+      }
 
-        // Terminal upgrade rows are audit/ledger records and are only deleted as part
-        // of final company deletion once verified that no active upgrade is running.
-        await tx.delete(companyMemoryUpgrades).where(eq(companyMemoryUpgrades.companyId, id));
+      // Terminal upgrade rows are audit/ledger records and are only deleted as part
+      // of final company deletion once verified that no active upgrade is running.
+      await tx.delete(companyMemoryUpgrades).where(eq(companyMemoryUpgrades.companyId, id));
         await agentObservabilityService(tx as unknown as Db).removeForCompanyDeletion(id);
         // Finance can reference costs and both can reference runs. Incidents
         // reference policies and approvals; delete these dependents first.
@@ -186,4 +257,8 @@ export async function deleteCompany(db: Db, id: string) {
           .returning();
         return rows[0] ?? null;
       }));
+  } catch (err) {
+    await clearCompanyDeletionIntent(db, id);
+    throw err;
+  }
 }

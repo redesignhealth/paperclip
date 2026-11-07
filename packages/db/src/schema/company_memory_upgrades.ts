@@ -52,15 +52,16 @@ export const companyMemoryUpgrades = pgTable(
     sourceDeletedCount: integer("source_deleted_count").notNull().default(0),
 
     // Bigint counters (default 0n, not null)
-    llmInputTokens: bigint("llm_input_tokens", { mode: "bigint" }).notNull().default(0n),
-    llmOutputTokens: bigint("llm_output_tokens", { mode: "bigint" }).notNull().default(0n),
-    embeddingTokens: bigint("embedding_tokens", { mode: "bigint" }).notNull().default(0n),
-    estimatedCostNanodollars: bigint("estimated_cost_nanodollars", { mode: "bigint" }).notNull().default(0n),
+    llmInputTokens: bigint("llm_input_tokens", { mode: "bigint" }).notNull().default(sql`0`),
+    llmOutputTokens: bigint("llm_output_tokens", { mode: "bigint" }).notNull().default(sql`0`),
+    embeddingTokens: bigint("embedding_tokens", { mode: "bigint" }).notNull().default(sql`0`),
+    estimatedCostNanodollars: bigint("estimated_cost_nanodollars", { mode: "bigint" }).notNull().default(sql`0`),
 
     // Timestamps (nullable)
     markedAt: timestamp("marked_at", { withTimezone: true }),
     drainConfirmedAt: timestamp("drain_confirmed_at", { withTimezone: true }),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    /** Timestamp recorded when pruning completes (recorded on transition to 'completed'). Null while in 'pruning' or if aborted/crashed. */
     prunedAt: timestamp("pruned_at", { withTimezone: true }),
     rolledBackAt: timestamp("rolled_back_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
