@@ -27,6 +27,12 @@ REPO_ID = 1326789272
 DEFAULT_BRANCH = "master"
 ORG_ID = 216950685
 
+# Base branches the gate is allowed to evaluate a PR against (TECH-8201). `integration` is the
+# no-report-only landing branch for upstream-sync and pin-bump PRs; `DEFAULT_BRANCH` stays the
+# single value the IAM role trust and job_workflow_ref pin (see
+# test_guard_constants_match_the_iam_role_trust_contract) and is NOT itself widened.
+ELIGIBLE_BASE_BRANCHES = frozenset({DEFAULT_BRANCH, "integration"})
+
 # The RH PR Approval Gate GitHub App (NOT the generic GitHub Actions app 15368, whose check
 # context any branch workflow can forge).
 APP_ID = 5166579
@@ -202,7 +208,8 @@ def pr_ineligibility(pr: Any, expected_head: str | None = None) -> str | None:
 
     Rejects: not open, wrong base branch/repo, missing or deleted head repo, malformed head SHA,
     a PR authored by the gate App itself (no self-approval), and a head that moved.
-    Fork PRs are eligible provided base is master of repo 1326789272 and head repo exists with an integer ID.
+    Fork PRs are eligible provided base is master or integration of repo 1326789272 and head repo
+    exists with an integer ID.
     """
     if not isinstance(pr, dict):
         return "MALFORMED_PR"
@@ -211,7 +218,7 @@ def pr_ineligibility(pr: Any, expected_head: str | None = None) -> str | None:
     if pr.get("state") != "open":
         return "NOT_OPEN"
     base_repo = base.get("repo") or {}
-    if base.get("ref") != DEFAULT_BRANCH or base_repo.get("id") != REPO_ID:
+    if base.get("ref") not in ELIGIBLE_BASE_BRANCHES or base_repo.get("id") != REPO_ID:
         return "WRONG_BASE"
     head_repo = head.get("repo")
     if not isinstance(head_repo, dict) or not isinstance(head_repo.get("id"), int) or head_repo.get("id") <= 0:

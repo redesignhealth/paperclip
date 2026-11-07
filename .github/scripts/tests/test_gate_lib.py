@@ -56,6 +56,11 @@ class EligibilityTests(unittest.TestCase):
         # Public fork PRs with positive integer head repo ID are eligible
         self.assertIsNone(gate_lib.pr_ineligibility(pr(head_repo=987654321)))
 
+    def test_integration_base_is_eligible(self):
+        # TECH-8201: sync/pin-bump PRs land on `integration`, not just `master`.
+        self.assertIsNone(gate_lib.pr_ineligibility(pr(base="integration")))
+        self.assertIsNone(gate_lib.pr_ineligibility(pr(base="integration", head_repo=987654321)))
+
     def test_rejections(self):
         cases = {
             "NOT_OPEN": pr(state="closed"),
