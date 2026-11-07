@@ -1155,13 +1155,13 @@ describe("RH Google MCP first-consent defaults", () => {
   // Dangerous tools must stay off by default; an owner enables them in Permissions.
   const DANGEROUS = [
     "send_gmail_message", "send_message", "manage_drive_access", "set_drive_file_permissions", "set_publish_settings",
-    "manage_gmail_filter", "manage_event", "respond_to_event", "create_event_with_zoom", "run_script_function",
-    "create_script_project", "update_script_content", "manage_deployment", "delete_script_project", "delete_doc_tab",
-    "manage_contact", "manage_contacts_batch", "manage_contact_group", "modify_gmail_message_labels",
-    "batch_modify_gmail_message_labels", "copy_drive_file", "export_doc_to_pdf", "import_to_google_doc",
-    "generate_trigger_code", "create_drive_file", "update_drive_file",
+    "get_drive_shareable_link", "manage_gmail_filter", "manage_event", "respond_to_event", "create_event_with_zoom",
+    "run_script_function", "create_script_project", "update_script_content", "manage_deployment", "delete_script_project",
+    "create_version", "delete_doc_tab", "manage_contact", "manage_contacts_batch", "manage_contact_group",
     // Multiplex a delete through an `action` argument, so enabling the tool name enables the delete.
     "manage_gmail_label", "manage_task", "manage_task_list",
+    // Can move a file to the trash (`trashed`) and change who can share it.
+    "update_drive_file",
   ];
 
   it("lists read-shaped names plus the reviewed safe writes, none duplicated, and none of the dangerous tools", () => {

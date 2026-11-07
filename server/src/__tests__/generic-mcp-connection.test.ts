@@ -4255,8 +4255,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       // The server's own readOnlyHint is wrong for several of these: the mislabelled ones (flagged read-only) change data.
       const REVIEWED_READS = ["get_events", "list_calendars", "search_gmail_messages", "read_sheet_values"];
       // Reviewed low-risk writes (RH_GOOGLE_MCP_SAFE_WRITE_TOOLS); `modify_sheet_values` is also flagged read-only upstream.
-      const REVIEWED_WRITES = ["create_doc", "modify_sheet_values"];
-      const MISLABELLED_AS_READ = ["manage_drive_access", "manage_event", "run_script_function", "modify_gmail_message_labels"];
+      const REVIEWED_WRITES = ["create_doc", "modify_sheet_values", "modify_gmail_message_labels", "copy_drive_file"];
+      const MISLABELLED_AS_READ = ["manage_drive_access", "manage_event", "run_script_function"];
       const WRITES = ["send_gmail_message", "manage_task"];
       const tools = [
         ...REVIEWED_READS.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),

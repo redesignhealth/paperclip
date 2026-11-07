@@ -18163,7 +18163,7 @@ export function toolAccessService(
       // S5 + S6: Derive initial active tool IDs for brand-new personal profile without writing outside TX
       let activateOnNewProfileIds: string[] = [];
       if (isPersonalInstance) {
-        // RH MCP: its read ceiling. RH Google MCP: its reviewed read-only starting set. Nothing else is switched on.
+        // RH MCP: its read ceiling. RH Google MCP: its reviewed starting set (reads plus the reviewed safe writes). Nothing else is switched on.
         const initiallyActive = initialActiveToolsForPersonalInstance(connection);
         if (initiallyActive && initiallyActive.size > 0) {
           activateOnNewProfileIds = refresh.catalog
