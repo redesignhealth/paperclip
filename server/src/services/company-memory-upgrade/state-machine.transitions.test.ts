@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CompanyMemoryUpgradeError,
+  assertUpgradeErrorCode,
   assertValidTransition,
   isValidTransition,
   VALID_TRANSITIONS,
@@ -139,5 +140,22 @@ describe("state-machine transitions", () => {
         }
       }
     }
+  });
+
+  describe("assertUpgradeErrorCode", () => {
+    it("never echoes rejected secret-bearing string in error message", () => {
+      const dsnSecret = "postgres://u:s3cret@h/db";
+      let caught: Error | undefined;
+      try {
+        assertUpgradeErrorCode(dsnSecret);
+      } catch (err: any) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expect(caught).toBeInstanceOf(CompanyMemoryUpgradeError);
+      expect((caught as CompanyMemoryUpgradeError).code).toBe("INVALID_ARGUMENT");
+      expect(caught!.message).not.toContain("s3cret");
+      expect(caught!.message).toContain("string");
+    });
   });
 });

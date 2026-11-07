@@ -618,16 +618,19 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     });
     expect(claim.acquired).toBe(true);
 
-    // 1. advanceState rejects raw error with DSN/secret
-    await expect(
-      advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted", {
-        lastError: "Connection failed to postgres://user:secret@db.internal:5432/corp and leaked memory: confidential data" as any,
-      }),
-    ).rejects.toThrowError(
-      expect.objectContaining({
-        code: "INVALID_ARGUMENT",
-      }),
-    );
+    // 1. advanceState rejects raw error with DSN/secret and does not echo secret
+    const secretDsn = "postgres://u:s3cret@h/db";
+    let advanceErr: Error | undefined;
+    try {
+      await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted", {
+        lastError: secretDsn as any,
+      });
+    } catch (err: any) {
+      advanceErr = err;
+    }
+    expect(advanceErr).toBeDefined();
+    expect((advanceErr as any).code).toBe("INVALID_ARGUMENT");
+    expect(advanceErr!.message).not.toContain("s3cret");
 
     // 2. advanceState accepts valid machine reason code from vocabulary
     const advanced = await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted", {
@@ -636,7 +639,7 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
     expect(advanced.state).toBe("aborted");
     expect(advanced.lastError).toBe("aborted_by_operator");
 
-    // 3. updateUpgradeCounters rejects raw string and accepts valid machine code
+    // 3. updateUpgradeCounters rejects raw string and accepts valid machine code without echoing secrets
     const upgrade2 = await openUpgrade(db, {
       companyId: (await createTestCompany("Co Err", "CE")).id,
       converterId: "mem0-v1",
@@ -652,15 +655,41 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
       ttlMs: 60_000,
     });
 
-    await expect(
-      updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
-        lastError: "SyntaxError: Unexpected token < in JSON at position 0" as any,
-      }),
-    ).rejects.toThrowError(
-      expect.objectContaining({
-        code: "INVALID_ARGUMENT",
-      }),
-    );
+    let counterLastErrorErr: Error | undefined;
+    try {
+      await updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
+        lastError: secretDsn as any,
+      });
+    } catch (err: any) {
+      counterLastErrorErr = err;
+    }
+    expect(counterLastErrorErr).toBeDefined();
+    expect((counterLastErrorErr as any).code).toBe("INVALID_ARGUMENT");
+    expect(counterLastErrorErr!.message).not.toContain("s3cret");
+
+    let counterDeltaErr: Error | undefined;
+    try {
+      await updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
+        sweepCount: secretDsn as any,
+      });
+    } catch (err: any) {
+      counterDeltaErr = err;
+    }
+    expect(counterDeltaErr).toBeDefined();
+    expect((counterDeltaErr as any).code).toBe("INVALID_ARGUMENT");
+    expect(counterDeltaErr!.message).not.toContain("s3cret");
+
+    let bigIntDeltaErr: Error | undefined;
+    try {
+      await updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
+        llmInputTokens: secretDsn as any,
+      });
+    } catch (err: any) {
+      bigIntDeltaErr = err;
+    }
+    expect(bigIntDeltaErr).toBeDefined();
+    expect((bigIntDeltaErr as any).code).toBe("INVALID_ARGUMENT");
+    expect(bigIntDeltaErr!.message).not.toContain("s3cret");
 
     const updatedCounters = await updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, {
       lastError: "conversion_failed",

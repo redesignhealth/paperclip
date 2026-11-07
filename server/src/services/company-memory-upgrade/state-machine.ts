@@ -27,7 +27,7 @@ export function isUpgradeErrorCode(value: unknown): value is UpgradeErrorCode {
 export function assertUpgradeErrorCode(value: unknown): asserts value is UpgradeErrorCode {
   if (!isUpgradeErrorCode(value)) {
     throw new CompanyMemoryUpgradeError(
-      `Invalid lastError reason code: "${value}". Must be a recognized UpgradeErrorCode`,
+      `Invalid lastError reason code (received type ${typeof value}). Must be a recognized UpgradeErrorCode`,
       "INVALID_ARGUMENT",
     );
   }
@@ -603,8 +603,14 @@ export async function recoverUpgrade(
 function validateIntegerDelta(fieldName: string, value: unknown): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    const detail =
+      typeof value !== "number"
+        ? `received type ${typeof value}`
+        : !Number.isSafeInteger(value)
+          ? "received non-integer"
+          : "received negative";
     throw new CompanyMemoryUpgradeError(
-      `Invalid delta for "${fieldName}": must be a nonnegative safe integer, got ${value}`,
+      `Invalid delta for "${fieldName}": must be a nonnegative safe integer (${detail})`,
       "INVALID_ARGUMENT",
     );
   }
@@ -616,17 +622,24 @@ function validateBigIntDelta(fieldName: string, value: unknown): number | bigint
   if (typeof value === "bigint") {
     if (value < 0n) {
       throw new CompanyMemoryUpgradeError(
-        `Invalid delta for "${fieldName}": must be a nonnegative bigint, got ${value}`,
+        `Invalid delta for "${fieldName}": must be a nonnegative bigint (received negative)`,
         "INVALID_ARGUMENT",
       );
     }
     return value;
   }
-  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      const detail = !Number.isSafeInteger(value) ? "received non-integer" : "received negative";
+      throw new CompanyMemoryUpgradeError(
+        `Invalid delta for "${fieldName}": must be a nonnegative safe integer or bigint (${detail})`,
+        "INVALID_ARGUMENT",
+      );
+    }
     return value;
   }
   throw new CompanyMemoryUpgradeError(
-    `Invalid delta for "${fieldName}": must be a nonnegative safe integer or bigint, got ${value}`,
+    `Invalid delta for "${fieldName}": must be a nonnegative safe integer or bigint (received type ${typeof value})`,
     "INVALID_ARGUMENT",
   );
 }
