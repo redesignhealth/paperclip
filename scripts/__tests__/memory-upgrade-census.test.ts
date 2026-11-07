@@ -667,10 +667,22 @@ describe("validation, path, and CLI flags unit tests", () => {
     // Supports space-separated --flag value
     assert.equal(parseFlagValue("--table", ["--table", "my_table"]), "my_table");
 
-    // Single-dash value passed through to validator
-    assert.equal(parseFlagValue("--table", ["--table", "-v"]), "-v");
-    assert.equal(parseFlagValue("--table", ["--table=-x"]), "-x");
+    // Negative numeric values are passed through to numeric validator
     assert.equal(parseFlagValue("--long-threshold", ["--long-threshold", "-5"]), "-5");
+
+    // Single-dash non-numeric values and boolean flags like -h are rejected as usable values
+    assert.throws(
+      () => parseFlagValue("--table", ["--table", "-h"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
+    assert.throws(
+      () => parseFlagValue("--table", ["--table", "-v"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
+    assert.throws(
+      () => parseFlagValue("--table", ["--table=-x"]),
+      (err: any) => err.code === "INVALID_ARGUMENT" && err.message.includes("--table"),
+    );
 
     // Value flag present without usable value (missing, next starts with --, or empty =) throws hard INVALID_ARGUMENT error
     assert.throws(
@@ -789,6 +801,68 @@ describe("validation, path, and CLI flags unit tests", () => {
       ]);
       assert.equal(exitNegativeNumeric, 1);
       assert.ok(stderrLogged.includes('Invalid --long-threshold "-5". Must be a positive integer.'));
+
+      // Value flag followed by -h fails INVALID_ARGUMENT rather than short-circuiting to help
+      stderrLogged = "";
+      let stdoutLogged = "";
+      const origLog = console.log;
+      console.log = (msg: string) => {
+        stdoutLogged += `${msg}\n`;
+      };
+      try {
+        const exitMissingValBeforeHelp = await runMemoryUpgradeCli([
+          "node",
+          "memory-upgrade.ts",
+          "census",
+          "--database-url",
+          "postgres://usr:pw@localhost:5432/db",
+          "--table",
+          "-h",
+        ]);
+        assert.equal(exitMissingValBeforeHelp, 1);
+        assert.ok(stderrLogged.includes("Flag '--table' requires a usable value."));
+        assert.equal(stdoutLogged, "", "Help must not be printed when a value flag is missing a value");
+
+        // Standalone -h works and prints help
+        stderrLogged = "";
+        stdoutLogged = "";
+        const exitHelpShort = await runMemoryUpgradeCli([
+          "node",
+          "memory-upgrade.ts",
+          "census",
+          "-h",
+        ]);
+        assert.equal(exitHelpShort, 0);
+        assert.ok(stdoutLogged.includes("Usage: pnpm memory:upgrade census"));
+
+        // Standalone --help works and prints help
+        stderrLogged = "";
+        stdoutLogged = "";
+        const exitHelpLong = await runMemoryUpgradeCli([
+          "node",
+          "memory-upgrade.ts",
+          "census",
+          "--help",
+        ]);
+        assert.equal(exitHelpLong, 0);
+        assert.ok(stdoutLogged.includes("Usage: pnpm memory:upgrade census"));
+
+        // Valid args with -h prints help
+        stderrLogged = "";
+        stdoutLogged = "";
+        const exitHelpWithValidArgs = await runMemoryUpgradeCli([
+          "node",
+          "memory-upgrade.ts",
+          "census",
+          "--database-url",
+          "postgres://usr:pw@localhost:5432/db",
+          "-h",
+        ]);
+        assert.equal(exitHelpWithValidArgs, 0);
+        assert.ok(stdoutLogged.includes("Usage: pnpm memory:upgrade census"));
+      } finally {
+        console.log = origLog;
+      }
     } finally {
       console.error = origError;
     }
@@ -1331,23 +1405,39 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.equal(report.census.distinctUserIds, 5);
 
       // Verify keyset query orders on native column t.id with index scan rather than alias sort
-      const explainRows = (await adminDb.execute<{ "QUERY PLAN": string }>(sql`
-        EXPLAIN SELECT
+      // Assert native order explicitly
+      const queryRows = (await adminDb.execute<{ id: string }>(sql`
+        SELECT
           t.id::text AS id,
           t.payload->>'agent_id' AS agent_id
         FROM mem0_memories t
         WHERE t.id > ${rowIds[1]}::uuid
         ORDER BY t.id ASC
         LIMIT 2;
-      `)) as unknown as Array<{ "QUERY PLAN": string }>;
-      const plan = explainRows.map((r) => r["QUERY PLAN"]).join("\n");
+      `)) as unknown as Array<{ id: string }>;
+      assert.deepEqual(queryRows.map((r) => r.id), [rowIds[2], rowIds[3]]);
+
+      // Plan assertion with SET LOCAL enable_seqscan = off to verify index suitability
+      const plan = await adminDb.transaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL enable_seqscan = off;`);
+        const explainRows = (await tx.execute<{ "QUERY PLAN": string }>(sql`
+          EXPLAIN SELECT
+            t.id::text AS id,
+            t.payload->>'agent_id' AS agent_id
+          FROM mem0_memories t
+          WHERE t.id > ${rowIds[1]}::uuid
+          ORDER BY t.id ASC
+          LIMIT 2;
+        `)) as unknown as Array<{ "QUERY PLAN": string }>;
+        return explainRows.map((r) => r["QUERY PLAN"]).join("\n");
+      });
       assert.ok(
         plan.includes("Index Scan") || plan.includes("mem0_memories_pkey"),
         `Expected plan to use native index scan, got: ${plan}`,
       );
       assert.ok(
         !plan.includes("Sort"),
-        `Expected no explicit Sort node when keyset orders on native PK column, got: ${plan}`,
+        `Expected no explicit Sort node when keyset orders on native PK column with enable_seqscan=off, got: ${plan}`,
       );
     } finally {
       await adminDb.$client.end({ timeout: 1 });
@@ -2081,28 +2171,39 @@ describe("census integration tests against embedded Postgres fixture", () => {
     const dockerDb = createDb(dockerDsn);
     const roleName = `docker_census_${Date.now()}`;
     const tableName = `docker_mem0_real_vector_${Date.now()}`;
+    const safeRole = roleName.replace(/[^a-zA-Z0-9_]/g, "");
+    const safeTable = tableName.replace(/[^a-zA-Z0-9_]/g, "");
+
     try {
+      const dbRes = (await dockerDb.execute<{ current_database: string }>(
+        sql`SELECT current_database();`,
+      )) as unknown as Array<{ current_database: string }>;
+      const dbName = dbRes[0]?.current_database;
+      if (!dbName) {
+        throw new Error("Could not determine current database name for Docker fixture");
+      }
+
       await dockerDb.execute(sql`CREATE EXTENSION IF NOT EXISTS vector;`);
+      await dockerDb.execute(sql.raw(`CREATE ROLE ${safeRole} WITH LOGIN PASSWORD 'docker_pass_123' NOSUPERUSER NOBYPASSRLS;`));
       await dockerDb.execute(sql.raw(`
-        CREATE ROLE ${roleName} WITH LOGIN PASSWORD 'docker_pass_123' NOSUPERUSER NOBYPASSRLS;
-        CREATE TABLE ${tableName} (
+        CREATE TABLE ${safeTable} (
           id UUID PRIMARY KEY,
           vector vector(1536),
           payload JSONB NOT NULL
         );
-        GRANT CONNECT ON DATABASE current_database() TO ${roleName};
-        GRANT USAGE ON SCHEMA public TO ${roleName};
-        GRANT SELECT ON ${tableName} TO ${roleName};
       `));
+      await dockerDb.execute(sql`GRANT CONNECT ON DATABASE ${sql.identifier(dbName)} TO ${sql.identifier(safeRole)};`);
+      await dockerDb.execute(sql`GRANT USAGE ON SCHEMA public TO ${sql.identifier(safeRole)};`);
+      await dockerDb.execute(sql`GRANT SELECT ON ${sql.identifier(safeTable)} TO ${sql.identifier(safeRole)};`);
 
       const parsed = new URL(dockerDsn);
-      parsed.username = roleName;
+      parsed.username = safeRole;
       parsed.password = "docker_pass_123";
       const nonSuperuserDsn = parsed.toString();
 
       const report = await runCensus({
         databaseUrl: nonSuperuserDsn,
-        tableName,
+        tableName: safeTable,
         companyId: "00000000-0000-4000-8000-000000000001",
         // Note: _internalSkipVectorIdentityCheck is NOT passed here! Production contract verified!
       });
@@ -2111,10 +2212,10 @@ describe("census integration tests against embedded Postgres fixture", () => {
       assert.equal(report.readOnly, true);
     } finally {
       try {
-        await dockerDb.execute(sql.raw(`
-          DROP TABLE IF EXISTS ${tableName};
-          DROP ROLE IF EXISTS ${roleName};
-        `));
+        await dockerDb.execute(sql.raw(`DROP TABLE IF EXISTS ${safeTable};`));
+      } catch {}
+      try {
+        await dockerDb.execute(sql.raw(`DROP ROLE IF EXISTS ${safeRole};`));
       } catch {}
       await dockerDb.$client.end({ timeout: 1 });
     }
@@ -2370,74 +2471,156 @@ describe("census integration tests against embedded Postgres fixture", () => {
       return;
     }
 
-    const fixture = await startEmbeddedPostgresTestDatabase("test_census_cli_output");
-    const adminDb = createDb(fixture.connectionString);
+    const tmpOut = path.join(os.tmpdir(), `test-cli-out-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
 
-    try {
-      await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
-      await adminDb.execute(sql`
-        CREATE TABLE mem0_memories (
-          id TEXT PRIMARY KEY,
-          vector "vector(1536)",
-          payload JSONB NOT NULL
-        );
-      `);
-      await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
-      await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
-      await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+    let stdoutLogged = "";
+    let stderrLogged = "";
+    const origLog = console.log;
+    const origError = console.error;
 
-      const tenantUrl = new URL(fixture.connectionString);
-      tenantUrl.username = "tenant_checker";
-      tenantUrl.password = "pass123";
-
-      const tmpOut = path.join(os.tmpdir(), `test-cli-out-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-
-      let stdoutLogged = "";
-      let stderrLogged = "";
-      const origLog = console.log;
-      const origError = console.error;
-      console.log = (msg: string) => {
-        stdoutLogged += `${msg}\n`;
-      };
-      console.error = (msg: string) => {
-        stderrLogged += `${msg}\n`;
-      };
-
-      process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY = "true";
+    t.after(() => {
+      console.log = origLog;
+      console.error = origError;
       try {
-        const exitCode = await runCensusCli([
-          "--database-url",
-          tenantUrl.toString(),
-          "--company",
-          "00000000-0000-4000-8000-000000000001",
-          "--output",
-          tmpOut,
-          "--format",
-          "json",
-        ]);
+        fs.unlinkSync(tmpOut);
+      } catch {}
+    });
 
-        assert.equal(exitCode, 0);
-        // stdout MUST be completely empty!
-        assert.equal(stdoutLogged, "", "stdout must be empty when --output is supplied");
-        // stderr MUST contain the notice with resolved path
-        assert.ok(
-          stderrLogged.includes(`Census report written to ${path.resolve(tmpOut)}`),
-          `Expected stderr to include resolved path notice, got: ${stderrLogged}`,
-        );
-        // File must exist with mode 0600
-        assert.ok(fs.existsSync(tmpOut));
-        assert.equal(fs.statSync(tmpOut).mode & 0o777, 0o600);
-      } finally {
-        delete process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY;
-        console.log = origLog;
-        console.error = origError;
-        try {
-          fs.unlinkSync(tmpOut);
-        } catch {}
-      }
-    } finally {
-      await adminDb.$client.end({ timeout: 1 });
+    console.log = (msg: string) => {
+      stdoutLogged += `${msg}\n`;
+    };
+    console.error = (msg: string) => {
+      stderrLogged += `${msg}\n`;
+    };
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_cli_output");
+    t.after(async () => {
       await fixture.cleanup();
+    });
+
+    const adminDb = createDb(fixture.connectionString);
+    t.after(async () => {
+      await adminDb.$client.end({ timeout: 1 });
+    });
+
+    await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+    await adminDb.execute(sql`
+      CREATE TABLE mem0_memories (
+        id TEXT PRIMARY KEY,
+        vector "vector(1536)",
+        payload JSONB NOT NULL
+      );
+    `);
+    await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+    await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+    await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+    const tenantUrl = new URL(fixture.connectionString);
+    tenantUrl.username = "tenant_checker";
+    tenantUrl.password = "pass123";
+
+    const exitCode = await runCensusCli(
+      [
+        "--database-url",
+        tenantUrl.toString(),
+        "--company",
+        "00000000-0000-4000-8000-000000000001",
+        "--output",
+        tmpOut,
+        "--format",
+        "json",
+      ],
+      { _internalSkipVectorIdentityCheck: true },
+    );
+
+    assert.equal(exitCode, 0);
+    // stdout MUST be completely empty!
+    assert.equal(stdoutLogged, "", "stdout must be empty when --output is supplied");
+    // stderr MUST contain the notice with resolved path
+    assert.ok(
+      stderrLogged.includes(`Census report written to ${path.resolve(tmpOut)}`),
+      `Expected stderr to include resolved path notice, got: ${stderrLogged}`,
+    );
+    // File must exist with mode 0600
+    assert.ok(fs.existsSync(tmpOut));
+    assert.equal(fs.statSync(tmpOut).mode & 0o777, 0o600);
+  });
+
+  it("enforces that env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY cannot bypass vector identity check in runCensus or runCensusCli", async (t) => {
+    const support = await getEmbeddedPostgresTestSupport();
+    if (!support.supported) {
+      handleEmbeddedPostgresUnsupported(support, t);
+      return;
     }
+
+    const fixture = await startEmbeddedPostgresTestDatabase("test_census_no_env_bypass");
+    t.after(async () => {
+      await fixture.cleanup();
+    });
+
+    const adminDb = createDb(fixture.connectionString);
+    t.after(async () => {
+      await adminDb.$client.end({ timeout: 1 });
+    });
+
+    // Create fake vector domain
+    await adminDb.execute(sql`CREATE DOMAIN "vector(1536)" AS text;`);
+    await adminDb.execute(sql`
+      CREATE TABLE mem0_memories (
+        id TEXT PRIMARY KEY,
+        vector "vector(1536)",
+        payload JSONB NOT NULL
+      );
+    `);
+    await adminDb.execute(sql`CREATE ROLE tenant_checker WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS;`);
+    await adminDb.execute(sql`GRANT USAGE ON SCHEMA public TO tenant_checker;`);
+    await adminDb.execute(sql`GRANT SELECT ON mem0_memories TO tenant_checker;`);
+
+    const tenantUrl = new URL(fixture.connectionString);
+    tenantUrl.username = "tenant_checker";
+    tenantUrl.password = "pass123";
+
+    const prevEnv = process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY;
+    process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY = "true";
+    t.after(() => {
+      if (prevEnv !== undefined) {
+        process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY = prevEnv;
+      } else {
+        delete process.env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY;
+      }
+    });
+
+    // 1. runCensus without explicit programmatic _internalSkipVectorIdentityCheck must reject with NOT_PGVECTOR
+    await assert.rejects(
+      () =>
+        runCensus({
+          databaseUrl: tenantUrl.toString(),
+          companyId: "00000000-0000-4000-8000-000000000001",
+        }),
+      (err: any) => err.code === "NOT_PGVECTOR",
+    );
+
+    // 2. runCensusCli without explicit injected dependencies must fail and report NOT_PGVECTOR error
+    let stderrLogged = "";
+    const origError = console.error;
+    t.after(() => {
+      console.error = origError;
+    });
+    console.error = (msg: string) => {
+      stderrLogged += `${msg}\n`;
+    };
+
+    const exitCode = await runCensusCli([
+      "--database-url",
+      tenantUrl.toString(),
+      "--company",
+      "00000000-0000-4000-8000-000000000001",
+    ]);
+
+    assert.equal(exitCode, 1);
+    assert.ok(
+      stderrLogged.includes("is not a valid pgvector column") || stderrLogged.includes("NOT_PGVECTOR"),
+      `Expected stderr to report pgvector rejection, got: ${stderrLogged}`,
+    );
   });
 });

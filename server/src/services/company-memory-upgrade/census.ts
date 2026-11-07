@@ -605,14 +605,11 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
     longThreshold = 500,
     pageSize: inputPageSize,
     allowProd = false,
-    _internalSkipVectorIdentityCheck: inputSkipVector = false,
+    _internalSkipVectorIdentityCheck = false,
     env = process.env,
     repoRoot,
     onTransaction,
   } = options;
-
-  const _internalSkipVectorIdentityCheck =
-    inputSkipVector || env.PAPERCLIP_TEST_SKIP_VECTOR_IDENTITY === "true";
 
   if (inputCompanyId !== undefined && inputCompanyId !== null) {
     if (!isValidUuid(inputCompanyId)) {

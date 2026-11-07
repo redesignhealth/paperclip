@@ -51,12 +51,24 @@ export const ALLOWED_CENSUS_FLAGS = new Set([
   ...VALUE_FLAGS,
 ]);
 
+export function isNumericString(val: string): boolean {
+  return /^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(val.trim());
+}
+
+export function isUsableFlagValue(val: string | undefined): boolean {
+  if (val === undefined || val === "") return false;
+  if (val.startsWith("--")) return false;
+  if (BOOLEAN_FLAGS.has(val) || VALUE_FLAGS.has(val)) return false;
+  if (val.startsWith("-") && !isNumericString(val)) return false;
+  return true;
+}
+
 export function parseFlagValue(name: string, argv: string[]): string | null {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === name) {
       const next = argv[i + 1];
-      if (!next || next.startsWith("--")) {
+      if (!isUsableFlagValue(next)) {
         throw new CompanyMemoryUpgradeError(
           `Flag '${name}' requires a usable value.`,
           "INVALID_ARGUMENT",
@@ -66,7 +78,7 @@ export function parseFlagValue(name: string, argv: string[]): string | null {
     }
     if (arg.startsWith(`${name}=`)) {
       const val = arg.slice(name.length + 1);
-      if (!val || val.startsWith("--")) {
+      if (!isUsableFlagValue(val)) {
         throw new CompanyMemoryUpgradeError(
           `Flag '${name}' requires a usable value.`,
           "INVALID_ARGUMENT",
@@ -79,13 +91,17 @@ export function parseFlagValue(name: string, argv: string[]): string | null {
 }
 
 export function hasBooleanFlag(name: string, argv: string[]): boolean {
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
     if (arg === name) return true;
     if (arg.startsWith(`${name}=`)) {
       throw new CompanyMemoryUpgradeError(
         `Boolean flag '${name}' does not take a value.`,
         "INVALID_ARGUMENT",
       );
+    }
+    if (VALUE_FLAGS.has(arg)) {
+      i++;
     }
   }
   return false;
@@ -112,7 +128,7 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
       } else if (VALUE_FLAGS.has(flagName)) {
         if (rest.length > 0) {
           const val = rest.join("=");
-          if (!val || val.startsWith("--")) {
+          if (!isUsableFlagValue(val)) {
             throw new CompanyMemoryUpgradeError(
               `Flag '${flagName}' requires a usable value.`,
               "INVALID_ARGUMENT",
@@ -120,7 +136,7 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
           }
         } else {
           const next = argv[i + 1];
-          if (!next || next.startsWith("--")) {
+          if (!isUsableFlagValue(next)) {
             throw new CompanyMemoryUpgradeError(
               `Flag '${flagName}' requires a usable value.`,
               "INVALID_ARGUMENT",
@@ -140,8 +156,20 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
   }
 }
 
-export async function runCensusCli(argv: string[]): Promise<number> {
+export interface RunCensusCliDependencies {
+  /** @internal Test-only injection for runCensus implementation */
+  runCensusFn?: typeof runCensus;
+  /** @internal Test-only option forwarded to runCensus */
+  _internalSkipVectorIdentityCheck?: boolean;
+}
+
+export async function runCensusCli(
+  argv: string[],
+  deps: RunCensusCliDependencies = {},
+): Promise<number> {
   try {
+    validateNoUnknownFlags(argv, ALLOWED_CENSUS_FLAGS);
+
     if (hasBooleanFlag("--help", argv) || hasBooleanFlag("-h", argv)) {
       console.log(`
 Usage: pnpm memory:upgrade census --database-url <tenant-dsn> [options]
@@ -237,7 +265,8 @@ Options:
     const chatOutputUsdPerMillion = parseOptionalPrice("--chat-output-usd-per-mtok", process.env.CHAT_OUTPUT_USD_PER_MTOK);
     const embeddingUsdPerMillion = parseOptionalPrice("--embedding-usd-per-mtok", process.env.EMBEDDING_USD_PER_MTOK);
 
-    const report = await runCensus({
+    const runCensusFn = deps.runCensusFn ?? runCensus;
+    const report = await runCensusFn({
       databaseUrl,
       companyId,
       controlPlaneUrl,
@@ -249,6 +278,7 @@ Options:
       chatInputUsdPerMillion,
       chatOutputUsdPerMillion,
       embeddingUsdPerMillion,
+      _internalSkipVectorIdentityCheck: deps._internalSkipVectorIdentityCheck,
       env: process.env,
     });
 
