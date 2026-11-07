@@ -15,11 +15,13 @@ import {
 } from "../../server/src/services/company-memory-upgrade/sensitive-patterns.js";
 import {
   CONVERSION_BUDGET_CONSTANTS,
+  DEFAULT_ATOMIC_EMBEDDING_TOKENS_PER_ROW,
   estimateConversionBudget,
   formatDurationHuman,
 } from "../../server/src/services/company-memory-upgrade/budget.js";
 import {
   formatCensusTextReport,
+  formatCostUsd,
   isValidUuid,
   runCensus,
   validateAndResolveTableIdentifier,
@@ -66,16 +68,32 @@ describe("classifyMemoryNoise pure unit tests", () => {
     assert.equal(classifyMemoryNoise(""), true);
     assert.equal(classifyMemoryNoise("   "), true);
     assert.equal(classifyMemoryNoise("\t\n  \r"), true);
+    assert.equal(classifyMemoryNoise(" . "), true);
+    assert.equal(classifyMemoryNoise(" ! "), true);
+    assert.equal(classifyMemoryNoise("---"), true);
+    assert.equal(classifyMemoryNoise("..."), true);
   });
 
-  it("classifies strings under length floor (< 4 characters) as noise", () => {
-    assert.equal(classifyMemoryNoise("a"), true);
-    assert.equal(classifyMemoryNoise("hi"), true);
-    assert.equal(classifyMemoryNoise("ok"), true);
-    assert.equal(classifyMemoryNoise("yes"), true);
-    assert.equal(classifyMemoryNoise("no"), true);
-    assert.equal(classifyMemoryNoise("yo"), true);
-    assert.equal(classifyMemoryNoise(" . "), true);
+  it("does NOT classify short substantive tokens as noise, while preserving exact noise tokens", () => {
+    // D1: Short substantive tokens like "Go", "TS", "AWS", "P0", "C#", "yo" must NOT be noise
+    const substantiveShort = ["Go", "TS", "AWS", "P0", "C#", "yo", "AI", "db", "CI"];
+    for (const s of substantiveShort) {
+      assert.equal(classifyMemoryNoise(s), false, `Expected "${s}" NOT to be noise`);
+    }
+
+    // Exact noise tokens like "yes", "no", "hi", "ok", "bye" remain noise
+    const noiseTokens = ["hi", "ok", "yes", "no", "bye", "ack", "yep", "nope"];
+    for (const n of noiseTokens) {
+      assert.equal(classifyMemoryNoise(n), true, `Expected exact token "${n}" to be noise`);
+    }
+  });
+
+  it("does NOT classify ambiguous context-dependent tokens like none, done, empty, sure as noise", () => {
+    // D2: "none", "done", "empty", "sure" are legitimate in context ("Allergies: none", "Task: done")
+    const ambiguousTokens = ["none", "done", "empty", "sure", "Allergies: none", "Status: done"];
+    for (const token of ambiguousTokens) {
+      assert.equal(classifyMemoryNoise(token), false, `Expected "${token}" NOT to be noise`);
+    }
   });
 
   it("classifies test and placeholder strings as noise", () => {
@@ -102,12 +120,10 @@ describe("classifyMemoryNoise pure unit tests", () => {
       "foobar",
       "n/a",
       "na",
-      "none",
       "null",
       "nil",
       "undefined",
       "nothing",
-      "empty",
       "ping",
       "pong",
     ];
@@ -141,7 +157,6 @@ describe("classifyMemoryNoise pure unit tests", () => {
       "goodbye",
       "see you",
       "cya",
-      "done",
     ];
 
     for (const g of greetings) {
@@ -343,21 +358,133 @@ describe("estimateConversionBudget unit tests", () => {
     assert.ok(bLong.estimatedTokens.chatInput > bShort.estimatedTokens.chatInput);
   });
 
-  it("correctly identifies RPM bottleneck vs TPM bottleneck boundary cases", () => {
-    const bNormal = estimateConversionBudget({
+  it("correctly identifies which of the 4 rate limit caps binds (chat_rpm, chat_tpm, embedding_rpm, embedding_tpm)", () => {
+    // 1. chat_tpm binds (default normal run: ~625 tokens per row against 200k TPM cap)
+    const bTpm = estimateConversionBudget({
       totalRows: 1000,
-      noiseRows: 0,
+      rowsToConvert: 1000,
       unroutableRows: 0,
-      duplicateSurplusRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
       averageTextLength: 100,
     });
+    assert.equal(bTpm.estimatedWallClock.bindingCap, "chat_tpm");
+    assert.equal(bTpm.estimatedWallClock.bottleneck, "chat_tpm");
+    assert.ok(bTpm.estimatedWallClock.label.includes("rate-limit floor"));
+    assert.equal((bTpm.estimatedWallClock as any).concurrency, undefined);
 
-    assert.equal(bNormal.estimatedWallClock.bottleneck, "tpm");
-    assert.ok(bNormal.estimatedWallClock.tpmDurationSeconds >= bNormal.estimatedWallClock.rpmDurationSeconds);
-    assert.equal(
-      bNormal.estimatedWallClock.seconds,
-      Math.ceil(Math.max(bNormal.estimatedWallClock.rpmDurationSeconds, bNormal.estimatedWallClock.tpmDurationSeconds)),
+    // 2. chat_rpm binds when chatRpmCap is lowered relative to TPM
+    const bChatRpm = estimateConversionBudget({
+      totalRows: 1000,
+      rowsToConvert: 1000,
+      unroutableRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
+      averageTextLength: 20,
+      chatRpmCap: 10, // strict 10 RPM -> 1000 rows = 6000s
+    });
+    assert.equal(bChatRpm.estimatedWallClock.bindingCap, "chat_rpm");
+
+    // 3. embedding_rpm binds when embeddingRpmCap is lowest
+    const bEmbRpm = estimateConversionBudget({
+      totalRows: 1000,
+      rowsToConvert: 1000,
+      unroutableRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
+      averageTextLength: 20,
+      chatRpmCap: 10_000,
+      chatTpmCap: 10_000_000,
+      embeddingRpmCap: 5, // 5 RPM -> 12000s
+    });
+    assert.equal(bEmbRpm.estimatedWallClock.bindingCap, "embedding_rpm");
+
+    // 4. embedding_tpm binds when embeddingTpmCap is lowest
+    const bEmbTpm = estimateConversionBudget({
+      totalRows: 1000,
+      rowsToConvert: 1000,
+      unroutableRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
+      averageTextLength: 20,
+      chatRpmCap: 10_000,
+      chatTpmCap: 10_000_000,
+      embeddingRpmCap: 10_000,
+      embeddingTpmCap: 100, // 100 TPM -> 80,000 tokens = 48000s
+    });
+    assert.equal(bEmbTpm.estimatedWallClock.bindingCap, "embedding_tpm");
+  });
+
+  it("validates budget inputs rejecting negative, NaN, and non-finite values", () => {
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: -1, averageTextLength: 50 }),
+      /Invalid budget input "totalRows": must be a finite non-negative number/,
     );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: NaN, averageTextLength: 50 }),
+      /Invalid budget input "totalRows": must be a finite non-negative number/,
+    );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: Infinity }),
+      /Invalid budget input "averageTextLength": must be a finite non-negative number/,
+    );
+    assert.throws(
+      () => estimateConversionBudget({ totalRows: 100, averageTextLength: 50, chatInputUsdPerMillion: -0.5 }),
+      /Invalid budget input "chatInputUsdPerMillion": must be a finite non-negative number/,
+    );
+  });
+
+  it("preserves full precision internally and formats tiny runs properly without showing $0.0000", () => {
+    // 1 row run
+    const bTiny = estimateConversionBudget({
+      totalRows: 1,
+      rowsToConvert: 1,
+      unroutableRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
+      averageTextLength: 40,
+    });
+    assert.ok(bTiny.estimatedCostUsd.total > 0);
+    // Full precision raw number
+    assert.ok(bTiny.estimatedCostUsd.total < 0.001);
+
+    // formatCostUsd does not display $0.0000 for non-zero cost
+    const formatted = formatCostUsd(bTiny.estimatedCostUsd.total);
+    assert.notEqual(formatted, "$0.0000");
+    assert.ok(formatted.startsWith("$"));
+  });
+
+  it("supports overridable pricing rates and labels defaults honestly", () => {
+    // Defaults label
+    const bDef = estimateConversionBudget({
+      totalRows: 10,
+      rowsToConvert: 10,
+      unroutableRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
+      averageTextLength: 40,
+    });
+    assert.equal(bDef.pricingSource, "unverified defaults — confirm against the approved rate card");
+
+    // Overridden pricing
+    const bCustom = estimateConversionBudget({
+      totalRows: 10,
+      rowsToConvert: 10,
+      unroutableRows: 0,
+      noiseRowsInRoutable: 0,
+      duplicateSurplusInRoutable: 0,
+      averageTextLength: 40,
+      chatInputUsdPerMillion: 2.50,
+      chatOutputUsdPerMillion: 10.00,
+      embeddingUsdPerMillion: 0.10,
+    });
+    assert.equal(bCustom.pricingSource, "operator pricing override");
+    assert.ok(bCustom.estimatedCostUsd.total > bDef.estimatedCostUsd.total);
+  });
+
+  it("documents embedding tokens assumption via DEFAULT_ATOMIC_EMBEDDING_TOKENS_PER_ROW", () => {
+    assert.equal(DEFAULT_ATOMIC_EMBEDDING_TOKENS_PER_ROW, 80);
+    assert.equal(CONVERSION_BUDGET_CONSTANTS.atomicEmbeddingTokensPerRow, 80);
   });
 
   it("formats human duration string properly", () => {

@@ -9,9 +9,6 @@
  * It must NEVER classify a substantive preference, decision, fact, or instruction as noise.
  */
 
-// Text length floor: any trimmed text shorter than 4 characters is noise (e.g. "", "a", "hi", "ok", "yes")
-export const MIN_SUBSTANTIVE_TEXT_LENGTH = 4;
-
 const EXACT_NOISE_TOKENS = new Set([
   // Bare greetings & acknowledgments
   "hi",
@@ -39,10 +36,8 @@ const EXACT_NOISE_TOKENS = new Set([
   "cya",
   "yes",
   "no",
-  "sure",
   "yep",
   "nope",
-  "done",
 
   // Test / placeholder strings
   "test",
@@ -67,12 +62,10 @@ const EXACT_NOISE_TOKENS = new Set([
   "foobar",
   "n/a",
   "na",
-  "none",
   "null",
   "nil",
   "undefined",
   "nothing",
-  "empty",
   "ping",
   "pong",
 ]);
@@ -90,7 +83,7 @@ function normalizeForNoiseCheck(text: string): string {
 
 export interface NoiseClassificationResult {
   isNoise: boolean;
-  reason?: "empty" | "under_length_floor" | "exact_placeholder_or_greeting";
+  reason?: "empty" | "exact_placeholder_or_greeting";
 }
 
 /**
@@ -110,8 +103,9 @@ export function classifyMemoryNoiseDetailed(
 
   const normalized = normalizeForNoiseCheck(trimmed);
 
-  if (normalized.length < MIN_SUBSTANTIVE_TEXT_LENGTH) {
-    return { isNoise: true, reason: "under_length_floor" };
+  // Explicit empty-after-normalization rule (e.g. " . " or "---" stays noise)
+  if (normalized.length === 0) {
+    return { isNoise: true, reason: "empty" };
   }
 
   if (EXACT_NOISE_TOKENS.has(normalized)) {

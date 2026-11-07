@@ -34,6 +34,9 @@ export const ALLOWED_CENSUS_FLAGS = new Set([
   "--format",
   "--table",
   "--long-threshold",
+  "--chat-input-usd-per-mtok",
+  "--chat-output-usd-per-mtok",
+  "--embedding-usd-per-mtok",
   "--prod",
   "--help",
   "-h",
@@ -96,6 +99,9 @@ Options:
   --format <text|json>         Output format: human summary (text, default) or JSON (json)
   --table <name>               Target Mem0 collection table name (default: "mem0_memories")
   --long-threshold <number>    Character length threshold for long memory rows (default: 500)
+  --chat-input-usd-per-mtok <num>   Override chat input price in USD per 1M tokens (or CHAT_INPUT_USD_PER_MTOK)
+  --chat-output-usd-per-mtok <num>  Override chat output price in USD per 1M tokens (or CHAT_OUTPUT_USD_PER_MTOK)
+  --embedding-usd-per-mtok <num>    Override embedding price in USD per 1M tokens (or EMBEDDING_USD_PER_MTOK)
   --prod                       Flag required when target host is non-localhost alongside
                                MEMORY_UPGRADE_ALLOW_PROD=1 environment variable.
                                Host locality is not proof of environment. A production database
@@ -152,6 +158,20 @@ Options:
 
   const allowProd = hasBooleanFlag("--prod", argv);
 
+  function parseOptionalPrice(flagName: string, envVal: string | undefined): number | undefined {
+    const raw = parseFlagValue(flagName, argv) ?? envVal ?? null;
+    if (raw === null) return undefined;
+    const num = parseFloat(raw);
+    if (!Number.isFinite(num) || Number.isNaN(num) || num < 0) {
+      throw new Error(`Invalid ${flagName} "${raw}". Must be a non-negative number.`);
+    }
+    return num;
+  }
+
+  const chatInputUsdPerMillion = parseOptionalPrice("--chat-input-usd-per-mtok", process.env.CHAT_INPUT_USD_PER_MTOK);
+  const chatOutputUsdPerMillion = parseOptionalPrice("--chat-output-usd-per-mtok", process.env.CHAT_OUTPUT_USD_PER_MTOK);
+  const embeddingUsdPerMillion = parseOptionalPrice("--embedding-usd-per-mtok", process.env.EMBEDDING_USD_PER_MTOK);
+
   const report = await runCensus({
     databaseUrl,
     companyId,
@@ -161,6 +181,9 @@ Options:
     tableName,
     longThreshold,
     allowProd,
+    chatInputUsdPerMillion,
+    chatOutputUsdPerMillion,
+    embeddingUsdPerMillion,
     env: process.env,
   });
 

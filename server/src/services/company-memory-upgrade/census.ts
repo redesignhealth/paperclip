@@ -336,6 +336,9 @@ export interface CensusOptions {
   longThreshold?: number;
   pageSize?: number;
   allowProd?: boolean;
+  chatInputUsdPerMillion?: number;
+  chatOutputUsdPerMillion?: number;
+  embeddingUsdPerMillion?: number;
   /** @internal Test-only seam to bypass pgvector catalog identity check when running against embedded PG without pgvector. */
   _internalSkipVectorIdentityCheck?: boolean;
   env?: NodeJS.ProcessEnv;
@@ -1285,6 +1288,9 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
       boundDescription: isProvisional
         ? "Upper bound estimate: assumes all syntactically valid agents are routable and excludes only known unroutable hygiene rows, noise, and duplicate surplus."
         : "Exact conversion volume verified against control plane agent routing and active memory adapters.",
+      chatInputUsdPerMillion: options.chatInputUsdPerMillion,
+      chatOutputUsdPerMillion: options.chatOutputUsdPerMillion,
+      embeddingUsdPerMillion: options.embeddingUsdPerMillion,
     });
 
     if (routingResult.status === "unverified") {
@@ -1335,6 +1341,14 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
   } finally {
     await tenantDb.$client.end({ timeout: 1 }).catch(() => {});
   }
+}
+
+export function formatCostUsd(cost: number): string {
+  if (cost === 0) return "$0.00";
+  if (cost < 0.0001) {
+    return `$${cost.toPrecision(3)}`;
+  }
+  return `$${cost.toFixed(4)}`;
 }
 
 export function formatCensusTextReport(report: CensusReport): string {
@@ -1450,10 +1464,11 @@ export function formatCensusTextReport(report: CensusReport): string {
   lines.push(`  - Chat Input Tokens:          ~${report.budget.estimatedTokens.chatInput.toLocaleString()} tokens`);
   lines.push(`  - Chat Output Tokens:         ~${report.budget.estimatedTokens.chatOutput.toLocaleString()} tokens`);
   lines.push(`  - Embedding Tokens:           ~${report.budget.estimatedTokens.embeddingTotal.toLocaleString()} tokens`);
-  lines.push(`  - Estimated Chat Cost:        ~$${report.budget.estimatedCostUsd.chat.toFixed(4)} USD`);
-  lines.push(`  - Estimated Embedding Cost:   ~$${report.budget.estimatedCostUsd.embedding.toFixed(4)} USD`);
-  lines.push(`  - Total Estimated USD:        ~$${report.budget.estimatedCostUsd.total.toFixed(4)} USD`);
-  lines.push(`  - Estimated Wall Clock:       ~${report.budget.estimatedWallClock.humanReadable} (concurrency: ${report.budget.estimatedWallClock.concurrency}, bottleneck: ${report.budget.estimatedWallClock.bottleneck})`);
+  lines.push(`  - Estimated Chat Cost:        ~${formatCostUsd(report.budget.estimatedCostUsd.chat)} USD`);
+  lines.push(`  - Estimated Embedding Cost:   ~${formatCostUsd(report.budget.estimatedCostUsd.embedding)} USD`);
+  lines.push(`  - Total Estimated USD:        ~${formatCostUsd(report.budget.estimatedCostUsd.total)} USD (${report.budget.pricingSource})`);
+  lines.push(`  - Rate-Limit Floor Duration:  ~${report.budget.estimatedWallClock.humanReadable} (floor: ${report.budget.estimatedWallClock.rateLimitFloorSeconds}s, binding cap: ${report.budget.estimatedWallClock.bindingCap})`);
+  lines.push(`    Note: ${report.budget.estimatedWallClock.label}`);
   lines.push("================================================================================");
 
   return lines.join("\n");
