@@ -713,7 +713,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     } } }).where(eq(connectionGrants.id, grant!.id));
     await instanceSettingsService(db).updateExperimental({ enablePaperclipNotebook: false });
     const callsBeforeDisabledDispatch = fixture.requestsTo("/mcp").length;
-    expect(await gateway.listToolsForNamedGateway({ gatewayPublicId: named.gatewayPublicId, bearerToken: token.token })).toEqual([]);
+    expect(await gateway.listToolsForNamedGateway({ gatewayPublicId: named.gatewayPublicId, bearerToken: token.token })).toMatchObject({ tools: [] });
     await expect(gateway.executeTool({ gatewayPublicId: named.gatewayPublicId, sessionToken: token.token, tool: publish.name, parameters: {} })).rejects.toMatchObject({ reasonCode: "tool_not_found" });
     await expect(gateway.approveActionRequest({ companyId: company.id, actionRequestId: action!.id, actor: { userId: "board-user" } })).rejects.toMatchObject({ reasonCode: "tool_not_found" });
     const intents = connectionIntentService(db);
