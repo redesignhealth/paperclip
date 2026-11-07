@@ -19,6 +19,7 @@ import {
 } from "../services/company-memory-upgrade/index.js";
 import { deleteCompany } from "../services/company-deletion.js";
 import * as memoryModule from "../services/company-memory-databases.js";
+import { agentLifecycleCompanyDeletion } from "../modules/agent-lifecycle/company-deletion.js";
 import { HttpError } from "../errors.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -269,9 +270,10 @@ describeEmbeddedPostgres("company deletion and memory upgrade interlock", () => 
     expect(deleteCompanyMemory).not.toHaveBeenCalled();
   });
 
-  // 5. Recovery: deleteCompanyMemory throws -> deleteCompany rejects;
-  // deletion_started_at null again; openUpgrade then succeeds; after abort, deleteCompany succeeds.
-  it("clears deletion intent when deprovisioning fails, allowing subsequent upgrade work and delete retry", async () => {
+  // 5. Fail-closed: deleteCompanyMemory throws -> deleteCompany rejects;
+  // deletionStartedAt remains non-null; openUpgrade is blocked with COMPANY_DELETION_IN_PROGRESS;
+  // retrying deleteCompany succeeds when transient error clears.
+  it("retains deletion intent when deprovisioning fails (fail-closed), blocking upgrades until retry deletion succeeds", async () => {
     const company = await createTestCompany("Recovery Co", "RCO");
 
     let shouldFailDeprovision = true;
@@ -297,35 +299,32 @@ describeEmbeddedPostgres("company deletion and memory upgrade interlock", () => 
       "Simulated memory deprovision failure",
     );
 
-    // Verify deletionStartedAt was rolled back / cleared
+    // Verify deletionStartedAt remains non-null (fail-closed)
     const [coAfterFail] = await db.select().from(companies).where(sql`id = ${company.id}`);
     expect(coAfterFail).toBeDefined();
-    expect(coAfterFail.deletionStartedAt).toBeNull();
+    expect(coAfterFail.deletionStartedAt).not.toBeNull();
 
-    // Now openUpgrade succeeds!
-    const upgrade = await openUpgrade(db, {
-      companyId: company.id,
-      converterId: "mem0-v1",
-      converterVersion: 1,
-      collectionName: "mem0_memories",
-      embeddingModel: "text-embedding-3-small",
-      embeddingDimensions: 1536,
-    });
-    expect(upgrade.id).toBeDefined();
-
-    // Claim lease and abort the upgrade
-    const claim = await claimUpgradeLease(db, {
-      upgradeId: upgrade.id,
-      leaseOwner: "cleaner",
-      ttlMs: 60_000,
-    });
-    expect(claim.acquired).toBe(true);
-    await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted");
+    // openUpgrade is blocked because company has deletion intent set
+    await expect(
+      openUpgrade(db, {
+        companyId: company.id,
+        converterId: "mem0-v1",
+        converterVersion: 1,
+        collectionName: "mem0_memories",
+        embeddingModel: "text-embedding-3-small",
+        embeddingDimensions: 1536,
+      }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "COMPANY_DELETION_IN_PROGRESS",
+      }),
+    );
 
     // Fix the deprovision mock to succeed
     shouldFailDeprovision = false;
 
-    // Retry deleteCompany; now succeeds!
+    // Retry deleteCompany; now succeeds via reentrant admission!
     const deleted = await deleteCompany(db, company.id);
     expect(deleted).toMatchObject({ id: company.id });
 
@@ -334,7 +333,76 @@ describeEmbeddedPostgres("company deletion and memory upgrade interlock", () => 
     expect(coFinal).toBeUndefined();
   });
 
-  // 6. Concurrency loop ~10 companies Promise.allSettled([deleteCompany, openUpgrade]):
+  // 6. Later-stage failure after deprovisioning:
+  // e.g. failure during final transaction (after memory deprovisioning succeeded).
+  // deletionStartedAt remains non-null; openUpgrade remains blocked against destroyed substrate;
+  // retrying deleteCompany succeeds once the transient failure clears.
+  it("retains deletion intent on later-stage failure after deprovisioning, blocking upgrade against destroyed substrate", async () => {
+    const company = await createTestCompany("Later Stage Co", "LSC");
+
+    let shouldFailLater = true;
+    const realDeleteCompanyData = agentLifecycleCompanyDeletion.deleteCompanyData;
+    vi.spyOn(agentLifecycleCompanyDeletion, "deleteCompanyData").mockImplementation(
+      async (tx, companyId) => {
+        if (shouldFailLater) {
+          throw new Error("Simulated later-stage failure in deletion transaction");
+        }
+        return await realDeleteCompanyData(tx, companyId);
+      },
+    );
+
+    vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+      companyScope: "all",
+      isSupported: () => true,
+      resolveRuntimeConfig: vi.fn(),
+      ensureProvisioned: vi.fn(),
+      rotateCredential: vi.fn(),
+      archiveCompanyMemory: vi.fn(),
+      unarchiveCompanyMemory: vi.fn(),
+      deleteCompanyMemory: vi.fn().mockResolvedValue(undefined),
+      reconcileStaleLeases: vi.fn(async () => 0),
+      isEligibleCompany: vi.fn(() => true),
+    });
+
+    // Attempt deletion; fails during later deletion transaction after memory deprovision
+    await expect(deleteCompany(db, company.id)).rejects.toThrow(
+      "Simulated later-stage failure in deletion transaction",
+    );
+
+    // Verify deletionStartedAt remains non-null (fail-closed)
+    const [coAfterFail] = await db.select().from(companies).where(sql`id = ${company.id}`);
+    expect(coAfterFail).toBeDefined();
+    expect(coAfterFail.deletionStartedAt).not.toBeNull();
+
+    // openUpgrade is blocked from operating against destroyed substrate
+    await expect(
+      openUpgrade(db, {
+        companyId: company.id,
+        converterId: "mem0-v1",
+        converterVersion: 1,
+        collectionName: "mem0_memories",
+        embeddingModel: "text-embedding-3-small",
+        embeddingDimensions: 1536,
+      }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "COMPANY_DELETION_IN_PROGRESS",
+      }),
+    );
+
+    // Fix the later-stage failure
+    shouldFailLater = false;
+
+    // Retry deleteCompany; succeeds!
+    const deleted = await deleteCompany(db, company.id);
+    expect(deleted).toMatchObject({ id: company.id });
+
+    const [coFinal] = await db.select().from(companies).where(sql`id = ${company.id}`);
+    expect(coFinal).toBeUndefined();
+  });
+
+  // 7. Concurrency loop ~10 companies Promise.allSettled([deleteCompany, openUpgrade]):
   // never both company deleted and upgrade persisted; whenever openUpgrade fulfils,
   // deletion rejected 409 and deprovision not called.
   it("concurrency stress loop guarantees mutually exclusive admission", async () => {

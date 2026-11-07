@@ -40,10 +40,10 @@ export const companies = pgTable(
     feedbackDataSharingConsentByUserId: text("feedback_data_sharing_consent_by_user_id"),
     feedbackDataSharingTermsVersion: text("feedback_data_sharing_terms_version"),
     /**
-     * Set when destructive deletion is admitted; cleared if deletion fails before
-     * company removal. While set, no new memory-upgrade work can be opened or admitted.
-     * If a worker or server crashes during deletion, this flag remains set (fail-safe).
-     * Admission is re-entrant so deletion retries succeed.
+     * Set when destructive deletion is admitted; retained on ANY failure (fail-closed)
+     * to prevent new memory upgrades or operations against a partially destroyed substrate.
+     * While set, no new memory-upgrade work can be opened or admitted.
+     * Deletion is re-entrant so deletion retries succeed.
      */
     deletionStartedAt: timestamp("deletion_started_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
