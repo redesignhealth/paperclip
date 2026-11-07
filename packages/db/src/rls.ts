@@ -301,6 +301,7 @@ export const RLS_TABLES_COVERED_BY_LATER_MIGRATION: ReadonlySet<string> = new Se
   "company_decision_models",
   "company_fast_responses",
   "company_memory_databases",
+  "company_memory_upgrades",
   "company_observability",
   "company_prompt_injection_prevention",
   "company_skill_import_budgets",
