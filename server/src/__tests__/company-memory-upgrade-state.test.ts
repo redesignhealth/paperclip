@@ -463,4 +463,138 @@ describeEmbeddedPostgres("company memory upgrade state machine integration", () 
       }),
     );
   });
+
+  it("updateUpgradeCounters rejects negative, non-integer, and invalid deltas", async () => {
+    const company = await createTestCompany();
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "validation-worker",
+      ttlMs: 60_000,
+    });
+    expect(claim.acquired).toBe(true);
+
+    // Negative integer delta
+    await expect(
+      updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, { sweepCount: -1 }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // Non-integer float delta
+    await expect(
+      updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, { publishedCount: 3.5 }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // NaN delta
+    await expect(
+      updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, { sourceSeenCount: Number.NaN }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // Negative bigint delta
+    await expect(
+      updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, { llmInputTokens: -50n }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // Non-integer float delta for bigint counter
+    await expect(
+      updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, { estimatedCostNanodollars: 12.34 }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // Nonnegative bigint deltas succeed and preserve atomic increments
+    const okBatch = await updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, {
+      llmInputTokens: 500n,
+      estimatedCostNanodollars: 1000n,
+      sweepCount: 0,
+    });
+    expect(okBatch.llmInputTokens).toBe(500);
+    expect(okBatch.estimatedCostNanodollars).toBe(1000);
+  });
+
+  it("updateUpgradeCounters refuses updates on terminal or needs_recovery states even if lease unexpired", async () => {
+    const company = await createTestCompany();
+    const upgrade = await openUpgrade(db, {
+      companyId: company.id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim = await claimUpgradeLease(db, {
+      upgradeId: upgrade.id,
+      leaseOwner: "terminal-test-worker",
+      ttlMs: 60_000,
+    });
+    expect(claim.acquired).toBe(true);
+
+    // Advance directly to aborted (terminal)
+    await advanceState(db, upgrade.id, claim.leaseToken!, "sweeping", "aborted");
+
+    // Attempting counter update on aborted upgrade while lease unexpired fails with INVALID_STATE
+    await expect(
+      updateUpgradeCounters(db, upgrade.id, claim.leaseToken!, { sweepCount: 1 }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_STATE",
+      }),
+    );
+
+    // Create another upgrade and set to needs_recovery with an unexpired lease
+    const upgrade2 = await openUpgrade(db, {
+      companyId: (await createTestCompany("Co 2", "C2")).id,
+      converterId: "mem0-v1",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    });
+
+    const claim2 = await claimUpgradeLease(db, {
+      upgradeId: upgrade2.id,
+      leaseOwner: "recovery-test-worker",
+      ttlMs: 60_000,
+    });
+
+    // Manually set state to needs_recovery keeping the lease unexpired
+    await db
+      .update(companyMemoryUpgrades)
+      .set({ state: "needs_recovery", recoverToState: "sweeping" })
+      .where(sql`id = ${upgrade2.id}`);
+
+    await expect(
+      updateUpgradeCounters(db, upgrade2.id, claim2.leaseToken!, { sweepCount: 1 }),
+    ).rejects.toThrowError(
+      expect.objectContaining({
+        code: "INVALID_STATE",
+      }),
+    );
+  });
 });

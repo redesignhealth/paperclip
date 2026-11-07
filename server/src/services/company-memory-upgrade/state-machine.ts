@@ -550,6 +550,37 @@ export async function recoverUpgrade(
   return recovered;
 }
 
+function validateIntegerDelta(fieldName: string, value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new CompanyMemoryUpgradeError(
+      `Invalid delta for "${fieldName}": must be a nonnegative safe integer, got ${value}`,
+      "INVALID_ARGUMENT",
+    );
+  }
+  return value;
+}
+
+function validateBigIntDelta(fieldName: string, value: unknown): number | bigint | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "bigint") {
+    if (value < 0n) {
+      throw new CompanyMemoryUpgradeError(
+        `Invalid delta for "${fieldName}": must be a nonnegative bigint, got ${value}`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  throw new CompanyMemoryUpgradeError(
+    `Invalid delta for "${fieldName}": must be a nonnegative safe integer or bigint, got ${value}`,
+    "INVALID_ARGUMENT",
+  );
+}
+
 /**
  * Atomically increments counters and updates timestamps for an in-flight upgrade under lease fencing.
  */
@@ -560,54 +591,70 @@ export async function updateUpgradeCounters(
   params: UpdateCountersParams,
   options?: { clock?: Clock },
 ): Promise<CompanyMemoryUpgradeRow> {
+  const sweepCount = validateIntegerDelta("sweepCount", params.sweepCount);
+  const sourceSeenCount = validateIntegerDelta("sourceSeenCount", params.sourceSeenCount);
+  const publishedCount = validateIntegerDelta("publishedCount", params.publishedCount);
+  const droppedNoiseCount = validateIntegerDelta("droppedNoiseCount", params.droppedNoiseCount);
+  const droppedSensitiveCount = validateIntegerDelta("droppedSensitiveCount", params.droppedSensitiveCount);
+  const deduplicatedCount = validateIntegerDelta("deduplicatedCount", params.deduplicatedCount);
+  const unroutableCount = validateIntegerDelta("unroutableCount", params.unroutableCount);
+  const quarantinedCount = validateIntegerDelta("quarantinedCount", params.quarantinedCount);
+  const supersededCount = validateIntegerDelta("supersededCount", params.supersededCount);
+  const sourceDeletedCount = validateIntegerDelta("sourceDeletedCount", params.sourceDeletedCount);
+
+  const llmInputTokens = validateBigIntDelta("llmInputTokens", params.llmInputTokens);
+  const llmOutputTokens = validateBigIntDelta("llmOutputTokens", params.llmOutputTokens);
+  const embeddingTokens = validateBigIntDelta("embeddingTokens", params.embeddingTokens);
+  const estimatedCostNanodollars = validateBigIntDelta("estimatedCostNanodollars", params.estimatedCostNanodollars);
+
   const now = options?.clock?.now() ?? new Date();
 
   const setFields: Record<string, unknown> = {
     updatedAt: now,
   };
 
-  if (params.sweepCount) {
-    setFields.sweepCount = sql`${companyMemoryUpgrades.sweepCount} + ${params.sweepCount}`;
+  if (sweepCount && sweepCount > 0) {
+    setFields.sweepCount = sql`${companyMemoryUpgrades.sweepCount} + ${sweepCount}`;
   }
-  if (params.sourceSeenCount) {
-    setFields.sourceSeenCount = sql`${companyMemoryUpgrades.sourceSeenCount} + ${params.sourceSeenCount}`;
+  if (sourceSeenCount && sourceSeenCount > 0) {
+    setFields.sourceSeenCount = sql`${companyMemoryUpgrades.sourceSeenCount} + ${sourceSeenCount}`;
   }
-  if (params.publishedCount) {
-    setFields.publishedCount = sql`${companyMemoryUpgrades.publishedCount} + ${params.publishedCount}`;
+  if (publishedCount && publishedCount > 0) {
+    setFields.publishedCount = sql`${companyMemoryUpgrades.publishedCount} + ${publishedCount}`;
   }
-  if (params.droppedNoiseCount) {
-    setFields.droppedNoiseCount = sql`${companyMemoryUpgrades.droppedNoiseCount} + ${params.droppedNoiseCount}`;
+  if (droppedNoiseCount && droppedNoiseCount > 0) {
+    setFields.droppedNoiseCount = sql`${companyMemoryUpgrades.droppedNoiseCount} + ${droppedNoiseCount}`;
   }
-  if (params.droppedSensitiveCount) {
-    setFields.droppedSensitiveCount = sql`${companyMemoryUpgrades.droppedSensitiveCount} + ${params.droppedSensitiveCount}`;
+  if (droppedSensitiveCount && droppedSensitiveCount > 0) {
+    setFields.droppedSensitiveCount = sql`${companyMemoryUpgrades.droppedSensitiveCount} + ${droppedSensitiveCount}`;
   }
-  if (params.deduplicatedCount) {
-    setFields.deduplicatedCount = sql`${companyMemoryUpgrades.deduplicatedCount} + ${params.deduplicatedCount}`;
+  if (deduplicatedCount && deduplicatedCount > 0) {
+    setFields.deduplicatedCount = sql`${companyMemoryUpgrades.deduplicatedCount} + ${deduplicatedCount}`;
   }
-  if (params.unroutableCount) {
-    setFields.unroutableCount = sql`${companyMemoryUpgrades.unroutableCount} + ${params.unroutableCount}`;
+  if (unroutableCount && unroutableCount > 0) {
+    setFields.unroutableCount = sql`${companyMemoryUpgrades.unroutableCount} + ${unroutableCount}`;
   }
-  if (params.quarantinedCount) {
-    setFields.quarantinedCount = sql`${companyMemoryUpgrades.quarantinedCount} + ${params.quarantinedCount}`;
+  if (quarantinedCount && quarantinedCount > 0) {
+    setFields.quarantinedCount = sql`${companyMemoryUpgrades.quarantinedCount} + ${quarantinedCount}`;
   }
-  if (params.supersededCount) {
-    setFields.supersededCount = sql`${companyMemoryUpgrades.supersededCount} + ${params.supersededCount}`;
+  if (supersededCount && supersededCount > 0) {
+    setFields.supersededCount = sql`${companyMemoryUpgrades.supersededCount} + ${supersededCount}`;
   }
-  if (params.sourceDeletedCount) {
-    setFields.sourceDeletedCount = sql`${companyMemoryUpgrades.sourceDeletedCount} + ${params.sourceDeletedCount}`;
+  if (sourceDeletedCount && sourceDeletedCount > 0) {
+    setFields.sourceDeletedCount = sql`${companyMemoryUpgrades.sourceDeletedCount} + ${sourceDeletedCount}`;
   }
 
-  if (params.llmInputTokens) {
-    setFields.llmInputTokens = sql`${companyMemoryUpgrades.llmInputTokens} + ${params.llmInputTokens}`;
+  if (llmInputTokens !== undefined && (typeof llmInputTokens === "bigint" ? llmInputTokens > 0n : llmInputTokens > 0)) {
+    setFields.llmInputTokens = sql`${companyMemoryUpgrades.llmInputTokens} + ${llmInputTokens}`;
   }
-  if (params.llmOutputTokens) {
-    setFields.llmOutputTokens = sql`${companyMemoryUpgrades.llmOutputTokens} + ${params.llmOutputTokens}`;
+  if (llmOutputTokens !== undefined && (typeof llmOutputTokens === "bigint" ? llmOutputTokens > 0n : llmOutputTokens > 0)) {
+    setFields.llmOutputTokens = sql`${companyMemoryUpgrades.llmOutputTokens} + ${llmOutputTokens}`;
   }
-  if (params.embeddingTokens) {
-    setFields.embeddingTokens = sql`${companyMemoryUpgrades.embeddingTokens} + ${params.embeddingTokens}`;
+  if (embeddingTokens !== undefined && (typeof embeddingTokens === "bigint" ? embeddingTokens > 0n : embeddingTokens > 0)) {
+    setFields.embeddingTokens = sql`${companyMemoryUpgrades.embeddingTokens} + ${embeddingTokens}`;
   }
-  if (params.estimatedCostNanodollars) {
-    setFields.estimatedCostNanodollars = sql`${companyMemoryUpgrades.estimatedCostNanodollars} + ${params.estimatedCostNanodollars}`;
+  if (estimatedCostNanodollars !== undefined && (typeof estimatedCostNanodollars === "bigint" ? estimatedCostNanodollars > 0n : estimatedCostNanodollars > 0)) {
+    setFields.estimatedCostNanodollars = sql`${companyMemoryUpgrades.estimatedCostNanodollars} + ${estimatedCostNanodollars}`;
   }
 
   if (params.markedAt !== undefined) {
@@ -640,6 +687,7 @@ export async function updateUpgradeCounters(
         eq(companyMemoryUpgrades.id, id),
         eq(companyMemoryUpgrades.leaseToken, leaseToken),
         gt(companyMemoryUpgrades.leaseExpiresAt, now),
+        inArray(companyMemoryUpgrades.state, Array.from(ACTIVE_PRE_LAPSE_STATES)),
       ),
     )
     .returning();
@@ -663,6 +711,12 @@ export async function updateUpgradeCounters(
       throw new CompanyMemoryUpgradeError(
         `Lease expired for upgrade ${id}`,
         "LEASE_EXPIRED",
+      );
+    }
+    if (!ACTIVE_PRE_LAPSE_STATES.has(existing.state as UpgradeState)) {
+      throw new CompanyMemoryUpgradeError(
+        `Cannot update counters for upgrade ${id} in state "${existing.state}"`,
+        "INVALID_STATE",
       );
     }
     throw new CompanyMemoryUpgradeError(

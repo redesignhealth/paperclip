@@ -65,10 +65,10 @@ export interface UpdateCountersParams {
   sourceDeletedCount?: number;
 
   // Bigint counter deltas
-  llmInputTokens?: number;
-  llmOutputTokens?: number;
-  embeddingTokens?: number;
-  estimatedCostNanodollars?: number;
+  llmInputTokens?: number | bigint;
+  llmOutputTokens?: number | bigint;
+  embeddingTokens?: number | bigint;
+  estimatedCostNanodollars?: number | bigint;
 
   // Timestamps to record
   markedAt?: Date;
