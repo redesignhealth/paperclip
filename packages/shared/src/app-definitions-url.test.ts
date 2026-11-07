@@ -53,6 +53,13 @@ describe("tool app gallery URL matching", () => {
     }
   });
 
+  it("uses Notebook's canonical endpoint without per-instance configuration", () => {
+    const notebook = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "paperclip-notebook");
+    expect(notebook?.availability?.available).toBe(true);
+    expect(notebook?.methods[0]?.defaults?.serverUrl).toBe("https://notebook.paperclip.app/mcp");
+    expect(getAppDefinitionForUrl("https://notebook.paperclip.app/p/page-id")?.slug).toBe("paperclip-notebook");
+  });
+
   it("offers region and custom model connections without claiming arbitrary URLs", () => {
     for (const slug of ["bedrock", "responses-api", "messages-api", "chat-completions-api", "local"]) {
       const app = CONNECTABLE_APP_DEFINITIONS.find(app => app.slug === slug);

@@ -34,6 +34,7 @@ import { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } 
 
 const googleScope = (scope: string) =>
   `https://www.googleapis.com/auth/${scope}`;
+
 const GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS = [
   {
     profile: "gmail.read",
