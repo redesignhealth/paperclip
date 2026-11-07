@@ -43,6 +43,9 @@ import {
   renderTemplate,
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  buildPaperclipAgentPromptTemplate,
+  parseMemoryAgentGuidanceContextResult,
+  type MemoryAgentGuidanceContext,
   joinPromptSections,
   selectPaperclipPromptSections,
   resolveEffectiveMemoryHardeningFlags,
@@ -1101,34 +1104,64 @@ export function renderHermesSystemPrompt(
   options: { includeDefaultIdentity?: boolean; agentPromptTemplate?: string } = {},
 ): string {
   const includeDefaultIdentity = options.includeDefaultIdentity ?? true;
-  const baseTemplate = options.agentPromptTemplate ?? DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+  const agentTemplate = options.agentPromptTemplate ?? DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
   if (includeDefaultIdentity) {
-    if (baseTemplate === DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE) {
+    if (!options.agentPromptTemplate) {
       return renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, { agent });
     }
     const fullTemplate = [
       HERMES_SYSTEM_PROMPT_API_GUIDANCE,
       "",
-      baseTemplate,
+      agentTemplate,
     ].join("\n");
     return renderTemplate(fullTemplate, { agent });
   }
   const identityRegex = /^You are agent \{\{agent\.id\}\} \(\{\{agent\.name\}\}\)\.\r?\n\r?\n?/;
-  if (!identityRegex.test(baseTemplate)) {
+  if (!identityRegex.test(agentTemplate)) {
     throw new Error(
-      "renderHermesSystemPrompt: failed to strip default identity line from DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE; template format may have changed",
+      "renderHermesSystemPrompt: failed to strip default identity line from agent template; template format may have changed",
     );
   }
-  const agentTemplate = baseTemplate.replace(
+  const strippedAgentTemplate = agentTemplate.replace(
     identityRegex,
     "",
   );
   const promptTemplate = [
     HERMES_SYSTEM_PROMPT_API_GUIDANCE,
     "",
-    agentTemplate,
+    strippedAgentTemplate,
   ].join("\n");
   return renderTemplate(promptTemplate, { agent });
+}
+
+export async function resolveMemoryGuidance(
+  ctx: AdapterExecutionContext,
+  options: { usingIsolatedHome: boolean },
+): Promise<MemoryAgentGuidanceContext | undefined> {
+  const result = parseMemoryAgentGuidanceContextResult(ctx.paperclipMemoryGuidance);
+  if (result.status === "valid") {
+    if (options.usingIsolatedHome && result.data.capabilities.hermesBuiltInStores) {
+      await ctx.onLog(
+        "stdout",
+        "[hermes] Isolation override: disabling Hermes built-in stores guidance\n",
+      );
+      return {
+        ...result.data,
+        capabilities: {
+          ...result.data.capabilities,
+          hermesBuiltInStores: false,
+        },
+      };
+    }
+    return result.data;
+  }
+  if (result.status === "malformed") {
+    await ctx.onLog(
+      "stderr",
+      `[hermes] Malformed paperclipMemoryGuidance context received; falling back to legacy memory guidance: ${result.error.message}\n`,
+    );
+  }
+  return undefined;
 }
 
 function renderConditionalSections(template: string, vars: Record<string, unknown>): string {
@@ -1652,6 +1685,11 @@ export async function execute(
   let prompt = builtPrompt.query;
   let finalSystemPrompt: string;
 
+  const memoryGuidance = await resolveMemoryGuidance(ctx, { usingIsolatedHome });
+  const agentPromptTemplate = memoryGuidance
+    ? buildPaperclipAgentPromptTemplate(memoryGuidance)
+    : undefined;
+
   if (builtPrompt.hermesPromptSplit) {
     const candidateOverlay = joinPromptSections([
       env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
@@ -1659,6 +1697,7 @@ export async function execute(
       ...builtPrompt.systemSections,
       renderHermesSystemPrompt(ctx.agent, {
         includeDefaultIdentity: false,
+        agentPromptTemplate,
       }),
     ]);
     if (Buffer.byteLength(candidateOverlay, "utf8") > HERMES_MAX_SYSTEM_PROMPT_BYTES) {
@@ -1679,6 +1718,7 @@ export async function execute(
         agentInstructions,
         renderHermesSystemPrompt(ctx.agent, {
           includeDefaultIdentity: true,
+          agentPromptTemplate,
         }),
       ]);
     } else {
@@ -1690,6 +1730,7 @@ export async function execute(
       agentInstructions,
       renderHermesSystemPrompt(ctx.agent, {
         includeDefaultIdentity: true,
+        agentPromptTemplate,
       }),
     ]);
   }
@@ -1757,7 +1798,6 @@ export async function execute(
   // Failed resumes remain failures. Do not infer a safe restart from CLI text.
   if (sessionId) args.push("--resume", sessionId);
   if (extraArgs?.length) args.push(...extraArgs);
-
   // TECH-7895: a Router run needs the canonical RAMP_ROUTER_API_KEY itself; another provider's key
   // never satisfies it, and the provider is never switched. Key precedence:
   //   1. The agent's own env binding, if present at all. An explicit blank value is a deliberate

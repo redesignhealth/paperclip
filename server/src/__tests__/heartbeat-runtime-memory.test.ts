@@ -3,9 +3,17 @@ import {
   adapterSupportsRuntimeMemory,
   resolveHeartbeatRuntimeMemory,
   HERMES_ADAPTER_TYPE,
+  UnsupportedMemoryEmbeddingError,
 } from "../services/heartbeat.js";
 import * as memoryModule from "../services/company-memory-databases.js";
-import { CompanyMemoryNotReadyError } from "../services/company-memory-databases.js";
+import {
+  CompanyMemoryNotReadyError,
+  SUPPORTED_COMPANY_MEMORY_EMBEDDINGS,
+  PROVISIONER_DEFAULT_EMBEDDING,
+  DEFAULT_COMPANY_MEMORY_EMBEDDING,
+  isSupportedCompanyMemoryEmbedding,
+} from "../services/company-memory-databases.js";
+import { companyMemoryDatabases } from "@paperclipai/db";
 import * as redactionModule from "../services/run-secret-redaction.js";
 import { recordAgentScopedMemoryUse } from "../services/memory-scope-observations.js";
 import { resolveEffectiveMemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
@@ -543,6 +551,168 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
       expect(recordSpy).toHaveBeenCalledWith(mockDb, companyId);
 
       recordSpy.mockRestore();
+    });
+  });
+
+  describe("embedding allowlist guard (TECH-8193)", () => {
+    it("canonical DB schema and provisioner defaults match and are supported", () => {
+      expect(PROVISIONER_DEFAULT_EMBEDDING).toEqual(DEFAULT_COMPANY_MEMORY_EMBEDDING);
+      expect(companyMemoryDatabases.embeddingModel.default).toBe(DEFAULT_COMPANY_MEMORY_EMBEDDING.model);
+      expect(companyMemoryDatabases.embeddingDimensions.default).toBe(DEFAULT_COMPANY_MEMORY_EMBEDDING.dimensions);
+      expect(isSupportedCompanyMemoryEmbedding(DEFAULT_COMPANY_MEMORY_EMBEDDING)).toBe(true);
+      expect(isSupportedCompanyMemoryEmbedding({
+        model: companyMemoryDatabases.embeddingModel.default,
+        dimensions: companyMemoryDatabases.embeddingDimensions.default,
+      })).toBe(true);
+      expect(SUPPORTED_COMPANY_MEMORY_EMBEDDINGS).toContainEqual(PROVISIONER_DEFAULT_EMBEDDING);
+      expect(SUPPORTED_COMPANY_MEMORY_EMBEDDINGS).toContainEqual({
+        model: companyMemoryDatabases.embeddingModel.default,
+        dimensions: companyMemoryDatabases.embeddingDimensions.default,
+      });
+
+      // Preserves policy distinction: changing a hypothetical default pair without updating allowlist fails
+      const hypotheticalNewDefault = { model: "text-embedding-3-large", dimensions: 3072 };
+      expect(isSupportedCompanyMemoryEmbedding(hypotheticalNewDefault)).toBe(false);
+    });
+
+    it("throws UnsupportedMemoryEmbeddingError and registers NO secret for text-embedding-3-large/3072", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          embeddingModel: "text-embedding-3-large",
+          embeddingDimensions: 3072,
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      let thrownError: any;
+      try {
+        await resolveHeartbeatRuntimeMemory({
+          db: mockDb,
+          agent: { id: agentId, adapterType: "hermes_local", companyId },
+          runId,
+        });
+      } catch (err) {
+        thrownError = err;
+      }
+
+      expect(thrownError).toBeInstanceOf(UnsupportedMemoryEmbeddingError);
+      expect(thrownError).toBeInstanceOf(memoryModule.UnsupportedMemoryEmbeddingError);
+      const directRuntimeMemory = await import("../services/heartbeat/runtime-memory.js");
+      expect(thrownError).toBeInstanceOf(directRuntimeMemory.UnsupportedMemoryEmbeddingError);
+      expect(thrownError.code).toBe("unsupported_memory_embedding");
+      expect(thrownError.companyId).toBe(companyId);
+      expect(thrownError.model).toBe("text-embedding-3-large");
+      expect(thrownError.dimensions).toBe(3072);
+      expect(thrownError.message).toContain(companyId);
+      expect(thrownError.message).toContain("text-embedding-3-large");
+      expect(thrownError.message).toContain("3072");
+      expect(thrownError.message).not.toContain(mockDescriptor.password);
+      expect(registeredSecrets).toHaveLength(0);
+    });
+
+    it("throws UnsupportedMemoryEmbeddingError for text-embedding-3-small/1500 (dims mismatch) and registers NO secret", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          embeddingModel: "text-embedding-3-small",
+          embeddingDimensions: 1500,
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      await expect(
+        resolveHeartbeatRuntimeMemory({
+          db: mockDb,
+          agent: { id: agentId, adapterType: "hermes_local", companyId },
+          runId,
+        }),
+      ).rejects.toThrow(UnsupportedMemoryEmbeddingError);
+
+      expect(registeredSecrets).toHaveLength(0);
+    });
+
+    it("supported pair (text-embedding-3-small/1536) passes allowlist check and registers secret", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => mockDescriptor),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId },
+        runId,
+      });
+
+      expect(runtimeMemory).toBeDefined();
+      expect(registeredSecrets).toEqual([
+        { companyId, runId, value: mockDescriptor.password },
+      ]);
+    });
+
+    it("guard fires regardless of PAPERCLIP_MEMORY_HARDENING (both unset and 'all')", async () => {
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "allowlist",
+        isSupported: () => true,
+        resolveRuntimeConfig: vi.fn(async () => ({
+          ...mockDescriptor,
+          embeddingModel: "unsupported-model",
+          embeddingDimensions: 768,
+        })),
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      });
+
+      // 1. Unset env / no flags
+      await expect(
+        resolveHeartbeatRuntimeMemory({
+          db: mockDb,
+          agent: { id: agentId, adapterType: "hermes_local", companyId },
+          runId,
+          env: {},
+        }),
+      ).rejects.toThrow(UnsupportedMemoryEmbeddingError);
+      expect(registeredSecrets).toHaveLength(0);
+
+      // 2. PAPERCLIP_MEMORY_HARDENING = "all"
+      await expect(
+        resolveHeartbeatRuntimeMemory({
+          db: mockDb,
+          agent: { id: agentId, adapterType: "hermes_local", companyId },
+          runId,
+          env: { PAPERCLIP_MEMORY_HARDENING: "all" },
+        }),
+      ).rejects.toThrow(UnsupportedMemoryEmbeddingError);
+      expect(registeredSecrets).toHaveLength(0);
     });
   });
 });

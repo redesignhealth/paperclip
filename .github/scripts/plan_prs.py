@@ -6,15 +6,16 @@ array of positive integers: the PR numbers the privileged reusable workflow is c
 
 - workflow_dispatch: exactly the one typed PR number.
 - workflow_run: a completed `pull_request` CI run of this repository; resolves fork and branch PRs
-  via bounded open master PR listing matching head_sha + head_repo_id (does not rely on pull_requests[]
-  or /commits/{sha}/pulls, which may be empty for fork PRs).
-- schedule: a bounded sweep of the open PRs into master (this is how an Argus approval that lands
-  after CI is noticed). Every eligible open PR is queued on every sweep, including PRs whose head
-  already holds green gate checks: the planner has no Argus API key and cannot tell whether a newer
-  BLOCKING verdict now exists for the same SHA, and only the privileged re-evaluation can revoke or
-  confirm. Only ineligible PRs (missing/deleted head repo, wrong base, closed, authored by the gate App)
-  are dropped. More than MAX_PRS candidates, or more list pages than allowed, fails the sweep loudly
-  instead of silently skipping PRs.
+  via bounded open PR listings (one per base in `gate_lib.ELIGIBLE_BASE_BRANCHES`) matching
+  head_sha + head_repo_id (does not rely on pull_requests[] or /commits/{sha}/pulls, which may be
+  empty for fork PRs).
+- schedule: a bounded sweep of the open PRs into every eligible base branch (this is how an Argus
+  approval that lands after CI is noticed). Every eligible open PR is queued on every sweep,
+  including PRs whose head already holds green gate checks: the planner has no Argus API key and
+  cannot tell whether a newer BLOCKING verdict now exists for the same SHA, and only the privileged
+  re-evaluation can revoke or confirm. Only ineligible PRs (missing/deleted head repo, wrong base,
+  closed, authored by the gate App) are dropped. More than MAX_PRS candidates, or more list pages
+  than allowed, fails the sweep loudly instead of silently skipping PRs.
 
 Unconfigured repository (role ARN or App id missing): the sweep and event paths do nothing, so the
 old human-review ruleset keeps protecting `master`; a manual dispatch fails loudly.
@@ -34,6 +35,14 @@ MAX_PRS = 100
 MAX_LIST_PAGES = 10
 
 
+def _open_pulls_by_eligible_base(gh: Any) -> list[Any]:
+    """Open PRs across every eligible base branch (TECH-8201), one bounded listing per base."""
+    pulls: list[Any] = []
+    for base in sorted(gate_lib.ELIGIBLE_BASE_BRANCHES):
+        pulls.extend(gh.paginate(f"/repos/{gate_lib.REPO}/pulls?state=open&base={base}", max_pages=MAX_LIST_PAGES))
+    return pulls
+
+
 def _from_workflow_run(gh: Any, event: dict[str, Any]) -> list[int]:
     run = event.get("workflow_run")
     if not isinstance(run, dict) or run.get("event") != "pull_request":
@@ -48,8 +57,8 @@ def _from_workflow_run(gh: Any, event: dict[str, Any]) -> list[int]:
         return []
 
     numbers: list[int] = []
-    # Resolve PR via bounded open master PR listing matching head_sha + head_repo_id
-    pulls = gh.paginate(f"/repos/{gate_lib.REPO}/pulls?state=open&base={gate_lib.DEFAULT_BRANCH}", max_pages=MAX_LIST_PAGES)
+    # Resolve PR via bounded open PR listing (every eligible base) matching head_sha + head_repo_id
+    pulls = _open_pulls_by_eligible_base(gh)
     for pr in pulls:
         if not isinstance(pr, dict):
             continue
@@ -63,13 +72,15 @@ def _from_workflow_run(gh: Any, event: dict[str, Any]) -> list[int]:
 
 
 def _sweep(gh: Any) -> list[int]:
-    pulls = gh.paginate(f"/repos/{gate_lib.REPO}/pulls?state=open&base={gate_lib.DEFAULT_BRANCH}", max_pages=MAX_LIST_PAGES)
+    pulls = _open_pulls_by_eligible_base(gh)
     numbers: list[int] = []
     for pr in pulls:
         if gate_lib.pr_ineligibility(pr) is not None:
             continue
         numbers.append(gate_lib.parse_pr_number(pr.get("number")))
-    return numbers
+    # Combining one listing per eligible base makes arrival order depend on base iteration order,
+    # not PR age; sort so the queue order stays deterministic regardless of base count.
+    return sorted(numbers)
 
 
 def plan(event_name: str, event: dict[str, Any], gh: Any, input_pr: str, configured: bool) -> list[int]:

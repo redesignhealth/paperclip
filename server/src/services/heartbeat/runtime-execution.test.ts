@@ -459,4 +459,39 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       }
     }
   });
+
+  it("dispatches paperclipMemoryGuidance to adapter.execute when capabilityMemoryGuidance flag is on", async () => {
+    const { input, adapter } = await fixture(false, "codex");
+    input.agent.adapterType = "hermes_local";
+    input.config.runtimeConfig = { env: { PAPERCLIP_MEMORY_HARDENING: "capability-memory-guidance" } };
+
+    const result = await executeHeartbeatRuntime(db, input);
+    expect(result).toMatchObject({ dispatched: true });
+    expect(adapter.execute).toHaveBeenCalledOnce();
+    const [execCtx] = adapter.execute.mock.calls[0]!;
+    expect(execCtx.paperclipMemoryGuidance).toBeDefined();
+    expect(execCtx.paperclipMemoryGuidance).toMatchObject({
+      variant: "write-rules",
+      capabilities: {
+        mem0: false,
+        arcana: false,
+        hermesBuiltInStores: true,
+      },
+    });
+    expect((execCtx.context as Record<string, unknown>).paperclipMemoryGuidance).toBeUndefined();
+    expectCleanup(input);
+  });
+
+  it("omits paperclipMemoryGuidance from adapter.execute when capabilityMemoryGuidance flag is off", async () => {
+    const { input, adapter } = await fixture(false, "codex");
+    input.agent.adapterType = "hermes_local";
+    input.config.runtimeConfig = { env: { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" } };
+
+    const result = await executeHeartbeatRuntime(db, input);
+    expect(result).toMatchObject({ dispatched: true });
+    expect(adapter.execute).toHaveBeenCalledOnce();
+    const [execCtx] = adapter.execute.mock.calls[0]!;
+    expect(execCtx.paperclipMemoryGuidance).toBeUndefined();
+    expectCleanup(input);
+  });
 });

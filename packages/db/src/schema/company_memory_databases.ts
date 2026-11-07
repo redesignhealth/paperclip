@@ -3,6 +3,11 @@ import { check, foreignKey, integer, pgTable, text, timestamp, uniqueIndex, inde
 import { companies } from "./companies.js";
 import { companySecrets } from "./company_secrets.js";
 
+export const DEFAULT_COMPANY_MEMORY_EMBEDDING = {
+  model: "text-embedding-3-small",
+  dimensions: 1536,
+} as const;
+
 export const companyMemoryDatabases = pgTable(
   "company_memory_databases",
   {
@@ -16,8 +21,8 @@ export const companyMemoryDatabases = pgTable(
     port: integer("port").notNull().default(5432),
     sslmode: text("sslmode").notNull().default("require"),
     collectionName: text("collection_name").notNull().default("mem0_memories"),
-    embeddingModel: text("embedding_model").notNull().default("text-embedding-3-small"),
-    embeddingDimensions: integer("embedding_dimensions").notNull().default(1536),
+    embeddingModel: text("embedding_model").notNull().default(DEFAULT_COMPANY_MEMORY_EMBEDDING.model),
+    embeddingDimensions: integer("embedding_dimensions").notNull().default(DEFAULT_COMPANY_MEMORY_EMBEDDING.dimensions),
     secretId: uuid("secret_id").references(() => companySecrets.id, { onDelete: "restrict" }),
     secretVersion: integer("secret_version"),
     status: text("status").notNull().default("pending"),

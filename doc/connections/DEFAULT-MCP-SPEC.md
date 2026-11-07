@@ -35,9 +35,13 @@ immutable except for archive (`409 managed_seed_immutable`); its operation is id
 company/entry advisory lock, and an archived seed is an organization opt-out that is not recreated.
 After the consenting owner first connects a personal Google instance, the tools named in
 `RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS` (`default-mcp-spec.ts`) are switched on and every other discovered
-catalog entry remains quarantined until the owner reviews it. That list is hand-built from tool names that only
-read; the Google server's own read-only flag is not used, because it marks tools that change data (for example
-`manage_drive_access`, `modify_sheet_values`, `run_script_function`) as read-only. The instance is also installed,
+catalog entry remains quarantined until the owner reviews it. That list is hand-built: every read tool plus the
+reviewed writes in `RH_GOOGLE_MCP_SAFE_WRITE_TOOLS` (drafts, Gmail label tagging, Docs, Sheets, Slides and Forms edits,
+Drive file writes and comments). Only real danger stays quarantined: sending, deleting (including label-object, task and
+contact management, which can delete through an `action` argument), sharing and publishing, calendar invites, Gmail
+filters and Apps Script. An owner can enable those in Permissions. The Google server's own read-only flag is not used, because it marks tools
+that change data (for example `manage_drive_access`, `modify_sheet_values`, `run_script_function`) as read-only. See
+[TOOL-ENABLEMENT-RUNBOOK.md](./TOOL-ENABLEMENT-RUNBOOK.md). The instance is also installed,
 through the owner-only per-agent install path, on the live agents that owner created (not terminated, not awaiting
 approval). Agents other people created and agents created later start with it off, and a reconnect changes
 neither the tool choices nor the installs. The result is recorded in a
