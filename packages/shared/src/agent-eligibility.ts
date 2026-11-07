@@ -64,10 +64,10 @@ export interface AgentWorkEligibility {
   orgChainHealth: AgentOrgChainHealth;
 }
 
-export const NON_ASSIGNABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval"]);
-export const NON_INVOKABLE_AGENT_STATUSES = new Set<string>(["terminated", "pending_approval", "paused"]);
-export const ASSIGNABLE_AGENT_STATUSES = new Set<string>(["active", "paused", "idle", "running", "error"]);
-export const INVOKABLE_AGENT_STATUSES = new Set<string>(["active", "idle", "running", "error"]);
+export const NON_ASSIGNABLE_AGENT_STATUSES: ReadonlySet<string> = new Set<string>(["terminated", "pending_approval"]);
+export const NON_INVOKABLE_AGENT_STATUSES: ReadonlySet<string> = new Set<string>(["terminated", "pending_approval", "paused"]);
+export const ASSIGNABLE_AGENT_STATUSES: ReadonlySet<string> = new Set<string>(["active", "paused", "idle", "running", "error"]);
+export const INVOKABLE_AGENT_STATUSES: ReadonlySet<string> = new Set<string>(["active", "idle", "running", "error"]);
 
 export function isAgentStatusAssignableToWork(status: AgentStatus | string): boolean {
   return ASSIGNABLE_AGENT_STATUSES.has(status) && !NON_ASSIGNABLE_AGENT_STATUSES.has(status);
