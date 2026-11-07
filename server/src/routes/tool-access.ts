@@ -14,6 +14,7 @@ import {
 } from "../services/app-company-visibility.js";
 import {
   APP_STORE_DEFINITIONS,
+  isConnectorFeatureEnabled,
   isMemoryConnectorId,
   GITHUB_CONNECTOR_PROFILES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
@@ -847,7 +848,8 @@ function connectorEnrollmentPrincipal(req: Request): string {
         ? await options.paperclipCloudConnector.getCapabilities()
         : [];
     const vercelConnect = vercelConnectIntegrationStatus();
-    const { enableMemoryConnectors } = await instanceSettingsService(db).getExperimental();
+    const settings = await instanceSettingsService(db).getExperimental();
+    const { enableMemoryConnectors } = settings;
     const companyVisibility = await loadCompanyVisibility(db, companyId);
     let oauthCallbackUrl: string | undefined;
     try {
@@ -879,7 +881,8 @@ function connectorEnrollmentPrincipal(req: Request): string {
             : "Vercel Connect setup is disabled on this Paperclip instance.",
         },
       },
-      apps: [...APP_STORE_DEFINITIONS.filter((app) => (enableMemoryConnectors || !isMemoryConnectorId(app.slug))).map((app) =>
+      apps: [...APP_STORE_DEFINITIONS.filter((app) => (enableMemoryConnectors || !isMemoryConnectorId(app.slug))
+        && isConnectorFeatureEnabled(app, settings)).map((app) =>
         withCompanyVisibilityAvailability(appWithPaperclipCloudConnectorAvailability(app, advertisedProfiles), companyVisibility)
       ), ...await aiConnectionRouterService(db).catalog()],
     });

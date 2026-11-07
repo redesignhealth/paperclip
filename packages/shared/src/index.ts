@@ -305,6 +305,8 @@ export {
   offRiskLevelsFromDefaults,
   resolveConnectionMethodServerUrl,
 } from "./app-definitions.js";
+export { isConnectorFeatureEnabled } from "./connector-availability.js";
+export { getAppDefinitionForApplicationKey } from "./connector-identity.js";
 export {
   connectionSetupStateForApp,
   connectionSetupStateForMethod,
