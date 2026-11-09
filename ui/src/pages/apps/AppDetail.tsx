@@ -58,7 +58,7 @@ import { appTabHref, appTabLabel, isAppTabKey, type AppTabKey } from "./app-tabs
 import { ConnectionProvenanceChip } from "./ConnectionProvenanceChip";
 import { IdentitiesSection } from "./app-detail/IdentitiesSection";
 import { PermissionsPanel } from "./app-detail/PermissionsPanel";
-import { accessForConnection } from "./app-detail/personal-access";
+import { accessForConnection, installsAfterPick } from "./app-detail/personal-access";
 import { AgentConnectionAccess } from "./app-detail/AgentConnectionAccess";
 import { ConnectedAggregatorApps } from "./app-detail/ConnectedAggregatorApps";
 import { isAppAggregator } from "@paperclipai/shared/aggregator-apps";
@@ -308,6 +308,24 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   );
   const managesRemoteMcpAccess = isRemoteMcpConnectorMethod(connection?.config?.sourceTemplateKey, connection?.config?.connectionMethodKey);
   const agents = agentsQuery.data ?? [];
+  // A default-MCP agent only gets a connection's tools with an explicit per-agent install row; a company
+  // profile or permission binding does not turn it on. For those agents the agent picker therefore IS the
+  // install: choosing one installs it, clearing it uninstalls it. Other agents keep the independent
+  // access-vs-always-installed model. Personal default-MCP instances install through their own guarded
+  // setup path, and AI / remote-MCP connections manage installs elsewhere.
+  const pickerInstallsManagedAgents =
+    connection?.connectionPurpose !== "ai" && !managesRemoteMcpAccess && !isPersonalDefaultMcpInstance(connection?.config);
+  const managedAgentIds = useMemo(
+    () => new Set(agents.filter((agent) => Boolean(agent.metadata?.defaultMcp)).map((agent) => agent.id)),
+    [agents],
+  );
+  // The installs the picker does not own (agents that are not default-MCP managed), so they stay locked in as before.
+  const pickerInstall = useMemo<InstallState>(
+    () => pickerInstallsManagedAgents
+      ? { ...install, agentIds: new Set([...install.agentIds].filter((id) => !managedAgentIds.has(id))) }
+      : install,
+    [install, managedAgentIds, pickerInstallsManagedAgents],
+  );
   const disconnectRemote = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
     onSuccess: () => {
@@ -326,15 +344,29 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       askFirst: Set<string>;
       access: AccessDraft;
       reviewed?: Set<string>;
+      /** True only when this save changes who may use the connection (the agent picker), not for action toggles. */
+      accessChanged?: boolean;
     }) => {
       return connection?.connectionPurpose === "ai"
       ? toolsApi.putConnectionInstalls(connectionId, next.access.mode === "all" ? [{ targetType: "company", targetId: selectedCompanyId! }] : [...next.access.agentIds].map(targetId => ({ targetType: "agent" as const, targetId })))
-      : toolsApi.finishApp(selectedCompanyId!, connectionId, {
-        enabledCatalogEntryIds: [...next.enabled],
-        askFirstCatalogEntryIds: [...next.askFirst].filter((id) => next.enabled.has(id)),
-        ...(next.reviewed ? { reviewedCatalogEntryIds: [...next.reviewed] } : {}),
-        access: next.access.mode === "all" ? "all_agents" : { agentIds: [...next.access.agentIds] },
-      });
+      : (async () => {
+        const finished = await toolsApi.finishApp(selectedCompanyId!, connectionId, {
+          enabledCatalogEntryIds: [...next.enabled],
+          askFirstCatalogEntryIds: [...next.askFirst].filter((id) => next.enabled.has(id)),
+          ...(next.reviewed ? { reviewedCatalogEntryIds: [...next.reviewed] } : {}),
+          access: next.access.mode === "all" ? "all_agents" : { agentIds: [...next.access.agentIds] },
+        });
+        if (pickerInstallsManagedAgents && next.accessChanged && next.access.mode === "specific") {
+          const wanted = installsAfterPick(install.agentIds, managedAgentIds, next.access.agentIds);
+          if (wanted) {
+            await toolsApi.putConnectionInstalls(
+              connectionId,
+              wanted.map((targetId) => ({ targetType: "agent" as const, targetId })),
+            );
+          }
+        }
+        return finished;
+      })();
     },
     onMutate: () => setPending(true),
     onSuccess: () => {
@@ -520,6 +552,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       askFirst: mutate.askFirst ?? new Set(askFirstIds),
       access: mutate.access ?? access,
       reviewed: mutate.reviewed,
+      accessChanged: mutate.access !== undefined,
     });
 
   const reviewQuarantined = (allowedIds: string[]) => {
@@ -753,7 +786,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                 anyAgentUnavailableReason={isPersonalDefaultMcpInstance(connection.config)
                   ? "This connection runs as one person's own sign-in, so it can't be shared with every agent."
                   : undefined}
-                install={connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? installStateFrom([]) : install}
+                install={connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? installStateFrom([]) : pickerInstall}
                 readOnly={readOnly}
                 canChange={canChange}
                 quarantined={quarantined}
@@ -766,7 +799,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                     ? "Shell Git and gh use this account for the run and are not constrained by per-tool Ask-first controls."
                     : undefined
                 }
-                onSaveAccess={(next) => apply({ access: connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? next : accessIncludingInstalls(next, install) })}
+                onSaveAccess={(next) => apply({ access: connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? next : accessIncludingInstalls(next, pickerInstall) })}
                 onRefreshActions={() => refreshTools.mutate()}
                 onSetActionPermission={(ids, next) => apply(actionPermissionMutation(ids, next, enabledIds, askFirstIds))}
                 onReviewQuarantined={reviewQuarantined}

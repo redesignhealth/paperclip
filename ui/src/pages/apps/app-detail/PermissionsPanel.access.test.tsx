@@ -7,7 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentAccessSection } from "./PermissionsPanel";
 import { installStateFrom } from "@/lib/tool-installs";
-import { accessForConnection } from "./personal-access";
+import { accessForConnection, installsAfterPick } from "./personal-access";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -93,5 +93,34 @@ describe("access draft for personal sign-in connections", () => {
   it("keeps an existing specific choice for a personal connection", () => {
     const draft = { mode: "specific" as const, agentIds: new Set(["agent-2"]) };
     expect(accessForConnection(draft, install, true)).toBe(draft);
+  });
+});
+
+describe("installs after the agent picker changes (TECH-8259)", () => {
+  const none = new Set<string>();
+
+  it("installs a picked default-MCP agent", () => {
+    expect(installsAfterPick(none, new Set(["cos"]), new Set(["cos"]))).toEqual(["cos"]);
+  });
+
+  it("uninstalls a default-MCP agent that is cleared from the picker", () => {
+    expect(installsAfterPick(new Set(["cos"]), new Set(["cos"]), none)).toEqual([]);
+  });
+
+  it("swaps one default-MCP agent for another", () => {
+    expect(installsAfterPick(new Set(["a"]), new Set(["a", "b"]), new Set(["b"]))).toEqual(["b"]);
+  });
+
+  it("never touches the installs of agents that are not default-MCP managed", () => {
+    expect(installsAfterPick(new Set(["legacy"]), new Set(["cos"]), new Set(["cos"]))).toEqual(["legacy", "cos"]);
+    expect(installsAfterPick(new Set(["legacy"]), new Set(["cos"]), none)).toBeNull();
+  });
+
+  it("does not install a picked agent that is not default-MCP managed", () => {
+    expect(installsAfterPick(none, new Set(["cos"]), new Set(["legacy"]))).toBeNull();
+  });
+
+  it("saves nothing when the managed agents are already installed as picked", () => {
+    expect(installsAfterPick(new Set(["cos"]), new Set(["cos"]), new Set(["cos"]))).toBeNull();
   });
 });

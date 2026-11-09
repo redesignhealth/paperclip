@@ -11,3 +11,22 @@ export function accessForConnection(draft: AccessDraft, install: InstallState, i
   if (!isPersonalSignIn || draft.mode !== "all") return draft;
   return { mode: "specific", agentIds: new Set(install.agentIds) };
 }
+
+/**
+ * The agent installs to save after the agent picker changes. A default-MCP agent only gets a connection's tools
+ * with an explicit install row (a permission binding does not turn it on), so for those agents the picker is the
+ * install: picked agents are installed and cleared agents are uninstalled. Installs of other agents are left
+ * exactly as they are, and `null` means nothing needs saving.
+ */
+export function installsAfterPick(
+  installedAgentIds: ReadonlySet<string>,
+  managedAgentIds: ReadonlySet<string>,
+  pickedAgentIds: ReadonlySet<string>,
+): string[] | null {
+  const wanted = new Set([
+    ...[...installedAgentIds].filter((id) => !managedAgentIds.has(id)),
+    ...[...pickedAgentIds].filter((id) => managedAgentIds.has(id)),
+  ]);
+  const unchanged = wanted.size === installedAgentIds.size && [...wanted].every((id) => installedAgentIds.has(id));
+  return unchanged ? null : [...wanted];
+}
