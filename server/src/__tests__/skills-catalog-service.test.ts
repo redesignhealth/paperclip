@@ -2,6 +2,12 @@ import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CatalogSkill } from "@paperclipai/shared";
 
+vi.mock("../services/remote-http-fetch.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/remote-http-fetch.js")>()),
+  // These tests stub global fetch for GitHub hosts; the guard itself is covered in github-fetch.test.ts.
+  guardedRemoteHttpFetch: (url: string | URL, init: RequestInit) => fetch(url.toString(), init),
+}));
+
 const mockExistsSync = vi.hoisted(() => vi.fn());
 const mockReadFileSync = vi.hoisted(() => vi.fn());
 const mockStatSync = vi.hoisted(() => vi.fn());
