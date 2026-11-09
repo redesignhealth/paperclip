@@ -1,7 +1,7 @@
 import { SpekoProviderSetup } from "@/components/voice/SpekoProviderSetup";
 import { NativeVoiceConversation } from "@/components/voice/NativeVoiceConversation";
 import { buildSlackAppManifest, defaultSlackAppConfiguration } from "@paperclipai/shared";
-import type { SlackOptInScopeGroup } from "@paperclipai/shared";
+import { SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS, type SlackOptInScopeGroup } from "@paperclipai/shared";
 import { SlackAppDetails, SlackSetupAdvanced } from "./SlackAppDetails";
 import { SlackScopeOptIns } from "./SlackScopeOptIns";
 import { slackOptInUiState } from "./slack-opt-in-state";
@@ -281,7 +281,8 @@ function ChatSdkEndpointSetup() {
   // TECH-7988: a draft selection wins until the server answers. An existing
   // endpoint reflects its saved request, including a pending change.
   const savedSlackOptIns = slackOptInUiState(endpoint);
-  const slackOptIns = slackOptInDraft ?? savedSlackOptIns.requested;
+  // A new app (no endpoint yet) starts with the default groups; a saved endpoint shows what it actually requested.
+  const slackOptIns = slackOptInDraft ?? (endpoint ? savedSlackOptIns.requested : [...SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS]);
   const syncEndpointSnapshot = (
     next: ChatEndpoint,
     onlyIfStillVisible = false,

@@ -164,16 +164,17 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     await vi.waitFor(() => expect(serverGroups).toEqual(finalOn ? ["file_upload"] : []));
     expect(api.update.mock.calls.at(-1)![1].slackOptInScopeGroups).toEqual(finalOn ? ["file_upload"] : []);
   });
-  it("shows all three groups off for a new agent", async () => {
+  it("shows Proactive DMs on and the other groups off for a new agent", async () => {
     await render();
     await openAgentStep();
     expect(container.textContent).toContain("Extra Slack permissions");
-    for (const label of ["Channel management", "Proactive DMs", "File upload"]) {
+    expect(optInCheckbox("Proactive DMs").getAttribute("aria-checked")).toBe("true");
+    for (const label of ["Channel management", "File upload"]) {
       expect(optInCheckbox(label).getAttribute("aria-checked")).toBe("false");
     }
   });
 
-  it("creates the endpoint with an explicit empty opt-in list by default", async () => {
+  it("creates the endpoint with Proactive DMs requested by default", async () => {
     api.create.mockResolvedValue(draft());
     await render();
     await openAgentStep();
@@ -183,7 +184,7 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     await act(async () => continueButton!.click());
     await vi.waitFor(() => expect(api.create).toHaveBeenCalled());
     const [, input] = api.create.mock.calls[0]!;
-    expect(input.slackOptInScopeGroups).toEqual([]);
+    expect(input.slackOptInScopeGroups).toEqual(["proactive_dms"]);
   });
 
   it("creates the endpoint with the chosen group when selected before creation", async () => {
@@ -196,7 +197,7 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     await act(async () => continueButton!.click());
     await vi.waitFor(() => expect(api.create).toHaveBeenCalled());
     const [, input] = api.create.mock.calls[0]!;
-    expect(input.slackOptInScopeGroups).toEqual(["file_upload"]);
+    expect(input.slackOptInScopeGroups).toEqual(["proactive_dms", "file_upload"]);
   });
 
   it("persists a toggle on an existing draft with only the opt-in field", async () => {

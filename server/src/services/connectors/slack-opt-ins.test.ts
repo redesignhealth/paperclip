@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS,
   SLACK_DEFAULT_BOT_SCOPES,
   SLACK_OPT_IN_SCOPE_GROUPS,
   SLACK_TOOLS,
@@ -15,6 +16,7 @@ import {
   sameSlackOptInGroups,
   slackEnabledToolsForSetup,
   slackEndpointOptInsChanged,
+  slackOtherUserDmsEnabled,
   slackVerificationOptInScopes,
 } from "./slack-opt-ins.js";
 
@@ -294,5 +296,39 @@ describe("Slack tool gating: requested and installed", () => {
         }
       }
     }
+  });
+});
+
+describe("Proactive DMs with other people (TECH-8286)", () => {
+  const endpoint = (setup: Parameters<typeof slackOtherUserDmsEnabled>[1]["setup"]) =>
+    ({ id: "endpoint", companyId: "company", setup }) as const;
+  // An explicit setup never touches the database (only a legacy install is looked up).
+  const db = null as never;
+
+  it("is on only when the group is both requested and installed", async () => {
+    expect(
+      await slackOtherUserDmsEnabled(
+        db,
+        endpoint({ slackOptInScopeGroups: ["proactive_dms"], slackInstalledOptInScopeGroups: ["proactive_dms"] }),
+      ),
+    ).toBe(true);
+    expect(
+      await slackOtherUserDmsEnabled(
+        db,
+        endpoint({ slackOptInScopeGroups: ["proactive_dms"], slackInstalledOptInScopeGroups: [] }),
+      ),
+    ).toBe(false);
+    expect(
+      await slackOtherUserDmsEnabled(
+        db,
+        endpoint({ slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: ["proactive_dms"] }),
+      ),
+    ).toBe(false);
+    expect(await slackOtherUserDmsEnabled(db, endpoint({ slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] }))).toBe(false);
+  });
+
+  it("new Slack apps start with Proactive DMs and nothing else", () => {
+    expect([...SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS]).toEqual(["proactive_dms"]);
+    expect(SLACK_OPT_IN_SCOPE_GROUPS).toContain("proactive_dms");
   });
 });

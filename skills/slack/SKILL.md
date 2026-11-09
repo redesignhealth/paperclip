@@ -70,7 +70,10 @@ Paperclip tasks, documents, assignments and approvals.
 ## Tasks and routines
 
 For “send me a Slack message,” call `slack_open_dm` to obtain the linked responsible
-user's DM channel, then use `slack_post_message`. Do not guess a user or DM ID.
+user's DM channel, then use `slack_post_message`. To message someone else, look their
+Slack user ID up with `slack_user`, call `slack_open_dm` with that `user`, then use
+`slack_post_message`. Do not guess a user or DM ID. Only message people the request
+names, and confirm the recipient when the name is ambiguous.
 For “at 10am,” use the normal Paperclip routine tools to schedule work, including
 the intended timezone and destination in the routine's instructions. The run uses
 the routine's responsible user and rechecks their link, membership, channel rules,
