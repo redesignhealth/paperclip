@@ -6,7 +6,10 @@
   "files": {
     ".github/workflows/ci-routing.yml": {
       "upstream_sha256": "bfeff99d50e6a31a8d503ec4b8b00e53e0198a883217f982e388195abe79a571",
-      "fork_edits": []
+      "fork_edits": [
+        "jobs.gate.steps[plan].env -> add EVENT_REPOSITORY (github.repository)",
+        "jobs.gate.steps[plan].run -> fail closed (emit empty plan) unless EVENT_REPOSITORY == 'paperclipai/paperclip'; planner stays off on the fork until ci-plan.mjs, ci-inputs.mjs, ci-diff.mjs and ci-task-matrix.json are ported"
+      ]
     },
     ".github/workflows/pr-trusted.yml": {
       "upstream_sha256": "6a14f4a8e478f7152578723a8f45d42ab147e828a226b7b617440316fce585bf",

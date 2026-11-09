@@ -14,6 +14,12 @@ import { companySkillService } from "../services/company-skills.ts";
 import { removeRuntimeSkillCache } from "../services/runtime-skill-cache.js";
 import { folderService } from "../services/folders.js";
 
+vi.mock("../services/remote-http-fetch.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/remote-http-fetch.js")>()),
+  // These tests stub global fetch for GitHub hosts; the guard itself is covered in github-fetch.test.ts.
+  guardedRemoteHttpFetch: (url: string | URL, init: RequestInit) => fetch(url.toString(), init),
+}));
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 

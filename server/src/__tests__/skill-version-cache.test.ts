@@ -12,6 +12,12 @@ import { skillVersionCachePaths, touchSkillVersionCache, withSkillVersionCacheLo
 import { skillVersionRetentionService } from "../services/skill-version-retention.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+
+vi.mock("../services/remote-http-fetch.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/remote-http-fetch.js")>()),
+  // These tests stub global fetch for GitHub hosts; the guard itself is covered in github-fetch.test.ts.
+  guardedRemoteHttpFetch: (url: string | URL, init: RequestInit) => fetch(url.toString(), init),
+}));
 async function sweepSkillVersionCache(db: ReturnType<typeof createDb>, options: { companyId: string; now?: number; dryRun?: boolean }) {
   const result = await skillVersionRetentionService(db).pruneCompany(options.companyId, { dryRun: options.dryRun, now: options.now === undefined ? undefined : new Date(options.now) });
   return { ...result, evicted: result.removed };
