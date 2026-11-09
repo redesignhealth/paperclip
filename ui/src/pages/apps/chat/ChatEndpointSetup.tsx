@@ -281,8 +281,11 @@ function ChatSdkEndpointSetup() {
   // TECH-7988: a draft selection wins until the server answers. An existing
   // endpoint reflects its saved request, including a pending change.
   const savedSlackOptIns = slackOptInUiState(endpoint);
-  // A new app (no endpoint yet) starts with the default groups; a saved endpoint shows what it actually requested.
-  const slackOptIns = slackOptInDraft ?? (endpoint ? savedSlackOptIns.requested : [...SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS]);
+  // A new app (no endpoint yet) starts with Proactive DMs on in a private company and off in a shared one; a saved
+  // endpoint shows what it actually requested.
+  const slackOptIns = slackOptInDraft ?? (endpoint
+    ? savedSlackOptIns.requested
+    : selectedCompany?.visibility === "private" ? [...SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS] : []);
   const syncEndpointSnapshot = (
     next: ChatEndpoint,
     onlyIfStillVisible = false,

@@ -210,13 +210,11 @@ idempotent wakeup outbox. Provider outages leave durable delivery state for retr
 The agent can use `slack_open_dm` to open its DM with the current task's linked
 responsible user, or, by passing `user` (a Slack user ID), with any other active
 member of the bot's workspace, followed by `slack_post_message`. This needs
-`im:write` (the Proactive DMs permission, on by default for new apps); existing apps
+`im:write` (the Proactive DMs permission, on by default for new apps in private companies and off in shared ones); existing apps
 without that scope require reinstalling with the updated manifest. The target must
 be a full member of the bot's own workspace: bots, deactivated users, guests and
-people from other workspaces are refused. A DM with someone other than the
-requester counts as a new destination, so a task that has read private content
-cannot send it there. Reading another person's bot DM stays refused; only posting is
-allowed. Scheduling uses ordinary Paperclip routines,
+people from other workspaces are refused. With the same permission the agent can also
+read and post in those DMs. Scheduling uses ordinary Paperclip routines,
 not a Slack-specific timer. Routine results are sent explicitly through the tool;
 ordinary task finals are not automatically broadcast to Slack.
 

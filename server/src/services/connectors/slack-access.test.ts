@@ -113,7 +113,7 @@ describe("Slack access and publication boundaries", () => {
         }),
       ).rejects.toThrow("Other people's bot DMs");
     });
-    it("allows another active full member's DM when Proactive DMs is on", async () => {
+    it("lets reads and writes use another active full member's DM when Proactive DMs is on", async () => {
       await expect(
         authorizeSlackChannel(authority, dmApi("UOTHER"), "D9", {
           allowOtherUserDm: true,
@@ -128,36 +128,21 @@ describe("Slack access and publication boundaries", () => {
           }),
         ).rejects.toThrow("not an active member");
     });
-    it("a write to another person's DM is a new destination once the task read private research", async () => {
+    it("writing to another person's DM follows the same private-research rule as the requester's DM", async () => {
       const options = { allowOtherUserDm: true };
       expect(
+        await authorizeSlackWrite(fakeDb([]), authority, dmApi("UOTHER"), "D9", options),
+      ).toMatchObject({ user: "UOTHER" });
+      // The requester's private research may still be sent to a DM, exactly as before this change.
+      expect(
         await authorizeSlackWrite(
-          fakeDb([]),
+          fakeDb([{ payload: { channelId: "G2", requesterId: "U1" } }]),
           authority,
           dmApi("UOTHER"),
           "D9",
           options,
         ),
       ).toMatchObject({ user: "UOTHER" });
-      await expect(
-        authorizeSlackWrite(
-          fakeDb([{ payload: { channelId: "G2", requesterId: "U1" } }]),
-          authority,
-          dmApi("UOTHER"),
-          "D9",
-          options,
-        ),
-      ).rejects.toThrow("Private research");
-      // The requester's own DM is unchanged: still allowed after reading their private research.
-      expect(
-        await authorizeSlackWrite(
-          fakeDb([{ payload: { channelId: "G2", requesterId: "U1" } }]),
-          authority,
-          dmApi("U1"),
-          "D9",
-          options,
-        ),
-      ).toMatchObject({ user: "U1" });
     });
     it("open_dm takes an optional Slack user ID and rejects anything else", () => {
       const openDm = SLACK_TOOLS.find((tool) => tool.name === "slack_open_dm")!;

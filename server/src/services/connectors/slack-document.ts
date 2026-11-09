@@ -10,6 +10,7 @@ import {
 } from "./slack-client.js";
 import { slackMessage } from "./slack-message.js";
 import { authorizeSlackWrite } from "./slack-access.js";
+import { slackOtherUserDmsEnabled } from "./slack-opt-ins.js";
 
 export async function authorizeSlackDocument(
   db: Db,
@@ -71,7 +72,9 @@ export async function authorizeSlackDocument(
     if (!created && !destinations.includes(String(args.channel)))
       throw forbidden("Slack did not provide verifiable document destinations");
     for (const channel of destinations)
-      await authorizeSlackWrite(db, authority, api, channel);
+      await authorizeSlackWrite(db, authority, api, channel, {
+        allowOtherUserDm: await slackOtherUserDmsEnabled(db, authority.endpoint),
+      });
   }
   return file;
 }

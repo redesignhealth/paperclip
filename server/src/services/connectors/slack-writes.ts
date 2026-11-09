@@ -109,24 +109,6 @@ export async function executeSlackWrite(
     await authorizeSlackWrite(db, authority, api, String(args.channel), {
       allowOtherUserDm: await slackOtherUserDmsEnabled(db, authority.endpoint),
     });
-  // Opening a DM with someone other than the requester is a new destination: once this task has read private
-  // content it cannot be published there, exactly like a new channel.
-  if (
-    name === "slack_open_dm" &&
-    typeof args.user === "string" &&
-    args.user !== authority.slackUserId &&
-    !(await slackPublicationAllowed(
-      db,
-      binding.companyId,
-      authority.endpoint.id,
-      binding.issueId,
-      "new-dm",
-      args.user,
-    ))
-  )
-    throw forbidden(
-      "Open a DM with another person in a separate task before reading private research; its content cannot be published to a new destination",
-    );
   if (
     name === "slack_invite" &&
     (args.users as string[]).includes(authority.endpoint.botExternalId!)

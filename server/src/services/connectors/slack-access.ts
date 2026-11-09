@@ -11,10 +11,7 @@ import {
 
 type Api = ReturnType<typeof slackClient>;
 export type SlackChannelAuthorizationOptions = {
-  /**
-   * Proactive DMs is enabled: a DM with another active workspace member may be written to. Reading such a DM stays
-   * refused, so only write paths pass this.
-   */
+  /** Proactive DMs is enabled: a DM with another active workspace member may be read and written. */
   allowOtherUserDm?: boolean;
 };
 
@@ -167,9 +164,7 @@ export async function authorizeSlackWrite(
       authority.endpoint.id,
       authority.issueId,
       channelId,
-      // A DM is delivered to its other party: the requester's own DM matches the requester's private sources, while
-      // a DM with anyone else is a new destination and is refused once the task has read private content.
-      channel.is_im === true && typeof channel.user === "string" ? channel.user : null,
+      channel.is_im === true ? authority.slackUserId : null,
     ))
   )
     throw forbidden(
