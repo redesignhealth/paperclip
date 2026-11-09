@@ -11,6 +11,7 @@ import {
   ALLOWED_SWEEP_FLAGS,
   main as runMemoryUpgradeCli,
   runSweepCli,
+  sanitizeCliErrorMessage,
   scrubDsnSecrets,
   validateNoUnknownFlags,
 } from "../memory-upgrade.js";
@@ -28,6 +29,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./memory-upgrade-sweep-helpers.js";
 import { openTenantClient } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import { CompanyMemoryUpgradeError } from "../../server/src/services/company-memory-upgrade/types.js";
 
 test("sweep CLI validation and flags", async (t) => {
   await t.test("scrubDsnSecrets scrubs credentials from URLs", () => {
@@ -334,6 +336,74 @@ test("sweep CLI validation and flags", async (t) => {
       console.error = origError;
     }
   });
+
+  await t.test("sanitizeCliErrorMessage maps downstream admission and state errors to generic messages without echoing identifiers", () => {
+    const markerSecret = "marker_secret_identifier_downstream_7788";
+
+    // 1. Admission: COMPANY_DELETION_IN_PROGRESS
+    const errDel = new CompanyMemoryUpgradeError(
+      `Company ${markerSecret} is undergoing deletion`,
+      "COMPANY_DELETION_IN_PROGRESS",
+    );
+    const msgDel = sanitizeCliErrorMessage(errDel);
+    assert.ok(!msgDel.includes(markerSecret), "Must never echo company ID from deletion error");
+    assert.equal(msgDel, "[COMPANY_DELETION_IN_PROGRESS] Target company is undergoing deletion.");
+
+    // 2. Admission: COMPANY_NOT_FOUND
+    const errNotFound = new CompanyMemoryUpgradeError(
+      `Company ${markerSecret} not found in control plane database.`,
+      "COMPANY_NOT_FOUND",
+    );
+    const msgNotFound = sanitizeCliErrorMessage(errNotFound);
+    assert.ok(!msgNotFound.includes(markerSecret), "Must never echo company ID from not-found error");
+    assert.equal(msgNotFound, "[COMPANY_NOT_FOUND] Target company record does not exist in control plane database.");
+
+    // 3. State machine: ACTIVE_UPGRADE_EXISTS
+    const errActive = new CompanyMemoryUpgradeError(
+      `An active memory upgrade is already in progress for company ${markerSecret}`,
+      "ACTIVE_UPGRADE_EXISTS",
+    );
+    const msgActive = sanitizeCliErrorMessage(errActive);
+    assert.ok(!msgActive.includes(markerSecret), "Must never echo company ID from active-upgrade error");
+    assert.equal(msgActive, "[ACTIVE_UPGRADE_EXISTS] An active memory upgrade is already in progress for target company.");
+
+    // 4. State machine: UPGRADE_NOT_FOUND
+    const errUpNotFound = new CompanyMemoryUpgradeError(
+      `Upgrade ${markerSecret} not found`,
+      "UPGRADE_NOT_FOUND",
+    );
+    const msgUpNotFound = sanitizeCliErrorMessage(errUpNotFound);
+    assert.ok(!msgUpNotFound.includes(markerSecret), "Must never echo upgrade ID from not-found error");
+    assert.equal(msgUpNotFound, "[UPGRADE_NOT_FOUND] Upgrade record not found.");
+
+    // 5. State machine: STATE_MISMATCH with arbitrary downstream text
+    const errStateMismatch = new CompanyMemoryUpgradeError(
+      `State mismatch for upgrade ${markerSecret}: invalid state`,
+      "STATE_MISMATCH",
+    );
+    const msgStateMismatch = sanitizeCliErrorMessage(errStateMismatch);
+    assert.ok(!msgStateMismatch.includes(markerSecret), "Must never echo upgrade ID from state mismatch error");
+    assert.equal(msgStateMismatch, "[STATE_MISMATCH] Cannot run sweep: active upgrade is not in sweeping state.");
+
+    // 6. State machine: LEASE_FENCED_OUT with arbitrary downstream text
+    const errLeaseFenced = new CompanyMemoryUpgradeError(
+      `Lease token mismatch for upgrade ${markerSecret}`,
+      "LEASE_FENCED_OUT",
+    );
+    const msgLeaseFenced = sanitizeCliErrorMessage(errLeaseFenced);
+    assert.ok(!msgLeaseFenced.includes(markerSecret), "Must never echo upgrade ID from lease error");
+    assert.equal(msgLeaseFenced, "[LEASE_FENCED_OUT] Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.");
+
+    // 7. Untrusted class or custom error with secret marker code & message (don't just trust class)
+    const errCustom = new CompanyMemoryUpgradeError(
+      `Secret internal details: ${markerSecret}`,
+      "SECRET_DOWNSTREAM_CODE_1234",
+    );
+    const msgCustom = sanitizeCliErrorMessage(errCustom);
+    assert.ok(!msgCustom.includes(markerSecret), "Must never echo custom message from untrusted error");
+    assert.ok(!msgCustom.includes("SECRET_DOWNSTREAM_CODE_1234"), "Must never echo custom code from untrusted error");
+    assert.equal(msgCustom, "[unexpected_failure] An unexpected error occurred during upgrade.");
+  });
 });
 
 test("sweep CLI database integration", async (t) => {
@@ -465,6 +535,51 @@ test("sweep CLI database integration", async (t) => {
         assert.ok(stderr.includes("status is not ready"));
         assert.ok(!stderr.includes(comp.id));
       }
+    } finally {
+      console.error = origError;
+    }
+  });
+
+  await t.test("downstream admission: company undergoing deletion fails closed without echoing company id", async () => {
+    let stderr = "";
+    const origError = console.error;
+    console.error = (msg: string) => { stderr += `${msg}\n`; };
+
+    const markerCompanyId = randomUUID();
+    const [delComp] = await cpAdminDb.insert(companies).values({
+      id: markerCompanyId,
+      name: "Deletion Test Co",
+      issuePrefix: "DT",
+      deletionStartedAt: new Date(),
+    }).returning();
+
+    const compDbName = `del_db_${markerCompanyId.replace(/-/g, "").slice(0, 12)}`;
+    const compDbRole = `del_r_${markerCompanyId.replace(/-/g, "").slice(0, 12)}`;
+    await cpAdminDb.insert(companyMemoryDatabases).values({
+      companyId: delComp.id,
+      databaseName: compDbName,
+      databaseRole: compDbRole,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    try {
+      const exit = await runSweepCli([
+        "--database-url", tenantUserUrl.toString(),
+        "--control-plane-url", cpUserUrl.toString(),
+        "--company", delComp.id,
+        "--confirm", delComp.id,
+        "--pause-when-active-runs", "0",
+      ], {
+        _internalSkipVectorIdentityCheck: true,
+        _internalDatabaseIdentityOverride: { database: compDbName, user: compDbRole },
+      });
+
+      assert.equal(exit, 1);
+      assert.ok(stderr.includes("[COMPANY_DELETION_IN_PROGRESS]"));
+      assert.ok(stderr.includes("Target company is undergoing deletion."));
+      assert.ok(!stderr.includes(markerCompanyId), "Downstream admission error must never echo company ID");
     } finally {
       console.error = origError;
     }

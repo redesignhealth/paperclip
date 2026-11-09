@@ -467,6 +467,122 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
     assert.equal(upgradeAfterFail.leaseToken, null, "Lease token must be cleared on failure path in finally");
   });
 
+  await t.test("Item 20: injected cleanup error code='marker_secret_cleanup' absent output, primary failure retained", async () => {
+    const clock = new ManualClock(4_500_000);
+    const [comp] = await cpDb.insert(companies).values({ name: "Cleanup Error Co", issuePrefix: "CE" }).returning();
+    const dbName = `tn_db_${comp.id.slice(0, 8)}`;
+    const role = `role_${comp.id.slice(0, 8)}`;
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: comp.id,
+      databaseName: dbName,
+      databaseRole: role,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    await cpDb.insert(agents).values({
+      companyId: comp.id,
+      name: "CE Agent",
+      adapterType: "hermes_local",
+      status: "active",
+    });
+
+    await setupTenantMem0Table(tenantWorkerSql, "mem0_ce");
+    await insertTenantMemoryRow(tenantWorkerSql, {
+      id: randomUUID(),
+      agentId: "agent_ce",
+      userId: "user_ce",
+      data: "Memory to read before simulated failure",
+      tableName: "mem0_ce",
+    });
+
+    let failCleanup = false;
+    const brokenSql = new Proxy(tenantWorkerSql, {
+      get(target, prop, receiver) {
+        if (prop === "unsafe") {
+          return async (...args: any[]) => {
+            const queryStr = String(args[0] ?? "");
+            if (queryStr.includes("mem0_ce") && (queryStr.includes("t.payload") || queryStr.includes("ORDER BY"))) {
+              failCleanup = true;
+              throw new CompanyMemoryUpgradeError("Primary tenant read error", "SOURCE_READ_FAILED");
+            }
+            return (target as any).unsafe(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const proxyCpDb = new Proxy(cpWorkerDb, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return (...args: any[]) => {
+            if (failCleanup) {
+              const cleanupErr = new Error("secret cleanup internal exception");
+              (cleanupErr as any).code = "marker_secret_cleanup";
+              throw cleanupErr;
+            }
+            return (target as any).update(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    let stderrOutput = "";
+    const origError = console.error;
+    console.error = (...args: any[]) => {
+      stderrOutput += `${args.join(" ")}\n`;
+    };
+
+    try {
+      await assert.rejects(
+        async () => {
+          await runSweep(
+            {
+              databaseUrl: tenantWorkerUrl.toString(),
+              controlPlaneUrl: cpWorkerUrl.toString(),
+              companyId: comp.id,
+              tableName: "mem0_ce",
+              pauseWhenActiveRuns: 0,
+            },
+            {
+              controlPlaneDb: proxyCpDb,
+              tenantSql: brokenSql,
+              clock,
+              _internalSkipVectorIdentityCheck: true,
+              _internalDatabaseIdentityOverride: { database: dbName, user: role },
+            },
+          );
+        },
+        (err: any) => {
+          assert.ok(err instanceof CompanyMemoryUpgradeError);
+          assert.equal(err.code, "SOURCE_READ_FAILED");
+          assert.equal(err.message, "Primary tenant read error");
+          return true;
+        },
+      );
+
+      // Verify the injected cleanup error code is ABSENT from console.error output
+      assert.ok(
+        !stderrOutput.includes("marker_secret_cleanup"),
+        "Cleanup error code 'marker_secret_cleanup' must never appear in output",
+      );
+      assert.ok(
+        !stderrOutput.includes("secret cleanup internal exception"),
+        "Cleanup error message must never appear in output",
+      );
+      // Verify bounded guarded error code is printed instead
+      assert.ok(
+        stderrOutput.includes("unexpected_failure"),
+        "Guarded code unexpected_failure should be output for unmapped cleanup error",
+      );
+    } finally {
+      console.error = origError;
+    }
+  });
+
   await t.test("Item 20: CONVERTER_CONTRACT_MISMATCH and needs_recovery refusal", async () => {
     const clock = new ManualClock(5_000_000);
     const [comp] = await cpDb.insert(companies).values({ name: "Contract Refusal Co", issuePrefix: "CR" }).returning();

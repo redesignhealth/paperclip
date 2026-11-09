@@ -408,26 +408,166 @@ Options:
 
 export interface RunSweepCliDependencies extends SweepDependencies {}
 
+const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
+  COMPANY_NOT_FOUND: "Target company record does not exist in control plane database.",
+  company_not_found: "Target company record does not exist in control plane database.",
+
+  COMPANY_DELETION_IN_PROGRESS: "Target company is undergoing deletion.",
+  company_deletion_in_progress: "Target company is undergoing deletion.",
+
+  ACTIVE_UPGRADE_EXISTS: "An active memory upgrade is already in progress for target company.",
+  active_upgrade_exists: "An active memory upgrade is already in progress for target company.",
+
+  UPGRADE_NOT_FOUND: "Upgrade record not found.",
+  upgrade_not_found: "Upgrade record not found.",
+
+  CONVERTER_CONTRACT_MISMATCH: "Upgrade record converter contract or collection mismatch.",
+  converter_contract_mismatch: "Upgrade record converter contract or collection mismatch.",
+
+  LEASE_FENCED_OUT: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
+  lease_fenced_out: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
+
+  LEASE_EXPIRED: "Upgrade lease has expired.",
+  lease_expired: "Upgrade lease has expired.",
+
+  LEASE_LAPSED: "Upgrade lease has lapsed.",
+  lease_lapsed: "Upgrade lease has lapsed.",
+
+  CAS_FAILED: "Failed to advance upgrade state.",
+  cas_failed: "Failed to advance upgrade state.",
+
+  INVALID_RECOVERY: "Upgrade cannot be recovered from current state.",
+  invalid_recovery: "Upgrade cannot be recovered from current state.",
+
+  INVALID_STATE: "Cannot update counters for upgrade: invalid state.",
+  invalid_state: "Cannot update counters for upgrade: invalid state.",
+
+  ILLEGAL_TRANSITION: "Illegal upgrade state transition.",
+  illegal_transition: "Illegal upgrade state transition.",
+
+  ROLLBACK_REFUSED: "Rollback refused from current state.",
+  rollback_refused: "Rollback refused from current state.",
+
+  UNSUPPORTED_SOURCE_ID: "Collection table contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.",
+  unsupported_source_id: "Collection table contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.",
+
+  ACTIVE_RUN_TIMEOUT: "Active heartbeat runs paused longer than limit.",
+  active_run_timeout: "Active heartbeat runs paused longer than limit.",
+  paused_too_long: "Active heartbeat runs paused longer than limit.",
+
+  DRAIN_TIMEOUT: "Drain timeout exceeded.",
+  drain_timeout: "Drain timeout exceeded.",
+
+  STAGING_WRITE_FAILED: "Failed to write to staging ledger.",
+  staging_write_failed: "Failed to write to staging ledger.",
+
+  PUBLISH_FAILED: "Failed to publish upgraded memories.",
+  publish_failed: "Failed to publish upgraded memories.",
+
+  VERIFICATION_FAILED: "Upgrade verification failed.",
+  verification_failed: "Upgrade verification failed.",
+
+  UNEXPECTED_FAILURE: "An unexpected error occurred during upgrade.",
+  unexpected_failure: "An unexpected error occurred during upgrade.",
+};
+
+const SAFE_COMPANY_BINDING_MISMATCH_MESSAGES = new Set([
+  "No company_memory_databases record found for target company.",
+  "Company memory database binding status is not ready (refusing pending, failed, deprovisioning, archived).",
+  "Company memory database binding mismatch between control plane and connected tenant.",
+  "Company memory database binding mismatch with derived credentials.",
+  "Tenant database does not have vector extension or vector column enabled for company memory.",
+]);
+
+const SAFE_STATE_MISMATCH_MESSAGES = new Set([
+  "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
+  "Cannot run sweep: active upgrade is not in sweeping state.",
+]);
+
+const SAFE_OUTPUT_PATH_REJECTED_MESSAGES = new Set([
+  "Refusing to write output inside repository. Memory reports contain sensitive identifiers. Use an external directory such as /tmp.",
+  "Parent directory does not exist. The output parent directory must exist prior to execution.",
+  "Refusing to write output inside repository via symlinked parent. Use an external directory such as /tmp.",
+]);
+
+const SAFE_INVALID_ARGUMENT_PREFIXES = [
+  "Invalid --",
+  "Flag '",
+  "Unknown option '",
+  "Refusing to connect to non-local host",
+  "Refusing to target non-localhost database",
+];
+
 export function sanitizeCliErrorMessage(error: unknown): string {
-  if (error instanceof CompanyMemoryUpgradeError) {
-    const scrubbed = scrubDsnSecrets(error.message);
-    return `[${error.code}] ${scrubbed}`;
-  }
   if (error && typeof error === "object") {
-    const err = error as { code?: string; message?: string };
-    if (err.code === "EEXIST") {
-      return "Output file already exists (flag 'wx' requires exclusive creation).";
-    }
-    if (err.code === "EACCES") {
-      return "Permission denied writing output file.";
-    }
-    if (err.code === "ENOENT") {
-      return "Output file path or parent directory not found.";
-    }
-    if (err.code === "ECONNREFUSED") {
-      return "Database connection refused.";
+    const err = error as { code?: unknown; message?: unknown };
+    const code = typeof err.code === "string" ? err.code : undefined;
+    const rawMsg = typeof err.message === "string" ? err.message : "";
+
+    if (code) {
+      if (code === "COMPANY_BINDING_MISMATCH" || code === "company_binding_mismatch") {
+        const msg = SAFE_COMPANY_BINDING_MISMATCH_MESSAGES.has(rawMsg)
+          ? rawMsg
+          : "Company memory database binding mismatch between control plane and connected tenant.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "STATE_MISMATCH" || code === "state_mismatch") {
+        const msg = SAFE_STATE_MISMATCH_MESSAGES.has(rawMsg)
+          ? rawMsg
+          : "Cannot run sweep: active upgrade is not in sweeping state.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "OUTPUT_PATH_REJECTED" || code === "output_path_rejected") {
+        const msg = SAFE_OUTPUT_PATH_REJECTED_MESSAGES.has(rawMsg)
+          ? rawMsg
+          : "Invalid --output path.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "INVALID_ARGUMENT" || code === "invalid_argument") {
+        const isSafe = SAFE_INVALID_ARGUMENT_PREFIXES.some((prefix) => rawMsg.startsWith(prefix));
+        const msg = isSafe ? scrubDsnSecrets(rawMsg) : "Invalid command argument.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "PROD_GUARD_ENFORCED" || code === "prod_guard_enforced") {
+        return `[${code}] ${scrubDsnSecrets(rawMsg)}`;
+      }
+
+      if (code === "INVALID_DATABASE_URL" || code === "invalid_database_url") {
+        return `[${code}] Invalid database URL. Must be a valid postgresql:// or postgres:// connection string.`;
+      }
+
+      if (code === "DATABASE_IDENTITY_UNAVAILABLE" || code === "database_identity_unavailable") {
+        return `[${code}] Unable to determine current database and user identity from tenant connection.`;
+      }
+
+      const generic = SWEEP_CLI_GENERIC_ERROR_MESSAGES[code];
+      if (generic) {
+        return `[${code}] ${generic}`;
+      }
+
+      if (code === "EEXIST") {
+        return "Output file already exists (flag 'wx' requires exclusive creation).";
+      }
+      if (code === "EACCES") {
+        return "Permission denied writing output file.";
+      }
+      if (code === "ENOENT") {
+        return "Output file path or parent directory not found.";
+      }
+      if (code === "ECONNREFUSED") {
+        return "Database connection refused.";
+      }
     }
   }
+
+  if (error instanceof CompanyMemoryUpgradeError) {
+    return "[unexpected_failure] An unexpected error occurred during upgrade.";
+  }
+
   const rawMessage = error instanceof Error ? error.message : String(error);
   return scrubDsnSecrets(rawMessage);
 }

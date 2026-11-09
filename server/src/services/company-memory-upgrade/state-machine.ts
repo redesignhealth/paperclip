@@ -194,7 +194,7 @@ export async function openUpgrade(
         String(cause?.message).includes("company_memory_upgrades_active_uq")
       ) {
         throw new CompanyMemoryUpgradeError(
-          `An active memory upgrade is already in progress for company ${params.companyId}`,
+          "An active memory upgrade is already in progress for target company.",
           "ACTIVE_UPGRADE_EXISTS",
         );
       }
@@ -555,28 +555,28 @@ export async function advanceState(
       .where(eq(companyMemoryUpgrades.id, id));
 
     if (!existing) {
-      throw new CompanyMemoryUpgradeError(`Upgrade ${id} not found`, "UPGRADE_NOT_FOUND");
+      throw new CompanyMemoryUpgradeError("Upgrade record not found", "UPGRADE_NOT_FOUND");
     }
     if (existing.state !== from) {
       throw new CompanyMemoryUpgradeError(
-        `State mismatch for upgrade ${id}: current state does not match expected state`,
+        "State mismatch: current state does not match expected state",
         "STATE_MISMATCH",
       );
     }
     if (existing.leaseToken !== leaseToken) {
       throw new CompanyMemoryUpgradeError(
-        `Lease token mismatch for upgrade ${id}`,
+        "Lease token mismatch for upgrade",
         "LEASE_FENCED_OUT",
       );
     }
     if (existing.leaseExpiresAt && existing.leaseExpiresAt <= now) {
       throw new CompanyMemoryUpgradeError(
-        `Lease expired for upgrade ${id}`,
+        "Lease expired for upgrade",
         "LEASE_EXPIRED",
       );
     }
     throw new CompanyMemoryUpgradeError(
-      `Failed to advance state for upgrade ${id}`,
+      "Failed to advance state for upgrade",
       "CAS_FAILED",
     );
   }
@@ -690,12 +690,12 @@ export async function recoverUpgrade(
     .where(eq(companyMemoryUpgrades.id, id));
 
   if (!existing) {
-    throw new CompanyMemoryUpgradeError(`Upgrade ${id} not found`, "UPGRADE_NOT_FOUND");
+    throw new CompanyMemoryUpgradeError("Upgrade record not found", "UPGRADE_NOT_FOUND");
   }
 
   if (existing.state !== "needs_recovery") {
     throw new CompanyMemoryUpgradeError(
-      `Cannot recover upgrade ${id}: current state is not needs_recovery`,
+      "Cannot recover upgrade: current state is not needs_recovery",
       "INVALID_RECOVERY",
     );
   }
@@ -703,7 +703,7 @@ export async function recoverUpgrade(
   const priorState = existing.recoverToState as UpgradeState | null;
   if (!priorState || !ACTIVE_PRE_LAPSE_STATES.has(priorState)) {
     throw new CompanyMemoryUpgradeError(
-      `Cannot recover upgrade ${id}: invalid or missing recover_to_state`,
+      "Cannot recover upgrade: invalid or missing recover_to_state",
       "INVALID_RECOVERY",
     );
   }
@@ -917,28 +917,28 @@ export async function updateUpgradeCounters(
       .where(eq(companyMemoryUpgrades.id, id));
 
     if (!existing) {
-      throw new CompanyMemoryUpgradeError(`Upgrade ${id} not found`, "UPGRADE_NOT_FOUND");
+      throw new CompanyMemoryUpgradeError("Upgrade record not found", "UPGRADE_NOT_FOUND");
     }
     if (!ACTIVE_PRE_LAPSE_STATES.has(existing.state as UpgradeState)) {
       throw new CompanyMemoryUpgradeError(
-        `Cannot update counters for upgrade ${id}: invalid state`,
+        "Cannot update counters for upgrade: invalid state",
         "INVALID_STATE",
       );
     }
     if (existing.leaseToken !== leaseToken) {
       throw new CompanyMemoryUpgradeError(
-        `Lease token mismatch for upgrade ${id}`,
+        "Lease token mismatch for upgrade",
         "LEASE_FENCED_OUT",
       );
     }
     if (existing.leaseExpiresAt && existing.leaseExpiresAt <= now) {
       throw new CompanyMemoryUpgradeError(
-        `Lease expired for upgrade ${id}`,
+        "Lease expired for upgrade",
         "LEASE_EXPIRED",
       );
     }
     throw new CompanyMemoryUpgradeError(
-      `Failed to update counters for upgrade ${id}`,
+      "Failed to update counters for upgrade",
       "CAS_FAILED",
     );
   }

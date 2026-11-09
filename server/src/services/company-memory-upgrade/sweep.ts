@@ -227,6 +227,13 @@ export function formatSweepTextReport(report: SweepReport): string {
   return lines.join("\n");
 }
 
+function guardCleanupErrorCode(err: unknown): UpgradeErrorCode {
+  if (err && typeof err === "object" && "code" in err && typeof (err as any).code === "string") {
+    return mapSweepErrorCode((err as any).code);
+  }
+  return "unexpected_failure";
+}
+
 export async function runSweep(
   options: SweepOptions,
   deps: SweepDependencies = {},
@@ -754,40 +761,40 @@ export async function runSweep(
             { lastError: errorCode },
             { clock },
           ).catch((cleanupErr: any) => {
-            console.error("[memory-upgrade] failed to record lastError:", cleanupErr?.code || "CLEANUP_ERROR");
+            console.error("[memory-upgrade] failed to record lastError:", guardCleanupErrorCode(cleanupErr));
           });
         }
       } catch (err: any) {
-        console.error("[memory-upgrade] error in lastError recording:", err?.code || "CLEANUP_ERROR");
+        console.error("[memory-upgrade] error in lastError recording:", guardCleanupErrorCode(err));
       }
     }
     throw error;
   } finally {
     if (heartbeatHandle) {
       await heartbeatHandle.stop().catch((err: any) => {
-        console.error("[memory-upgrade] heartbeat stop error:", err?.code || "CLEANUP_ERROR");
+        console.error("[memory-upgrade] heartbeat stop error:", guardCleanupErrorCode(err));
       });
     }
 
     if (upgradeId && leaseToken) {
       try {
         await releaseUpgradeLease(cpDb, upgradeId, leaseToken, { clock }).catch((err: any) => {
-          console.error("[memory-upgrade] lease release error:", err?.code || "CLEANUP_ERROR");
+          console.error("[memory-upgrade] lease release error:", guardCleanupErrorCode(err));
         });
       } catch (err: any) {
-        console.error("[memory-upgrade] lease release failure:", err?.code || "CLEANUP_ERROR");
+        console.error("[memory-upgrade] lease release failure:", guardCleanupErrorCode(err));
       }
     }
 
     if (ownsTenantSql) {
       await tenantSql.end().catch((err: any) => {
-        console.error("[memory-upgrade] tenant connection close error:", err?.code || "CLEANUP_ERROR");
+        console.error("[memory-upgrade] tenant connection close error:", guardCleanupErrorCode(err));
       });
     }
 
     if (ownsCpDb) {
       await cpDb.$client?.end().catch((err: any) => {
-        console.error("[memory-upgrade] control plane connection close error:", err?.code || "CLEANUP_ERROR");
+        console.error("[memory-upgrade] control plane connection close error:", guardCleanupErrorCode(err));
       });
     }
   }
