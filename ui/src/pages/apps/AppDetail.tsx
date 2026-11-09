@@ -58,7 +58,7 @@ import { appTabHref, appTabLabel, isAppTabKey, type AppTabKey } from "./app-tabs
 import { ConnectionProvenanceChip } from "./ConnectionProvenanceChip";
 import { IdentitiesSection } from "./app-detail/IdentitiesSection";
 import { PermissionsPanel } from "./app-detail/PermissionsPanel";
-import { accessForConnection } from "./app-detail/personal-access";
+import { accessForConnection, installsAfterPick } from "./app-detail/personal-access";
 import { AgentConnectionAccess } from "./app-detail/AgentConnectionAccess";
 import { ConnectedAggregatorApps } from "./app-detail/ConnectedAggregatorApps";
 import { isAppAggregator } from "@paperclipai/shared/aggregator-apps";
@@ -308,6 +308,15 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   );
   const managesRemoteMcpAccess = isRemoteMcpConnectorMethod(connection?.config?.sourceTemplateKey, connection?.config?.connectionMethodKey);
   const agents = agentsQuery.data ?? [];
+  // On an ordinary tool connection the agent picker IS the install: an agent only gets a connection's tools
+  // with an explicit per-agent install row (a permission binding does not turn a default-MCP agent on), so
+  // choosing an agent installs it and clearing it uninstalls it. Personal default-MCP instances install through
+  // their own guarded setup path, and AI / remote-MCP connections manage installs elsewhere.
+  const pickerInstallsAgents =
+    connection?.connectionPurpose !== "ai"
+    && !managesRemoteMcpAccess
+    && !isPersonalDefaultMcpInstance(connection?.config)
+    && managedDefaultMcpKind(connection?.config) === null;
   const disconnectRemote = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
     onSuccess: () => {
@@ -326,15 +335,30 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       askFirst: Set<string>;
       access: AccessDraft;
       reviewed?: Set<string>;
+      /** True only when this save changes who may use the connection (the agent picker), not for action toggles. */
+      accessChanged?: boolean;
     }) => {
       return connection?.connectionPurpose === "ai"
       ? toolsApi.putConnectionInstalls(connectionId, next.access.mode === "all" ? [{ targetType: "company", targetId: selectedCompanyId! }] : [...next.access.agentIds].map(targetId => ({ targetType: "agent" as const, targetId })))
-      : toolsApi.finishApp(selectedCompanyId!, connectionId, {
-        enabledCatalogEntryIds: [...next.enabled],
-        askFirstCatalogEntryIds: [...next.askFirst].filter((id) => next.enabled.has(id)),
-        ...(next.reviewed ? { reviewedCatalogEntryIds: [...next.reviewed] } : {}),
-        access: next.access.mode === "all" ? "all_agents" : { agentIds: [...next.access.agentIds] },
-      });
+      : (async () => {
+        const finished = await toolsApi.finishApp(selectedCompanyId!, connectionId, {
+          enabledCatalogEntryIds: [...next.enabled],
+          askFirstCatalogEntryIds: [...next.askFirst].filter((id) => next.enabled.has(id)),
+          ...(next.reviewed ? { reviewedCatalogEntryIds: [...next.reviewed] } : {}),
+          access: next.access.mode === "all" ? "all_agents" : { agentIds: [...next.access.agentIds] },
+        });
+        if (pickerInstallsAgents && next.accessChanged && next.access.mode === "specific") {
+          const wanted = installsAfterPick(install.agentIds, next.access.agentIds);
+          if (wanted) {
+            await toolsApi.putConnectionInstalls(connectionId, [
+              // PUT replaces the whole list, so a company-wide install row must be sent back to survive.
+              ...(install.onAll ? [{ targetType: "company" as const, targetId: selectedCompanyId! }] : []),
+              ...wanted.map((targetId) => ({ targetType: "agent" as const, targetId })),
+            ]);
+          }
+        }
+        return finished;
+      })();
     },
     onMutate: () => setPending(true),
     onSuccess: () => {
@@ -347,12 +371,17 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.apps.attention(selectedCompanyId!) });
     },
-    onError: (error) =>
+    onError: (error) => {
+      // A picker save is two calls (bindings, then installs); if the second fails the page must re-read both.
+      void installsQuery.refetch();
+      queryClient.invalidateQueries({ queryKey: queryKeys.tools.connection(connectionId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.tools.profiles(selectedCompanyId!) });
       pushToast({
         title: "Couldn't save that",
         body: error instanceof Error ? error.message : "Please try again.",
         tone: "error",
-      }),
+      });
+    },
     onSettled: () => setPending(false),
   });
 
@@ -520,6 +549,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       askFirst: mutate.askFirst ?? new Set(askFirstIds),
       access: mutate.access ?? access,
       reviewed: mutate.reviewed,
+      accessChanged: mutate.access !== undefined,
     });
 
   const reviewQuarantined = (allowedIds: string[]) => {
@@ -750,7 +780,8 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                 appName={baseAppName}
                 agents={agents}
                 access={access}
-                anyAgentUnavailableReason={isPersonalDefaultMcpInstance(connection.config)
+                pickerOwnsInstalls={pickerInstallsAgents}
+                anyAgentUnavailableReason={isPersonalDefaultMcpInstance(connection.config) || (pickerInstallsAgents && connection.credentialPolicy === "per_user")
                   ? "This connection runs as one person's own sign-in, so it can't be shared with every agent."
                   : undefined}
                 install={connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? installStateFrom([]) : install}
@@ -766,7 +797,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                     ? "Shell Git and gh use this account for the run and are not constrained by per-tool Ask-first controls."
                     : undefined
                 }
-                onSaveAccess={(next) => apply({ access: connection.connectionPurpose === "ai" || managesRemoteMcpAccess ? next : accessIncludingInstalls(next, install) })}
+                onSaveAccess={(next) => apply({ access: connection.connectionPurpose === "ai" || managesRemoteMcpAccess || pickerInstallsAgents ? next : accessIncludingInstalls(next, install) })}
                 onRefreshActions={() => refreshTools.mutate()}
                 onSetActionPermission={(ids, next) => apply(actionPermissionMutation(ids, next, enabledIds, askFirstIds))}
                 onReviewQuarantined={reviewQuarantined}

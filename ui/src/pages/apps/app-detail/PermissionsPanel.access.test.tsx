@@ -7,7 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentAccessSection } from "./PermissionsPanel";
 import { installStateFrom } from "@/lib/tool-installs";
-import { accessForConnection } from "./personal-access";
+import { accessForConnection, installsAfterPick } from "./personal-access";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -93,5 +93,30 @@ describe("access draft for personal sign-in connections", () => {
   it("keeps an existing specific choice for a personal connection", () => {
     const draft = { mode: "specific" as const, agentIds: new Set(["agent-2"]) };
     expect(accessForConnection(draft, install, true)).toBe(draft);
+  });
+});
+
+describe("installs after the agent picker changes (TECH-8259)", () => {
+  const none = new Set<string>();
+
+  it("installs a picked agent", () => {
+    expect(installsAfterPick(none, new Set(["cos"]))).toEqual(["cos"]);
+  });
+
+  it("uninstalls an agent that is cleared from the picker", () => {
+    expect(installsAfterPick(new Set(["cos"]), none)).toEqual([]);
+  });
+
+  it("swaps one agent for another", () => {
+    expect(installsAfterPick(new Set(["a"]), new Set(["b"]))).toEqual(["b"]);
+  });
+
+  it("keeps an agent that stays picked and adds the new one", () => {
+    expect(installsAfterPick(new Set(["a"]), new Set(["a", "b"]))).toEqual(["a", "b"]);
+  });
+
+  it("saves nothing when the installs already match the picks", () => {
+    expect(installsAfterPick(new Set(["cos"]), new Set(["cos"]))).toBeNull();
+    expect(installsAfterPick(none, none)).toBeNull();
   });
 });

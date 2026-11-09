@@ -18,7 +18,7 @@ printf '{"type":"agent_end","success":true,"messages":[{"role":"assistant","cont
 `;
 
 const providers = JSON.stringify({
-  "ramp-router": { baseUrl: "https://api.router.com/v1", api: "openai-responses", apiKey: "RAMP_ROUTER_API_KEY", models: [{ id: "gpt-6-luna" }] },
+  "ramp-router": { baseUrl: "https://api.router.com/v1", api: "openai-responses", apiKey: "$RAMP_ROUTER_API_KEY", models: [{ id: "gpt-6-luna" }] },
 });
 
 let dir: string | undefined;

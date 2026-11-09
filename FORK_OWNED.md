@@ -84,12 +84,14 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/middleware/tenant-context.ts`
 - `server/src/services/scram-verifier.ts`
 - `server/src/services/company-memory-*.ts`
+- `server/src/services/company-memory-upgrade/`
 - `server/src/services/company-visibility-backfill.ts`
 - `packages/db/src/company-scope.ts`
 - `packages/db/src/rls.ts`
 - `packages/db/src/rls-boot-check.ts`
 - `packages/db/src/render-rls-migration.ts`
 - `packages/db/src/tenant-context.ts`
+- `packages/db/src/schema/company_memory_upgrades.ts`
 - `ui/src/pages/InstanceSsoSettings.tsx`
 - `ui/src/components/auth/`
 - `docker/sso/`
@@ -101,6 +103,7 @@ any new fork patch; remove one when the patch is upstreamed.
 - `.github/workflows/auto-approve-job.yml`
 - `.github/workflows/gate-tests.yml`
 - `.github/workflows/pr-trusted.yml`
+- `.github/workflows/ci-routing.yml`
 - `.github/rulesets/`
 - `.github/scripts/`
 - `docs/merge-policy.md`

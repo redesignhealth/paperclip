@@ -205,12 +205,14 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
   }
 
   // Fork migration 0374_reflective_paladin adds the nullable companies.visibility
-  // column after the replayed histories, so a retained company row gains
-  // `visibility: null` and must otherwise be unchanged.
+  // column and migration 0386_minor_clea adds nullable companies.deletion_started_at
+  // after the replayed histories, so a retained company row gains
+  // `visibility: null` and `deletion_started_at: null` and must otherwise be unchanged.
   function withoutForkAddedCompanyColumns<T extends { company: Record<string, unknown> } | undefined>(rows: T): T {
     if (!rows) return rows;
-    const { visibility, ...company } = rows.company;
+    const { visibility, deletion_started_at, ...company } = rows.company;
     expect(visibility ?? null).toBeNull();
+    expect(deletion_started_at ?? null).toBeNull();
     return { ...rows, company } as T;
   }
 

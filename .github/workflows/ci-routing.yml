@@ -373,6 +373,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_REPOSITORY: ${{ github.repository }}
           FULL_CI: ${{ steps.scope.outputs.full_ci }}
           PROFILE_CI: ${{ steps.profile.outputs.profile_ci }}
           FORCE_FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
@@ -383,6 +384,22 @@ jobs:
         run: |
           set -euo pipefail
           fallback() { echo 'plan=' >> "$GITHUB_OUTPUT"; exit 0; }
+          # This fork shares paperclipai/paperclip's GitHub object store, so the
+          # `git fetch ... "$EVENT_MERGE_SHA"` below against the upstream remote
+          # succeeds about half the time instead of reliably missing. Runs
+          # 42334395642 and 42337048313 resolved a plan and failed; runs
+          # 42339077506 and 42340184720 hit the fetch failure path, fell back,
+          # and passed (all four on 2026-11-07, same workflow). A resolved plan
+          # runs upstream's newer `test:typescript:vitest` lane commands
+          # (`--package-lane=N/3`, `--native-server`, upstream commit
+          # a2aa69bc6), which this fork's
+          # packages/paperclip-runner/scripts/run-pr-vitest-lane.mjs does not
+          # implement, so those lanes fail with `CACError: Unknown option`.
+          # Fail closed on repository identity so the plan is always empty and
+          # every dependent job runs its full fallback matrix instead of a
+          # partial, possibly-upstream plan. Re-enabling this planner requires
+          # porting it into this repository first (separate ticket).
+          [[ "${EVENT_REPOSITORY:-}" == 'paperclipai/paperclip' ]] || fallback
           [[ "$FULL_CI" == 'true' ]] || fallback
           [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$EVENT_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || fallback
           trusted="$(gh api /repos/paperclipai/paperclip/git/ref/heads/master --jq .object.sha)" || fallback
