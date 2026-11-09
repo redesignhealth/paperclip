@@ -116,23 +116,38 @@ export function createActiveRunGate(
       const pauseStartMs = clock.nowMs();
 
       while (active >= threshold) {
-        const stepMs = Math.min(5000, pollMs);
-        await sleeper.sleep(stepMs);
-        assertLeaseActive?.();
-
         const currentMs = clock.nowMs();
-        const pausedElapsed = currentMs - pauseStartMs;
-        if (maxPauseMs > 0 && pausedElapsed >= maxPauseMs) {
-          totalPausedMs += pausedElapsed;
+        const cumulativePausedMs = totalPausedMs + (currentMs - pauseStartMs);
+
+        if (maxPauseMs > 0 && cumulativePausedMs >= maxPauseMs) {
+          // Re-poll before declaring paused_too_long
+          active = await countActiveCompanyRuns(db, companyId);
+          lastCheckMs = clock.nowMs();
+          if (active < threshold) {
+            break;
+          }
+          totalPausedMs += (clock.nowMs() - pauseStartMs);
           throw new CompanyMemoryUpgradeError(
-            `Active heartbeat runs paused longer than limit (${pausedElapsed}ms >= maxPauseMs ${maxPauseMs}ms)`,
+            `Active heartbeat runs paused longer than limit (${cumulativePausedMs}ms >= maxPauseMs ${maxPauseMs}ms)`,
             "paused_too_long",
           );
         }
 
-        if (currentMs - lastCheckMs >= pollMs) {
+        const remainingBudgetMs = maxPauseMs > 0 ? maxPauseMs - cumulativePausedMs : Infinity;
+        const stepMs = Math.min(5000, pollMs, Math.max(1, remainingBudgetMs));
+
+        await sleeper.sleep(stepMs);
+        assertLeaseActive?.();
+
+        const afterSleepMs = clock.nowMs();
+        const newCumulative = totalPausedMs + (afterSleepMs - pauseStartMs);
+        const shouldPoll =
+          afterSleepMs - lastCheckMs >= pollMs ||
+          (maxPauseMs > 0 && newCumulative >= maxPauseMs);
+
+        if (shouldPoll) {
           active = await countActiveCompanyRuns(db, companyId);
-          lastCheckMs = currentMs;
+          lastCheckMs = clock.nowMs();
         }
       }
 

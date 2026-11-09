@@ -5,7 +5,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import postgres from "postgres";
 import {
   commitSourceOutcome,
   ensureUpgradeTables,
@@ -15,6 +14,10 @@ import {
   reconcileTombstones,
   validateOutcomeReason,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import {
+  isValidVectorType,
+  quoteVectorType,
+} from "../../server/src/services/company-memory-upgrade/tenant-tables.js";
 import { computeSourceContentSha256 } from "../../server/src/services/company-memory-upgrade/source-hash.js";
 import { CompanyMemoryUpgradeError, UPGRADE_LEDGER_OUTCOMES } from "../../server/src/services/company-memory-upgrade/types.js";
 import {
@@ -270,7 +273,7 @@ test("sweep-tenant ledger operations", async (t) => {
       SELECT outcome FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ${sourceId}::uuid;
     `;
-    assert.equal(ledgerRow.outcome, "superseded");
+    assert.equal(ledgerRow, undefined, "Stale ledger row is deleted to allow clean reclassification");
 
     const stagingCount = await sql`
       SELECT count(*)::int AS count FROM paperclip_memory_upgrade_staging
@@ -546,5 +549,67 @@ test("sweep-tenant ledger operations", async (t) => {
       },
       (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
     );
+  });
+
+  await t.test("tombstone reconciliation is idempotent and sets reason_code to null", async () => {
+    const upgradeId = randomUUID();
+    const sourceId = randomUUID();
+    const agentId = randomUUID();
+
+    // 1. Commit initial outcome with reason_code
+    await commitSourceOutcome(sql, {
+      upgradeId,
+      sourceId,
+      sourceContentSha256: "hash-tomb-test",
+      agentId,
+      outcome: "dropped_noise",
+      reasonCode: "empty",
+    });
+
+    const [rowBefore] = await sql`
+      SELECT outcome, reason_code FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(rowBefore.outcome, "dropped_noise");
+    assert.equal(rowBefore.reason_code, "empty");
+
+    // 2. Reconcile tombstone pass 1: transitions row and returns count 1
+    const res1 = await reconcileTombstones(sql, upgradeId, {
+      tombstoneSourceIds: [sourceId],
+    });
+    assert.equal(res1.tombstonesCount, 1);
+
+    const [rowAfter1] = await sql`
+      SELECT outcome, reason_code FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(rowAfter1.outcome, "source_deleted");
+    assert.equal(rowAfter1.reason_code, null, "reason_code must be set to null");
+
+    // 3. Reconcile tombstone pass 2 (idempotence): does NOT re-transition and returns count 0
+    const res2 = await reconcileTombstones(sql, upgradeId, {
+      tombstoneSourceIds: [sourceId],
+    });
+    assert.equal(res2.tombstonesCount, 0, "Repeated tombstone pass counts zero transitions");
+  });
+
+  await t.test("schema-qualified and quoted vector types are safely validated and quoted", async () => {
+    assert.ok(isValidVectorType("text"));
+    assert.ok(isValidVectorType("vector(1536)"));
+    assert.ok(isValidVectorType("ext.vector(1536)"));
+    assert.ok(isValidVectorType('"extensions".vector(768)'));
+    assert.ok(isValidVectorType('"public"."vector"(1536)'));
+
+    assert.equal(quoteVectorType("text"), "text");
+    assert.equal(quoteVectorType("vector(1536)"), "vector(1536)");
+    assert.equal(quoteVectorType("ext.vector(1536)"), '"ext"."vector"(1536)');
+    assert.equal(quoteVectorType('"extensions".vector(768)'), '"extensions"."vector"(768)');
+
+    // Invalids rejected
+    assert.ok(!isValidVectorType("vector(0)"));
+    assert.ok(!isValidVectorType("vector(16001)"));
+    assert.ok(!isValidVectorType("bad-ident;drop.vector(1536)"));
+    assert.ok(!isValidVectorType(""));
+    assert.ok(!isValidVectorType("int"));
   });
 });

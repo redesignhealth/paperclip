@@ -94,7 +94,67 @@ export const ALLOWED_SWEEP_FLAGS = new Set([
 ]);
 
 export function scrubDsnSecrets(text: string): string {
-  return text.replace(/(postgres(?:ql)?:\/\/[^:@\s]+):[^@\s]+@/g, "$1:***@");
+  if (!text) return "";
+  let result = text;
+  const secrets = new Set<string>();
+
+  // 1. Identify URL candidates and parse secrets with WHATWG URL
+  const urlCandidateRegex = /postgres(?:ql)?:\/\/[^\s"'<>]+/g;
+  let match: RegExpExecArray | null;
+  while ((match = urlCandidateRegex.exec(text)) !== null) {
+    const rawUrl = match[0];
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.password) {
+        secrets.add(parsed.password);
+        try {
+          secrets.add(decodeURIComponent(parsed.password));
+        } catch {}
+      }
+      if (parsed.searchParams.has("password")) {
+        const queryPass = parsed.searchParams.get("password");
+        if (queryPass) {
+          secrets.add(queryPass);
+          try {
+            secrets.add(decodeURIComponent(queryPass));
+          } catch {}
+        }
+      }
+    } catch {
+      // WHATWG URL parsing failed: parse authority manually
+      const authMatch = rawUrl.match(/^postgres(?:ql)?:\/\/([^/@\s]*):([^@\s]+)@/);
+      if (authMatch && authMatch[2]) {
+        secrets.add(authMatch[2]);
+        try {
+          secrets.add(decodeURIComponent(authMatch[2]));
+        } catch {}
+      }
+    }
+  }
+
+  // 2. Check for query parameter passwords (?password=... or &password=...) anywhere in text
+  const queryParamRegex = /[?&]password=([^&#\s]+)/gi;
+  while ((match = queryParamRegex.exec(text)) !== null) {
+    if (match[1]) {
+      secrets.add(match[1]);
+      try {
+        secrets.add(decodeURIComponent(match[1]));
+      } catch {}
+    }
+  }
+
+  // 3. Scrub DSN URLs in result (supports empty usernames and arbitrary characters in passwords)
+  result = result.replace(/(postgres(?:ql)?:\/\/[^/@\s]*):[^@\s]+@/g, "$1:***@");
+  result = result.replace(/([?&]password=)[^&#\s]+/gi, "$1***");
+
+  // 4. Scrub any identified plaintext secrets that are non-empty
+  for (const secret of secrets) {
+    if (secret && secret.length > 0 && secret !== "***") {
+      result = result.replaceAll(secret, "***");
+    }
+  }
+
+  return result;
 }
 
 export function isNumericString(val: string): boolean {
@@ -350,7 +410,8 @@ export interface RunSweepCliDependencies extends SweepDependencies {}
 
 export function sanitizeCliErrorMessage(error: unknown): string {
   if (error instanceof CompanyMemoryUpgradeError) {
-    return scrubDsnSecrets(error.message);
+    const scrubbed = scrubDsnSecrets(error.message);
+    return `[${error.code}] ${scrubbed}`;
   }
   if (error && typeof error === "object") {
     const err = error as { code?: string; message?: string };
@@ -376,8 +437,6 @@ export async function runSweepCli(
   deps: RunSweepCliDependencies = {},
 ): Promise<number> {
   try {
-    validateNoUnknownFlags(argv, ALLOWED_SWEEP_FLAGS, "sweep");
-
     if (hasBooleanFlag("--help", argv) || hasBooleanFlag("-h", argv)) {
       console.log(`
 Usage: pnpm memory:upgrade sweep --database-url <tenant-dsn> --control-plane-url <cp-dsn> --company <uuid> --confirm <uuid> [options]
@@ -408,9 +467,13 @@ Options:
       return 0;
     }
 
+    validateNoUnknownFlags(argv, ALLOWED_SWEEP_FLAGS, "sweep");
+
+    const env = deps.env ?? process.env;
+
     const databaseUrl =
       parseFlagValue("--database-url", argv) ??
-      process.env.COMPANY_MEMORY_DATABASE_URL ??
+      env.COMPANY_MEMORY_DATABASE_URL ??
       null;
 
     if (!databaseUrl) {
@@ -422,7 +485,7 @@ Options:
 
     const controlPlaneUrl =
       parseFlagValue("--control-plane-url", argv) ??
-      process.env.CONTROL_PLANE_DATABASE_URL ??
+      env.CONTROL_PLANE_DATABASE_URL ??
       null;
 
     if (!controlPlaneUrl) {
@@ -489,6 +552,18 @@ Options:
     const activeRunPollMs = parsePositiveInt("--active-run-poll-ms", 15_000);
     const maxPauseSeconds = parseNonNegativeInt("--max-pause-seconds", 0);
     const operatorLabel = parseFlagValue("--operator-label", argv);
+    if (operatorLabel !== null) {
+      if (
+        operatorLabel.length < 1 ||
+        operatorLabel.length > 64 ||
+        !/^[A-Za-z0-9._:@-]+$/.test(operatorLabel)
+      ) {
+        throw new CompanyMemoryUpgradeError(
+          "Invalid --operator-label. Must be 1-64 characters matching [A-Za-z0-9._:@-].",
+          "INVALID_ARGUMENT",
+        );
+      }
+    }
 
     const outputPath =
       parseFlagValue("--output", argv) ??

@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
-  ACTIVE_HEARTBEAT_RUN_STATUSES,
   countActiveCompanyRuns,
   createActiveRunGate,
 } from "../../server/src/services/company-memory-upgrade/active-runs.js";
@@ -218,5 +217,124 @@ test("active-runs: countActiveCompanyRuns and createActiveRunGate", async (t) =>
 
     assert.equal(gate.stats().pauseCount, 1);
     assert.ok(gate.stats().totalPausedMs >= 15_000);
+  });
+
+  await t.test("createActiveRunGate re-polls before declaring paused_too_long and resumes if runs cleared", async () => {
+    await db.delete(heartbeatRuns);
+    await db.insert(heartbeatRuns).values({
+      companyId: companyA.id,
+      agentId: agentA.id,
+      status: "running",
+    });
+
+    const clock = new ManualClock(3_000_000);
+    let sleeps = 0;
+
+    const gate = createActiveRunGate({
+      db,
+      companyId: companyA.id,
+      threshold: 1,
+      pollMs: 10_000,
+      maxPauseMs: 15_000,
+      clock,
+      sleeper: {
+        async sleep(ms: number) {
+          sleeps++;
+          clock.advance(ms);
+          // Just before maxPauseMs is reached, the active run completes
+          if (clock.nowMs() >= 3_010_000) {
+            await db.delete(heartbeatRuns);
+          }
+        },
+      },
+    });
+
+    // Should NOT throw because re-poll catches that runs subsided
+    await gate.waitUntilQuiet();
+    assert.ok(sleeps > 0);
+    assert.equal(gate.stats().pauseCount, 1);
+  });
+
+  await t.test("createActiveRunGate caps sleep at remaining budget and handles maxPauseMs < pollMs", async () => {
+    await db.delete(heartbeatRuns);
+    await db.insert(heartbeatRuns).values({
+      companyId: companyA.id,
+      agentId: agentA.id,
+      status: "running",
+    });
+
+    const clock = new ManualClock(4_000_000);
+    const sleepDurations: number[] = [];
+
+    const gate = createActiveRunGate({
+      db,
+      companyId: companyA.id,
+      threshold: 1,
+      pollMs: 15_000,
+      maxPauseMs: 7_000, // maxPauseMs is smaller than pollMs
+      clock,
+      sleeper: {
+        async sleep(ms: number) {
+          sleepDurations.push(ms);
+          clock.advance(ms);
+        },
+      },
+    });
+
+    await assert.rejects(
+      async () => {
+        await gate.waitUntilQuiet();
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "paused_too_long");
+        return true;
+      },
+    );
+
+    // First sleep was min(5000, 15000, 7000) = 5000
+    // Second sleep was min(5000, 15000, 2000 remaining) = 2000
+    assert.deepEqual(sleepDurations, [5000, 2000]);
+    assert.equal(gate.stats().totalPausedMs, 7_000);
+  });
+
+  await t.test("createActiveRunGate tracks cumulative paused time accurately across multiple pauses", async () => {
+    await db.delete(heartbeatRuns);
+
+    const clock = new ManualClock(5_000_000);
+
+    const gate = createActiveRunGate({
+      db,
+      companyId: companyA.id,
+      threshold: 1,
+      pollMs: 5_000,
+      maxPauseMs: 50_000,
+      clock,
+      sleeper: {
+        async sleep(ms: number) {
+          clock.advance(ms);
+          // When called, unblock active runs
+          await db.delete(heartbeatRuns);
+        },
+      },
+    });
+
+    // Pause 1
+    await db.insert(heartbeatRuns).values({ companyId: companyA.id, agentId: agentA.id, status: "running" });
+    await gate.waitUntilQuiet();
+
+    assert.equal(gate.stats().pauseCount, 1);
+    const pausedAfter1 = gate.stats().totalPausedMs;
+    assert.ok(pausedAfter1 >= 5_000);
+
+    // Advance clock past pollMs so next check triggers
+    clock.advance(10_000);
+
+    // Pause 2
+    await db.insert(heartbeatRuns).values({ companyId: companyA.id, agentId: agentA.id, status: "running" });
+    await gate.waitUntilQuiet();
+
+    assert.equal(gate.stats().pauseCount, 2);
+    assert.ok(gate.stats().totalPausedMs >= pausedAfter1 + 5_000);
   });
 });

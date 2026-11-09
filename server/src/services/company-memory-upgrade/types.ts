@@ -22,6 +22,7 @@ export const UPGRADE_ERROR_CODES = [
   "lease_lapsed",
   "lease_expired",
   "lease_fenced_out",
+  "paused_too_long",
   "state_mismatch",
   "migration_failed",
   "schema_init_failed",
@@ -38,6 +39,79 @@ export const UPGRADE_ERROR_CODES = [
 ] as const;
 
 export type UpgradeErrorCode = (typeof UPGRADE_ERROR_CODES)[number];
+
+export const SWEEP_ERROR_CODE_MAP: Record<string, UpgradeErrorCode> = {
+  // Lease
+  LEASE_FENCED_OUT: "lease_fenced_out",
+  lease_fenced_out: "lease_fenced_out",
+  LEASE_EXPIRED: "lease_expired",
+  lease_expired: "lease_expired",
+  LEASE_LAPSED: "lease_lapsed",
+  lease_lapsed: "lease_lapsed",
+  HEARTBEAT_RENEWAL_FAILED: "lease_fenced_out",
+  // Active runs
+  paused_too_long: "paused_too_long",
+  PAUSED_TOO_LONG: "paused_too_long",
+  ACTIVE_RUNS_PAUSED_TOO_LONG: "paused_too_long",
+  // State
+  INVALID_STATE: "state_mismatch",
+  STATE_MISMATCH: "state_mismatch",
+  UPGRADE_NOT_FOUND: "state_mismatch",
+  ACTIVE_UPGRADE_EXISTS: "state_mismatch",
+  CONVERTER_CONTRACT_MISMATCH: "state_mismatch",
+  // Schema / init
+  SCHEMA_INIT_FAILED: "schema_init_failed",
+  schema_init_failed: "schema_init_failed",
+  MIGRATION_FAILED: "migration_failed",
+  migration_failed: "migration_failed",
+  NOT_PGVECTOR: "schema_init_failed",
+  // Source read / tenant database / binding
+  SOURCE_READ_FAILED: "source_read_failed",
+  source_read_failed: "source_read_failed",
+  UNSUPPORTED_SOURCE_ID: "source_read_failed",
+  LIVE_TABLE_MISSING: "source_read_failed",
+  LIVE_TABLE_INVALID: "source_read_failed",
+  DATABASE_IDENTITY_MISMATCH: "source_read_failed",
+  DATABASE_IDENTITY_UNAVAILABLE: "source_read_failed",
+  SUPERUSER_DISALLOWED: "source_read_failed",
+  BYPASSRLS_DISALLOWED: "source_read_failed",
+  ROLE_CANNOT_SELECT: "source_read_failed",
+  ROLE_CAN_MUTATE: "source_read_failed",
+  COMPANY_MEMORY_DATABASE_UNVERIFIED: "source_read_failed",
+  COMPANY_MEMORY_DATABASE_NOT_READY: "source_read_failed",
+  COMPANY_NOT_FOUND: "source_read_failed",
+  COMPANY_BINDING_MISMATCH: "source_read_failed",
+  INVALID_ARGUMENT: "source_read_failed",
+  // Conversion / embedding / staging / publish / drain / rollback
+  CONVERSION_FAILED: "conversion_failed",
+  conversion_failed: "conversion_failed",
+  EMBEDDING_FAILED: "embedding_failed",
+  embedding_failed: "embedding_failed",
+  STAGING_WRITE_FAILED: "staging_write_failed",
+  staging_write_failed: "staging_write_failed",
+  PUBLISH_FAILED: "publish_failed",
+  publish_failed: "publish_failed",
+  VERIFICATION_FAILED: "verification_failed",
+  verification_failed: "verification_failed",
+  DRAIN_TIMEOUT: "drain_timeout",
+  drain_timeout: "drain_timeout",
+  ROLLBACK_FAILED: "rollback_failed",
+  rollback_failed: "rollback_failed",
+  ABORTED_BY_OPERATOR: "aborted_by_operator",
+  aborted_by_operator: "aborted_by_operator",
+  UNEXPECTED_FAILURE: "unexpected_failure",
+  unexpected_failure: "unexpected_failure",
+};
+
+export function mapSweepErrorCode(code: string | undefined | null): UpgradeErrorCode {
+  if (!code) return "unexpected_failure";
+  if (SWEEP_ERROR_CODE_MAP[code]) return SWEEP_ERROR_CODE_MAP[code];
+  const lower = code.toLowerCase();
+  if ((UPGRADE_ERROR_CODES as readonly string[]).includes(lower)) {
+    return lower as UpgradeErrorCode;
+  }
+  return "unexpected_failure";
+}
 
 export class CompanyMemoryUpgradeError extends Error {
   readonly code: string;

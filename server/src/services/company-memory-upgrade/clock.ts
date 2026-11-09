@@ -4,15 +4,17 @@
 
 export interface MonotonicClock {
   nowMs(): number;
+  now?(): Date;
 }
 
 export interface Sleeper {
   sleep(ms: number): Promise<void>;
 }
 
-export function createSystemClock(): MonotonicClock {
+export function createSystemClock(): MonotonicClock & { now(): Date } {
   return {
-    nowMs: () => Date.now(),
+    nowMs: () => performance.timeOrigin + performance.now(),
+    now: () => new Date(performance.timeOrigin + performance.now()),
   };
 }
 

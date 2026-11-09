@@ -72,6 +72,7 @@ import {
 import {
   type Clock,
   CompanyMemoryUpgradeError,
+  mapSweepErrorCode,
   type UpgradeErrorCode,
   UPGRADE_ERROR_CODES,
 } from "./types.js";
@@ -231,10 +232,7 @@ export async function runSweep(
   deps: SweepDependencies = {},
 ): Promise<SweepReport> {
   const env = deps.env ?? process.env;
-  const clock = deps.clock ?? {
-    nowMs: () => Date.now(),
-    now: () => new Date(),
-  };
+  const clock = deps.clock ?? createSystemClock();
   const sleeper = deps.sleeper ?? createSystemSleeper();
 
   const {
@@ -251,6 +249,20 @@ export async function runSweep(
     allowProd = false,
     outputPath,
   } = options;
+
+  if (operatorLabel !== null && operatorLabel !== undefined) {
+    if (
+      typeof operatorLabel !== "string" ||
+      operatorLabel.length < 1 ||
+      operatorLabel.length > 64 ||
+      !/^[A-Za-z0-9._:@-]+$/.test(operatorLabel)
+    ) {
+      throw new CompanyMemoryUpgradeError(
+        "Invalid --operator-label. Must be 1-64 characters matching [A-Za-z0-9._:@-].",
+        "INVALID_ARGUMENT",
+      );
+    }
+  }
 
   if (!isValidUuid(companyId)) {
     throw new CompanyMemoryUpgradeError(
@@ -335,7 +347,7 @@ export async function runSweep(
 
       if (!compRows[0]) {
         throw new CompanyMemoryUpgradeError(
-          `Company "${companyId}" not found in control plane database.`,
+          "Target company record does not exist in control plane database.",
           "COMPANY_NOT_FOUND",
         );
       }
@@ -355,7 +367,7 @@ export async function runSweep(
 
       if (!memDbRows[0]) {
         throw new CompanyMemoryUpgradeError(
-          `No company_memory_databases record found for company "${companyId}".`,
+          "No company_memory_databases record found for target company.",
           "COMPANY_BINDING_MISMATCH",
         );
       }
@@ -363,14 +375,14 @@ export async function runSweep(
       const memRow = memDbRows[0];
       if (memRow.status !== "ready") {
         throw new CompanyMemoryUpgradeError(
-          `Company memory database binding status for company "${companyId}" is "${memRow.status}". Sweep requires status "ready" (refusing pending, failed, deprovisioning, archived).`,
+          "Company memory database binding status is not ready (refusing pending, failed, deprovisioning, archived).",
           "COMPANY_BINDING_MISMATCH",
         );
       }
 
       if (memRow.databaseName !== currentDatabase || memRow.databaseRole !== currentUser) {
         throw new CompanyMemoryUpgradeError(
-          `Company memory database binding mismatch: control-plane specifies database "${memRow.databaseName}" and role "${memRow.databaseRole}", but connected tenant is "${currentDatabase}" / "${currentUser}".`,
+          "Company memory database binding mismatch between control plane and connected tenant.",
           "COMPANY_BINDING_MISMATCH",
         );
       }
@@ -380,7 +392,7 @@ export async function runSweep(
         const derived = deriveCompanyMemoryDatabaseNames(companyId);
         if (currentDatabase !== derived.databaseName || currentUser !== derived.databaseRole) {
           throw new CompanyMemoryUpgradeError(
-            `Company binding mismatch: tenant database "${currentDatabase}" and role "${currentUser}" do not match expected derived database "${derived.databaseName}" and role "${derived.databaseRole}" for company "${companyId}".`,
+            "Company memory database binding mismatch with derived credentials.",
             "COMPANY_BINDING_MISMATCH",
           );
         }
@@ -447,12 +459,12 @@ export async function runSweep(
       }
     } else if (upgrade.state === "needs_recovery") {
       throw new CompanyMemoryUpgradeError(
-        `Upgrade ${upgrade.id} is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.`,
+        "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
         "STATE_MISMATCH",
       );
     } else {
       throw new CompanyMemoryUpgradeError(
-        `Cannot run sweep: upgrade ${upgrade.id} is in state '${upgrade.state}' (expected 'sweeping').`,
+        "Cannot run sweep: active upgrade is not in sweeping state.",
         "STATE_MISMATCH",
       );
     }
@@ -468,7 +480,7 @@ export async function runSweep(
 
     if (!claim.acquired || !claim.leaseToken || !claim.leaseExpiresAt) {
       throw new CompanyMemoryUpgradeError(
-        `Failed to acquire lease for upgrade ${upgrade.id}. Another worker may hold the lease.`,
+        "Failed to acquire lease for upgrade. Another worker may hold the lease.",
         "LEASE_FENCED_OUT",
       );
     }
@@ -508,6 +520,7 @@ export async function runSweep(
     while (true) {
       heartbeatHandle.assertActive();
       await activeRunGate.waitUntilQuiet();
+      heartbeatHandle.assertActive();
 
       const iterResult = await sourceIterator.next();
       if (iterResult.done) {
@@ -519,7 +532,7 @@ export async function runSweep(
       for (const source of page) {
         if (!isValidUuid(source.id)) {
           throw new CompanyMemoryUpgradeError(
-            `Mem0 table "${tableName}" contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.`,
+            "Collection table contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.",
             "UNSUPPORTED_SOURCE_ID",
           );
         }
@@ -536,7 +549,7 @@ export async function runSweep(
         pendingConversionCount: 0,
       };
 
-      const pageSourceIds = page.map((r) => r.id);
+      const pageSourceIds = page.map((r) => r.id.toLowerCase());
       const minPageId = pageSourceIds[0];
       const maxPageId = pageSourceIds[pageSourceIds.length - 1];
 
@@ -558,29 +571,36 @@ export async function runSweep(
       for (const source of page) {
         heartbeatHandle.assertActive();
 
+        const canonicalSourceId = source.id.toLowerCase();
         const contentSha256 = computeSourceContentSha256(source.data);
-        const existingLedger = ledgerMap.get(source.id);
+        const existingLedger = ledgerMap.get(canonicalSourceId);
+
+        // Pre-compute routing to compare agent assignment
+        const routing = classifyAgentRouting(source.agentId, cpAgentMap);
+        const matchedAgentId = routing.matchedAgentId;
 
         if (existingLedger) {
-          if (existingLedger.sourceContentSha256 === contentSha256) {
+          if (
+            existingLedger.sourceContentSha256 === contentSha256 &&
+            existingLedger.agentId === matchedAgentId
+          ) {
             pageDeltas.skippedUnchangedCount++;
             continue;
           }
 
-          // Content changed: reconcile to superseded
+          // Content or agent assignment changed: reconcile to superseded
           heartbeatHandle.assertActive();
-          await reconcileChangedContent(tenantSql, upgradeId, source.id);
+          await reconcileChangedContent(tenantSql, upgradeId, canonicalSourceId);
           pageDeltas.supersededCount++;
           // Then source re-enters classification in this same sweep
         }
 
         // Gate 1: Routing -> unroutable
-        const routing = classifyAgentRouting(source.agentId, cpAgentMap);
         if (!routing.isRoutable) {
           heartbeatHandle.assertActive();
           await commitSourceOutcome(tenantSql, {
             upgradeId,
-            sourceId: source.id,
+            sourceId: canonicalSourceId,
             sourceContentSha256: contentSha256,
             agentId: routing.matchedAgentId,
             outcome: "unroutable",
@@ -590,15 +610,13 @@ export async function runSweep(
           continue;
         }
 
-        const matchedAgentId = routing.matchedAgentId;
-
         // Gate 2: Noise -> dropped_noise
         const noise = classifyMemoryNoiseDetailed(source.data);
         if (noise.isNoise) {
           heartbeatHandle.assertActive();
           await commitSourceOutcome(tenantSql, {
             upgradeId,
-            sourceId: source.id,
+            sourceId: canonicalSourceId,
             sourceContentSha256: contentSha256,
             agentId: matchedAgentId,
             outcome: "dropped_noise",
@@ -619,7 +637,7 @@ export async function runSweep(
           heartbeatHandle.assertActive();
           await commitSourceOutcome(tenantSql, {
             upgradeId,
-            sourceId: source.id,
+            sourceId: canonicalSourceId,
             sourceContentSha256: contentSha256,
             agentId: matchedAgentId,
             outcome: "dropped_sensitive",
@@ -724,41 +742,53 @@ export async function runSweep(
   } catch (error) {
     if (upgradeId && leaseToken) {
       try {
-        const errorCode = error instanceof CompanyMemoryUpgradeError && (UPGRADE_ERROR_CODES as readonly string[]).includes(error.code)
-          ? (error.code as UpgradeErrorCode)
+        const errorCode = error instanceof CompanyMemoryUpgradeError
+          ? mapSweepErrorCode(error.code)
           : "unexpected_failure";
 
-        await updateUpgradeCounters(
-          cpDb,
-          upgradeId,
-          leaseToken,
-          { lastError: errorCode },
-          { clock },
-        ).catch(() => {});
-      } catch {
-        // Defensive
+        if (errorCode !== "lease_fenced_out" && errorCode !== "lease_expired" && errorCode !== "lease_lapsed") {
+          await updateUpgradeCounters(
+            cpDb,
+            upgradeId,
+            leaseToken,
+            { lastError: errorCode },
+            { clock },
+          ).catch((cleanupErr: any) => {
+            console.error("[memory-upgrade] failed to record lastError:", cleanupErr?.code || "CLEANUP_ERROR");
+          });
+        }
+      } catch (err: any) {
+        console.error("[memory-upgrade] error in lastError recording:", err?.code || "CLEANUP_ERROR");
       }
     }
     throw error;
   } finally {
+    if (heartbeatHandle) {
+      await heartbeatHandle.stop().catch((err: any) => {
+        console.error("[memory-upgrade] heartbeat stop error:", err?.code || "CLEANUP_ERROR");
+      });
+    }
+
     if (upgradeId && leaseToken) {
       try {
-        await releaseUpgradeLease(cpDb, upgradeId, leaseToken, { clock }).catch(() => {});
-      } catch {
-        // Defensive
+        await releaseUpgradeLease(cpDb, upgradeId, leaseToken, { clock }).catch((err: any) => {
+          console.error("[memory-upgrade] lease release error:", err?.code || "CLEANUP_ERROR");
+        });
+      } catch (err: any) {
+        console.error("[memory-upgrade] lease release failure:", err?.code || "CLEANUP_ERROR");
       }
     }
 
-    if (heartbeatHandle) {
-      await heartbeatHandle.stop().catch(() => {});
-    }
-
     if (ownsTenantSql) {
-      await tenantSql.end().catch(() => {});
+      await tenantSql.end().catch((err: any) => {
+        console.error("[memory-upgrade] tenant connection close error:", err?.code || "CLEANUP_ERROR");
+      });
     }
 
     if (ownsCpDb) {
-      await cpDb.$client?.end().catch(() => {});
+      await cpDb.$client?.end().catch((err: any) => {
+        console.error("[memory-upgrade] control plane connection close error:", err?.code || "CLEANUP_ERROR");
+      });
     }
   }
 }

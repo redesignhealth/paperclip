@@ -35,6 +35,67 @@ test("sweep CLI validation and flags", async (t) => {
     const scrubbed = scrubDsnSecrets(raw);
     assert.ok(!scrubbed.includes("super_secret_password"));
     assert.ok(scrubbed.includes("postgres://app_user:***@db.internal.net:5432/db_prod"));
+
+    // Empty username
+    const emptyUser = "postgres://:secret_pass_123@localhost:5432/mydb";
+    assert.ok(!scrubDsnSecrets(emptyUser).includes("secret_pass_123"));
+    assert.ok(scrubDsnSecrets(emptyUser).includes("postgres://:***@localhost:5432/mydb"));
+
+    // Password containing @ or special characters
+    const passWithAt = "postgres://u:pass%40word123@localhost:5432/mydb";
+    const scrubbedAt = scrubDsnSecrets(passWithAt);
+    assert.ok(!scrubbedAt.includes("pass%40word123"));
+    assert.ok(!scrubbedAt.includes("pass@word123"));
+    assert.ok(scrubbedAt.includes("postgres://u:***@localhost:5432/mydb"));
+
+    // Query param password
+    const queryPass = "postgres://u:pass1@localhost:5432/mydb?password=query_secret_456&ssl=true";
+    const scrubbedQuery = scrubDsnSecrets(queryPass);
+    assert.ok(!scrubbedQuery.includes("query_secret_456"));
+    assert.ok(!scrubbedQuery.includes("pass1"));
+    assert.ok(scrubbedQuery.includes("password=***"));
+  });
+
+  await t.test("--help works even with unexpected or unknown flags", async () => {
+    let stdout = "";
+    const origLog = console.log;
+    console.log = (msg: string) => { stdout += `${msg}\n`; };
+    try {
+      const exitHelp = await runSweepCli(["--help", "--unknown-bogus-flag"]);
+      assert.equal(exitHelp, 0);
+      assert.ok(stdout.includes("Usage: pnpm memory:upgrade sweep"));
+
+      stdout = "";
+      const exitShortHelp = await runSweepCli(["-h", "--bad-flag=123"]);
+      assert.equal(exitShortHelp, 0);
+      assert.ok(stdout.includes("Usage: pnpm memory:upgrade sweep"));
+    } finally {
+      console.log = origLog;
+    }
+  });
+
+  await t.test("--operator-label bounds and rejection without echoing value", async () => {
+    let stderr = "";
+    const origError = console.error;
+    console.error = (msg: string) => { stderr += `${msg}\n`; };
+    const markerBadLabel = "bad_label_with_forbidden_chars!#$%^&*()_+secret9988";
+    const validUuid = randomUUID();
+    const localDsn = "postgres://u:p@localhost:5432/db";
+
+    try {
+      const exit = await runSweepCli([
+        "--database-url", localDsn,
+        "--control-plane-url", localDsn,
+        "--company", validUuid,
+        "--confirm", validUuid,
+        "--operator-label", markerBadLabel,
+      ]);
+      assert.equal(exit, 1);
+      assert.ok(stderr.includes("Invalid --operator-label"));
+      assert.ok(!stderr.includes(markerBadLabel), "Never echo invalid operator label value");
+    } finally {
+      console.error = origError;
+    }
   });
 
   await t.test("validateNoUnknownFlags rejects unexpected options for sweep", () => {
@@ -355,7 +416,7 @@ test("sweep CLI database integration", async (t) => {
       ], { _internalSkipVectorIdentityCheck: true });
 
       assert.equal(exit, 1);
-      assert.ok(stderr.includes("Company"));
+      assert.ok(stderr.includes("COMPANY_NOT_FOUND"));
     } finally {
       console.error = origError;
     }
@@ -400,8 +461,9 @@ test("sweep CLI database integration", async (t) => {
         });
 
         assert.equal(exit, 1);
-        assert.ok(stderr.includes(`status for company "${comp.id}" is "${st}"`));
-        assert.ok(stderr.includes("Sweep requires status \"ready\""));
+        assert.ok(stderr.includes("[COMPANY_BINDING_MISMATCH]"));
+        assert.ok(stderr.includes("status is not ready"));
+        assert.ok(!stderr.includes(comp.id));
       }
     } finally {
       console.error = origError;

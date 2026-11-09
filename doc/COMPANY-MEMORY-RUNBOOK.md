@@ -356,10 +356,22 @@ Key Options and Safety Rules:
 - `--control-plane-url <dsn>`: Control-plane PostgreSQL DSN (or `CONTROL_PLANE_DATABASE_URL` env var).
 - `--company <uuid>`: Target company UUID (validated against control-plane binding).
 - `--confirm <uuid>`: Required confirmation matching `--company` exactly; prevents accidental cutover execution.
-- `--pause-when-active-runs <n>`: Threshold of active runs (`queued`, `scheduled_retry`, `running`) above which the sweep pauses (default: 1, set to 0 to disable).
+- `--table <name>`: Target Mem0 collection table name (default: "mem0_memories").
+- `--page-size <int>`: Keyset page size for scanning sources (default: 1000).
+- `--max-rows <int>`: Maximum number of live source rows to scan.
+- `--operator-label <text>`: Operator-provided label for upgrade record identification (1-64 characters matching `[A-Za-z0-9._:@-]`).
+- `--output, --out <path>`: Write sweep report to external path (mode 0600, exclusive create).
+- `--format <text|json>`: Output format: human summary (`text`, default) or JSON (`json`).
+- `--pause-when-active-runs <n>`: Threshold of active runs (`queued`, `scheduled_retry`, `running`) at or above which the sweep pauses (default: 1, set to 0 to disable).
 - `--active-run-poll-ms <int>`: Polling interval while waiting for active runs to subside (default: 15000ms).
-- `--max-pause-seconds <int>`: Bounded pause timeout before failing closed with `paused_too_long` (default: 0 = unbounded).
+- `--max-pause-seconds <int>`: Maximum total pause time allowed before failing closed with `paused_too_long` (default: 0 = unbounded).
 - `--prod`: Flag required alongside `MEMORY_UPGRADE_ALLOW_PROD=1` for any non-localhost database host (enforced on both tenant and control-plane DSNs).
+
+Operational Prerequisites:
+- **Role restrictions**: The tenant role must NOT be a superuser and must NOT have `BYPASSRLS`. The role must have `SELECT` privilege on the live collection table, and `CREATE`/`USAGE` privileges to manage upgrade tables (`paperclip_memory_upgrade_ledger`, `paperclip_memory_upgrade_staging`, `paperclip_memory_upgrade_dedupe`). The control-plane role must have read/write access to upgrade tracking and agent tables.
+- **Ready binding**: The company memory database record (`company_memory_databases`) must have status `ready`. The sweep strictly refuses bindings in `pending`, `failed`, `deprovisioning`, or `archived` states.
+- **Lease release behaviour**: Upon successful sweep completion or clean error termination, the worker immediately stops the heartbeat timer and releases its lease on the upgrade record. A cleanly released upgrade does not lapse and remains claimable by future sweeps.
+- **Crash-expiry TTL and recover path**: If a worker crashes ungracefully without releasing, its lease will expire after the lease TTL (default 10 minutes / 600s). Background reconciliation (`reconcileLapsedUpgradeLeases`) detects the expired lease on the active upgrade and transitions it to `needs_recovery`. When an upgrade is in `needs_recovery`, future sweep attempts are refused with `STATE_MISMATCH` until an operator runs `pnpm memory:upgrade recover --company <uuid>` to safely clear the failure state and mint a new lease.
 
 Operational Invariants:
 1. **Scope and Staging in PR3a**:
@@ -375,7 +387,7 @@ Operational Invariants:
    - `dropped_sensitive` rows are **never** automatically pruned or published. They remain retained in the ledger for operator audit and manual inspection.
 4. **Active-Run Quiescence and Leases**:
    - The active-run gate throttles polling and pauses sweep progress during active agent runs to prevent latency interference.
-   - While paused, lease heartbeat timers remain active and assert lease health every 5 seconds. If the lease lapses or is lost, the sweep aborts cleanly.
+   - While paused, lease heartbeat timers remain active and periodically renew the lease in the background (approximately every 2 minutes, or `min(120s, ttl/3)`), while the active-run gate sleeps in bounded 5-second slices and asserts lease health between slices. If the lease lapses or is lost, the sweep aborts cleanly.
 5. **Read-Only Access to Live Collection**:
    - The live Mem0 collection table is accessed **strictly via SELECT statements**.
    - No UPDATE, DELETE, INSERT, or DDL index modifications are ever issued against the live Mem0 collection table during sweep.

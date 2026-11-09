@@ -5,7 +5,7 @@ import {
   type Db,
   type UpgradeState,
 } from "@paperclipai/db";
-import { and, eq, gt, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import { logger } from "../../middleware/logger.js";
 import { assertCompanyAcceptsMemoryWork } from "./admission.js";
 import {
@@ -312,7 +312,7 @@ export async function releaseUpgradeLease(
       leaseToken: null,
       leaseOwner: null,
       leaseAcquiredAt: null,
-      leaseExpiresAt: null,
+      leaseExpiresAt: now,
       updatedAt: now,
     })
     .where(
@@ -653,8 +653,12 @@ export async function reconcileLapsedUpgradeLeases(
     .where(
       and(
         or(
-          lte(companyMemoryUpgrades.leaseExpiresAt, now),
           and(
+            isNotNull(companyMemoryUpgrades.leaseToken),
+            lte(companyMemoryUpgrades.leaseExpiresAt, now),
+          ),
+          and(
+            isNull(companyMemoryUpgrades.leaseToken),
             isNull(companyMemoryUpgrades.leaseExpiresAt),
             lte(companyMemoryUpgrades.createdAt, staleCreatedAt),
           ),

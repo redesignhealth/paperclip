@@ -4,17 +4,50 @@ import { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome } from "./types.js";
 
 export { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome };
 
+const VECTOR_TYPE_PARSER = /^(?:(?:"([a-zA-Z_][a-zA-Z0-9_]*)"|([a-zA-Z_][a-zA-Z0-9_]*))\.)?(?:"?vector"?)\((\d{1,5})\)$/i;
+
+export function parseVectorType(vectorType: string): { schema: string | null; dimensions: number } | null {
+  const normalized = vectorType.trim();
+  if (normalized.toLowerCase() === "text") {
+    return null;
+  }
+  const match = normalized.match(VECTOR_TYPE_PARSER);
+  if (!match) {
+    return null;
+  }
+  const schema = match[1] || match[2] || null;
+  const dimStr = match[3];
+  const dim = Number.parseInt(dimStr, 10);
+  if (dim < 1 || dim > 16000 || String(dim) !== dimStr) {
+    return null;
+  }
+  return { schema, dimensions: dim };
+}
+
 export function isValidVectorType(vectorType: string): boolean {
   const normalized = vectorType.trim();
   if (normalized.toLowerCase() === "text") {
     return true;
   }
-  const match = normalized.match(/^vector\((\d{1,5})\)$/i);
-  if (!match) {
-    return false;
+  return parseVectorType(normalized) !== null;
+}
+
+export function quoteVectorType(vectorType: string): string {
+  const normalized = vectorType.trim();
+  if (normalized.toLowerCase() === "text") {
+    return "text";
   }
-  const dim = Number.parseInt(match[1], 10);
-  return dim >= 1 && dim <= 16000 && String(dim) === match[1];
+  const parsed = parseVectorType(normalized);
+  if (!parsed) {
+    throw new CompanyMemoryUpgradeError(
+      "Invalid vectorType: must be text or vector(N) with 1 <= N <= 16000",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (parsed.schema) {
+    return `"${parsed.schema}"."vector"(${parsed.dimensions})`;
+  }
+  return `vector(${parsed.dimensions})`;
 }
 
 export interface SqlClient {
@@ -51,6 +84,7 @@ export async function ensureUpgradeTables(
       "INVALID_ARGUMENT",
     );
   }
+  const quotedVectorType = quoteVectorType(normalizedVectorType);
 
   const outcomesList = UPGRADE_LEDGER_OUTCOMES.map((o) => `'${o}'`).join(", ");
 
@@ -61,7 +95,7 @@ export async function ensureUpgradeTables(
       "output_id" uuid PRIMARY KEY,
       "agent_id" uuid NOT NULL,
       "payload" jsonb NOT NULL,
-      "embedding" ${normalizedVectorType} NOT NULL,
+      "embedding" ${quotedVectorType} NOT NULL,
       "content_sha256" text NOT NULL,
       "published_at" timestamp with time zone,
       "created_at" timestamp with time zone NOT NULL DEFAULT now()

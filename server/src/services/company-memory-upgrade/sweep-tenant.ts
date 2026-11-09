@@ -431,13 +431,13 @@ export async function* iterateSourcePages(
       rows = await sql.unsafe(`
         /* Live collection table query (SELECT ONLY) */
         SELECT
-          t.id::text AS id,
+          lower(t.id::text) AS id,
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
           t.payload->>'created_at' AS created_at
         FROM ${resolved.regclassArg} t
-        ORDER BY t.id ASC
+        ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text)"} ASC
         LIMIT ${currentLimit};
       `);
     } else if (isUuidId) {
@@ -445,7 +445,7 @@ export async function* iterateSourcePages(
         `
         /* Live collection table query (SELECT ONLY) */
         SELECT
-          t.id::text AS id,
+          lower(t.id::text) AS id,
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
@@ -462,14 +462,14 @@ export async function* iterateSourcePages(
         `
         /* Live collection table query (SELECT ONLY) */
         SELECT
-          t.id::text AS id,
+          lower(t.id::text) AS id,
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
           t.payload->>'created_at' AS created_at
         FROM ${resolved.regclassArg} t
-        WHERE t.id > $1::text
-        ORDER BY t.id ASC
+        WHERE lower(t.id::text) > $1::text
+        ORDER BY lower(t.id::text) ASC
         LIMIT ${currentLimit};
       `,
         [lastId],
@@ -481,7 +481,7 @@ export async function* iterateSourcePages(
     }
 
     const page: TenantSourceRow[] = rows.map((r) => ({
-      id: r.id,
+      id: String(r.id).toLowerCase(),
       agentId: r.agent_id ?? null,
       userId: r.user_id ?? null,
       data: r.data ?? null,
@@ -532,9 +532,10 @@ export async function loadLedgerForSources(
   `;
 
   for (const r of rows) {
-    map.set(r.source_id, {
+    const canonicalId = String(r.source_id).toLowerCase();
+    map.set(canonicalId, {
       upgradeId: r.upgrade_id,
-      sourceId: r.source_id,
+      sourceId: canonicalId,
       sourceContentSha256: r.source_content_sha256,
       agentId: r.agent_id ?? null,
       outcome: r.outcome as UpgradeLedgerOutcome,
@@ -591,18 +592,18 @@ export async function reconcileTombstones(
         "UNSUPPORTED_SOURCE_ID",
       );
     }
-    const liveSet = new Set(options.liveSourceIds);
+    const liveSet = new Set(options.liveSourceIds.map((id) => id.toLowerCase()));
     const rangeRows = await sql`
       SELECT source_id
       FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${upgradeId}::uuid
-        AND source_id >= ${options.minSourceId}::uuid
-        AND source_id <= ${options.maxSourceId}::uuid
+        AND source_id >= ${options.minSourceId.toLowerCase()}::uuid
+        AND source_id <= ${options.maxSourceId.toLowerCase()}::uuid
         AND outcome != 'source_deleted'
       ORDER BY source_id ASC;
     `;
     tombstoneIds = rangeRows
-      .map((r) => r.source_id)
+      .map((r) => String(r.source_id).toLowerCase())
       .filter((id) => !liveSet.has(id));
   } else if (options.liveTableName) {
     options.assertLeaseActive?.();
@@ -615,11 +616,11 @@ export async function reconcileTombstones(
         AND l.outcome != 'source_deleted'
         AND NOT EXISTS (
           /* Live collection table query (SELECT ONLY) */
-          SELECT 1 FROM ${resolved.regclassArg} t WHERE ${isUuid ? "t.id = l.source_id" : "t.id = l.source_id::text"}
+          SELECT 1 FROM ${resolved.regclassArg} t WHERE ${isUuid ? "t.id = l.source_id" : "lower(t.id::text) = l.source_id::text"}
         )
       ORDER BY l.source_id ASC;
     `, [upgradeId]);
-    tombstoneIds = missingRows.map((r) => r.source_id);
+    tombstoneIds = missingRows.map((r) => String(r.source_id).toLowerCase());
   }
 
   if (tombstoneIds.length === 0) {
@@ -633,6 +634,7 @@ export async function reconcileTombstones(
 
   let deletedStagingCount = 0;
   let deletedDedupeCount = 0;
+  let actualTombstonesCount = 0;
 
   const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : 500;
 
@@ -673,19 +675,23 @@ export async function reconcileTombstones(
       deletedStagingCount += deletedStaging.length;
 
       // 4. Update ledger outcome to source_deleted
-      await tx`
+      const updatedRows = await tx`
         UPDATE paperclip_memory_upgrade_ledger
         SET
           outcome = 'source_deleted',
+          reason_code = NULL,
           updated_at = now()
         WHERE upgrade_id = ${upgradeId}::uuid
-          AND source_id = ANY(${batch}::uuid[]);
+          AND source_id = ANY(${batch}::uuid[])
+          AND outcome <> 'source_deleted'
+        RETURNING source_id;
       `;
+      actualTombstonesCount += updatedRows.length;
     });
   }
 
   return {
-    tombstonesCount: tombstoneIds.length,
+    tombstonesCount: actualTombstonesCount,
     deletedStagingCount,
     deletedDedupeCount,
     tombstoneSourceIds: tombstoneIds,
@@ -694,7 +700,8 @@ export async function reconcileTombstones(
 
 /**
  * Reconciles changed content for a single source.
- * Sets ledger outcome to 'superseded' and clears unpublished staging and dedupe rows.
+ * Clears unpublished staging and dedupe rows, and deletes the stale ledger row so
+ * the source can reclassify cleanly without leaving stale superseded rows.
  */
 export async function reconcileChangedContent(
   sql: postgres.Sql,
@@ -743,12 +750,9 @@ export async function reconcileChangedContent(
     `;
     deletedStagingCount = deletedStaging.length;
 
-    // 4. Mark ledger as superseded
+    // 4. Delete stale ledger row so changed source can reclassify cleanly
     await tx`
-      UPDATE paperclip_memory_upgrade_ledger
-      SET
-        outcome = 'superseded',
-        updated_at = now()
+      DELETE FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${upgradeId}::uuid
         AND source_id = ${sourceId}::uuid;
     `;

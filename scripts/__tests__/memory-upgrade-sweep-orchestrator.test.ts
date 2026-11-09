@@ -12,21 +12,19 @@ import {
   companyMemoryUpgrades,
   createDb,
   eq,
+  getEmbeddedPostgresTestSupport,
+  handleEmbeddedPostgresUnsupported,
   heartbeatRuns,
-  type Db,
+  insertTenantMemoryRow,
+  ManualClock,
+  setupTenantMem0Table,
   sql,
+  startEmbeddedPostgresTestDatabase,
+  type Db,
 } from "./memory-upgrade-sweep-helpers.js";
 import { runSweep, type SweepReport } from "../../server/src/services/company-memory-upgrade/sweep.js";
 import { openTenantClient } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
 import { CompanyMemoryUpgradeError } from "../../server/src/services/company-memory-upgrade/types.js";
-import {
-  getEmbeddedPostgresTestSupport,
-  handleEmbeddedPostgresUnsupported,
-  insertTenantMemoryRow,
-  ManualClock,
-  setupTenantMem0Table,
-  startEmbeddedPostgresTestDatabase,
-} from "./memory-upgrade-sweep-helpers.js";
 
 test("sweep orchestrator integration", async (t) => {
   const support = await getEmbeddedPostgresTestSupport();
@@ -395,32 +393,52 @@ test("sweep orchestrator integration", async (t) => {
     let writesAfterLoss = 0;
     let leaseLost = false;
 
-    // Fast-forward time past lease expiry (default TTL 10m = 600_000ms) during iteration
-    const tenantSqlProxy = new Proxy(tenantWorkerSql, {
-      get(target, prop, receiver) {
-        if (prop === "unsafe") {
-          return async (...args: any[]) => {
-            const queryStr = String(args[0] ?? "");
-            if (leaseLost) {
-              if (queryStr.includes("SELECT")) readsAfterLoss++;
-              if (queryStr.includes("INSERT") || queryStr.includes("UPDATE") || queryStr.includes("DELETE")) {
-                writesAfterLoss++;
-              }
-            }
-            if (queryStr.includes("SELECT") && queryStr.includes("mem0_memories")) {
-              pageCount++;
-              if (pageCount >= 2) {
-                // Simulate time jumping forward by 15 minutes, expiring lease
-                clock.advance(900_000);
-                leaseLost = true;
-              }
-            }
-            return (target as any).unsafe(...args);
-          };
+    const recordQuery = (queryStr: string) => {
+      if (leaseLost) {
+        if (queryStr.includes("SELECT")) readsAfterLoss++;
+        if (queryStr.includes("INSERT") || queryStr.includes("UPDATE") || queryStr.includes("DELETE")) {
+          writesAfterLoss++;
         }
-        return Reflect.get(target, prop, receiver);
-      },
-    });
+      }
+      if (queryStr.includes("SELECT") && queryStr.includes("mem0_memories")) {
+        pageCount++;
+        if (pageCount >= 2) {
+          // Simulate time jumping forward by 15 minutes, expiring lease
+          clock.advance(900_000);
+          leaseLost = true;
+        }
+      }
+    };
+
+    function wrapSqlProxy(baseSql: any): any {
+      return new Proxy(baseSql, {
+        apply(target, thisArg, argArray) {
+          const template = argArray[0];
+          const queryStr = Array.isArray(template) ? template.join("?") : String(template ?? "");
+          recordQuery(queryStr);
+          return Reflect.apply(target, thisArg, argArray);
+        },
+        get(target, prop, receiver) {
+          if (prop === "unsafe") {
+            return async (...args: any[]) => {
+              recordQuery(String(args[0] ?? ""));
+              return target.unsafe(...args);
+            };
+          }
+          if (prop === "begin") {
+            return async (cb: any) => {
+              return target.begin(async (tx: any) => {
+                const txProxy = wrapSqlProxy(tx);
+                return cb(txProxy);
+              });
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    }
+
+    const tenantSqlProxy = wrapSqlProxy(tenantWorkerSql);
 
     await assert.rejects(
       async () => {
