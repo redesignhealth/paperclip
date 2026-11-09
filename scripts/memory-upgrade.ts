@@ -98,58 +98,56 @@ export function scrubDsnSecrets(text: string): string {
   let result = text;
   const secrets = new Set<string>();
 
-  // 1. Identify URL candidates and parse secrets with WHATWG URL
-  const urlCandidateRegex = /postgres(?:ql)?:\/\/[^\s"'<>]+/g;
-  let match: RegExpExecArray | null;
-  while ((match = urlCandidateRegex.exec(text)) !== null) {
-    const rawUrl = match[0];
-    try {
-      const parsed = new URL(rawUrl);
-      if (parsed.password) {
-        secrets.add(parsed.password);
-        try {
-          secrets.add(decodeURIComponent(parsed.password));
-        } catch {}
-      }
-      if (parsed.searchParams.has("password")) {
-        const queryPass = parsed.searchParams.get("password");
-        if (queryPass) {
-          secrets.add(queryPass);
-          try {
-            secrets.add(decodeURIComponent(queryPass));
-          } catch {}
-        }
-      }
-    } catch {
-      // WHATWG URL parsing failed: parse authority manually
-      const authMatch = rawUrl.match(/^postgres(?:ql)?:\/\/([^/@\s]*):([^@\s]+)@/);
-      if (authMatch && authMatch[2]) {
-        secrets.add(authMatch[2]);
-        try {
-          secrets.add(decodeURIComponent(authMatch[2]));
-        } catch {}
-      }
-    }
-  }
+  // 1. Identify URL candidates and redact credentials in-place.
+  // Supports postgres://, postgresql:// and +driver variants like postgresql+asyncpg://
+  const urlCandidateRegex = /(postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/)([^\s"'<>]+)/g;
+  result = result.replace(urlCandidateRegex, (_fullMatch, scheme, rest) => {
+    // The authority ends at the first '/', '?', or '#'
+    const pathIdx = rest.search(/[\/?#]/);
+    const authority = pathIdx === -1 ? rest : rest.slice(0, pathIdx);
+    const remainder = pathIdx === -1 ? "" : rest.slice(pathIdx);
 
-  // 2. Check for query parameter passwords (?password=... or &password=...) anywhere in text
-  const queryParamRegex = /[?&]password=([^&#\s]+)/gi;
-  while ((match = queryParamRegex.exec(text)) !== null) {
-    if (match[1]) {
-      secrets.add(match[1]);
+    const lastAt = authority.lastIndexOf("@");
+    if (lastAt === -1) {
+      return scheme + authority + remainder;
+    }
+
+    const userinfo = authority.slice(0, lastAt);
+    const hostPort = authority.slice(lastAt + 1);
+
+    const colonIdx = userinfo.indexOf(":");
+    let redactedUserinfo: string;
+    if (colonIdx !== -1) {
+      const user = userinfo.slice(0, colonIdx);
+      const pass = userinfo.slice(colonIdx + 1);
+      if (pass) {
+        secrets.add(pass);
+        try {
+          secrets.add(decodeURIComponent(pass));
+        } catch {}
+      }
+      redactedUserinfo = `${user}:***`;
+    } else {
+      secrets.add(userinfo);
       try {
-        secrets.add(decodeURIComponent(match[1]));
+        secrets.add(decodeURIComponent(userinfo));
       } catch {}
+      redactedUserinfo = "***";
     }
-  }
 
-  // 3. Scrub DSN URLs in result (supports empty usernames and arbitrary characters in passwords)
-  result = result.replace(/(postgres(?:ql)?:\/\/[^/@\s]*):[^@\s]+@/g, "$1:***@");
-  result = result.replace(/([?&]password=)[^&#\s]+/gi, "$1***");
+    return `${scheme}${redactedUserinfo}@${hostPort}${remainder}`;
+  });
 
-  // 4. Scrub any identified plaintext secrets that are non-empty
+  // 2. Redact query parameter passwords (?password=... or &password=...) anywhere in text
+  const queryParamRegex = /([?&]password=)[^&#\s]*/gi;
+  result = result.replace(queryParamRegex, (_m, prefix) => {
+    return `${prefix}***`;
+  });
+
+  // 3. For any extracted secrets from URLs, only redact in arbitrary prose if length >= 8
+  // to avoid corrupting diagnostic codes or normal English words with short passwords like 'a'
   for (const secret of secrets) {
-    if (secret && secret.length > 0 && secret !== "***") {
+    if (secret && secret.length >= 8 && secret !== "***") {
       result = result.replaceAll(secret, "***");
     }
   }
@@ -347,7 +345,7 @@ Options:
     if (longThresholdStr !== null) {
       longThreshold = parseInt(longThresholdStr, 10);
       if (!Number.isInteger(longThreshold) || longThreshold <= 0 || String(longThreshold) !== longThresholdStr.trim()) {
-        console.error(`Error: Invalid --long-threshold "${longThresholdStr}". Must be a positive integer.`);
+        console.error("Error: Invalid --long-threshold. Must be a positive integer.");
         return 1;
       }
     }
@@ -360,7 +358,7 @@ Options:
       const num = parseFloat(raw);
       if (!Number.isFinite(num) || Number.isNaN(num) || num < 0) {
         throw new CompanyMemoryUpgradeError(
-          `Invalid ${flagName} "${raw}". Must be a non-negative number.`,
+          `Invalid ${flagName}. Must be a non-negative number.`,
           "INVALID_ARGUMENT",
         );
       }
@@ -409,6 +407,34 @@ Options:
 export interface RunSweepCliDependencies extends SweepDependencies {}
 
 const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
+  // Census & Preflight codes
+  NOT_PGVECTOR: "Target database is missing required vector extension or column is not a valid pgvector column.",
+  not_pgvector: "Target database is missing required vector extension or column is not a valid pgvector column.",
+
+  SUPERUSER_REJECTED: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
+  superuser_rejected: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
+
+  BYPASSRLS_REJECTED: "Connecting role on database has BYPASSRLS privileges. Dedicated role required.",
+  bypassrls_rejected: "Connecting role on database has BYPASSRLS privileges. Dedicated role required.",
+
+  EXCESSIVE_PRIVILEGE_REJECTED: "Connecting role on database has excessive privileges. Dedicated restricted role required.",
+  excessive_privilege_rejected: "Connecting role on database has excessive privileges. Dedicated restricted role required.",
+
+  TABLE_NOT_FOUND: "Mem0 collection table not found or has no columns in target database.",
+  table_not_found: "Mem0 collection table not found or has no columns in target database.",
+
+  SCHEMA_MISMATCH: "Mem0 collection table schema does not match required shape.",
+  schema_mismatch: "Mem0 collection table schema does not match required shape.",
+
+  EMBEDDING_DIMENSIONS_MISMATCH: "Mem0 collection embedding dimensions do not match expected 1536 dimensions.",
+  embedding_dimensions_mismatch: "Mem0 collection embedding dimensions do not match expected 1536 dimensions.",
+
+  CONTROL_PLANE_ROUTING_MISMATCH: "Company memory database routing mismatch between control plane and connected tenant.",
+  control_plane_routing_mismatch: "Company memory database routing mismatch between control plane and connected tenant.",
+
+  CONTROL_PLANE_UNREACHABLE: "Unable to reach control plane database.",
+  control_plane_unreachable: "Unable to reach control plane database.",
+
   COMPANY_NOT_FOUND: "Target company record does not exist in control plane database.",
   company_not_found: "Target company record does not exist in control plane database.",
 
@@ -454,6 +480,7 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   ACTIVE_RUN_TIMEOUT: "Active heartbeat runs paused longer than limit.",
   active_run_timeout: "Active heartbeat runs paused longer than limit.",
   paused_too_long: "Active heartbeat runs paused longer than limit.",
+  PAUSED_TOO_LONG: "Active heartbeat runs paused longer than limit.",
 
   DRAIN_TIMEOUT: "Drain timeout exceeded.",
   drain_timeout: "Drain timeout exceeded.",
@@ -469,6 +496,27 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
 
   UNEXPECTED_FAILURE: "An unexpected error occurred during upgrade.",
   unexpected_failure: "An unexpected error occurred during upgrade.",
+
+  SCHEMA_INIT_FAILED: "Failed to initialize upgrade tables in tenant schema.",
+  schema_init_failed: "Failed to initialize upgrade tables in tenant schema.",
+
+  MIGRATION_FAILED: "Upgrade migration failed.",
+  migration_failed: "Upgrade migration failed.",
+
+  SOURCE_READ_FAILED: "Failed to read sources from target collection table.",
+  source_read_failed: "Failed to read sources from target collection table.",
+
+  CONVERSION_FAILED: "Memory conversion failed.",
+  conversion_failed: "Memory conversion failed.",
+
+  EMBEDDING_FAILED: "Embedding generation failed.",
+  embedding_failed: "Embedding generation failed.",
+
+  ROLLBACK_FAILED: "Upgrade rollback failed.",
+  rollback_failed: "Upgrade rollback failed.",
+
+  ABORTED_BY_OPERATOR: "Upgrade aborted by operator.",
+  aborted_by_operator: "Upgrade aborted by operator.",
 };
 
 const SAFE_COMPANY_BINDING_MISMATCH_MESSAGES = new Set([
@@ -480,6 +528,7 @@ const SAFE_COMPANY_BINDING_MISMATCH_MESSAGES = new Set([
 ]);
 
 const SAFE_STATE_MISMATCH_MESSAGES = new Set([
+  "Upgrade is in needs_recovery. Recovery/status/rollback are unavailable in this slice.",
   "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
   "Cannot run sweep: active upgrade is not in sweeping state.",
 ]);
@@ -490,13 +539,25 @@ const SAFE_OUTPUT_PATH_REJECTED_MESSAGES = new Set([
   "Refusing to write output inside repository via symlinked parent. Use an external directory such as /tmp.",
 ]);
 
-const SAFE_INVALID_ARGUMENT_PREFIXES = [
-  "Invalid --",
-  "Flag '",
-  "Unknown option '",
-  "Refusing to connect to non-local host",
-  "Refusing to target non-localhost database",
+const SAFE_INVALID_ARGUMENT_REGEXES = [
+  /^Flag '--[a-z0-9-]+' requires a (usable|positive integer|non-negative integer) value\.$/,
+  /^Boolean flag '--[a-z0-9-]+' does not take a value\.$/,
+  /^Unknown option '--?[a-zA-Z0-9_-]+'\. Only [a-zA-Z0-9_ -]+ options are accepted\.$/,
+  /^Invalid --[a-z0-9-]+\. Must be a non-negative number\.$/,
 ];
+
+const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
+  "Invalid --company. Must be a valid UUID.",
+  "Invalid --long-threshold. Must be a positive integer.",
+  "Invalid --format. Must be \"text\" or \"json\".",
+  "Invalid --operator-label. Must be 1-64 characters matching [A-Za-z0-9._:@-].",
+  "Invalid --table value. Must be a valid bare identifier (e.g. \"mem0_memories\") or schema.identifier (e.g. \"public.mem0_memories\").",
+  "Invalid database URL: URL must be a non-empty string.",
+  "Invalid database URL: Unable to parse URL with standard WHATWG parser. Supported format: postgres://user:password@host:port/dbname",
+  "Refusing to run census without --company <uuid> when control plane URL is not provided.",
+  "Unable to infer company ID for memory database. Please supply --company <uuid>.",
+  "Ambiguous company mapping: multiple company_memory_databases records found. Please supply --company <uuid>.",
+]);
 
 export function sanitizeCliErrorMessage(error: unknown): string {
   if (error && typeof error === "object") {
@@ -527,8 +588,10 @@ export function sanitizeCliErrorMessage(error: unknown): string {
       }
 
       if (code === "INVALID_ARGUMENT" || code === "invalid_argument") {
-        const isSafe = SAFE_INVALID_ARGUMENT_PREFIXES.some((prefix) => rawMsg.startsWith(prefix));
-        const msg = isSafe ? scrubDsnSecrets(rawMsg) : "Invalid command argument.";
+        const isSafe =
+          SAFE_INVALID_ARGUMENT_EXACT_MESSAGES.has(rawMsg) ||
+          SAFE_INVALID_ARGUMENT_REGEXES.some((re) => re.test(rawMsg));
+        const msg = isSafe ? rawMsg : "Invalid command argument.";
         return `[${code}] ${msg}`;
       }
 
@@ -564,12 +627,7 @@ export function sanitizeCliErrorMessage(error: unknown): string {
     }
   }
 
-  if (error instanceof CompanyMemoryUpgradeError) {
-    return "[unexpected_failure] An unexpected error occurred during upgrade.";
-  }
-
-  const rawMessage = error instanceof Error ? error.message : String(error);
-  return scrubDsnSecrets(rawMessage);
+  return "[unexpected_failure] An unexpected error occurred during upgrade.";
 }
 
 export async function runSweepCli(

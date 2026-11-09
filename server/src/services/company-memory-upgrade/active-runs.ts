@@ -40,7 +40,14 @@ export async function countActiveCompanyRuns(
       ),
     );
 
-  return row?.count ?? 0;
+  if (!row || typeof row.count !== "number" || Number.isNaN(row.count)) {
+    throw new CompanyMemoryUpgradeError(
+      "Failed to count active company runs: query returned no result.",
+      "UNEXPECTED_FAILURE",
+    );
+  }
+
+  return row.count;
 }
 
 export interface CreateActiveRunGateOptions {
@@ -69,6 +76,11 @@ export interface ActiveRunGate {
 /**
  * Creates an active run gate that pauses callers when active runs >= threshold.
  * Threshold <= 0 disables the gate.
+ *
+ * Polling throttle: To avoid excessive database load, active runs are re-counted at most
+ * once every `pollMs` (default 15,000ms / 15s) while work is actively progressing. Pages
+ * processed within the 15s window skip recounting. When threshold is met, the gate enters
+ * a pause loop and checks at `pollMs` intervals or bounded sleep steps.
  */
 export function createActiveRunGate(
   options: CreateActiveRunGateOptions,
@@ -115,43 +127,45 @@ export function createActiveRunGate(
       onPause?.(active);
       const pauseStartMs = clock.nowMs();
 
-      while (active >= threshold) {
-        const currentMs = clock.nowMs();
-        const cumulativePausedMs = totalPausedMs + (currentMs - pauseStartMs);
+      try {
+        while (active >= threshold) {
+          const currentMs = clock.nowMs();
+          const cumulativePausedMs = totalPausedMs + (currentMs - pauseStartMs);
 
-        if (maxPauseMs > 0 && cumulativePausedMs >= maxPauseMs) {
-          // Re-poll before declaring paused_too_long
-          active = await countActiveCompanyRuns(db, companyId);
-          lastCheckMs = clock.nowMs();
-          if (active < threshold) {
-            break;
+          if (maxPauseMs > 0 && cumulativePausedMs >= maxPauseMs) {
+            // Re-poll before declaring paused_too_long
+            active = await countActiveCompanyRuns(db, companyId);
+            lastCheckMs = clock.nowMs();
+            if (active < threshold) {
+              break;
+            }
+            throw new CompanyMemoryUpgradeError(
+              `Active heartbeat runs paused longer than limit (${cumulativePausedMs}ms >= maxPauseMs ${maxPauseMs}ms)`,
+              "paused_too_long",
+            );
           }
-          totalPausedMs += (clock.nowMs() - pauseStartMs);
-          throw new CompanyMemoryUpgradeError(
-            `Active heartbeat runs paused longer than limit (${cumulativePausedMs}ms >= maxPauseMs ${maxPauseMs}ms)`,
-            "paused_too_long",
-          );
+
+          const remainingBudgetMs = maxPauseMs > 0 ? maxPauseMs - cumulativePausedMs : Infinity;
+          const stepMs = Math.min(5000, pollMs, Math.max(1, remainingBudgetMs));
+
+          await sleeper.sleep(stepMs);
+          assertLeaseActive?.();
+
+          const afterSleepMs = clock.nowMs();
+          const newCumulative = totalPausedMs + (afterSleepMs - pauseStartMs);
+          const shouldPoll =
+            afterSleepMs - lastCheckMs >= pollMs ||
+            (maxPauseMs > 0 && newCumulative >= maxPauseMs);
+
+          if (shouldPoll) {
+            active = await countActiveCompanyRuns(db, companyId);
+            lastCheckMs = clock.nowMs();
+          }
         }
-
-        const remainingBudgetMs = maxPauseMs > 0 ? maxPauseMs - cumulativePausedMs : Infinity;
-        const stepMs = Math.min(5000, pollMs, Math.max(1, remainingBudgetMs));
-
-        await sleeper.sleep(stepMs);
-        assertLeaseActive?.();
-
-        const afterSleepMs = clock.nowMs();
-        const newCumulative = totalPausedMs + (afterSleepMs - pauseStartMs);
-        const shouldPoll =
-          afterSleepMs - lastCheckMs >= pollMs ||
-          (maxPauseMs > 0 && newCumulative >= maxPauseMs);
-
-        if (shouldPoll) {
-          active = await countActiveCompanyRuns(db, companyId);
-          lastCheckMs = clock.nowMs();
-        }
+      } finally {
+        totalPausedMs += clock.nowMs() - pauseStartMs;
       }
 
-      totalPausedMs += clock.nowMs() - pauseStartMs;
       onResume?.();
     },
 

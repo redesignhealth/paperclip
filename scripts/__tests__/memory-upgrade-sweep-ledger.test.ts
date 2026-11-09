@@ -403,6 +403,26 @@ test("sweep-tenant ledger operations", async (t) => {
       (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
     );
 
+    // 6b. Malicious sensitive family name is rejected without echoing token
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "dropped_sensitive",
+          reasonCode: "apiKey,malicious_payload_token",
+        });
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(!err.message.includes("malicious_payload_token"));
+        return true;
+      },
+    );
+
     // 7. Valid sorted sensitive family combination accepted
     await commitSourceOutcome(sql, {
       upgradeId,
@@ -545,6 +565,18 @@ test("sweep-tenant ledger operations", async (t) => {
       async () => {
         await reconcileTombstones(sql, upgradeId, {
           tombstoneSourceIds: ["not-a-valid-uuid"],
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
+    );
+
+    // Interior invalid ID in liveSourceIds is rejected upfront before any mutation
+    await assert.rejects(
+      async () => {
+        await reconcileTombstones(sql, upgradeId, {
+          minSourceId: randomUUID(),
+          maxSourceId: randomUUID(),
+          liveSourceIds: [randomUUID(), "malicious-interior-non-uuid", randomUUID()],
         });
       },
       (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",

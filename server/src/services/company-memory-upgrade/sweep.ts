@@ -406,7 +406,7 @@ export async function runSweep(
       }
     });
 
-    // 4. Introspect live collection shape and ensure tenant upgrade tables exist
+    // 4. Introspect live collection shape
     const shape = await introspectCollection(tenantSql, tableName, {
       skipVectorIdentityCheck: deps._internalSkipVectorIdentityCheck,
     });
@@ -414,7 +414,6 @@ export async function runSweep(
     const stagingVectorType = deps._internalSkipVectorIdentityCheck
       ? "text"
       : shape.embeddingType;
-    await ensureUpgradeTables(tenantSql, stagingVectorType);
 
     // 5. Pre-load company agents for routing
     const agentRows = await cpDb
@@ -466,7 +465,7 @@ export async function runSweep(
       }
     } else if (upgrade.state === "needs_recovery") {
       throw new CompanyMemoryUpgradeError(
-        "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
+        "Upgrade is in needs_recovery. Recovery/status/rollback are unavailable in this slice.",
         "STATE_MISMATCH",
       );
     } else {
@@ -503,7 +502,11 @@ export async function runSweep(
       },
     });
 
-    // 9. Active run gate
+    // 9. Ensure tenant upgrade tables exist (DDL runs only after lease acquired)
+    heartbeatHandle.assertActive();
+    await ensureUpgradeTables(tenantSql, stagingVectorType);
+
+    // 10. Active run gate
     activeRunGate = createActiveRunGate({
       db: cpDb,
       companyId,
@@ -535,7 +538,8 @@ export async function runSweep(
       }
       const page = iterResult.value;
 
-      // Upfront validation: reject non-UUID source IDs before any mutations
+      // Upfront validation: reject non-UUID source IDs and duplicate case variants before any mutations
+      const seenPageIds = new Set<string>();
       for (const source of page) {
         if (!isValidUuid(source.id)) {
           throw new CompanyMemoryUpgradeError(
@@ -543,6 +547,14 @@ export async function runSweep(
             "UNSUPPORTED_SOURCE_ID",
           );
         }
+        const canonical = source.id.toLowerCase();
+        if (seenPageIds.has(canonical)) {
+          throw new CompanyMemoryUpgradeError(
+            "Collection table contains duplicate source IDs differing only in case.",
+            "UNSUPPORTED_SOURCE_ID",
+          );
+        }
+        seenPageIds.add(canonical);
       }
 
       const pageDeltas = {

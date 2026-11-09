@@ -116,6 +116,12 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
     );
   }
 
+  if (existsSync(resolvedOutPath)) {
+    const error = new Error(`Output file already exists: ${resolvedOutPath}`);
+    (error as any).code = "EEXIST";
+    throw error;
+  }
+
   return resolvedOutPath;
 }
 
@@ -625,7 +631,7 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
   if (inputCompanyId !== undefined && inputCompanyId !== null) {
     if (!isValidUuid(inputCompanyId)) {
       throw new CompanyMemoryUpgradeError(
-        `Invalid --company "${inputCompanyId}". Must be a valid UUID.`,
+        "Invalid --company. Must be a valid UUID.",
         "INVALID_ARGUMENT",
       );
     }
@@ -1075,13 +1081,13 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
 
               if (memDbRows.length === 0) {
                 throw new CompanyMemoryUpgradeError(
-                  `Unable to infer company ID for memory database "${currentDatabase}". Please supply --company <uuid>.`,
+                  "Unable to infer company ID for memory database. Please supply --company <uuid>.",
                   "INVALID_ARGUMENT",
                 );
               }
               if (memDbRows.length > 1) {
                 throw new CompanyMemoryUpgradeError(
-                  `Ambiguous company mapping: multiple company_memory_databases records found for "${currentDatabase}". Please supply --company <uuid>.`,
+                  "Ambiguous company mapping: multiple company_memory_databases records found. Please supply --company <uuid>.",
                   "INVALID_ARGUMENT",
                 );
               }

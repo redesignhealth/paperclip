@@ -337,4 +337,70 @@ test("active-runs: countActiveCompanyRuns and createActiveRunGate", async (t) =>
     assert.equal(gate.stats().pauseCount, 2);
     assert.ok(gate.stats().totalPausedMs >= pausedAfter1 + 5_000);
   });
+
+  await t.test("countActiveCompanyRuns throws bounded UNEXPECTED_FAILURE when row is undefined", async () => {
+    const mockDb = {
+      select() {
+        return {
+          from() {
+            return {
+              where() {
+                return []; // empty array -> [row] is undefined
+              },
+            };
+          },
+        };
+      },
+    } as any;
+
+    await assert.rejects(
+      async () => {
+        await countActiveCompanyRuns(mockDb, companyA.id);
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "UNEXPECTED_FAILURE");
+        assert.ok(!err.message.includes(companyA.id));
+        return true;
+      },
+    );
+  });
+
+  await t.test("createActiveRunGate accumulates totalPausedMs when assertion throws during pause", async () => {
+    await db.delete(heartbeatRuns);
+    const clock = new ManualClock(1_000_000);
+
+    const gate = createActiveRunGate({
+      db,
+      companyId: companyA.id,
+      threshold: 1,
+      pollMs: 1_000,
+      clock,
+      sleeper: {
+        async sleep(ms: number) {
+          clock.advance(ms);
+        },
+      },
+      assertLeaseActive: () => {
+        if (clock.nowMs() > 1_000_000) {
+          throw new CompanyMemoryUpgradeError("Lease lost", "LEASE_FENCED_OUT");
+        }
+      },
+    });
+
+    await db.insert(heartbeatRuns).values({ companyId: companyA.id, agentId: agentA.id, status: "running" });
+
+    await assert.rejects(
+      async () => {
+        await gate.waitUntilQuiet();
+      },
+      (err: any) => {
+        assert.equal(err.code, "LEASE_FENCED_OUT");
+        return true;
+      },
+    );
+
+    assert.equal(gate.stats().pauseCount, 1);
+    assert.ok(gate.stats().totalPausedMs > 0);
+  });
 });

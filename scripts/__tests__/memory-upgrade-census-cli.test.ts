@@ -364,7 +364,8 @@ describe("validation, path, and CLI flags unit tests", () => {
         "-5",
       ]);
       assert.equal(exitNegativeNumeric, 1);
-      assert.ok(stderrLogged.includes('Invalid --long-threshold "-5". Must be a positive integer.'));
+      assert.ok(stderrLogged.includes("Invalid --long-threshold. Must be a positive integer."));
+      assert.ok(!stderrLogged.includes("-5"));
 
       // Value flag followed by -h fails INVALID_ARGUMENT rather than short-circuiting to help
       stderrLogged = "";

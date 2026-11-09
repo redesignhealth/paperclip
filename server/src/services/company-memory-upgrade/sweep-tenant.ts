@@ -105,7 +105,7 @@ export function validateOutcomeReason(
     for (const token of tokens) {
       if (!KNOWN_SENSITIVE_FAMILY_NAMES.includes(token as KnownSensitiveFamilyName)) {
         throw new CompanyMemoryUpgradeError(
-          `Invalid sensitive family "${token}" in reason_code. Must be one of [${KNOWN_SENSITIVE_FAMILY_NAMES.join(", ")}]`,
+          `Invalid sensitive family in reason_code. Must be one of [${KNOWN_SENSITIVE_FAMILY_NAMES.join(", ")}]`,
           "INVALID_ARGUMENT",
         );
       }
@@ -139,7 +139,7 @@ export function validateOutcomeReason(
       "INVALID_ARGUMENT",
     );
   }
-  if (reasonCode.length > 100 || !/^[a-zA-Z0-9_, -]+$/.test(reasonCode)) {
+  if (reasonCode.length > 100 || !/^[a-z0-9_,-]+$/.test(reasonCode)) {
     throw new CompanyMemoryUpgradeError(
       `Invalid reason_code format for outcome '${outcome}'`,
       "INVALID_ARGUMENT",
@@ -384,6 +384,24 @@ export async function introspectCollection(
   );
   const rowCount = countRows[0]?.count ?? 0;
 
+  // Preflight text-ID collections to ensure no duplicate IDs differing only in case
+  if (!isUuidId && rowCount > 0) {
+    const dupRows = await sql.unsafe(
+      `/* Live collection table query (SELECT ONLY) */
+      SELECT lower(t.id::text) AS id
+      FROM ${resolved.regclassArg} t
+      GROUP BY lower(t.id::text)
+      HAVING count(*) > 1
+      LIMIT 1;`,
+    );
+    if (dupRows.length > 0) {
+      throw new CompanyMemoryUpgradeError(
+        `Mem0 table "${tableName}" contains duplicate text IDs differing only in case.`,
+        "UNSUPPORTED_SOURCE_ID",
+      );
+    }
+  }
+
   return {
     table: tableName,
     embeddingColumn: vectorColName,
@@ -437,7 +455,7 @@ export async function* iterateSourcePages(
           t.payload->>'data' AS data,
           t.payload->>'created_at' AS created_at
         FROM ${resolved.regclassArg} t
-        ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text)"} ASC
+        ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text) COLLATE \"C\""} ASC
         LIMIT ${currentLimit};
       `);
     } else if (isUuidId) {
@@ -468,8 +486,8 @@ export async function* iterateSourcePages(
           t.payload->>'data' AS data,
           t.payload->>'created_at' AS created_at
         FROM ${resolved.regclassArg} t
-        WHERE lower(t.id::text) > $1::text
-        ORDER BY lower(t.id::text) ASC
+        WHERE lower(t.id::text) COLLATE "C" > $1::text COLLATE "C"
+        ORDER BY lower(t.id::text) COLLATE "C" ASC
         LIMIT ${currentLimit};
       `,
         [lastId],
@@ -591,6 +609,14 @@ export async function reconcileTombstones(
         "minSourceId and maxSourceId must be valid UUID strings.",
         "UNSUPPORTED_SOURCE_ID",
       );
+    }
+    for (const id of options.liveSourceIds) {
+      if (!isValidUuid(id)) {
+        throw new CompanyMemoryUpgradeError(
+          "liveSourceIds must contain valid UUID strings.",
+          "UNSUPPORTED_SOURCE_ID",
+        );
+      }
     }
     const liveSet = new Set(options.liveSourceIds.map((id) => id.toLowerCase()));
     const rangeRows = await sql`
