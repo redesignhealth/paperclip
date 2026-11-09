@@ -313,7 +313,10 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   // choosing an agent installs it and clearing it uninstalls it. Personal default-MCP instances install through
   // their own guarded setup path, and AI / remote-MCP connections manage installs elsewhere.
   const pickerInstallsAgents =
-    connection?.connectionPurpose !== "ai" && !managesRemoteMcpAccess && !isPersonalDefaultMcpInstance(connection?.config);
+    connection?.connectionPurpose !== "ai"
+    && !managesRemoteMcpAccess
+    && !isPersonalDefaultMcpInstance(connection?.config)
+    && managedDefaultMcpKind(connection?.config) === null;
   const disconnectRemote = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
     onSuccess: () => {
@@ -347,10 +350,11 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
         if (pickerInstallsAgents && next.accessChanged && next.access.mode === "specific") {
           const wanted = installsAfterPick(install.agentIds, next.access.agentIds);
           if (wanted) {
-            await toolsApi.putConnectionInstalls(
-              connectionId,
-              wanted.map((targetId) => ({ targetType: "agent" as const, targetId })),
-            );
+            await toolsApi.putConnectionInstalls(connectionId, [
+              // PUT replaces the whole list, so a company-wide install row must be sent back to survive.
+              ...(install.onAll ? [{ targetType: "company" as const, targetId: selectedCompanyId! }] : []),
+              ...wanted.map((targetId) => ({ targetType: "agent" as const, targetId })),
+            ]);
           }
         }
         return finished;
@@ -367,12 +371,17 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.apps.attention(selectedCompanyId!) });
     },
-    onError: (error) =>
+    onError: (error) => {
+      // A picker save is two calls (bindings, then installs); if the second fails the page must re-read both.
+      void installsQuery.refetch();
+      queryClient.invalidateQueries({ queryKey: queryKeys.tools.connection(connectionId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.tools.profiles(selectedCompanyId!) });
       pushToast({
         title: "Couldn't save that",
         body: error instanceof Error ? error.message : "Please try again.",
         tone: "error",
-      }),
+      });
+    },
     onSettled: () => setPending(false),
   });
 

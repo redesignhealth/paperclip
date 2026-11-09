@@ -1341,6 +1341,41 @@ describe("AppDetail", () => {
     expect(container.textContent).toContain("can't be shared with every agent");
   });
 
+  it("TECH-8259: a rejected install save refreshes the installs and keeps the page usable", async () => {
+    mockParams.tab = "permissions";
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-1",
+        entries: [
+          { effect: "include", catalogEntryId: "catalog-read" },
+          { effect: "include", catalogEntryId: "catalog-write" },
+        ],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+    putConnectionInstallsMock.mockRejectedValueOnce(new Error("install refused"));
+
+    await renderAppDetail();
+
+    const accessGroup = container.querySelector('[role="radiogroup"][aria-label="Which agents can use this connection"]');
+    const anyAgent = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Any agent"));
+    await act(async () => {
+      anyAgent?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    const refetchesBefore = getConnectionInstallsMock.mock.calls.length;
+    const picked = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Just agents I pick"));
+    await act(async () => {
+      picked?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(putConnectionInstallsMock).toHaveBeenCalled();
+    expect(getConnectionInstallsMock.mock.calls.length).toBeGreaterThan(refetchesBefore);
+  });
+
   it("uses the setup-style agent access question without install terminology", async () => {
     mockParams.tab = "permissions";
     listProfilesMock.mockResolvedValue({
