@@ -337,6 +337,24 @@ test("http timeout is configurable with a sane default", () => {
   assert.equal(loadConfig({ UPSTREAM_SYNC_HTTP_TIMEOUT_MS: "1500" }).httpTimeoutMs, 1500);
 });
 
+test("worker trunkRef defaults to master, respects UPSTREAM_SYNC_TRUNK_REF, falls back to deprecated UPSTREAM_SYNC_INTEGRATION_REF with warning", () => {
+  const def = loadConfig({});
+  assert.equal(def.worker.trunkRef, "refs/remotes/origin/master");
+  assert.equal(def.worker.integrationRef, "refs/remotes/origin/master");
+  assert.equal(def.worker.masterRef, "refs/remotes/origin/master");
+
+  const custom = loadConfig({ UPSTREAM_SYNC_TRUNK_REF: "refs/heads/custom-trunk" });
+  assert.equal(custom.worker.trunkRef, "refs/heads/custom-trunk");
+  assert.equal(custom.worker.integrationRef, "refs/heads/custom-trunk");
+
+  const warnings = [];
+  const legacy = loadConfig({ UPSTREAM_SYNC_INTEGRATION_REF: "refs/heads/legacy-integration" }, (m) => warnings.push(m));
+  assert.equal(legacy.worker.trunkRef, "refs/heads/legacy-integration");
+  assert.equal(legacy.worker.integrationRef, "refs/heads/legacy-integration");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /UPSTREAM_SYNC_INTEGRATION_REF is deprecated/);
+});
+
 test("invalid integer env settings fall back to the default and warn", () => {
   const warnings = [];
   const cfg = loadConfig({

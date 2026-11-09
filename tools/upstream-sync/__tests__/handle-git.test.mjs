@@ -11,27 +11,33 @@ test("merge-plan: longest clean prefix, flagged commits stand alone, conflict pl
     const all = [fx.U1, fx.U2, fx.U3, fx.U4];
     const ref = "refs/heads/integration";
 
-    const plan = await mergePlan(fx.dir, all, { integrationRef: ref });
+    const plan = await mergePlan(fx.dir, all, { trunkRef: ref });
     assert.equal(plan.kind, "clean");
     assert.deepEqual(plan.shas, [fx.U1, fx.U2], "stops before U3, which conflicts with the fork edit of a.txt");
     assert.equal(plan.upTo, fx.U2);
+    assert.equal(plan.trunk, fx.integration);
+    assert.equal(plan.integration, fx.integration);
     assert.equal((await mergeTree(fx.dir, fx.integration, plan.upTo)).clean, true);
 
+    // Fallback: integrationRef still accepted for one release.
+    const fallbackPlan = await mergePlan(fx.dir, all, { integrationRef: ref });
+    assert.deepEqual(fallbackPlan.shas, [fx.U1, fx.U2]);
+
     // A flagged commit is never batched with others.
-    const flagU2 = await mergePlan(fx.dir, all, { integrationRef: ref, isFlagged: (s) => s === fx.U2 });
+    const flagU2 = await mergePlan(fx.dir, all, { trunkRef: ref, isFlagged: (s) => s === fx.U2 });
     assert.deepEqual(flagU2.shas, [fx.U1]);
-    const flagFirst = await mergePlan(fx.dir, all, { integrationRef: ref, isFlagged: (s) => s === fx.U1 });
+    const flagFirst = await mergePlan(fx.dir, all, { trunkRef: ref, isFlagged: (s) => s === fx.U1 });
     assert.deepEqual(flagFirst.shas, [fx.U1], "a flagged first commit is merged alone");
 
-    assert.deepEqual((await mergePlan(fx.dir, all, { integrationRef: ref, maxBatch: 1 })).shas, [fx.U1]);
+    assert.deepEqual((await mergePlan(fx.dir, all, { trunkRef: ref, maxBatch: 1 })).shas, [fx.U1]);
 
-    const conflict = await mergePlan(fx.dir, [fx.U3, fx.U4], { integrationRef: ref });
+    const conflict = await mergePlan(fx.dir, [fx.U3, fx.U4], { trunkRef: ref });
     assert.equal(conflict.kind, "conflict");
     assert.deepEqual(conflict.shas, [fx.U3]);
 
-    assert.deepEqual(await mergePlan(fx.dir, [], { integrationRef: ref }), { kind: "empty", shas: [] });
-    await assert.rejects(mergePlan(fx.dir, ["abc"], { integrationRef: ref }), /not a full sha/);
-    await assert.rejects(mergePlan(fx.dir, all, { integrationRef: "refs/heads/nope" }), /does not resolve/);
+    assert.deepEqual(await mergePlan(fx.dir, [], { trunkRef: ref }), { kind: "empty", shas: [] });
+    await assert.rejects(mergePlan(fx.dir, ["abc"], { trunkRef: ref }), /not a full sha/);
+    await assert.rejects(mergePlan(fx.dir, all, { trunkRef: "refs/heads/nope" }), /does not resolve/);
   } finally {
     fx.cleanup();
   }
@@ -83,7 +89,7 @@ test("delta/merge-plan do not modify refs or the work tree", async () => {
   const fx = makeFixture();
   try {
     const before = execFileSync("git", ["-C", fx.dir, "for-each-ref"], { encoding: "utf8" });
-    await mergePlan(fx.dir, [fx.U1, fx.U2, fx.U3], { integrationRef: "refs/heads/integration" });
+    await mergePlan(fx.dir, [fx.U1, fx.U2, fx.U3], { trunkRef: "refs/heads/integration" });
     assert.equal(execFileSync("git", ["-C", fx.dir, "for-each-ref"], { encoding: "utf8" }), before);
     assert.equal(execFileSync("git", ["-C", fx.dir, "status", "--porcelain"], { encoding: "utf8" }), "");
   } finally {

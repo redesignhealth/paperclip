@@ -56,16 +56,12 @@ class EligibilityTests(unittest.TestCase):
         # Public fork PRs with positive integer head repo ID are eligible
         self.assertIsNone(gate_lib.pr_ineligibility(pr(head_repo=987654321)))
 
-    def test_integration_base_is_eligible(self):
-        # TECH-8201: sync/pin-bump PRs land on `integration`, not just `master`.
-        self.assertIsNone(gate_lib.pr_ineligibility(pr(base="integration")))
-        self.assertIsNone(gate_lib.pr_ineligibility(pr(base="integration", head_repo=987654321)))
-
     def test_rejections(self):
         cases = {
             "NOT_OPEN": pr(state="closed"),
             "WRONG_BASE": pr(base="release"),
             "WRONG_BASE_MAIN": pr(base="main"),  # base must be master, not main
+            "WRONG_BASE_INTEGRATION": pr(base="integration"),  # integration retired (TECH-8283)
             "WRONG_BASE_RH_ID": pr(base_repo=1326026498),  # rh-paperclip repo ID is not allowed
             "WRONG_BASE_UPSTREAM_ID": pr(base_repo=1170821064),  # upstream paperclipai repo ID not allowed
             "FORK_OR_MISSING_HEAD_REPO_DELETED": pr(head_repo=None),  # fork deleted

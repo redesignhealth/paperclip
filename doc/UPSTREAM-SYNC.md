@@ -8,6 +8,24 @@ Code: `tools/upstream-sync/` (Node >=24.11.0, matching
 `packages/shared/src/node-version.ts`; one dependency: `pg`). Fork-owned path list:
 `FORK_OWNED.md`. Requires **git >= 2.31** (`diff-tree --diff-merges=first-parent`).
 
+## Branch model (TECH-8283)
+
+`master` is the **only long-lived branch** in `redesignhealth/paperclip`. The previous permanent `integration` branch has been retired and archived at branch `archive/integration-2026-11-09` (tag `archive/integration-tip-tech-8283`).
+
+Under the direct-to-master model, upstream sync PRs land directly into `master`:
+
+- **Per-row flow:**
+  1. Branch off fresh `origin/master`.
+  2. Run `git merge <upstream_sha>` so `<upstream_sha>` is a git parent of the branch HEAD.
+  3. **Diff split rule:** If the cumulative patch exceeds ~130,000 characters (to ensure Argus can review within payload bounds), split the change into a sequence of slice PRs targeting `master`. The merge of `<upstream_sha>` must be on the **LAST non-empty slice PR**; never create an empty-diff PR.
+  4. Ensure both `ci-aggregate` and `argus-gate` are green on the **same HEAD commit**. Never push empty commits to retrigger Argus.
+  5. No admin bypass without Dan's explicit approval.
+  6. **Human merge:** A human merges the approved PR into `master` using a **merge commit** (`--no-ff`), **never squash or rebase** (squash/rebase destroys git ancestry and causes false regressions; see PR #293 and PR #302).
+  7. **Ledger tracking:**
+     - Prepare / record: `record --status integrated --integration-sha <PR head> --review-pr N [conflict args]` (`integration_sha` is the PR head merge commit; the historical column name is kept).
+     - Once merged to master: `promote --promote-pr N` (which detects `integration_sha` is an ancestor of `master` and advances the row to `promoted`), followed by `verify`.
+     - In this direct-to-master model, rows are integrated and promoted in the same merge cycle; there is **no separate promotion PR**.
+
 ## What runs
 
 `node tools/upstream-sync/cli.mjs run` is the hourly job. In order:
@@ -81,12 +99,13 @@ Tables:
   A worker should tag its work with `SET upstream_sync.run_ref = '<run issue id>'` per run so
   each event ties back to a Paperclip run.
 
-- **Worker state on `upstream_sync_log` (migration `0382`, RED-583).** The detector only ever
+- **Worker state on `upstream_sync_log` (migration `0382`, RED-583; updated for TECH-8283).** The detector only ever
   writes `pending` rows. The sync worker adds, per row: a claim/lease (`claimed_by` = Paperclip
-  run id, `claimed_at`, `lease_expires_at`, `attempt`), the merge evidence (`integration_sha`,
-  `resolution_delta_sha256` — non-null exactly for a conflict resolution — `review_pr`,
-  `promote_pr`, `master_sha`) and the review trail (`argus_verdict`, `argus_rounds`, an
-  append-only jsonb array of `{round, sha, verdict, ...}`). Statuses and legal moves:
+  run id, `claimed_at`, `lease_expires_at`, `attempt`), the merge evidence (`integration_sha` —
+  under TECH-8283, the PR head merge commit landing into master — `resolution_delta_sha256` —
+  non-null exactly for a conflict resolution — `review_pr`, `promote_pr`, `master_sha`) and
+  the review trail (`argus_verdict`, `argus_rounds`, an append-only jsonb array of
+  `{round, sha, verdict, ...}`). Statuses and legal moves:
 
   ```
   pending -> claimed -> assessed -> integrated (clean path) -> promoted
@@ -94,6 +113,11 @@ Tables:
   any of claimed/assessed/in_review/integrated -> needs_human | failed
   claimed -> pending (release)       claimed -> claimed (extend, or reclaim after expiry)
   ```
+
+  In the direct-to-master model (TECH-8283), `integration_sha` records the PR head merge
+  commit targeting `master`. When that PR merges to `master` with a merge commit, `promote`
+  records `promote_pr` (the merged PR number) and `master_sha` (the merge commit on master)
+  in the same run; no separate promotion branch or PR exists.
 
   Worker fields: `claimed_by` is the Paperclip run id holding the lease, `claimed_at` its start,
   `lease_expires_at` when another run may reclaim it (set exactly while `claimed`), `attempt` the

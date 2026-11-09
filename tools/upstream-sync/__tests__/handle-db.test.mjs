@@ -70,7 +70,7 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     u.searchParams.set("options", `-c search_path=${SCHEMA}`);
     // One connection: a leaked session-level run_ref would be visible to the next statement.
     pool = new pg.Pool({ connectionString: u.toString(), max: 1 });
-    const refs = { integrationRef: "refs/heads/integration", masterRef: "refs/heads/master" };
+    const refs = { trunkRef: "refs/heads/integration", integrationRef: "refs/heads/integration", masterRef: "refs/heads/master" };
     const rowOf = async (sha) => (await admin.query(`SELECT * FROM upstream_sync_log WHERE upstream_sha = $1`, [sha])).rows[0];
 
     // ---- claim: oldest first, attributed to the run; run_ref is transaction-local ----------
@@ -108,8 +108,9 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     assert.equal((await events(admin, fx.U1, "assessed"))[0].run_ref, "run-A");
 
     // ---- merge-plan -> merge -> record integrated (one commit covers both rows) -----------
-    const plan = await mergePlan(fx.dir, [fx.U1, fx.U2, fx.U3, fx.U4], { integrationRef: refs.integrationRef });
+    const plan = await mergePlan(fx.dir, [fx.U1, fx.U2, fx.U3, fx.U4], { trunkRef: refs.trunkRef });
     assert.deepEqual(plan.shas, [fx.U1, fx.U2]);
+    assert.equal(plan.trunk, fx.integration);
     const M = fx.merge("integration", plan.upTo);
     await record(pool, { shas: plan.shas, status: "integrated", runId: "run-A", fields: { integration_sha: M } });
     for (const sha of plan.shas) {
@@ -185,13 +186,38 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     assert.equal((await rowOf(fx.U4)).status, "needs_human", "unrelated rows are untouched");
     await assert.rejects(promote(pool, fx.dir, { runId: "run-C", promotePr: 0, ...refs }), /promotePr/);
 
+    // ---- direct-to-master (TECH-8283): row whose integration_sha is already an ancestor of master promotes in same run
+    fx.git("checkout", "-q", "upstream");
+    fs.writeFileSync(path.join(fx.dir, "u5.txt"), "u5\n");
+    fx.git("add", "-A");
+    fx.git("commit", "-q", "-m", "U5");
+    const U5 = fx.git("rev-parse", "HEAD");
+
+    await admin.query(`INSERT INTO upstream_sync_log (upstream_sha, title, category) VALUES ($1, 'U5', 'feature')`, [U5]);
+    fx.git("checkout", "-q", "-b", "sync-u5", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge U5 to PR branch", U5);
+    const PR_HEAD = fx.git("rev-parse", "HEAD");
+    fx.git("checkout", "-q", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge PR 100 to master", PR_HEAD);
+
+    await record(pool, { shas: [U5], status: "integrated", runId: "run-D", fields: { integration_sha: PR_HEAD, review_pr: 100, path: "clean" } });
+    const r5Before = await rowOf(U5);
+    assert.equal(r5Before.status, "integrated");
+
+    const promoteDirect = await promote(pool, fx.dir, { runId: "run-D", promotePr: 100, ...refs });
+    assert.deepEqual(promoteDirect.promoted, [U5]);
+    const r5After = await rowOf(U5);
+    assert.equal(r5After.status, "promoted");
+    assert.equal(r5After.promote_pr, 100);
+    assert.equal(r5After.master_sha, promoteDirect.masterSha);
+
     // ---- verify: consistent, then a promotion that is not in master is reported -------------
     const ok = await verify(pool, fx.dir, refs);
-    assert.deepEqual(ok, { ok: true, checked: 3, problems: [] });
+    assert.deepEqual(ok, { ok: true, checked: 4, problems: [] });
     fx.git("branch", "old-master", oldMaster);
-    const bad = await verify(pool, fx.dir, { integrationRef: refs.integrationRef, masterRef: "refs/heads/old-master" });
+    const bad = await verify(pool, fx.dir, { trunkRef: refs.trunkRef, masterRef: "refs/heads/old-master" });
     assert.equal(bad.ok, false);
-    assert.deepEqual([...new Set(bad.problems.map((p) => p.sha))].sort(), [fx.U1, fx.U2, fx.U3].sort());
+    assert.deepEqual([...new Set(bad.problems.map((p) => p.sha))].sort(), [fx.U1, fx.U2, fx.U3, U5].sort());
     assert.ok(bad.problems.every((p) => p.status === "promoted"));
   } finally {
     await pool?.end();

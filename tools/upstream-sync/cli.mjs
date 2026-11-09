@@ -27,10 +27,10 @@ const USAGE = `usage: node tools/upstream-sync/cli.mjs <command>
   view                    print the readable ledger view (JSON)
   report                  print the ledger as a markdown table (for the doc view)
 
-worker commands (JSON on stdout; common flags: --run-id, --repo, --integration-ref, --master-ref):
+worker commands (JSON on stdout; common flags: --run-id, --repo, --trunk-ref (or --integration-ref), --master-ref):
   claim                   claim the oldest pending/expired row   [--lease-minutes]
   assess --sha S          claimed row -> skipped (already present) or assessed clean|conflict
-  merge-plan --shas A,B,..  longest clean prefix to merge into integration (oldest first; default: assessed rows)
+  merge-plan --shas A,B,..  longest clean prefix to merge into trunk (oldest first; default: assessed rows)
   delta --base B --upstream U --merge M [--expect SHA256]   resolution delta of merge commit M
   record --shas A,B --status S [--path --integration-sha --delta-sha256 --review-pr --promote-pr --master-sha
          --skip-reason --argus-verdict] [--argus-round JSON] [--argus-round-cap N (default 10)]
@@ -108,7 +108,8 @@ async function workerCommand(db, argv) {
   const { values: v } = parseArgs({
     args: argv,
     options: {
-      "run-id": { type: "string" }, repo: { type: "string" }, "integration-ref": { type: "string" }, "master-ref": { type: "string" },
+      "run-id": { type: "string" }, repo: { type: "string" }, "trunk-ref": { type: "string" },
+      "integration-ref": { type: "string" }, "master-ref": { type: "string" },
       "lease-minutes": { type: "string" }, sha: { type: "string" }, shas: { type: "string" }, base: { type: "string" },
       upstream: { type: "string" }, merge: { type: "string" }, expect: { type: "string" }, status: { type: "string" },
       path: { type: "string" }, "integration-sha": { type: "string" }, "delta-sha256": { type: "string" },
@@ -119,7 +120,8 @@ async function workerCommand(db, argv) {
   });
   const w = cfg.worker;
   const repo = v.repo ?? w.repoDir;
-  const refs = { integrationRef: v["integration-ref"] ?? w.integrationRef, masterRef: v["master-ref"] ?? w.masterRef };
+  const trunkRef = v["trunk-ref"] ?? v["integration-ref"] ?? w.trunkRef;
+  const refs = { trunkRef, integrationRef: trunkRef, masterRef: v["master-ref"] ?? w.masterRef };
   const runId = v["run-id"] ?? w.runId;
   const num = (name) => (v[name] === undefined ? undefined : Number(v[name]));
   const out = (x) => console.log(JSON.stringify(x, null, 2));
@@ -128,7 +130,7 @@ async function workerCommand(db, argv) {
   if (cmd === "assess") return out(await handle.assess(db, repo, { sha: v.sha, runId, ...refs }));
   if (cmd === "merge-plan") {
     const { shas, flagged, blockedBy } = await handle.planCandidates(db, { shas: v.shas ? v.shas.split(",").filter(Boolean) : null });
-    const plan = await handle.mergePlan(repo, shas, { integrationRef: refs.integrationRef, isFlagged: (s) => flagged.has(s) });
+    const plan = await handle.mergePlan(repo, shas, { trunkRef: refs.trunkRef, isFlagged: (s) => flagged.has(s) });
     return out({ ...plan, blockedBy });
   }
   if (cmd === "delta") {

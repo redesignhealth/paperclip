@@ -72,12 +72,17 @@ export const upstreamSyncLog = pgTable(
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     attempt: integer("attempt").notNull().default(0),
-    // Merge-into-`integration` result: the merge commit and the sha256 of its
-    // resolution delta (null for an empty delta, i.e. a clean merge).
+    // Upstream merge result: the merge commit and the sha256 of its resolution
+    // delta (null for an empty delta, i.e. a clean merge). Under TECH-8283 the
+    // permanent `integration` branch is retired and PRs land directly into
+    // `master`; `integrationSha` is the PR head merge commit that lands on master
+    // (historical column name kept).
     integrationSha: text("integration_sha"),
     resolutionDeltaSha256: text("resolution_delta_sha256"),
-    // Argus review PR for a conflict resolution, and the human-merged
-    // `integration` -> `master` promotion PR plus the resulting master sha.
+    // PR numbers and resulting master tip. In the direct-to-master model (TECH-8283),
+    // a slice PR's number is recorded as reviewPr upon creation/review, and once
+    // human-merged to master with a merge commit, promotePr is recorded (matching
+    // the merged PR) and masterSha holds the merge commit on master.
     reviewPr: integer("review_pr"),
     promotePr: integer("promote_pr"),
     masterSha: text("master_sha"),
