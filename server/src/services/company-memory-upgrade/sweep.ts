@@ -31,9 +31,10 @@ import {
 import { INVOKABLE_AGENT_STATUSES } from "@paperclipai/shared";
 import { eq, sql } from "drizzle-orm";
 import postgres from "postgres";
-import { adapterSupportsRuntimeMemory, deriveCompanyMemoryDatabaseNames } from "../company-memory-constants.js";
+import { adapterSupportsRuntimeMemory, deriveCompanyMemoryDatabaseNames, isSupportedCompanyMemoryEmbedding } from "../company-memory-constants.js";
 import { countActiveCompanyRuns, createActiveRunGate } from "./active-runs.js";
 import { assertCompanyAcceptsMemoryWork, findActiveUpgrade } from "./admission.js";
+import { CONVERSION_BUDGET_CONSTANTS } from "./budget.js";
 import {
   assertNoElevatedRolePrivileges,
   assertNonSuperuserAndRestrictedRole,
@@ -47,7 +48,18 @@ import {
 } from "./census.js";
 import { classifyMemoryNoiseDetailed } from "./classify-noise.js";
 import { createSystemClock, createSystemSleeper, type MonotonicClock, type Sleeper } from "./clock.js";
-import { CONVERTER_ID, CONVERTER_VERSION } from "./converter-version.js";
+import {
+  buildTargetPayload,
+  computeRecordDataSha256,
+  CONVERTER_ID,
+  CONVERTER_VERSION,
+  SUPPORTED_CONVERTER_MODELS,
+  type SupportedConverterModel,
+} from "./converter-contract.js";
+import { createOpenAiEmbeddingClient, type EmbeddingClient } from "./embedding-client.js";
+import { createOpenAiConversionClient, type ConversionClient, type ConversionClientResult } from "./llm-converter.js";
+import { RedactionRegistry, resolveCompanyOpenAiKey } from "./openai-key.js";
+import { createRateLimiter } from "./rate-limiter.js";
 import { detectSensitiveFamilies, type SensitiveFamilyName } from "./sensitive-patterns.js";
 import { computeSourceContentSha256 } from "./source-hash.js";
 import {
@@ -67,6 +79,8 @@ import {
   openTenantClient,
   reconcileChangedContent,
   reconcileTombstones,
+  stageSourceRecords,
+  type StageSourceRecordItem,
   type TenantSourceRow,
 } from "./sweep-tenant.js";
 import {
@@ -76,6 +90,10 @@ import {
   type UpgradeErrorCode,
   UPGRADE_ERROR_CODES,
 } from "./types.js";
+
+export function shouldHaltOnQuarantine(quarantined: number, considered: number): boolean {
+  return quarantined > 50 || (considered >= 200 && (quarantined / considered) > 0.02);
+}
 
 export interface SweepOptions {
   databaseUrl: string;
@@ -91,6 +109,16 @@ export interface SweepOptions {
   allowProd?: boolean;
   outputPath?: string | null;
   format?: "text" | "json";
+  model?: string;
+  openaiKeyFile?: string | null;
+  maxCostUsd?: number | null;
+  chatRpm?: number;
+  chatTpm?: number;
+  embeddingRpm?: number;
+  embeddingTpm?: number;
+  chatInputUsdPerMillion?: number;
+  chatOutputUsdPerMillion?: number;
+  embeddingUsdPerMillion?: number;
 }
 
 export interface SweepDependencies {
@@ -103,6 +131,10 @@ export interface SweepDependencies {
   _internalNow?: Date;
   env?: NodeJS.ProcessEnv;
   repoRoot?: string;
+  conversionClient?: ConversionClient;
+  embeddingClient?: EmbeddingClient;
+  fetchImpl?: typeof fetch;
+  openaiApiKey?: string;
 }
 
 export interface SweepCounts {
@@ -111,9 +143,17 @@ export interface SweepCounts {
   droppedNoiseCount: number;
   droppedSensitiveCount: number;
   pendingConversionCount: number;
+  stagedPendingPublishCount: number;
+  stagedCount?: number;
+  deduplicatedCount: number;
+  quarantinedCount: number;
   supersededCount: number;
   sourceDeletedCount: number;
   skippedUnchangedCount: number;
+  llmInputTokens?: number;
+  llmOutputTokens?: number;
+  embeddingTokens?: number;
+  estimatedCostNanodollars?: number;
 }
 
 export interface SweepReport {
@@ -200,13 +240,30 @@ export function formatSweepTextReport(report: SweepReport): string {
   lines.push("Classification Counts");
   lines.push("--------------------------------------------------------------------------------");
   lines.push(`  Total Sources Scanned:        ${report.counts.sourceSeenCount}`);
-  lines.push(`  Pending Conversion (3b):      ${report.counts.pendingConversionCount}`);
+  lines.push(`  Staged (Pending Publish):     ${report.counts.stagedPendingPublishCount ?? report.counts.stagedCount ?? 0}`);
+  lines.push(`  Deduplicated:                 ${report.counts.deduplicatedCount ?? 0}`);
+  lines.push(`  Quarantined:                  ${report.counts.quarantinedCount ?? 0}`);
   lines.push(`  Dropped Noise:                ${report.counts.droppedNoiseCount}`);
   lines.push(`  Dropped Sensitive:            ${report.counts.droppedSensitiveCount}`);
   lines.push(`  Unroutable:                   ${report.counts.unroutableCount}`);
   lines.push(`  Superseded (Changed Content): ${report.counts.supersededCount}`);
   lines.push(`  Source Deleted (Tombstones):  ${report.counts.sourceDeletedCount}`);
   lines.push(`  Skipped Unchanged:            ${report.counts.skippedUnchangedCount}`);
+  if (
+    (report.counts.llmInputTokens ?? 0) > 0 ||
+    (report.counts.embeddingTokens ?? 0) > 0
+  ) {
+    lines.push("");
+    lines.push("--------------------------------------------------------------------------------");
+    lines.push("Resource Usage (Cumulative)");
+    lines.push("--------------------------------------------------------------------------------");
+    lines.push(`  LLM Input Tokens:             ${report.counts.llmInputTokens ?? 0}`);
+    lines.push(`  LLM Output Tokens:            ${report.counts.llmOutputTokens ?? 0}`);
+    lines.push(`  Embedding Tokens:             ${report.counts.embeddingTokens ?? 0}`);
+    if (report.counts.estimatedCostNanodollars !== undefined) {
+      lines.push(`  Estimated Cost:               $${(report.counts.estimatedCostNanodollars / 1e9).toFixed(4)}`);
+    }
+  }
   lines.push("");
   lines.push("--------------------------------------------------------------------------------");
   lines.push("Active Run Gate");
@@ -271,6 +328,24 @@ export async function runSweep(
     }
   }
 
+  if (options.model !== undefined && options.model !== null) {
+    if (!SUPPORTED_CONVERTER_MODELS.includes(options.model as SupportedConverterModel)) {
+      throw new CompanyMemoryUpgradeError(
+        `Invalid --model. Only 'gpt-5.4-mini' is supported.`,
+        "INVALID_ARGUMENT",
+      );
+    }
+  }
+
+  if (options.maxCostUsd !== undefined && options.maxCostUsd !== null) {
+    if (typeof options.maxCostUsd !== "number" || !Number.isFinite(options.maxCostUsd) || options.maxCostUsd <= 0) {
+      throw new CompanyMemoryUpgradeError(
+        "Flag '--max-cost-usd' requires a positive number value.",
+        "INVALID_ARGUMENT",
+      );
+    }
+  }
+
   if (!isValidUuid(companyId)) {
     throw new CompanyMemoryUpgradeError(
       "Invalid --company. Must be a valid UUID.",
@@ -287,8 +362,8 @@ export async function runSweep(
   }
 
   const caveats: string[] = [
-    "CLASSIFICATION SWEEP (PR3a): Sources classified and recorded in ledger; zero memories converted or written to staging.",
-    "Conversion and embedding generation will occur in follow-up cutover PR3b.",
+    "CONVERSION SWEEP (PR3b): Routable memories converted and staged into tenant staging table (published_at NULL).",
+    "Zero memories published to the live collection table.",
     "Live collection table accessed read-only (SELECT ONLY).",
   ];
 
@@ -310,9 +385,17 @@ export async function runSweep(
     droppedNoiseCount: 0,
     droppedSensitiveCount: 0,
     pendingConversionCount: 0,
+    stagedPendingPublishCount: 0,
+    stagedCount: 0,
+    deduplicatedCount: 0,
+    quarantinedCount: 0,
     supersededCount: 0,
     sourceDeletedCount: 0,
     skippedUnchangedCount: 0,
+    llmInputTokens: 0,
+    llmOutputTokens: 0,
+    embeddingTokens: 0,
+    estimatedCostNanodollars: 0,
   };
 
   const rand8 = randomUUID().replace(/-/g, "").slice(0, 8);
@@ -367,6 +450,8 @@ export async function runSweep(
           host: companyMemoryDatabases.host,
           port: companyMemoryDatabases.port,
           status: companyMemoryDatabases.status,
+          embeddingModel: companyMemoryDatabases.embeddingModel,
+          embeddingDimensions: companyMemoryDatabases.embeddingDimensions,
         })
         .from(companyMemoryDatabases)
         .where(eq(companyMemoryDatabases.companyId, companyId))
@@ -384,6 +469,27 @@ export async function runSweep(
         throw new CompanyMemoryUpgradeError(
           "Company memory database binding status is not ready (refusing pending, failed, deprovisioning, archived).",
           "COMPANY_BINDING_MISMATCH",
+        );
+      }
+
+      // Preflight BEFORE lease work spends money:
+      // company_memory_databases embedding model/dims must satisfy isSupportedCompanyMemoryEmbedding;
+      // agree with converter (text-embedding-3-small, 1536).
+      if (
+        !isSupportedCompanyMemoryEmbedding({
+          model: memRow.embeddingModel,
+          dimensions: memRow.embeddingDimensions,
+        })
+      ) {
+        throw new CompanyMemoryUpgradeError(
+          `Company memory database embedding (${memRow.embeddingModel}, ${memRow.embeddingDimensions}) is not supported.`,
+          "EMBEDDING_FAILED",
+        );
+      }
+      if (memRow.embeddingModel !== "text-embedding-3-small" || memRow.embeddingDimensions !== 1536) {
+        throw new CompanyMemoryUpgradeError(
+          `Company memory database embedding (${memRow.embeddingModel}, ${memRow.embeddingDimensions}) does not match converter target (text-embedding-3-small, 1536).`,
+          "EMBEDDING_FAILED",
         );
       }
 
@@ -506,7 +612,94 @@ export async function runSweep(
     heartbeatHandle.assertActive();
     await ensureUpgradeTables(tenantSql, stagingVectorType);
 
-    // 10. Active run gate
+    // 10. Rate limiters and conversion clients
+    const redaction = new RedactionRegistry();
+
+    const chatLimiter = createRateLimiter({
+      rpm: options.chatRpm ?? CONVERSION_BUDGET_CONSTANTS.rateLimits.chatRpmCap,
+      tpm: options.chatTpm ?? CONVERSION_BUDGET_CONSTANTS.rateLimits.chatTpmCap,
+      concurrency: 2,
+      clock,
+      sleeper,
+    });
+
+    const embeddingLimiter = createRateLimiter({
+      rpm: options.embeddingRpm ?? CONVERSION_BUDGET_CONSTANTS.rateLimits.embeddingRpmCap,
+      tpm: options.embeddingTpm ?? CONVERSION_BUDGET_CONSTANTS.rateLimits.embeddingTpmCap,
+      concurrency: 2,
+      clock,
+      sleeper,
+    });
+
+    let convClient: ConversionClient | null = deps.conversionClient ?? null;
+    let embClient: EmbeddingClient | null = deps.embeddingClient ?? null;
+
+    async function getClients(): Promise<{
+      conversionClient: ConversionClient;
+      embeddingClient: EmbeddingClient;
+    }> {
+      if (convClient && embClient) {
+        return { conversionClient: convClient, embeddingClient: embClient };
+      }
+
+      const apiKey =
+        deps.openaiApiKey ??
+        (await resolveCompanyOpenAiKey({
+          controlPlaneDb: cpDb,
+          companyId,
+          keyFilePath: options.openaiKeyFile,
+          redaction,
+          repoRoot: deps.repoRoot,
+        }));
+
+      if (!convClient) {
+        convClient = createOpenAiConversionClient({
+          apiKey,
+          model: options.model ?? "gpt-5.4-mini",
+          limiter: chatLimiter,
+          sleeper,
+          clock,
+          redaction,
+          fetchImpl: deps.fetchImpl,
+        });
+      }
+
+      if (!embClient) {
+        embClient = createOpenAiEmbeddingClient({
+          apiKey,
+          limiter: embeddingLimiter,
+          sleeper,
+          clock,
+          redaction,
+          fetchImpl: deps.fetchImpl,
+        });
+      }
+
+      return { conversionClient: convClient, embeddingClient: embClient };
+    }
+
+    const chatInPrice = options.chatInputUsdPerMillion ?? CONVERSION_BUDGET_CONSTANTS.pricing.chatInputUsdPerMillion;
+    const chatOutPrice = options.chatOutputUsdPerMillion ?? CONVERSION_BUDGET_CONSTANTS.pricing.chatOutputUsdPerMillion;
+    const embPrice = options.embeddingUsdPerMillion ?? CONVERSION_BUDGET_CONSTANTS.pricing.embeddingUsdPerMillion;
+    let runningCostUsd = 0;
+    let consideredCount = 0;
+    let didPrintBudgetLine = false;
+    const quarantinedHistogram: Record<string, number> = {};
+
+    function assertWithinMaxCost(): void {
+      if (
+        options.maxCostUsd !== null &&
+        options.maxCostUsd !== undefined &&
+        runningCostUsd >= options.maxCostUsd
+      ) {
+        throw new CompanyMemoryUpgradeError(
+          "Conversion budget exceeded --max-cost-usd limit.",
+          "ABORTED_BY_OPERATOR",
+        );
+      }
+    }
+
+    // 11. Active run gate
     activeRunGate = createActiveRunGate({
       db: cpDb,
       companyId,
@@ -518,7 +711,7 @@ export async function runSweep(
       assertLeaseActive: () => heartbeatHandle?.assertActive(),
     });
 
-    // 10. Process live source pages
+    // 12. Process live source pages
     let isFirstPage = true;
 
     const sourceIterator = iterateSourcePages(tenantSql, tableName, {
@@ -562,10 +755,16 @@ export async function runSweep(
         unroutableCount: 0,
         droppedNoiseCount: 0,
         droppedSensitiveCount: 0,
+        stagedCount: 0,
+        deduplicatedCount: 0,
+        quarantinedCount: 0,
         supersededCount: 0,
         sourceDeletedCount: 0,
         skippedUnchangedCount: 0,
         pendingConversionCount: 0,
+        llmInputTokens: 0,
+        llmOutputTokens: 0,
+        embeddingTokens: 0,
       };
 
       const pageSourceIds = page.map((r) => r.id.toLowerCase());
@@ -666,9 +865,159 @@ export async function runSweep(
           continue;
         }
 
-        // Gate 4: Routable non-noise non-sensitive -> pending conversion
-        // In PR3a: ZERO staging writes, no ledger row written.
-        pageDeltas.pendingConversionCount++;
+        // Gate 4: Routable non-noise non-sensitive -> LLM conversion + re-embedding
+        if (!didPrintBudgetLine) {
+          didPrintBudgetLine = true;
+          console.error(
+            `[memory-upgrade] Budget line: running conversion sweep (model: ${options.model ?? "gpt-5.4-mini"}, embedding: text-embedding-3-small, max-rows: ${maxRows ?? "unbounded"}, max-cost-usd: ${options.maxCostUsd ? `$${options.maxCostUsd}` : "unbounded"})`,
+          );
+        }
+
+        assertWithinMaxCost();
+
+        heartbeatHandle.assertActive();
+        const { conversionClient, embeddingClient } = await getClients();
+        consideredCount++;
+
+        const convRes = await conversionClient.convert(source.data ?? "");
+        pageDeltas.llmInputTokens += convRes.inputTokens;
+        pageDeltas.llmOutputTokens += convRes.outputTokens;
+        runningCostUsd +=
+          (convRes.inputTokens * chatInPrice + convRes.outputTokens * chatOutPrice) / 1e6;
+        assertWithinMaxCost();
+
+        if (convRes.status === "drop_noise") {
+          heartbeatHandle.assertActive();
+          await commitSourceOutcome(tenantSql, {
+            upgradeId,
+            sourceId: canonicalSourceId,
+            sourceContentSha256: contentSha256,
+            agentId: matchedAgentId,
+            outcome: "dropped_noise",
+            reasonCode: "exact_placeholder_or_greeting",
+          });
+          pageDeltas.droppedNoiseCount++;
+          continue;
+        }
+
+        if (convRes.status === "drop_sensitive") {
+          heartbeatHandle.assertActive();
+          await commitSourceOutcome(tenantSql, {
+            upgradeId,
+            sourceId: canonicalSourceId,
+            sourceContentSha256: contentSha256,
+            agentId: matchedAgentId,
+            outcome: "dropped_sensitive",
+            reasonCode: convRes.reasonCode,
+          });
+          pageDeltas.droppedSensitiveCount++;
+          continue;
+        }
+
+        if (convRes.status === "quarantined") {
+          heartbeatHandle.assertActive();
+          await commitSourceOutcome(tenantSql, {
+            upgradeId,
+            sourceId: canonicalSourceId,
+            sourceContentSha256: contentSha256,
+            agentId: matchedAgentId,
+            outcome: "quarantined",
+            reasonCode: convRes.rejectCode,
+          });
+          pageDeltas.quarantinedCount++;
+          counts.quarantinedCount++;
+          quarantinedHistogram[convRes.rejectCode] =
+            (quarantinedHistogram[convRes.rejectCode] ?? 0) + 1;
+
+          if (shouldHaltOnQuarantine(counts.quarantinedCount, consideredCount)) {
+            console.error(
+              "[memory-upgrade] Quarantine threshold exceeded. Halting sweep.",
+            );
+            console.error("[memory-upgrade] Quarantine reason histogram:");
+            for (const [code, cnt] of Object.entries(quarantinedHistogram)) {
+              console.error(`  ${code}: ${cnt}`);
+            }
+
+            heartbeatHandle.assertActive();
+            await updateUpgradeCounters(
+              cpDb,
+              upgradeId,
+              leaseToken,
+              {
+                sourceSeenCount: pageDeltas.sourceSeenCount,
+                unroutableCount: pageDeltas.unroutableCount,
+                droppedNoiseCount: pageDeltas.droppedNoiseCount,
+                droppedSensitiveCount: pageDeltas.droppedSensitiveCount,
+                publishedCount: pageDeltas.stagedCount,
+                deduplicatedCount: pageDeltas.deduplicatedCount,
+                quarantinedCount: pageDeltas.quarantinedCount,
+                supersededCount: pageDeltas.supersededCount,
+                sourceDeletedCount: pageDeltas.sourceDeletedCount,
+                llmInputTokens: pageDeltas.llmInputTokens > 0 ? pageDeltas.llmInputTokens : undefined,
+                llmOutputTokens: pageDeltas.llmOutputTokens > 0 ? pageDeltas.llmOutputTokens : undefined,
+                embeddingTokens: pageDeltas.embeddingTokens > 0 ? pageDeltas.embeddingTokens : undefined,
+                estimatedCostNanodollars: BigInt(Math.round(runningCostUsd * 1e9)),
+                lastError: "conversion_failed",
+              },
+              { clock },
+            );
+
+            await heartbeatHandle.stop();
+            heartbeatHandle = null;
+            await releaseUpgradeLease(cpDb, upgradeId, leaseToken, { clock });
+            leaseToken = null;
+
+            throw new CompanyMemoryUpgradeError(
+              "Quarantine threshold exceeded: sweep halted.",
+              "CONVERSION_FAILED",
+            );
+          }
+          continue;
+        }
+
+        // convRes.status === "convert"
+        const stageItems: StageSourceRecordItem[] = [];
+        for (const rec of convRes.records) {
+          heartbeatHandle.assertActive();
+          const emb = await embeddingClient.embed(rec.data);
+          pageDeltas.embeddingTokens += emb.tokens;
+          runningCostUsd += (emb.tokens * embPrice) / 1e6;
+          assertWithinMaxCost();
+
+          const dataSha256 = computeRecordDataSha256(rec.data);
+          const payload = buildTargetPayload({
+            record: rec,
+            sourceId: canonicalSourceId,
+            agentId: matchedAgentId!,
+            companyId,
+            upgradeId,
+            sourcePayloadCreatedAt: source.createdAt,
+            sourcePayload: source.rawPayload,
+          });
+
+          stageItems.push({
+            outputId: randomUUID(),
+            dataSha256,
+            payload,
+            embedding: emb.embedding,
+          });
+        }
+
+        heartbeatHandle.assertActive();
+        const stageRes = await stageSourceRecords(tenantSql, {
+          upgradeId,
+          sourceId: canonicalSourceId,
+          sourceContentSha256: contentSha256,
+          agentId: matchedAgentId!,
+          records: stageItems,
+          vectorType: stagingVectorType,
+        });
+
+        if (stageRes.outcome === "published") {
+          pageDeltas.stagedCount++;
+        } else {
+          pageDeltas.deduplicatedCount++;
+        }
       }
 
       // Flush counter deltas for this page to control plane
@@ -683,8 +1032,15 @@ export async function runSweep(
           unroutableCount: pageDeltas.unroutableCount,
           droppedNoiseCount: pageDeltas.droppedNoiseCount,
           droppedSensitiveCount: pageDeltas.droppedSensitiveCount,
+          publishedCount: pageDeltas.stagedCount,
+          deduplicatedCount: pageDeltas.deduplicatedCount,
+          quarantinedCount: pageDeltas.quarantinedCount,
           supersededCount: pageDeltas.supersededCount,
           sourceDeletedCount: pageDeltas.sourceDeletedCount,
+          llmInputTokens: pageDeltas.llmInputTokens > 0 ? pageDeltas.llmInputTokens : undefined,
+          llmOutputTokens: pageDeltas.llmOutputTokens > 0 ? pageDeltas.llmOutputTokens : undefined,
+          embeddingTokens: pageDeltas.embeddingTokens > 0 ? pageDeltas.embeddingTokens : undefined,
+          estimatedCostNanodollars: BigInt(Math.round(runningCostUsd * 1e9)),
         },
         { clock },
       );
@@ -694,10 +1050,16 @@ export async function runSweep(
       counts.unroutableCount += pageDeltas.unroutableCount;
       counts.droppedNoiseCount += pageDeltas.droppedNoiseCount;
       counts.droppedSensitiveCount += pageDeltas.droppedSensitiveCount;
+      counts.stagedPendingPublishCount += pageDeltas.stagedCount;
+      counts.stagedCount = counts.stagedPendingPublishCount;
+      counts.deduplicatedCount += pageDeltas.deduplicatedCount;
       counts.supersededCount += pageDeltas.supersededCount;
       counts.sourceDeletedCount += pageDeltas.sourceDeletedCount;
       counts.skippedUnchangedCount += pageDeltas.skippedUnchangedCount;
-      counts.pendingConversionCount += pageDeltas.pendingConversionCount;
+      counts.llmInputTokens = (counts.llmInputTokens ?? 0) + pageDeltas.llmInputTokens;
+      counts.llmOutputTokens = (counts.llmOutputTokens ?? 0) + pageDeltas.llmOutputTokens;
+      counts.embeddingTokens = (counts.embeddingTokens ?? 0) + pageDeltas.embeddingTokens;
+      counts.estimatedCostNanodollars = Number(BigInt(Math.round(runningCostUsd * 1e9)));
 
       isFirstPage = false;
     }

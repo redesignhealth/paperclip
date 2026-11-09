@@ -124,6 +124,12 @@ export const SWEEP_ERROR_CODE_MAP: Record<string, UpgradeErrorCode> = {
   // Conversion / embedding / staging / publish / drain / rollback
   CONVERSION_FAILED: "conversion_failed",
   conversion_failed: "conversion_failed",
+  LLM_UNAVAILABLE: "conversion_failed",
+  llm_unavailable: "conversion_failed",
+  COMPANY_OPENAI_KEY_MISSING: "source_read_failed",
+  company_openai_key_missing: "source_read_failed",
+  COMPANY_OPENAI_KEY_PROVIDER_UNSUPPORTED: "source_read_failed",
+  company_openai_key_provider_unsupported: "source_read_failed",
   EMBEDDING_FAILED: "embedding_failed",
   embedding_failed: "embedding_failed",
   STAGING_WRITE_FAILED: "staging_write_failed",

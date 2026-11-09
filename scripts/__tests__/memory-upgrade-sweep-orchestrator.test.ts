@@ -11,6 +11,8 @@ import {
   companyMemoryDatabases,
   companyMemoryUpgrades,
   createDb,
+  createFakeConversionClient,
+  createFakeEmbeddingClient,
   eq,
   getEmbeddedPostgresTestSupport,
   handleEmbeddedPostgresUnsupported,
@@ -229,6 +231,19 @@ test("sweep orchestrator integration", async (t) => {
     });
 
     const clock = new ManualClock();
+    let llmCalls = 0;
+    let embCalls = 0;
+    const conversionClient = createFakeConversionClient(() => {
+      llmCalls++;
+      return { status: "convert" };
+    });
+    const embeddingClient = createFakeEmbeddingClient();
+    const origEmbed = embeddingClient.embed;
+    embeddingClient.embed = async (txt: string) => {
+      embCalls++;
+      return origEmbed(txt);
+    };
+
     const report: SweepReport = await runSweep(
       {
         databaseUrl: tenantWorkerUrl.toString(),
@@ -242,26 +257,39 @@ test("sweep orchestrator integration", async (t) => {
         tenantSql: tenantWorkerSql,
         clock,
         _internalSkipVectorIdentityCheck: true,
+        conversionClient,
+        embeddingClient,
       },
     );
 
     // Assert counts
     assert.equal(report.status, "completed");
     assert.equal(report.counts.sourceSeenCount, 10);
-    assert.equal(report.counts.pendingConversionCount, 2); // substantiveId + pausedSubstantiveId
+    assert.equal(report.counts.stagedPendingPublishCount, 2); // substantiveId + pausedSubstantiveId
     assert.equal(report.counts.droppedNoiseCount, 2); // empty + greeting
     assert.equal(report.counts.droppedSensitiveCount, 1); // sensitive
     assert.equal(report.counts.unroutableCount, 5); // missing, malformed, unknown, terminated, nonMemory
     assert.equal(report.counts.supersededCount, 0);
     assert.equal(report.counts.sourceDeletedCount, 0);
 
-    // Verify routable non-noise non-sensitive rows get NO ledger row!
+    // Verify routable non-noise non-sensitive rows get ledger rows with published and output_ids!
     const substantiveLedger = await tenantWorkerSql`
       SELECT * FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${report.upgradeId}::uuid
-        AND source_id IN (${substantiveId}::uuid, ${pausedSubstantiveId}::uuid);
+        AND source_id = ANY(${[substantiveId, pausedSubstantiveId]}::uuid[]);
     `;
-    assert.equal(substantiveLedger.length, 0);
+    assert.equal(substantiveLedger.length, 2);
+    assert.equal(substantiveLedger[0].outcome, "published");
+    assert.equal(substantiveLedger[1].outcome, "published");
+
+    const stagedRows = await tenantWorkerSql`
+      SELECT * FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${report.upgradeId}::uuid
+        AND source_id = ANY(${[substantiveId, pausedSubstantiveId]}::uuid[]);
+    `;
+    assert.equal(stagedRows.length, 2);
+    assert.equal(stagedRows[0].published_at, null);
+    assert.equal(stagedRows[1].published_at, null);
 
     // Verify sensitive row has family names only in reason_code, NEVER matched text
     const sensitiveLedger = await tenantWorkerSql`
@@ -308,6 +336,7 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(upgradeRow.unroutableCount, ledgerMap.get("unroutable"));
     assert.equal(upgradeRow.droppedNoiseCount, ledgerMap.get("dropped_noise"));
     assert.equal(upgradeRow.droppedSensitiveCount, ledgerMap.get("dropped_sensitive"));
+    assert.equal(upgradeRow.publishedCount, ledgerMap.get("published"));
     assert.equal(upgradeRow.sweepCount, 1);
 
     // Verify NO memory text exists in ANY column of company_memory_upgrades
@@ -321,7 +350,9 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(rowsAfter.length, initialLiveCount + 10);
     assert.deepEqual([...rowsAfter.slice(0, initialLiveCount)], [...rowsBefore]);
 
-    // Idempotent re-run test: makes zero new ledger writes
+    // Idempotent re-run test: makes ZERO new LLM calls and ZERO embedding calls
+    const prevLlmCalls = llmCalls;
+    const prevEmbCalls = embCalls;
     const ledgerRowsBeforeRerun = await tenantWorkerSql`SELECT count(*)::int AS count FROM paperclip_memory_upgrade_ledger WHERE upgrade_id = ${report.upgradeId}::uuid`;
 
     const rerunReport = await runSweep(
@@ -337,13 +368,17 @@ test("sweep orchestrator integration", async (t) => {
         tenantSql: tenantWorkerSql,
         clock,
         _internalSkipVectorIdentityCheck: true,
+        conversionClient,
+        embeddingClient,
       },
     );
 
     const ledgerRowsAfterRerun = await tenantWorkerSql`SELECT count(*)::int AS count FROM paperclip_memory_upgrade_ledger WHERE upgrade_id = ${report.upgradeId}::uuid`;
     assert.equal(ledgerRowsAfterRerun[0].count, ledgerRowsBeforeRerun[0].count);
-    assert.equal(rerunReport.counts.skippedUnchangedCount, 8); // 8 non-pending rows skipped
-    assert.equal(rerunReport.counts.pendingConversionCount, 2);
+    assert.equal(rerunReport.counts.skippedUnchangedCount, 10); // All 10 rows skipped!
+    assert.equal(rerunReport.counts.stagedPendingPublishCount, 0);
+    assert.equal(llmCalls, prevLlmCalls, "Completed re-run makes ZERO LLM calls");
+    assert.equal(embCalls, prevEmbCalls, "Completed re-run makes ZERO embedding calls");
 
     // Verify unchanged rerun does NOT duplicate outcome increments on control plane
     const [upgradeRowRerun] = await cpWorkerDb
@@ -354,6 +389,7 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(upgradeRowRerun.unroutableCount, upgradeRow.unroutableCount);
     assert.equal(upgradeRowRerun.droppedNoiseCount, upgradeRow.droppedNoiseCount);
     assert.equal(upgradeRowRerun.droppedSensitiveCount, upgradeRow.droppedSensitiveCount);
+    assert.equal(upgradeRowRerun.publishedCount, upgradeRow.publishedCount);
     assert.equal(upgradeRowRerun.supersededCount, 0);
     assert.equal(upgradeRowRerun.sourceDeletedCount, 0);
   });

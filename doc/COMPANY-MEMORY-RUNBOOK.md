@@ -340,7 +340,7 @@ Key Options and Environment Variables:
 
 #### Conversion Sweep (TECH-8191)
 
-Paperclip provides an online, tenant-isolated sweep command to classify legacy company-scoped Mem0 memories and record outcomes in the tenant upgrade ledger:
+Paperclip provides an online, tenant-isolated sweep command to classify legacy company-scoped Mem0 memories, convert substantive records into atomic sentences, re-embed them, and record outcomes in the tenant upgrade ledger and staging table:
 
 ```bash
 pnpm memory:upgrade sweep \
@@ -357,8 +357,18 @@ Key Options and Safety Rules:
 - `--company <uuid>`: Target company UUID (validated against control-plane binding).
 - `--confirm <uuid>`: Required confirmation matching `--company` exactly; prevents accidental cutover execution.
 - `--table <name>`: Target Mem0 collection table name (default: "mem0_memories").
+- `--model <name>`: Converter LLM model (default: "gpt-5.4-mini").
+- `--openai-key-file <path>`: External 0600 key file path (bypasses control-plane `company_secrets` resolution).
 - `--page-size <int>`: Keyset page size for scanning sources (default: 1000).
 - `--max-rows <int>`: Maximum number of live source rows to scan.
+- `--max-cost-usd <num>`: Maximum cumulative cost in USD before aborting sweep.
+- `--chat-rpm <int>`: Chat completions rate limit cap (RPM, default: 500).
+- `--chat-tpm <int>`: Chat completions token limit cap (TPM, default: 200,000).
+- `--embedding-rpm <int>`: Embeddings rate limit cap (RPM, default: 3,000).
+- `--embedding-tpm <int>`: Embeddings token limit cap (TPM, default: 1,000,000).
+- `--chat-input-usd-per-mtok <num>`: Override chat input price in USD per 1M tokens.
+- `--chat-output-usd-per-mtok <num>`: Override chat output price in USD per 1M tokens.
+- `--embedding-usd-per-mtok <num>`: Override embedding price in USD per 1M tokens.
 - `--operator-label <text>`: Operator-provided label for upgrade record identification (1-64 characters matching `[A-Za-z0-9._:@-]`).
 - `--output, --out <path>`: Write sweep report to external path (mode 0600, exclusive create).
 - `--format <text|json>`: Output format: human summary (`text`, default) or JSON (`json`).
@@ -370,6 +380,7 @@ Key Options and Safety Rules:
 Operational Prerequisites:
 - **Role restrictions**: The tenant role must NOT be a superuser and must NOT have `BYPASSRLS`. The role must have `SELECT` privilege on the live collection table, and `CREATE`/`USAGE` privileges to manage upgrade tables (`paperclip_memory_upgrade_ledger`, `paperclip_memory_upgrade_staging`, `paperclip_memory_upgrade_dedupe`). The control-plane role must have read/write access to upgrade tracking and agent tables.
 - **Ready binding**: The company memory database record (`company_memory_databases`) must have status `ready`. The sweep strictly refuses bindings in `pending`, `failed`, `deprovisioning`, or `archived` states.
+- **Key Sourcing**: The OpenAI API key is sourced from the company-scoped `openai_api_key` secret in control-plane `company_secrets` (`local_encrypted` provider only; other providers must use `--openai-key-file`). External key files must reside outside the repository tree, have non-symlink mode `0600` or `0400` permissions (group/other bits strictly refused), and contain 20..512 printable non-whitespace ASCII characters. `process.env.OPENAI_API_KEY` is strictly ignored.
 - **Lease release behaviour**: Upon successful sweep completion or clean error termination, the worker immediately stops the heartbeat timer and releases its lease on the upgrade record. A cleanly released upgrade does not lapse and remains claimable by future sweeps.
 - **Crash-expiry TTL and recovery unavailability in this slice**: If a worker crashes ungracefully without releasing, its lease will expire after the lease TTL (default 10 minutes / 600s). Background reconciliation (`reconcileLapsedUpgradeLeases`) detects the expired lease on the active upgrade and transitions it to `needs_recovery`. When an upgrade is in `needs_recovery`, future sweep attempts are refused with `STATE_MISMATCH`. Recovery, status, and rollback commands (`pnpm memory:upgrade recover|status|rollback`) are unimplemented stubs that fail closed in this slice; do not attempt to run stub commands. Operators must wait for subsequent lifecycle cutover tooling to ship before recovering or resuming upgrades in `needs_recovery`.
 
@@ -381,23 +392,33 @@ Operational Prerequisites:
 > NEVER perform manual SQL bypasses (e.g. deleting or mutating `company_memory_upgrades` rows) or attempt ad-hoc auto-clearing to work around deletion blocks. Manual tampering invalidates upgrade invariants and risks catastrophic memory corruption.
 
 Operational Invariants:
-1. **Scope and Staging in PR3a**:
-   - In PR3a, the sweep is strictly **zero network egress, zero API keys, and zero staging writes**.
-   - Live sources are evaluated through the deterministic classification pipeline: routing readiness (`unroutable`), deterministic noise (`dropped_noise`), and sensitive pattern detection (`dropped_sensitive`).
-   - Routable, non-noise, non-sensitive rows receive **no ledger row** and are counted as `pendingConversion`. LLM conversion, embedding generation, and staging table population arrive in follow-up PR3b.
-2. **Authoritative Ledger vs. Cumulative Activity Counters**:
+1. **Staging-Only Guarantee (PR3b)**:
+   - Routable, non-noise, non-sensitive rows are converted into 1 to 3 atomic memory sentences via `gpt-5.4-mini` and re-embedded via `text-embedding-3-small` (1536 dims).
+   - Records are written to `paperclip_memory_upgrade_staging` with `published_at = NULL` (unambiguously not live).
+   - In reports, logs, and CLI output, these are explicitly labeled **"staged (pending publish)"**, never "published".
+   - **Zero rows are published to the live collection table.**
+2. **Rate Limiting & Concurrency**:
+   - Outgoing OpenAI API calls are rate-limited across dual token buckets (RPM and TPM for both chat and embeddings) with concurrency hard-capped at 2.
+   - 429 and 5xx responses are retried using Retry-After-aware exponential backoff with jitter.
+3. **Quarantine Halt & Resume**:
+   - A row is quarantined if schema validation or repair retries fail.
+   - The sweep halts immediately if quarantine threshold is exceeded: `quarantined > 50 || (considered >= 200 && quarantined / considered > 0.02)`.
+   - On halt, the worker flushes cumulative counters with `last_error = "conversion_failed"`, prints a histogram of reject codes, stops the heartbeat, and cleanly releases its lease. The upgrade state remains `sweeping`.
+   - Because already-ledgered rows are skipped on re-run, resuming a sweep after fixing upstream issues safely picks up from where it left off without re-evaluating or re-converting processed sources.
+4. **Authoritative Ledger vs. Cumulative Activity Counters**:
    - The tenant database table `paperclip_memory_upgrade_ledger` is authoritative for source classifications, content hashes, and outcomes.
    - Counters on `company_memory_upgrades` (including `superseded_count`) record cumulative **activity**, tracking lifecycle transition events over time rather than a gauge of rows currently in that state.
-   - When a source's content or agent routing changes between sweeps, `reconcileChangedContent` removes its old ledger entry so the source can reclassify cleanly into its current state; it is not stored as a persistent `outcome = 'superseded'` row.
-   - If an ungraceful crash or interruption occurs between removal and reclassification, the source simply has no ledger entry (which matches `pending_conversion` rows in this slice, since PR3a persists only terminal classifications or tombstones). On a subsequent resumed sweep, the source is safely re-evaluated from scratch without state leakage.
-3. **Sensitive Rows are Never Auto-Pruned**:
-   - Sources identified by `detectSensitiveFamilies` are recorded with outcome `dropped_sensitive` and reason codes naming matched family categories (e.g. `apiKey,passwordAssignment`), never raw text.
+   - When a source's content or agent routing changes between sweeps, `reconcileChangedContent` removes its old ledger entry and clears unpublished staging/dedupe rows so the source can reclassify cleanly into its current state.
+5. **Sensitive Rows are Never Auto-Pruned**:
+   - Sources identified by `detectSensitiveFamilies` (or sensitive pattern echoes on model output) are recorded with outcome `dropped_sensitive` and reason codes naming matched family categories (e.g. `apiKey,passwordAssignment`), never raw text.
    - `dropped_sensitive` rows are **never** automatically pruned or published. They remain retained in the ledger for operator audit and manual inspection.
-4. **Active-Run Quiescence, Polling Throttle, and Leases**:
+6. **Active-Run Quiescence, Polling Throttle, and Leases**:
    - The active-run gate throttles polling: active heartbeat runs are re-counted at most once every `active-run-poll-ms` (default 15,000ms / 15s) while scanning continues, avoiding excessive control-plane query load.
    - When active runs reach or exceed the threshold, the sweep pauses. While paused, lease heartbeat timers remain active and periodically renew the lease in the background (approximately every 2 minutes, or `min(120s, ttl/3)`), while the active-run gate sleeps in bounded 5-second slices and asserts lease health between slices. If the lease lapses or is lost, the sweep aborts cleanly.
    - Total paused duration is tracked accurately using a finally guard so all elapsed pause time is accounted for even if lease assertions or sleep intervals fail.
-5. **Read-Only Access to Live Collection**:
+7. **Read-Only Access to Live Collection**:
+   - The live Mem0 collection table is accessed **strictly via SELECT statements**.
+   - No UPDATE, DELETE, INSERT, or DDL index modifications are ever issued against the live Mem0 collection table during sweep.
    - The live Mem0 collection table is accessed **strictly via SELECT statements**.
    - No UPDATE, DELETE, INSERT, or DDL index modifications are ever issued against the live Mem0 collection table during sweep.
 

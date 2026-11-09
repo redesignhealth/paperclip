@@ -20,6 +20,8 @@ import {
   companies,
   companyMemoryDatabases,
   createDb,
+  createFakeConversionClient,
+  createFakeEmbeddingClient,
   getEmbeddedPostgresTestSupport,
   handleEmbeddedPostgresUnsupported,
   insertTenantMemoryRow,
@@ -108,10 +110,10 @@ test("sweep CLI validation and flags", async (t) => {
 
   await t.test("validateNoUnknownFlags rejects unexpected options for sweep", () => {
     assert.throws(
-      () => validateNoUnknownFlags(["--chat-input-usd-per-mtok=1.5"], ALLOWED_SWEEP_FLAGS, "sweep"),
+      () => validateNoUnknownFlags(["--long-threshold=500"], ALLOWED_SWEEP_FLAGS, "sweep"),
       (err: any) => {
         assert.equal(err.code, "INVALID_ARGUMENT");
-        assert.ok(err.message.includes("Unknown option '--chat-input-usd-per-mtok'"));
+        assert.ok(err.message.includes("Unknown option '--long-threshold'"));
         assert.ok(err.message.includes("Only sweep options are accepted"));
         return true;
       },
@@ -629,7 +631,11 @@ test("sweep CLI database integration", async (t) => {
         "--output", externalOut,
         "--format", "json",
         "--pause-when-active-runs", "0",
-      ], { _internalSkipVectorIdentityCheck: true });
+      ], {
+        _internalSkipVectorIdentityCheck: true,
+        conversionClient: createFakeConversionClient(),
+        embeddingClient: createFakeEmbeddingClient(),
+      });
       assert.equal(exitExternal, 0);
       assert.ok(stderr.includes("Sweep report written to"));
 
@@ -646,6 +652,11 @@ test("sweep CLI database integration", async (t) => {
     const origLog = console.log;
     console.log = (msg: string) => { stdout += `${msg}\n`; };
 
+    await insertTenantMemoryRow(tenantAdminSql, {
+      agentId: agent.id,
+      data: "Fresh substantive preference memory text for JSON output test.",
+    });
+
     try {
       const exit = await runSweepCli([
         "--database-url", tenantUserUrl.toString(),
@@ -654,12 +665,16 @@ test("sweep CLI database integration", async (t) => {
         "--confirm", company.id,
         "--format", "json",
         "--pause-when-active-runs", "0",
-      ], { _internalSkipVectorIdentityCheck: true });
+      ], {
+        _internalSkipVectorIdentityCheck: true,
+        conversionClient: createFakeConversionClient(),
+        embeddingClient: createFakeEmbeddingClient(),
+      });
 
       assert.equal(exit, 0);
       const parsed = JSON.parse(stdout);
       assert.equal(parsed.schemaVersion, "1.0");
-      assert.equal(parsed.counts.pendingConversionCount, 1);
+      assert.equal(parsed.counts.stagedPendingPublishCount, 1);
       assert.ok(parsed.counts.sourceSeenCount >= 1);
 
       // Verify ZERO memory text anywhere in stdout

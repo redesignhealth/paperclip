@@ -32,6 +32,7 @@ export interface TenantSourceRow {
   userId: string | null;
   data: string | null;
   createdAt: string | null;
+  rawPayload?: Record<string, unknown> | null;
 }
 
 export interface TenantCollectionShape {
@@ -464,7 +465,8 @@ export async function* iterateSourcePages(
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
-          t.payload->>'created_at' AS created_at
+          t.payload->>'created_at' AS created_at,
+          t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text) COLLATE \"C\""} ASC
         LIMIT ${currentLimit};
@@ -478,7 +480,8 @@ export async function* iterateSourcePages(
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
-          t.payload->>'created_at' AS created_at
+          t.payload->>'created_at' AS created_at,
+          t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         WHERE t.id > $1::uuid
         ORDER BY t.id ASC
@@ -495,7 +498,8 @@ export async function* iterateSourcePages(
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
-          t.payload->>'created_at' AS created_at
+          t.payload->>'created_at' AS created_at,
+          t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         WHERE lower(t.id::text) COLLATE "C" > $1::text COLLATE "C"
         ORDER BY lower(t.id::text) COLLATE "C" ASC
@@ -509,13 +513,28 @@ export async function* iterateSourcePages(
       break;
     }
 
-    const page: TenantSourceRow[] = rows.map((r) => ({
-      id: String(r.id).toLowerCase(),
-      agentId: r.agent_id ?? null,
-      userId: r.user_id ?? null,
-      data: r.data ?? null,
-      createdAt: r.created_at ?? null,
-    }));
+    const page: TenantSourceRow[] = rows.map((r) => {
+      let rawPayload: Record<string, unknown> | null = null;
+      if (r.raw_payload) {
+        if (typeof r.raw_payload === "object") {
+          rawPayload = r.raw_payload;
+        } else if (typeof r.raw_payload === "string") {
+          try {
+            rawPayload = JSON.parse(r.raw_payload);
+          } catch {
+            rawPayload = null;
+          }
+        }
+      }
+      return {
+        id: String(r.id).toLowerCase(),
+        agentId: r.agent_id ?? null,
+        userId: r.user_id ?? null,
+        data: r.data ?? null,
+        createdAt: r.created_at ?? null,
+        rawPayload,
+      };
+    });
 
     lastId = page[page.length - 1].id;
     totalYielded += page.length;
@@ -867,4 +886,259 @@ export async function commitSourceOutcome(
         updated_at = now();
     `;
   });
+}
+
+export interface StageSourceRecordItem {
+  outputId: string;
+  dataSha256: string;
+  payload: Record<string, unknown>;
+  embedding: number[];
+}
+
+export interface StageSourceRecordsParams {
+  upgradeId: string;
+  sourceId: string;
+  sourceContentSha256: string;
+  agentId: string;
+  records: StageSourceRecordItem[];
+  vectorType?: string;
+}
+
+export interface StageSourceRecordsResult {
+  outcome: "published" | "deduplicated";
+  outputIds: string[];
+  stagedCount: number;
+  deduplicatedCount: number;
+}
+
+/**
+ * Stages converted records for a single source row in one atomic tenant transaction.
+ *
+ * Operational rules:
+ * - Deletes unpublished staging rows for the source and their matching dedupe slots.
+ *   Published staging rows (published_at IS NOT NULL) are NEVER deleted.
+ * - Claims dedupe slots via INSERT ... ON CONFLICT (upgrade_id, agent_id, data_sha256) DO NOTHING.
+ * - Stages won records with published_at NULL (unambiguously not live).
+ * - Upserts ledger with outcome 'published' (if >= 1 won) or 'deduplicated' (if all duplicate).
+ *   NOTE: The ledger CHECK vocabulary has no 'staged'; published_at IS NULL is the
+ *   authoritative marker for not-live staging rows.
+ */
+export async function stageSourceRecords(
+  sql: postgres.Sql,
+  params: StageSourceRecordsParams,
+): Promise<StageSourceRecordsResult> {
+  const { upgradeId, sourceId, sourceContentSha256, agentId, records } = params;
+
+  if (!isValidUuid(sourceId)) {
+    throw new CompanyMemoryUpgradeError(
+      "sourceId must be a valid UUID string.",
+      "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(
+      "upgradeId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (!isValidUuid(agentId)) {
+    throw new CompanyMemoryUpgradeError(
+      "agentId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+
+  let resultOutcome: "published" | "deduplicated" = "published";
+  const wonOutputIds: string[] = [];
+
+  await sql.begin(async (tx: any) => {
+    // 1. Find unpublished staging output_ids for this source
+    const existingStaging = await tx`
+      SELECT output_id
+      FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgradeId}::uuid
+        AND source_id = ${sourceId}::uuid
+        AND published_at IS NULL;
+    `;
+    const oldOutputIds = existingStaging.map((r: any) => r.output_id);
+
+    // 2. Delete matching dedupe rows and unpublished staging rows
+    if (oldOutputIds.length > 0) {
+      await tx`
+        DELETE FROM paperclip_memory_upgrade_dedupe
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND output_id = ANY(${oldOutputIds}::uuid[]);
+      `;
+      await tx`
+        DELETE FROM paperclip_memory_upgrade_staging
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND source_id = ${sourceId}::uuid
+          AND published_at IS NULL;
+      `;
+    }
+
+    // 3. Claim dedupe slots for each record
+    const wonRecords: StageSourceRecordItem[] = [];
+    for (const rec of records) {
+      if (!isValidUuid(rec.outputId)) {
+        throw new CompanyMemoryUpgradeError(
+          "outputId must be a valid UUID string.",
+          "INVALID_ARGUMENT",
+        );
+      }
+
+      const claimRows = await tx`
+        INSERT INTO paperclip_memory_upgrade_dedupe (
+          upgrade_id,
+          agent_id,
+          data_sha256,
+          output_id,
+          created_at
+        ) VALUES (
+          ${upgradeId}::uuid,
+          ${agentId}::uuid,
+          ${rec.dataSha256},
+          ${rec.outputId}::uuid,
+          now()
+        )
+        ON CONFLICT (upgrade_id, agent_id, data_sha256) DO NOTHING
+        RETURNING output_id;
+      `;
+
+      if (claimRows.length > 0) {
+        wonRecords.push(rec);
+        wonOutputIds.push(rec.outputId);
+      }
+    }
+
+    // 4. Stage won records (published_at IS NULL)
+    for (const won of wonRecords) {
+      const vectorLiteral = JSON.stringify(won.embedding);
+      if (params.vectorType === "text") {
+        await tx`
+          INSERT INTO paperclip_memory_upgrade_staging (
+            upgrade_id,
+            source_id,
+            output_id,
+            agent_id,
+            payload,
+            embedding,
+            content_sha256,
+            published_at,
+            created_at
+          ) VALUES (
+            ${upgradeId}::uuid,
+            ${sourceId}::uuid,
+            ${won.outputId}::uuid,
+            ${agentId}::uuid,
+            ${JSON.stringify(won.payload)}::jsonb,
+            ${vectorLiteral}::text,
+            ${won.dataSha256},
+            NULL,
+            now()
+          );
+        `;
+      } else {
+        await tx`
+          INSERT INTO paperclip_memory_upgrade_staging (
+            upgrade_id,
+            source_id,
+            output_id,
+            agent_id,
+            payload,
+            embedding,
+            content_sha256,
+            published_at,
+            created_at
+          ) VALUES (
+            ${upgradeId}::uuid,
+            ${sourceId}::uuid,
+            ${won.outputId}::uuid,
+            ${agentId}::uuid,
+            ${JSON.stringify(won.payload)}::jsonb,
+            ${vectorLiteral}::vector(1536),
+            ${won.dataSha256},
+            NULL,
+            now()
+          );
+        `;
+      }
+    }
+
+    // 5. Upsert ledger outcome
+    // NOTE: The CHECK vocabulary has no 'staged'; published_at IS NULL in staging
+    // is the authoritative not-live marker.
+    if (wonRecords.length > 0) {
+      resultOutcome = "published";
+      await tx`
+        INSERT INTO paperclip_memory_upgrade_ledger (
+          upgrade_id,
+          source_id,
+          source_content_sha256,
+          agent_id,
+          outcome,
+          reason_code,
+          output_ids,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${upgradeId}::uuid,
+          ${sourceId}::uuid,
+          ${sourceContentSha256},
+          ${agentId}::uuid,
+          'published',
+          NULL,
+          ${wonOutputIds}::uuid[],
+          now(),
+          now()
+        )
+        ON CONFLICT (upgrade_id, source_id) DO UPDATE SET
+          source_content_sha256 = EXCLUDED.source_content_sha256,
+          agent_id = EXCLUDED.agent_id,
+          outcome = EXCLUDED.outcome,
+          reason_code = EXCLUDED.reason_code,
+          output_ids = EXCLUDED.output_ids,
+          updated_at = now();
+      `;
+    } else {
+      resultOutcome = "deduplicated";
+      await tx`
+        INSERT INTO paperclip_memory_upgrade_ledger (
+          upgrade_id,
+          source_id,
+          source_content_sha256,
+          agent_id,
+          outcome,
+          reason_code,
+          output_ids,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${upgradeId}::uuid,
+          ${sourceId}::uuid,
+          ${sourceContentSha256},
+          ${agentId}::uuid,
+          'deduplicated',
+          NULL,
+          '{}',
+          now(),
+          now()
+        )
+        ON CONFLICT (upgrade_id, source_id) DO UPDATE SET
+          source_content_sha256 = EXCLUDED.source_content_sha256,
+          agent_id = EXCLUDED.agent_id,
+          outcome = EXCLUDED.outcome,
+          reason_code = EXCLUDED.reason_code,
+          output_ids = EXCLUDED.output_ids,
+          updated_at = now();
+      `;
+    }
+  });
+
+  return {
+    outcome: resultOutcome,
+    outputIds: wonOutputIds,
+    stagedCount: wonOutputIds.length,
+    deduplicatedCount: records.length - wonOutputIds.length,
+  };
 }
