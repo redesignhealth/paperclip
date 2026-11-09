@@ -321,6 +321,23 @@ WHERE (embedding_model, embedding_dimensions) NOT IN (
 
 If the census reveals any rows with unsupported pairs or unexpected NULL values, deployment must not proceed until those rows are investigated and remediated.
 
+#### Read-Only Memory Upgrade Census CLI (TECH-8191)
+
+Paperclip provides a strictly read-only inspection CLI to evaluate Mem0 memory data and estimate conversion budgets prior to upgrades:
+
+```bash
+pnpm memory:upgrade census --database-url <tenant-dsn> [options]
+```
+
+Key Options and Environment Variables:
+- `--database-url <dsn>`: Tenant PostgreSQL DSN (or `COMPANY_MEMORY_DATABASE_URL` env var).
+- `--control-plane-url <dsn>`: Paperclip control-plane DSN to verify company existence and agent routing (or `CONTROL_PLANE_DATABASE_URL` env var).
+- `--company <uuid>`: Target company UUID (validated against control plane or derived names).
+- `--prod`: Flag required alongside `MEMORY_UPGRADE_ALLOW_PROD=1` whenever target host is non-localhost.
+- `MEMORY_UPGRADE_ALLOW_PROD=1`: Environment variable required alongside `--prod` for non-local database hosts.
+
+> **Production Safety Notice**: Host locality is not proof of environment. A production database reached over an SSH tunnel or port-forward presents as a local host and will not trigger this gate. Always verify connection targets before running operational tooling.
+
 #### Safe Expand/Contract Migration Procedure
 Transitioning to a new embedding model or dimension must follow a multi-phase expand/contract lifecycle. The runtime does not support arbitrary live migrations; all data transitions require planned offline cutovers with operator verification. Never execute arbitrary or automatic production actions.
 

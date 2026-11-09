@@ -77,6 +77,9 @@ OPTIONAL_SKIPPED_JOBS: dict[str, frozenset[str]] = {
     # pr-trusted.yml's Vitest selection is an optimization. Its `if` skips it whenever the plan
     # forces a full run, and the full test matrix then runs instead. A failure still fails.
     ".github/workflows/pr.yml": frozenset({"ci / Select Vitest files"}),
+    # docker-runner-check.yml also runs on pull_request when runner paths change, but both of its
+    # jobs are workflow_dispatch-only maintainer gates and skip there. Any other job still has to pass.
+    ".github/workflows/docker-runner-check.yml": frozenset({"authorize_manual", "Build and verify on Linux"}),
 }
 
 WAITING_CONCLUSIONS = frozenset({"action_required"})

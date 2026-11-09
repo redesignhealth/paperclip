@@ -275,30 +275,32 @@ describe("preparePiRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("warns by provider name only when a bare-name apiKey is missing or empty, and never writes the key value", async () => {
-    for (const env of [{} as Record<string, string>, { RAMP_ROUTER_API_KEY: "" }]) {
-      const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: routerProviders("RAMP_ROUTER_API_KEY"), ...env } });
+  it("warns with the env var name when a $NAME apiKey reference is missing or empty, and never writes the key value", async () => {
+    for (const apiKey of ["$RAMP_ROUTER_API_KEY", "${RAMP_ROUTER_API_KEY}"]) {
+      for (const env of [{} as Record<string, string>, { RAMP_ROUTER_API_KEY: "" }]) {
+        const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: routerProviders(apiKey), ...env } });
+        cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
+        expect(prepared.notes.filter((n) => n.includes('"ramp-router"') && n.includes("RAMP_ROUTER_API_KEY") && n.includes("missing or empty"))).toHaveLength(1);
+        await prepared.cleanup();
+      }
+      const prepared = await preparePiRuntimeConfig({
+        env: { PAPERCLIP_PI_PROVIDERS: routerProviders(apiKey), RAMP_ROUTER_API_KEY: "sk-secret-value" },
+      });
       cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
-      expect(prepared.notes.filter((n) => n.includes('"ramp-router"') && n.includes("missing or empty"))).toHaveLength(1);
+      expect(prepared.notes.some((n) => n.includes("missing or empty"))).toBe(false);
+      const raw = await fs.readFile(path.join(prepared.env.PI_CODING_AGENT_DIR, "models.json"), "utf8");
+      expect(raw).not.toContain("sk-secret-value");
+      expect(raw).toContain(`"apiKey": ${JSON.stringify(apiKey)}`);
       await prepared.cleanup();
     }
+  });
+
+  it("warns that a bare env var name is a literal key in Pi 0.87 and says to use $NAME", async () => {
     const prepared = await preparePiRuntimeConfig({
       env: { PAPERCLIP_PI_PROVIDERS: routerProviders("RAMP_ROUTER_API_KEY"), RAMP_ROUTER_API_KEY: "sk-secret-value" },
     });
     cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
-    expect(prepared.notes.some((n) => n.includes("missing or empty"))).toBe(false);
-    const raw = await fs.readFile(path.join(prepared.env.PI_CODING_AGENT_DIR, "models.json"), "utf8");
-    expect(raw).not.toContain("sk-secret-value");
-    expect(raw).toContain('"apiKey": "RAMP_ROUTER_API_KEY"');
-    await prepared.cleanup();
-  });
-
-  it("warns that ${NAME} is not expanded and says to use the bare env var name", async () => {
-    const prepared = await preparePiRuntimeConfig({
-      env: { PAPERCLIP_PI_PROVIDERS: routerProviders("${RAMP_ROUTER_API_KEY}"), RAMP_ROUTER_API_KEY: "sk-secret-value" },
-    });
-    cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
-    expect(prepared.notes.some((n) => n.includes('"ramp-router"') && n.includes("bare env var name"))).toBe(true);
+    expect(prepared.notes.some((n) => n.includes('"ramp-router"') && n.includes("literal key") && n.includes("$NAME"))).toBe(true);
     expect(prepared.notes.join("\n")).not.toContain("sk-secret-value");
     await prepared.cleanup();
   });

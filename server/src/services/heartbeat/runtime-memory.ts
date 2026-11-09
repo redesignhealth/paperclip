@@ -6,26 +6,20 @@ import {
   UnsupportedMemoryEmbeddingError,
   UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   isUnsupportedMemoryEmbeddingError,
+  HERMES_ADAPTER_TYPE,
+  adapterSupportsRuntimeMemory,
 } from "../company-memory-constants.js";
 import { recordAgentScopedMemoryUse } from "../memory-scope-observations.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
-import { HERMES_ADAPTER_TYPE } from "./run-state.js";
 import { logger } from "../../middleware/logger.js";
 
 export {
+  HERMES_ADAPTER_TYPE,
+  adapterSupportsRuntimeMemory,
   UnsupportedMemoryEmbeddingError,
   UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   isUnsupportedMemoryEmbeddingError,
 };
-
-/**
- * Only the local Hermes adapter consumes the per-company Mem0/pgvector
- * descriptor. Gateway adapters run outside the host and must never receive
- * per-company database credentials.
- */
-export function adapterSupportsRuntimeMemory(adapterType: string | null | undefined): boolean {
-  return adapterType === HERMES_ADAPTER_TYPE;
-}
 
 /**
  * Resolve the isolated company memory database for a run and wrap it in the

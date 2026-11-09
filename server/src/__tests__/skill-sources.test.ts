@@ -12,6 +12,12 @@ import { and, eq, sql } from 'drizzle-orm';
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from './helpers/embedded-postgres.js';
 import { unprocessable } from '../errors.js';
 import { githubFixture } from './helpers/github-skills.js';
+
+vi.mock('../services/remote-http-fetch.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../services/remote-http-fetch.js')>()),
+  // These tests stub global fetch for GitHub hosts; the guard itself is covered in github-fetch.test.ts.
+  guardedRemoteHttpFetch: (url: string | URL, init: RequestInit) => fetch(url.toString(), init),
+}));
 import { skillSourceService, type SkillSourceContext } from '../services/skill-sources.js';
 import { companySkillService } from '../services/company-skills.js';
 import { skillFileBytes } from '../services/skill-snapshot.js';
