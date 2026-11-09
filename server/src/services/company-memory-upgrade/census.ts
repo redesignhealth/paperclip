@@ -49,7 +49,7 @@ export function validateAndResolveTableIdentifier(
     const parts = tableName.split(".");
     if (parts.length !== 2 || !SAFE_IDENTIFIER_REGEX.test(parts[0]) || !SAFE_IDENTIFIER_REGEX.test(parts[1])) {
       throw new CompanyMemoryUpgradeError(
-        `Invalid --table value: "${tableName}". Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
+        `Invalid --table value. Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
         "INVALID_ARGUMENT",
       );
     }
@@ -63,7 +63,7 @@ export function validateAndResolveTableIdentifier(
 
   if (!SAFE_IDENTIFIER_REGEX.test(tableName)) {
     throw new CompanyMemoryUpgradeError(
-      `Invalid --table value: "${tableName}". Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
+      `Invalid --table value. Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
       "INVALID_ARGUMENT",
     );
   }
@@ -94,7 +94,7 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
 
   if (isPathInside(resolvedOutPath, repoRoot) || isPathInside(resolvedOutPath, realRepoRoot)) {
     throw new CompanyMemoryUpgradeError(
-      `Refusing to write output inside repository (${resolvedOutPath}). Memory census reports contain sensitive identifiers. Use an external directory such as /tmp.`,
+      `Refusing to write output inside repository. Memory reports contain sensitive identifiers. Use an external directory such as /tmp.`,
       "OUTPUT_PATH_REJECTED",
     );
   }
@@ -102,7 +102,7 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
   const parentDir = path.dirname(resolvedOutPath);
   if (!existsSync(parentDir)) {
     throw new CompanyMemoryUpgradeError(
-      `Parent directory does not exist: "${parentDir}". The output parent directory must exist prior to running census.`,
+      `Parent directory does not exist. The output parent directory must exist prior to execution.`,
       "OUTPUT_PATH_REJECTED",
     );
   }
@@ -111,7 +111,7 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
   const simulatedTargetPath = path.resolve(realParentDir, path.basename(resolvedOutPath));
   if (isPathInside(simulatedTargetPath, repoRoot) || isPathInside(simulatedTargetPath, realRepoRoot)) {
     throw new CompanyMemoryUpgradeError(
-      `Refusing to write output inside repository via symlinked parent (${resolvedOutPath}). Use an external directory such as /tmp.`,
+      `Refusing to write output inside repository via symlinked parent. Use an external directory such as /tmp.`,
       "OUTPUT_PATH_REJECTED",
     );
   }

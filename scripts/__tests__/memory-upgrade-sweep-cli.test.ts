@@ -192,6 +192,87 @@ test("sweep CLI validation and flags", async (t) => {
       console.error = origError;
     }
   });
+
+  await t.test("secret markers in --format, --table, and --output paths are NEVER echoed to stdout or stderr", async () => {
+    let stdout = "";
+    let stderr = "";
+    const origLog = console.log;
+    const origError = console.error;
+    console.log = (msg: string) => { stdout += `${msg}\n`; };
+    console.error = (msg: string) => { stderr += `${msg}\n`; };
+
+    const validUuid = randomUUID();
+    const localDsn = "postgres://u:p@localhost:5432/db";
+    const secretMarkerFormat = "marker_secret_format_val_998877";
+    const secretMarkerTable = "marker_secret_table_val_998877; DROP TABLE--";
+    const secretMarkerPathInRepo = "scripts/marker_secret_path_val_998877.json";
+    const secretMarkerPathMissingParent = "/nonexistent_parent_dir_998877/out.json";
+
+    try {
+      // 1. Invalid --format with secret marker
+      stdout = "";
+      stderr = "";
+      const exitFormat = await runSweepCli([
+        "--database-url", localDsn,
+        "--control-plane-url", localDsn,
+        "--company", validUuid,
+        "--confirm", validUuid,
+        "--format", secretMarkerFormat,
+      ]);
+      assert.equal(exitFormat, 1);
+      assert.ok(stderr.includes("Invalid --format"));
+      assert.ok(!stdout.includes(secretMarkerFormat));
+      assert.ok(!stderr.includes(secretMarkerFormat));
+
+      // 2. Invalid --table with secret marker
+      stdout = "";
+      stderr = "";
+      const exitTable = await runSweepCli([
+        "--database-url", localDsn,
+        "--control-plane-url", localDsn,
+        "--company", validUuid,
+        "--confirm", validUuid,
+        "--table", secretMarkerTable,
+      ]);
+      assert.equal(exitTable, 1);
+      assert.ok(stderr.includes("Invalid --table value"));
+      assert.ok(!stdout.includes(secretMarkerTable));
+      assert.ok(!stderr.includes(secretMarkerTable));
+
+      // 3. Invalid in-repo --output path with secret marker
+      stdout = "";
+      stderr = "";
+      const exitPathRepo = await runSweepCli([
+        "--database-url", localDsn,
+        "--control-plane-url", localDsn,
+        "--company", validUuid,
+        "--confirm", validUuid,
+        "--output", secretMarkerPathInRepo,
+      ]);
+      assert.equal(exitPathRepo, 1);
+      assert.ok(stderr.includes("Refusing to write output inside repository"));
+      assert.ok(!stdout.includes(secretMarkerPathInRepo));
+      assert.ok(!stderr.includes(secretMarkerPathInRepo));
+
+      // 4. Invalid missing-parent --output path with secret marker
+      stdout = "";
+      stderr = "";
+      const exitPathParent = await runSweepCli([
+        "--database-url", localDsn,
+        "--control-plane-url", localDsn,
+        "--company", validUuid,
+        "--confirm", validUuid,
+        "--output", secretMarkerPathMissingParent,
+      ]);
+      assert.equal(exitPathParent, 1);
+      assert.ok(stderr.includes("Parent directory does not exist"));
+      assert.ok(!stdout.includes(secretMarkerPathMissingParent));
+      assert.ok(!stderr.includes(secretMarkerPathMissingParent));
+    } finally {
+      console.log = origLog;
+      console.error = origError;
+    }
+  });
 });
 
 test("sweep CLI database integration", async (t) => {
@@ -275,6 +356,53 @@ test("sweep CLI database integration", async (t) => {
 
       assert.equal(exit, 1);
       assert.ok(stderr.includes("Company"));
+    } finally {
+      console.error = origError;
+    }
+  });
+
+  await t.test("refuses when company memory database status is not ready (pending, failed, deprovisioning, archived)", async () => {
+    let stderr = "";
+    const origError = console.error;
+    console.error = (msg: string) => { stderr += `${msg}\n`; };
+
+    const testStatuses = ["pending", "failed", "deprovisioning", "archived"] as const;
+
+    try {
+      for (const st of testStatuses) {
+        const prefix = `S${st.slice(0, 2).toUpperCase()}`;
+        const [comp] = await cpAdminDb.insert(companies).values({
+          name: `Status Test Co ${st}`,
+          issuePrefix: prefix,
+        }).returning();
+
+        const compDbName = `status_db_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        const compDbRole = `status_r_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+        await cpAdminDb.insert(companyMemoryDatabases).values({
+          companyId: comp.id,
+          databaseName: compDbName,
+          databaseRole: compDbRole,
+          host: "localhost",
+          port: 5432,
+          status: st,
+        });
+
+        stderr = "";
+        const exit = await runSweepCli([
+          "--database-url", tenantUserUrl.toString(),
+          "--control-plane-url", cpUserUrl.toString(),
+          "--company", comp.id,
+          "--confirm", comp.id,
+          "--pause-when-active-runs", "0",
+        ], {
+          _internalSkipVectorIdentityCheck: true,
+          _internalDatabaseIdentityOverride: { database: compDbName, user: compDbRole },
+        });
+
+        assert.equal(exit, 1);
+        assert.ok(stderr.includes(`status for company "${comp.id}" is "${st}"`));
+        assert.ok(stderr.includes("Sweep requires status \"ready\""));
+      }
     } finally {
       console.error = origError;
     }

@@ -286,7 +286,10 @@ test("sweep orchestrator integration", async (t) => {
     `;
     assert.equal(greetingNoiseLedger[0].reason_code, "exact_placeholder_or_greeting");
 
-    // Verify ledger GROUP BY outcome reconciles with control-plane upgrade counters
+    // Control plane upgrade counters track cumulative activity (transitions + classifications),
+    // while the tenant upgrade ledger records the authoritative current partition.
+    // On a clean first sweep without prior edits or superseded rows, initial classification activity
+    // matches the initial ledger partition.
     const ledgerCounts = await tenantWorkerSql`
       SELECT outcome, count(*)::int AS count
       FROM paperclip_memory_upgrade_ledger
@@ -343,6 +346,18 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(ledgerRowsAfterRerun[0].count, ledgerRowsBeforeRerun[0].count);
     assert.equal(rerunReport.counts.skippedUnchangedCount, 8); // 8 non-pending rows skipped
     assert.equal(rerunReport.counts.pendingConversionCount, 2);
+
+    // Verify unchanged rerun does NOT duplicate outcome increments on control plane
+    const [upgradeRowRerun] = await cpWorkerDb
+      .select()
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.id, report.upgradeId));
+    assert.equal(upgradeRowRerun.sweepCount, 2);
+    assert.equal(upgradeRowRerun.unroutableCount, upgradeRow.unroutableCount);
+    assert.equal(upgradeRowRerun.droppedNoiseCount, upgradeRow.droppedNoiseCount);
+    assert.equal(upgradeRowRerun.droppedSensitiveCount, upgradeRow.droppedSensitiveCount);
+    assert.equal(upgradeRowRerun.supersededCount, 0);
+    assert.equal(upgradeRowRerun.sourceDeletedCount, 0);
   });
 
   await t.test("lease loss mid-sweep aborts cleanly with LEASE_FENCED_OUT and consistent ledger", async () => {
@@ -376,17 +391,28 @@ test("sweep orchestrator integration", async (t) => {
       async sleep(ms: number) { clock.advance(ms); },
     };
 
+    let readsAfterLoss = 0;
+    let writesAfterLoss = 0;
+    let leaseLost = false;
+
     // Fast-forward time past lease expiry (default TTL 10m = 600_000ms) during iteration
     const tenantSqlProxy = new Proxy(tenantWorkerSql, {
       get(target, prop, receiver) {
         if (prop === "unsafe") {
           return async (...args: any[]) => {
             const queryStr = String(args[0] ?? "");
+            if (leaseLost) {
+              if (queryStr.includes("SELECT")) readsAfterLoss++;
+              if (queryStr.includes("INSERT") || queryStr.includes("UPDATE") || queryStr.includes("DELETE")) {
+                writesAfterLoss++;
+              }
+            }
             if (queryStr.includes("SELECT") && queryStr.includes("mem0_memories")) {
               pageCount++;
               if (pageCount >= 2) {
                 // Simulate time jumping forward by 15 minutes, expiring lease
                 clock.advance(900_000);
+                leaseLost = true;
               }
             }
             return (target as any).unsafe(...args);
@@ -421,6 +447,9 @@ test("sweep orchestrator integration", async (t) => {
         return true;
       },
     );
+
+    assert.equal(readsAfterLoss, 0, "No next read occurs after lease loss");
+    assert.equal(writesAfterLoss, 0, "No next write occurs after lease loss");
   });
 
   await t.test("active-run gate pauses then resumes during sweep", async () => {
@@ -485,5 +514,214 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(report.status, "completed");
     assert.equal(report.activeRunGate.pauseCount, 1);
     assert.ok(report.activeRunGate.totalPausedMs >= 10_000);
+  });
+
+  await t.test("repeated edits count superseded transitions and reclassifications in cumulative counters while ledger is authoritative current partition", async () => {
+    const clock = new ManualClock(3_000_000);
+    const [compEdit] = await cpDb.insert(companies).values({ name: "Comp Edit", issuePrefix: "CE" }).returning();
+    const dbNameEdit = `tenant_db_${compEdit.id.slice(0, 8)}`;
+    const roleEdit = `${tenantInfo.usr}_edit`;
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: compEdit.id,
+      databaseName: dbNameEdit,
+      databaseRole: roleEdit,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    const [editAgent] = await cpDb.insert(agents).values({
+      companyId: compEdit.id,
+      name: "Edit Agent",
+      adapterType: "hermes_local",
+      status: "active",
+    }).returning();
+
+    await setupTenantMem0Table(tenantWorkerSql, "mem0_edits");
+
+    // 1. Insert a row that is noise
+    const memoryRowId = await insertTenantMemoryRow(tenantWorkerSql, {
+      tableName: "mem0_edits",
+      agentId: editAgent.id,
+      data: "hello",
+    });
+
+    // Run sweep 1: classifies as dropped_noise
+    const report1 = await runSweep(
+      {
+        databaseUrl: tenantWorkerUrl.toString(),
+        controlPlaneUrl: cpWorkerUrl.toString(),
+        companyId: compEdit.id,
+        tableName: "mem0_edits",
+        pauseWhenActiveRuns: 0,
+      },
+      {
+        controlPlaneDb: cpWorkerDb,
+        tenantSql: tenantWorkerSql,
+        clock,
+        _internalSkipVectorIdentityCheck: true,
+        _internalDatabaseIdentityOverride: { database: dbNameEdit, user: roleEdit },
+      },
+    );
+    assert.equal(report1.counts.droppedNoiseCount, 1);
+    assert.equal(report1.counts.supersededCount, 0);
+
+    const [ledger1] = await tenantWorkerSql`
+      SELECT outcome, reason_code FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${report1.upgradeId}::uuid AND source_id = ${memoryRowId}::uuid;
+    `;
+    assert.equal(ledger1.outcome, "dropped_noise");
+
+    // 2. Edit memory text in live table to contain a sensitive API key
+    await tenantWorkerSql.unsafe(
+      `UPDATE mem0_edits SET payload = jsonb_set(payload, '{data}', '"Updated content with API key: sk-abcdef1234567890abcdef1234567890"') WHERE id = $1::uuid;`,
+      [memoryRowId],
+    );
+
+    // Run sweep 2: detects content change, increments supersededCount (+1 transition),
+    // and re-classifies as dropped_sensitive (+1 reclassification)
+    const report2 = await runSweep(
+      {
+        databaseUrl: tenantWorkerUrl.toString(),
+        controlPlaneUrl: cpWorkerUrl.toString(),
+        companyId: compEdit.id,
+        tableName: "mem0_edits",
+        pauseWhenActiveRuns: 0,
+      },
+      {
+        controlPlaneDb: cpWorkerDb,
+        tenantSql: tenantWorkerSql,
+        clock,
+        _internalSkipVectorIdentityCheck: true,
+        _internalDatabaseIdentityOverride: { database: dbNameEdit, user: roleEdit },
+      },
+    );
+    assert.equal(report2.counts.supersededCount, 1);
+    assert.equal(report2.counts.droppedSensitiveCount, 1);
+
+    // Ledger has authoritative current partition: outcome is dropped_sensitive, NOT superseded
+    const [ledger2] = await tenantWorkerSql`
+      SELECT outcome, reason_code FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${report1.upgradeId}::uuid AND source_id = ${memoryRowId}::uuid;
+    `;
+    assert.equal(ledger2.outcome, "dropped_sensitive");
+
+    const totalLedgerRows = await tenantWorkerSql`
+      SELECT count(*)::int AS count FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${report1.upgradeId}::uuid;
+    `;
+    assert.equal(totalLedgerRows[0].count, 1, "Ledger has exactly 1 current row");
+
+    // Control plane counters record cumulative activity:
+    // droppedNoiseCount (1) + supersededCount (1) + droppedSensitiveCount (1)
+    const [cpRow] = await cpWorkerDb
+      .select()
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.id, report1.upgradeId));
+    assert.equal(cpRow.droppedNoiseCount, 1, "Cumulative noise count preserved");
+    assert.equal(cpRow.supersededCount, 1, "Cumulative superseded transition counted");
+    assert.equal(cpRow.droppedSensitiveCount, 1, "Cumulative sensitive classification counted");
+    assert.equal(cpRow.sweepCount, 2, "Cumulative sweep count incremented");
+
+    // Cumulative activity sum (3) exceeds ledger current partition count (1) by design
+    assert.ok(cpRow.droppedNoiseCount + cpRow.supersededCount + cpRow.droppedSensitiveCount > totalLedgerRows[0].count);
+  });
+
+  await t.test("live table with text ID column: classifies valid UUIDs and rejects non-UUID IDs upfront", async () => {
+    const clock = new ManualClock(4_000_000);
+    const [compText] = await cpDb.insert(companies).values({ name: "Comp Text ID", issuePrefix: "CT" }).returning();
+    const dbNameText = `tenant_db_${compText.id.slice(0, 8)}`;
+    const roleText = `${tenantInfo.usr}_text`;
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: compText.id,
+      databaseName: dbNameText,
+      databaseRole: roleText,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    const [textAgent] = await cpDb.insert(agents).values({
+      companyId: compText.id,
+      name: "Text Agent",
+      adapterType: "hermes_local",
+      status: "active",
+    }).returning();
+
+    // Create a live table with id TEXT
+    await tenantWorkerSql.unsafe(`
+      CREATE TABLE IF NOT EXISTS mem0_text_ids (
+        id text PRIMARY KEY,
+        payload jsonb NOT NULL,
+        vector "vector(1536)"
+      );
+    `);
+
+    // 1. Seed with a valid UUID formatted as text
+    const validTextUuid = randomUUID();
+    const textPayload = {
+      agent_id: textAgent.id,
+      user_id: "company",
+      data: "hello",
+      created_at: new Date().toISOString(),
+    };
+    await tenantWorkerSql.unsafe(
+      `INSERT INTO mem0_text_ids (id, payload, vector) VALUES ($1, $2, 'vec');`,
+      [validTextUuid, textPayload],
+    );
+
+    const report = await runSweep(
+      {
+        databaseUrl: tenantWorkerUrl.toString(),
+        controlPlaneUrl: cpWorkerUrl.toString(),
+        companyId: compText.id,
+        tableName: "mem0_text_ids",
+        pauseWhenActiveRuns: 0,
+      },
+      {
+        controlPlaneDb: cpWorkerDb,
+        tenantSql: tenantWorkerSql,
+        clock,
+        _internalSkipVectorIdentityCheck: true,
+        _internalDatabaseIdentityOverride: { database: dbNameText, user: roleText },
+      },
+    );
+
+    assert.equal(report.status, "completed");
+    assert.equal(report.counts.droppedNoiseCount, 1);
+
+    const [ledgerRow] = await tenantWorkerSql`
+      SELECT outcome FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${report.upgradeId}::uuid AND source_id = ${validTextUuid}::uuid;
+    `;
+    assert.equal(ledgerRow.outcome, "dropped_noise");
+
+    // 2. Insert an unsupported non-UUID text ID
+    await tenantWorkerSql.unsafe(
+      `INSERT INTO mem0_text_ids (id, payload, vector) VALUES ('non-uuid-custom-id-999', $1, 'vec');`,
+      [textPayload],
+    );
+
+    await assert.rejects(
+      async () => {
+        await runSweep(
+          {
+            databaseUrl: tenantWorkerUrl.toString(),
+            controlPlaneUrl: cpWorkerUrl.toString(),
+            companyId: compText.id,
+            tableName: "mem0_text_ids",
+            pauseWhenActiveRuns: 0,
+          },
+          {
+            controlPlaneDb: cpWorkerDb,
+            tenantSql: tenantWorkerSql,
+            clock,
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: dbNameText, user: roleText },
+          },
+        );
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
+    );
   });
 });

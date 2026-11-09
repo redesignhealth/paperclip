@@ -12,6 +12,7 @@
 import postgres from "postgres";
 import {
   assertNoElevatedRolePrivileges,
+  isValidUuid,
   ROLE_PRIVILEGE_PREFLIGHT_SQL_TEXT,
   type RolePrivilegeRow,
   validateAndResolveTableIdentifier,
@@ -39,6 +40,114 @@ export interface TenantCollectionShape {
   isUuidId: boolean;
 }
 
+export const VALID_UNROUTABLE_REASONS = [
+  "missing_agent_id",
+  "malformed_agent_id",
+  "unknown_agent",
+  "non_memory_adapter",
+  "terminated",
+  "pending_approval",
+  "unknown_status",
+] as const;
+
+export type UnroutableReasonCode = (typeof VALID_UNROUTABLE_REASONS)[number];
+
+export const VALID_NOISE_REASONS = [
+  "empty",
+  "exact_placeholder_or_greeting",
+] as const;
+
+export type NoiseReasonCode = (typeof VALID_NOISE_REASONS)[number];
+
+export const KNOWN_SENSITIVE_FAMILY_NAMES = [
+  "apiKey",
+  "bearerToken",
+  "creditCard",
+  "passwordAssignment",
+  "privateKey",
+  "ssn",
+] as const;
+
+export type KnownSensitiveFamilyName = (typeof KNOWN_SENSITIVE_FAMILY_NAMES)[number];
+
+export function validateOutcomeReason(
+  outcome: UpgradeLedgerOutcome,
+  reasonCode: unknown,
+): string | null {
+  if (outcome === "unroutable") {
+    if (typeof reasonCode !== "string" || !VALID_UNROUTABLE_REASONS.includes(reasonCode as UnroutableReasonCode)) {
+      throw new CompanyMemoryUpgradeError(
+        `Invalid reason_code for outcome 'unroutable': must be one of [${VALID_UNROUTABLE_REASONS.join(", ")}]`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    return reasonCode;
+  }
+
+  if (outcome === "dropped_noise") {
+    if (typeof reasonCode !== "string" || !VALID_NOISE_REASONS.includes(reasonCode as NoiseReasonCode)) {
+      throw new CompanyMemoryUpgradeError(
+        `Invalid reason_code for outcome 'dropped_noise': must be one of [${VALID_NOISE_REASONS.join(", ")}]`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    return reasonCode;
+  }
+
+  if (outcome === "dropped_sensitive") {
+    if (typeof reasonCode !== "string" || reasonCode.trim() === "") {
+      throw new CompanyMemoryUpgradeError(
+        "reason_code is required for outcome 'dropped_sensitive'",
+        "INVALID_ARGUMENT",
+      );
+    }
+    const tokens = reasonCode.split(",");
+    for (const token of tokens) {
+      if (!KNOWN_SENSITIVE_FAMILY_NAMES.includes(token as KnownSensitiveFamilyName)) {
+        throw new CompanyMemoryUpgradeError(
+          `Invalid sensitive family "${token}" in reason_code. Must be one of [${KNOWN_SENSITIVE_FAMILY_NAMES.join(", ")}]`,
+          "INVALID_ARGUMENT",
+        );
+      }
+    }
+    const sorted = [...new Set(tokens)].sort();
+    if (sorted.length !== tokens.length || sorted.join(",") !== reasonCode) {
+      throw new CompanyMemoryUpgradeError(
+        `Sensitive reason_code must be sorted and deduplicated tokens (expected "${sorted.join(",")}")`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    return reasonCode;
+  }
+
+  if (outcome === "superseded" || outcome === "source_deleted") {
+    if (reasonCode !== null && reasonCode !== undefined) {
+      throw new CompanyMemoryUpgradeError(
+        `Outcome '${outcome}' does not permit a reason_code`,
+        "INVALID_ARGUMENT",
+      );
+    }
+    return null;
+  }
+
+  if (reasonCode === null || reasonCode === undefined) {
+    return null;
+  }
+  if (typeof reasonCode !== "string") {
+    throw new CompanyMemoryUpgradeError(
+      `reason_code must be a string or null for outcome '${outcome}'`,
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (reasonCode.length > 100 || !/^[a-zA-Z0-9_, -]+$/.test(reasonCode)) {
+    throw new CompanyMemoryUpgradeError(
+      `Invalid reason_code format for outcome '${outcome}'`,
+      "INVALID_ARGUMENT",
+    );
+  }
+  return reasonCode;
+}
+
 export interface LedgerRow {
   upgradeId: string;
   sourceId: string;
@@ -49,14 +158,47 @@ export interface LedgerRow {
   outputIds: string[];
 }
 
-export interface CommitSourceOutcomeParams {
-  upgradeId: string;
-  sourceId: string;
-  sourceContentSha256: string;
-  agentId: string | null;
-  outcome: UpgradeLedgerOutcome;
-  reasonCode?: string | null;
-}
+export type CommitSourceOutcomeParams =
+  | {
+      upgradeId: string;
+      sourceId: string;
+      sourceContentSha256: string;
+      agentId: string | null;
+      outcome: "unroutable";
+      reasonCode: UnroutableReasonCode;
+    }
+  | {
+      upgradeId: string;
+      sourceId: string;
+      sourceContentSha256: string;
+      agentId: string | null;
+      outcome: "dropped_noise";
+      reasonCode: NoiseReasonCode;
+    }
+  | {
+      upgradeId: string;
+      sourceId: string;
+      sourceContentSha256: string;
+      agentId: string | null;
+      outcome: "dropped_sensitive";
+      reasonCode: string;
+    }
+  | {
+      upgradeId: string;
+      sourceId: string;
+      sourceContentSha256: string;
+      agentId: string | null;
+      outcome: "superseded" | "source_deleted";
+      reasonCode?: null;
+    }
+  | {
+      upgradeId: string;
+      sourceId: string;
+      sourceContentSha256: string;
+      agentId: string | null;
+      outcome: "published" | "deduplicated" | "quarantined";
+      reasonCode?: string | null;
+    };
 
 export interface ReconcileTombstonesOptions {
   tombstoneSourceIds?: string[];
@@ -64,6 +206,9 @@ export interface ReconcileTombstonesOptions {
   maxSourceId?: string;
   liveSourceIds?: string[];
   liveTableName?: string;
+  isUuidId?: boolean;
+  batchSize?: number;
+  assertLeaseActive?: () => void;
 }
 
 export interface ReconcileTombstonesResult {
@@ -363,6 +508,15 @@ export async function loadLedgerForSources(
     return map;
   }
 
+  for (const id of sourceIds) {
+    if (!isValidUuid(id)) {
+      throw new CompanyMemoryUpgradeError(
+        "sourceIds must be valid UUID strings.",
+        "UNSUPPORTED_SOURCE_ID",
+      );
+    }
+  }
+
   const rows = await sql`
     SELECT
       upgrade_id,
@@ -403,16 +557,27 @@ export async function reconcileTombstones(
   upgradeId: string,
   options: ReconcileTombstonesOptions,
 ): Promise<ReconcileTombstonesResult> {
+  options.assertLeaseActive?.();
+
   let tombstoneIds: string[] = [];
 
   if (options.tombstoneSourceIds && options.tombstoneSourceIds.length > 0) {
+    for (const id of options.tombstoneSourceIds) {
+      if (!isValidUuid(id)) {
+        throw new CompanyMemoryUpgradeError(
+          "tombstoneSourceIds must be valid UUID strings.",
+          "UNSUPPORTED_SOURCE_ID",
+        );
+      }
+    }
     // Check which ones are not already source_deleted
     const checkRows = await sql`
       SELECT source_id
       FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${upgradeId}::uuid
         AND source_id = ANY(${options.tombstoneSourceIds}::uuid[])
-        AND outcome != 'source_deleted';
+        AND outcome != 'source_deleted'
+      ORDER BY source_id ASC;
     `;
     tombstoneIds = checkRows.map((r) => r.source_id);
   } else if (
@@ -420,6 +585,12 @@ export async function reconcileTombstones(
     options.maxSourceId !== undefined &&
     options.liveSourceIds !== undefined
   ) {
+    if (!isValidUuid(options.minSourceId) || !isValidUuid(options.maxSourceId)) {
+      throw new CompanyMemoryUpgradeError(
+        "minSourceId and maxSourceId must be valid UUID strings.",
+        "UNSUPPORTED_SOURCE_ID",
+      );
+    }
     const liveSet = new Set(options.liveSourceIds);
     const rangeRows = await sql`
       SELECT source_id
@@ -427,13 +598,16 @@ export async function reconcileTombstones(
       WHERE upgrade_id = ${upgradeId}::uuid
         AND source_id >= ${options.minSourceId}::uuid
         AND source_id <= ${options.maxSourceId}::uuid
-        AND outcome != 'source_deleted';
+        AND outcome != 'source_deleted'
+      ORDER BY source_id ASC;
     `;
     tombstoneIds = rangeRows
       .map((r) => r.source_id)
       .filter((id) => !liveSet.has(id));
   } else if (options.liveTableName) {
+    options.assertLeaseActive?.();
     const resolved = validateAndResolveTableIdentifier(options.liveTableName);
+    const isUuid = options.isUuidId ?? true;
     const missingRows = await sql.unsafe(`
       SELECT l.source_id
       FROM paperclip_memory_upgrade_ledger l
@@ -441,8 +615,9 @@ export async function reconcileTombstones(
         AND l.outcome != 'source_deleted'
         AND NOT EXISTS (
           /* Live collection table query (SELECT ONLY) */
-          SELECT 1 FROM ${resolved.regclassArg} t WHERE t.id = l.source_id
-        );
+          SELECT 1 FROM ${resolved.regclassArg} t WHERE ${isUuid ? "t.id = l.source_id" : "t.id = l.source_id::text"}
+        )
+      ORDER BY l.source_id ASC;
     `, [upgradeId]);
     tombstoneIds = missingRows.map((r) => r.source_id);
   }
@@ -459,48 +634,55 @@ export async function reconcileTombstones(
   let deletedStagingCount = 0;
   let deletedDedupeCount = 0;
 
-  await sql.begin(async (tx: any) => {
-    // 1. Find unpublished staging output_ids
-    const stagingRows = await tx`
-      SELECT output_id
-      FROM paperclip_memory_upgrade_staging
-      WHERE upgrade_id = ${upgradeId}::uuid
-        AND source_id = ANY(${tombstoneIds}::uuid[])
-        AND published_at IS NULL;
-    `;
-    const outputIds = stagingRows.map((r: any) => r.output_id);
+  const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : 500;
 
-    // 2. Delete matching dedupe rows
-    if (outputIds.length > 0) {
-      const deletedDedupe = await tx`
-        DELETE FROM paperclip_memory_upgrade_dedupe
+  for (let i = 0; i < tombstoneIds.length; i += batchSize) {
+    options.assertLeaseActive?.();
+    const batch = tombstoneIds.slice(i, i + batchSize);
+
+    await sql.begin(async (tx: any) => {
+      // 1. Find unpublished staging output_ids
+      const stagingRows = await tx`
+        SELECT output_id
+        FROM paperclip_memory_upgrade_staging
         WHERE upgrade_id = ${upgradeId}::uuid
-          AND output_id = ANY(${outputIds}::uuid[])
+          AND source_id = ANY(${batch}::uuid[])
+          AND published_at IS NULL;
+      `;
+      const outputIds = stagingRows.map((r: any) => r.output_id);
+
+      // 2. Delete matching dedupe rows
+      if (outputIds.length > 0) {
+        const deletedDedupe = await tx`
+          DELETE FROM paperclip_memory_upgrade_dedupe
+          WHERE upgrade_id = ${upgradeId}::uuid
+            AND output_id = ANY(${outputIds}::uuid[])
+          RETURNING output_id;
+        `;
+        deletedDedupeCount += deletedDedupe.length;
+      }
+
+      // 3. Delete unpublished staging rows
+      const deletedStaging = await tx`
+        DELETE FROM paperclip_memory_upgrade_staging
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND source_id = ANY(${batch}::uuid[])
+          AND published_at IS NULL
         RETURNING output_id;
       `;
-      deletedDedupeCount = deletedDedupe.length;
-    }
+      deletedStagingCount += deletedStaging.length;
 
-    // 3. Delete unpublished staging rows
-    const deletedStaging = await tx`
-      DELETE FROM paperclip_memory_upgrade_staging
-      WHERE upgrade_id = ${upgradeId}::uuid
-        AND source_id = ANY(${tombstoneIds}::uuid[])
-        AND published_at IS NULL
-      RETURNING output_id;
-    `;
-    deletedStagingCount = deletedStaging.length;
-
-    // 4. Update ledger outcome to source_deleted
-    await tx`
-      UPDATE paperclip_memory_upgrade_ledger
-      SET
-        outcome = 'source_deleted',
-        updated_at = now()
-      WHERE upgrade_id = ${upgradeId}::uuid
-        AND source_id = ANY(${tombstoneIds}::uuid[]);
-    `;
-  });
+      // 4. Update ledger outcome to source_deleted
+      await tx`
+        UPDATE paperclip_memory_upgrade_ledger
+        SET
+          outcome = 'source_deleted',
+          updated_at = now()
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND source_id = ANY(${batch}::uuid[]);
+      `;
+    });
+  }
 
   return {
     tombstonesCount: tombstoneIds.length,
@@ -519,6 +701,13 @@ export async function reconcileChangedContent(
   upgradeId: string,
   sourceId: string,
 ): Promise<{ deletedStagingCount: number; deletedDedupeCount: number }> {
+  if (!isValidUuid(sourceId)) {
+    throw new CompanyMemoryUpgradeError(
+      "sourceId must be a valid UUID string.",
+      "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+
   let deletedStagingCount = 0;
   let deletedDedupeCount = 0;
 
@@ -585,6 +774,27 @@ export async function commitSourceOutcome(
     reasonCode = null,
   } = params;
 
+  if (!isValidUuid(sourceId)) {
+    throw new CompanyMemoryUpgradeError(
+      "sourceId must be a valid UUID string.",
+      "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(
+      "upgradeId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (agentId && !isValidUuid(agentId)) {
+    throw new CompanyMemoryUpgradeError(
+      "agentId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+
+  const validatedReason = validateOutcomeReason(outcome, reasonCode);
+
   await sql.begin(async (tx: any) => {
     await tx`
       INSERT INTO paperclip_memory_upgrade_ledger (
@@ -603,7 +813,7 @@ export async function commitSourceOutcome(
         ${sourceContentSha256},
         ${agentId ? sql`${agentId}::uuid` : null},
         ${outcome},
-        ${reasonCode},
+        ${validatedReason},
         '{}',
         now(),
         now()

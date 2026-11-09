@@ -13,9 +13,10 @@ import {
   openTenantClient,
   reconcileChangedContent,
   reconcileTombstones,
+  validateOutcomeReason,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
 import { computeSourceContentSha256 } from "../../server/src/services/company-memory-upgrade/source-hash.js";
-import { UPGRADE_LEDGER_OUTCOMES } from "../../server/src/services/company-memory-upgrade/types.js";
+import { CompanyMemoryUpgradeError, UPGRADE_LEDGER_OUTCOMES } from "../../server/src/services/company-memory-upgrade/types.js";
 import {
   getEmbeddedPostgresTestSupport,
   handleEmbeddedPostgresUnsupported,
@@ -302,5 +303,248 @@ test("sweep-tenant ledger operations", async (t) => {
     const row = ledgerMap.get(sourceId);
     assert.ok(row);
     assert.equal(row.sourceContentSha256, hash);
+  });
+
+  await t.test("runtime validation rejects direct unsafe casts and arbitrary strings in reasonCode", async () => {
+    const upgradeId = randomUUID();
+    const sourceId = randomUUID();
+    const hash = computeSourceContentSha256("Test text");
+
+    // 1. Invalid unroutable reason code
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "unroutable",
+          reasonCode: "arbitrary_unroutable_reason" as any,
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+
+    // 2. Invalid noise reason code
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "dropped_noise",
+          reasonCode: "random_noise_tag" as any,
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+
+    // 3. Unsorted sensitive family tokens
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "dropped_sensitive",
+          reasonCode: "ssn,apiKey", // not sorted alphabetically
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+
+    // 4. Unknown sensitive family token
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "dropped_sensitive",
+          reasonCode: "apiKey,secretPassportNumber",
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+
+    // 5. Reason code supplied on outcome that forbids reason code (superseded)
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "superseded",
+          reasonCode: "arbitrary_reason" as any,
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+
+    // 6. Memory-derived text rejected
+    await assert.rejects(
+      async () => {
+        await commitSourceOutcome(sql, {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: hash,
+          agentId: null,
+          outcome: "dropped_noise",
+          reasonCode: "User prefers coffee with milk and two sugars in the morning" as any,
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+
+    // 7. Valid sorted sensitive family combination accepted
+    await commitSourceOutcome(sql, {
+      upgradeId,
+      sourceId,
+      sourceContentSha256: hash,
+      agentId: null,
+      outcome: "dropped_sensitive",
+      reasonCode: "apiKey,passwordAssignment",
+    });
+
+    const [row] = await sql`
+      SELECT outcome, reason_code FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(row.outcome, "dropped_sensitive");
+    assert.equal(row.reason_code, "apiKey,passwordAssignment");
+  });
+
+  await t.test("tombstone reconciliation batches are lease-fenced and abort mid-batch on lease loss without further writes", async () => {
+    const upgradeId = randomUUID();
+    const ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID()].sort();
+
+    for (const id of ids) {
+      await commitSourceOutcome(sql, {
+        upgradeId,
+        sourceId: id,
+        sourceContentSha256: "hash",
+        agentId: null,
+        outcome: "dropped_noise",
+        reasonCode: "empty",
+      });
+    }
+
+    let assertionCallCount = 0;
+    const assertLeaseActive = () => {
+      assertionCallCount++;
+      // Throw on 3rd call (1st is initial preflight, 2nd is batch 1, 3rd is batch 2)
+      if (assertionCallCount >= 3) {
+        throw new CompanyMemoryUpgradeError("Lease lost mid-batch", "lease_fenced_out");
+      }
+    };
+
+    await assert.rejects(
+      async () => {
+        await reconcileTombstones(sql, upgradeId, {
+          tombstoneSourceIds: ids,
+          batchSize: 2,
+          assertLeaseActive,
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "lease_fenced_out",
+    );
+
+    // Batch 1 ([ids[0], ids[1]]) was committed before the loss
+    const rowsBatch1 = await sql`
+      SELECT outcome FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ANY(${[ids[0], ids[1]]}::uuid[]);
+    `;
+    assert.equal(rowsBatch1.length, 2);
+    assert.ok(rowsBatch1.every((r) => r.outcome === "source_deleted"));
+
+    // Batch 2 ([ids[2], ids[3]]) was fenced out and NEVER written
+    const rowsBatch2 = await sql`
+      SELECT outcome FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ANY(${[ids[2], ids[3]]}::uuid[]);
+    `;
+    assert.equal(rowsBatch2.length, 2);
+    assert.ok(rowsBatch2.every((r) => r.outcome === "dropped_noise"));
+  });
+
+  await t.test("reconcileTombstones safely handles live tables with text ID column", async () => {
+    const upgradeId = randomUUID();
+    const idLive = randomUUID();
+    const idDeleted = randomUUID();
+
+    await sql.unsafe(`
+      CREATE TABLE IF NOT EXISTS text_id_memories (
+        id text PRIMARY KEY,
+        payload jsonb NOT NULL,
+        vector text
+      );
+    `);
+
+    await sql.unsafe(
+      `INSERT INTO text_id_memories (id, payload, vector) VALUES ($1, '{"data": "live"}'::jsonb, 'vec') ON CONFLICT DO NOTHING;`,
+      [idLive],
+    );
+
+    await commitSourceOutcome(sql, {
+      upgradeId,
+      sourceId: idLive,
+      sourceContentSha256: "live-hash",
+      agentId: null,
+      outcome: "dropped_noise",
+      reasonCode: "empty",
+    });
+
+    await commitSourceOutcome(sql, {
+      upgradeId,
+      sourceId: idDeleted,
+      sourceContentSha256: "del-hash",
+      agentId: null,
+      outcome: "dropped_noise",
+      reasonCode: "empty",
+    });
+
+    // Reconcile with isUuidId: false against text_id_memories
+    const res = await reconcileTombstones(sql, upgradeId, {
+      liveTableName: "text_id_memories",
+      isUuidId: false,
+    });
+
+    assert.equal(res.tombstonesCount, 1);
+    assert.deepEqual(res.tombstoneSourceIds, [idDeleted]);
+
+    const [delRow] = await sql`
+      SELECT outcome FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ${idDeleted}::uuid;
+    `;
+    assert.equal(delRow.outcome, "source_deleted");
+
+    const [liveRow] = await sql`
+      SELECT outcome FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgradeId}::uuid AND source_id = ${idLive}::uuid;
+    `;
+    assert.equal(liveRow.outcome, "dropped_noise");
+  });
+
+  await t.test("loadLedgerForSources and reconcileTombstones refuse unsupported non-UUID IDs upfront", async () => {
+    const upgradeId = randomUUID();
+
+    await assert.rejects(
+      async () => {
+        await loadLedgerForSources(sql, upgradeId, ["not-a-valid-uuid"]);
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
+    );
+
+    await assert.rejects(
+      async () => {
+        await reconcileTombstones(sql, upgradeId, {
+          tombstoneSourceIds: ["not-a-valid-uuid"],
+        });
+      },
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
+    );
   });
 });

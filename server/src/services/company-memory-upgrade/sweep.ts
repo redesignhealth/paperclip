@@ -254,7 +254,7 @@ export async function runSweep(
 
   if (!isValidUuid(companyId)) {
     throw new CompanyMemoryUpgradeError(
-      `Invalid --company "${companyId}". Must be a valid UUID.`,
+      "Invalid --company. Must be a valid UUID.",
       "INVALID_ARGUMENT",
     );
   }
@@ -361,6 +361,13 @@ export async function runSweep(
       }
 
       const memRow = memDbRows[0];
+      if (memRow.status !== "ready") {
+        throw new CompanyMemoryUpgradeError(
+          `Company memory database binding status for company "${companyId}" is "${memRow.status}". Sweep requires status "ready" (refusing pending, failed, deprovisioning, archived).`,
+          "COMPANY_BINDING_MISMATCH",
+        );
+      }
+
       if (memRow.databaseName !== currentDatabase || memRow.databaseRole !== currentUser) {
         throw new CompanyMemoryUpgradeError(
           `Company memory database binding mismatch: control-plane specifies database "${memRow.databaseName}" and role "${memRow.databaseRole}", but connected tenant is "${currentDatabase}" / "${currentUser}".`,
@@ -492,13 +499,31 @@ export async function runSweep(
     // 10. Process live source pages
     let isFirstPage = true;
 
-    for await (const page of iterateSourcePages(tenantSql, tableName, {
+    const sourceIterator = iterateSourcePages(tenantSql, tableName, {
       pageSize,
       maxRows,
       isUuidId: shape.isUuidId,
-    })) {
+    });
+
+    while (true) {
       heartbeatHandle.assertActive();
       await activeRunGate.waitUntilQuiet();
+
+      const iterResult = await sourceIterator.next();
+      if (iterResult.done) {
+        break;
+      }
+      const page = iterResult.value;
+
+      // Upfront validation: reject non-UUID source IDs before any mutations
+      for (const source of page) {
+        if (!isValidUuid(source.id)) {
+          throw new CompanyMemoryUpgradeError(
+            `Mem0 table "${tableName}" contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.`,
+            "UNSUPPORTED_SOURCE_ID",
+          );
+        }
+      }
 
       const pageDeltas = {
         sourceSeenCount: page.length,
@@ -516,14 +541,17 @@ export async function runSweep(
       const maxPageId = pageSourceIds[pageSourceIds.length - 1];
 
       // Reconcile tombstones for this page's keyset range
+      heartbeatHandle.assertActive();
       const tombstoneResult = await reconcileTombstones(tenantSql, upgradeId, {
         minSourceId: minPageId,
         maxSourceId: maxPageId,
         liveSourceIds: pageSourceIds,
+        assertLeaseActive: () => heartbeatHandle?.assertActive(),
       });
       pageDeltas.sourceDeletedCount += tombstoneResult.tombstonesCount;
 
       // Load existing ledger rows for live sources in this page
+      heartbeatHandle.assertActive();
       const ledgerMap = await loadLedgerForSources(tenantSql, upgradeId, pageSourceIds);
 
       // Classify each source in this page
@@ -540,6 +568,7 @@ export async function runSweep(
           }
 
           // Content changed: reconcile to superseded
+          heartbeatHandle.assertActive();
           await reconcileChangedContent(tenantSql, upgradeId, source.id);
           pageDeltas.supersededCount++;
           // Then source re-enters classification in this same sweep
@@ -548,13 +577,14 @@ export async function runSweep(
         // Gate 1: Routing -> unroutable
         const routing = classifyAgentRouting(source.agentId, cpAgentMap);
         if (!routing.isRoutable) {
+          heartbeatHandle.assertActive();
           await commitSourceOutcome(tenantSql, {
             upgradeId,
             sourceId: source.id,
             sourceContentSha256: contentSha256,
             agentId: routing.matchedAgentId,
             outcome: "unroutable",
-            reasonCode: routing.unroutableReason,
+            reasonCode: routing.unroutableReason!,
           });
           pageDeltas.unroutableCount++;
           continue;
@@ -565,13 +595,14 @@ export async function runSweep(
         // Gate 2: Noise -> dropped_noise
         const noise = classifyMemoryNoiseDetailed(source.data);
         if (noise.isNoise) {
+          heartbeatHandle.assertActive();
           await commitSourceOutcome(tenantSql, {
             upgradeId,
             sourceId: source.id,
             sourceContentSha256: contentSha256,
             agentId: matchedAgentId,
             outcome: "dropped_noise",
-            reasonCode: noise.reason,
+            reasonCode: noise.reason!,
           });
           pageDeltas.droppedNoiseCount++;
           continue;
@@ -585,6 +616,7 @@ export async function runSweep(
             .map(([fam]) => fam)
             .sort()
             .join(",");
+          heartbeatHandle.assertActive();
           await commitSourceOutcome(tenantSql, {
             upgradeId,
             sourceId: source.id,
@@ -646,10 +678,14 @@ export async function runSweep(
     }
 
     // Final pass for any tombstones in ledger that were outside the live keyset bounds
+    heartbeatHandle.assertActive();
     const finalTombstones = await reconcileTombstones(tenantSql, upgradeId, {
       liveTableName: tableName,
+      isUuidId: shape.isUuidId,
+      assertLeaseActive: () => heartbeatHandle?.assertActive(),
     });
     if (finalTombstones.tombstonesCount > 0) {
+      heartbeatHandle.assertActive();
       counts.sourceDeletedCount += finalTombstones.tombstonesCount;
       await updateUpgradeCounters(
         cpDb,

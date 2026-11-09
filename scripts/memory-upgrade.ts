@@ -14,6 +14,8 @@ import {
   formatCensusTextReport,
   isValidUuid,
   runCensus,
+  validateAndResolveTableIdentifier,
+  validateOutputPath,
 } from "../server/src/services/company-memory-upgrade/census.js";
 import {
   formatSweepTextReport,
@@ -273,7 +275,7 @@ Options:
 
     const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
     if (rawFormat !== "text" && rawFormat !== "json") {
-      console.error(`Error: Invalid --format "${rawFormat}". Must be "text" or "json".`);
+      console.error(`Error: Invalid --format. Must be "text" or "json".`);
       return 1;
     }
     const format = rawFormat as "text" | "json";
@@ -338,14 +340,36 @@ Options:
 
     return 0;
   } catch (error) {
-    const rawMessage = error instanceof Error ? error.message : String(error);
-    const message = scrubDsnSecrets(rawMessage);
+    const message = sanitizeCliErrorMessage(error);
     console.error(`Error: ${message}`);
     return 1;
   }
 }
 
 export interface RunSweepCliDependencies extends SweepDependencies {}
+
+export function sanitizeCliErrorMessage(error: unknown): string {
+  if (error instanceof CompanyMemoryUpgradeError) {
+    return scrubDsnSecrets(error.message);
+  }
+  if (error && typeof error === "object") {
+    const err = error as { code?: string; message?: string };
+    if (err.code === "EEXIST") {
+      return "Output file already exists (flag 'wx' requires exclusive creation).";
+    }
+    if (err.code === "EACCES") {
+      return "Permission denied writing output file.";
+    }
+    if (err.code === "ENOENT") {
+      return "Output file path or parent directory not found.";
+    }
+    if (err.code === "ECONNREFUSED") {
+      return "Database connection refused.";
+    }
+  }
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  return scrubDsnSecrets(rawMessage);
+}
 
 export async function runSweepCli(
   argv: string[],
@@ -431,6 +455,7 @@ Options:
     }
 
     const tableName = parseFlagValue("--table", argv) ?? "mem0_memories";
+    validateAndResolveTableIdentifier(tableName);
 
     function parsePositiveInt(name: string, defaultVal?: number): number | undefined {
       const raw = parseFlagValue(name, argv);
@@ -470,9 +495,14 @@ Options:
       parseFlagValue("--out", argv) ??
       null;
 
+    const repoRoot = deps.repoRoot ?? path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+    if (outputPath) {
+      validateOutputPath(outputPath, repoRoot);
+    }
+
     const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
     if (rawFormat !== "text" && rawFormat !== "json") {
-      console.error(`Error: Invalid --format "${rawFormat}". Must be "text" or "json".`);
+      console.error(`Error: Invalid --format. Must be "text" or "json".`);
       return 1;
     }
     const format = rawFormat as "text" | "json";
@@ -511,8 +541,7 @@ Options:
 
     return 0;
   } catch (error) {
-    const rawMessage = error instanceof Error ? error.message : String(error);
-    const message = scrubDsnSecrets(rawMessage);
+    const message = sanitizeCliErrorMessage(error);
     console.error(`Error: ${message}`);
     return 1;
   }
