@@ -17,12 +17,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 // Recursively replace {env:VAR} placeholders with the resolved value. Used to bake
 // gateway provider secrets (e.g. an LLM-gateway virtual key) into models.json
-// SERVER-SIDE, where the value is reliably present. Pi resolves a provider apiKey
-// by reading a bare NAME as an env var, falling back to the literal text (the
-// `${NAME}` form is NOT supported). The (possibly sandboxed) run process env
-// plumbing is not guaranteed to carry the key, so this baking is available, but
-// prefer a bare env var name so the secret is never written to models.json. Unresolvable placeholders are left intact; an env var set to
-// an empty string counts as unresolvable (the placeholder stays for Pi to try).
+// SERVER-SIDE, where the value is reliably present. Prefer Pi's own env reference
+// (`$NAME` or `${NAME}`, resolved from the run env at request time) so the secret is
+// never written to models.json. A bare NAME is a literal key in Pi 0.87. Unresolvable
+// placeholders are left intact; an env var set to an empty string counts as unresolvable.
 function expandEnvPlaceholders<T>(value: T, resolve: (name: string) => string | undefined): T {
   if (typeof value === "string") {
     return value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name: string) => {
@@ -89,18 +87,23 @@ export function parseProviderConfig(
   }
 }
 
-// Names only, never values. A bare env-var-style apiKey must be present in the run env;
-// `${...}` is not interpolated by Pi and would be sent as a literal string.
+// Names only, never values. Pi 0.87 resolves an apiKey of `$NAME` or `${NAME}` from the run env at request time,
+// `!cmd` by running it, and anything else (including a bare NAME) as the literal key.
+const PI_ENV_REFERENCE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
 function apiKeyWarnings(providers: Record<string, unknown>, env: Record<string, string>): string[] {
   const out: string[] = [];
   for (const [name, provider] of Object.entries(providers)) {
     const apiKey = isPlainObject(provider) ? provider.apiKey : undefined;
-    if (typeof apiKey !== "string") continue;
-    if (apiKey.includes("${")) {
-      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey uses "\${...}", which Pi does not expand; use the bare env var name (e.g. "RAMP_ROUTER_API_KEY").`);
-    } else if (/^[A-Z][A-Z0-9_]*$/.test(apiKey) && !env[apiKey]) {
-      // Never echo the value: a literal key can look like an env var name.
-      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey looks like an env var name that is missing or empty in the run env.`);
+    if (typeof apiKey !== "string" || apiKey.startsWith("!")) continue;
+    const referenced = [...apiKey.matchAll(PI_ENV_REFERENCE)].map((match) => match[1] ?? match[2]);
+    for (const variable of new Set(referenced)) {
+      if (!env[variable]) {
+        out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey references env var ${variable}, which is missing or empty in the run env.`);
+      }
+    }
+    // Never echo the value: a literal key can look like an env var name.
+    if (referenced.length === 0 && /^[A-Z][A-Z0-9_]*$/.test(apiKey)) {
+      out.push(`PAPERCLIP_PI_PROVIDERS: provider "${name}" apiKey looks like a bare env var name, which Pi 0.87 sends as a literal key. Write it as $NAME.`);
     }
   }
   return out;
