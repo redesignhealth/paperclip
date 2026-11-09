@@ -131,6 +131,14 @@ export async function ensureUpgradeTables(
 
     CREATE UNIQUE INDEX IF NOT EXISTS "pmu_dedupe_uq"
     ON "paperclip_memory_upgrade_dedupe" ("upgrade_id", "agent_id", "data_sha256");
+
+    CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_fence" (
+      "upgrade_id" uuid PRIMARY KEY,
+      "fence_epoch" bigint NOT NULL DEFAULT 0,
+      "lease_token" text NOT NULL,
+      "lease_owner" text NOT NULL,
+      "claimed_at" timestamp with time zone NOT NULL DEFAULT now()
+    );
   `;
 
   if ("begin" in sql && typeof (sql as any).begin === "function") {

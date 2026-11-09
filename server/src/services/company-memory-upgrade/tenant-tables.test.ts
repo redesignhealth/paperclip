@@ -28,6 +28,7 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_staging CASCADE`;
     await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_ledger CASCADE`;
     await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_dedupe CASCADE`;
+    await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_fence CASCADE`;
   });
 
   afterAll(async () => {
@@ -128,6 +129,50 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     expect(indexNames).toContain("pmu_staging_src_idx");
     expect(indexNames).toContain("pmu_ledger_outcome_idx");
     expect(indexNames).toContain("pmu_dedupe_uq");
+  });
+
+  it("idempotently creates paperclip_memory_upgrade_fence with expected columns, PK, and defaults", async () => {
+    await ensureUpgradeTables(sql, "text");
+    await expect(ensureUpgradeTables(sql, "text")).resolves.toBeUndefined();
+
+    const columns = await sql`
+      SELECT column_name, data_type, is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'paperclip_memory_upgrade_fence'
+      ORDER BY ordinal_position;
+    `;
+    const colNames = columns.map((c) => c.column_name);
+    expect(colNames).toEqual(["upgrade_id", "fence_epoch", "lease_token", "lease_owner", "claimed_at"]);
+
+    const pkRows = await sql`
+      SELECT a.attname
+      FROM pg_index i
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+      WHERE i.indrelid = 'paperclip_memory_upgrade_fence'::regclass AND i.indisprimary;
+    `;
+    expect(pkRows.map((r) => r.attname)).toEqual(["upgrade_id"]);
+
+    // Claim-like upsert: unconditional increment on conflict
+    const upgradeId = randomUUID();
+    await sql`
+      INSERT INTO paperclip_memory_upgrade_fence (upgrade_id, fence_epoch, lease_token, lease_owner)
+      VALUES (${upgradeId}::uuid, 1, 'token-a', 'owner-a')
+    `;
+    const [row1] = await sql`SELECT fence_epoch::text AS fence_epoch FROM paperclip_memory_upgrade_fence WHERE upgrade_id = ${upgradeId}::uuid`;
+    expect(row1.fence_epoch).toBe("1");
+
+    await sql`
+      INSERT INTO paperclip_memory_upgrade_fence (upgrade_id, fence_epoch, lease_token, lease_owner)
+      VALUES (${upgradeId}::uuid, 1, 'token-b', 'owner-b')
+      ON CONFLICT (upgrade_id) DO UPDATE SET
+        fence_epoch = paperclip_memory_upgrade_fence.fence_epoch + 1,
+        lease_token = EXCLUDED.lease_token,
+        lease_owner = EXCLUDED.lease_owner,
+        claimed_at = now()
+    `;
+    const [row2] = await sql`SELECT fence_epoch::text AS fence_epoch, lease_token FROM paperclip_memory_upgrade_fence WHERE upgrade_id = ${upgradeId}::uuid`;
+    expect(row2.fence_epoch).toBe("2");
+    expect(row2.lease_token).toBe("token-b");
   });
 
   it("enforces unique constraint on (upgrade_id, agent_id, data_sha256) in paperclip_memory_upgrade_dedupe", async () => {
