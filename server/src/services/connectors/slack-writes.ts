@@ -34,6 +34,7 @@ import { logActivity } from "../activity-log.js";
 import {
   assertSlackToolEnabledForSetup,
   slackEndpointOptInsForGating,
+  slackOtherUserDmsEnabled,
 } from "./slack-opt-ins.js";
 
 const richText = (text: unknown) => [
@@ -105,7 +106,9 @@ export async function executeSlackWrite(
       "Create channels in a separate task before reading private research; its content cannot be published to a new destination",
     );
   if (name !== "slack_create_channel" && name !== "slack_open_dm")
-    await authorizeSlackWrite(db, authority, api, String(args.channel));
+    await authorizeSlackWrite(db, authority, api, String(args.channel), {
+      allowOtherUserDm: await slackOtherUserDmsEnabled(db, authority.endpoint),
+    });
   if (
     name === "slack_invite" &&
     (args.users as string[]).includes(authority.endpoint.botExternalId!)
@@ -189,7 +192,9 @@ export async function executeSlackWrite(
         "Slack authorization changed after this operation was queued",
       );
     if (name !== "slack_create_channel" && name !== "slack_open_dm")
-      await authorizeSlackWrite(db, authority, api, String(args.channel));
+      await authorizeSlackWrite(db, authority, api, String(args.channel), {
+        allowOtherUserDm: await slackOtherUserDmsEnabled(db, authority.endpoint),
+      });
     if (name === "slack_update_message" || name === "slack_delete_message") {
       const message = await slackMessage(api, args);
       if (!message || message.user !== authority.endpoint.botExternalId)
@@ -201,19 +206,26 @@ export async function executeSlackWrite(
     if (name === "slack_open_dm") {
       if (!authority.endpoint.allowDirectMessages)
         throw forbidden("Direct messages are disabled");
-      const user = object(
-        (await api("users.info", { user: authority.slackUserId })).user,
-      );
+      // The requester by default; any other active workspace member when the caller names one (the tool is only
+      // callable with the Proactive DMs opt-in).
+      const target =
+        typeof args.user === "string" ? args.user : authority.slackUserId;
+      const user = object((await api("users.info", { user: target })).user);
+      const others = target !== authority.slackUserId;
       if (
-        user.id !== authority.slackUserId ||
+        user.id !== target ||
         user.deleted === true ||
         user.is_bot === true ||
-        user.team_id !== authority.endpoint.providerAccountId
+        user.team_id !== authority.endpoint.providerAccountId ||
+        (others &&
+          (user.is_restricted === true || user.is_ultra_restricted === true))
       )
         throw forbidden(
-          "The linked Slack user is no longer an active workspace member",
+          others
+            ? "That Slack user is not an active member of this workspace"
+            : "The linked Slack user is no longer an active workspace member",
         );
-      result = await api(tool.method, { users: authority.slackUserId });
+      result = await api(tool.method, { users: target });
     } else if (name === "slack_upload_file") {
       const [attachment] = await db
         .select({ asset: assets })
@@ -298,7 +310,9 @@ export async function executeSlackWrite(
         authority.revision !== action.payload.revision
       )
         throw forbidden("Slack authorization changed during upload");
-      await authorizeSlackWrite(db, authority, api, String(args.channel));
+      await authorizeSlackWrite(db, authority, api, String(args.channel), {
+        allowOtherUserDm: await slackOtherUserDmsEnabled(db, authority.endpoint),
+      });
       result = await api("files.completeUploadExternal", {
         files: [
           {

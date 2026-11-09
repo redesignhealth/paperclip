@@ -84,6 +84,81 @@ describe("Slack access and publication boundaries", () => {
       ),
     ).rejects.toThrow("Other people's bot DMs");
   });
+  describe("DMs with other people (Proactive DMs, TECH-8286)", () => {
+    const members: Record<string, Record<string, unknown>> = {
+      U1: { id: "U1", team_id: "T1" },
+      UOTHER: { id: "UOTHER", team_id: "T1" },
+      UGONE: { id: "UGONE", team_id: "T1", deleted: true },
+      UBOTTY: { id: "UBOTTY", team_id: "T1", is_bot: true },
+      UGUEST: { id: "UGUEST", team_id: "T1", is_restricted: true },
+      UFOREIGN: { id: "UFOREIGN", team_id: "T2" },
+    };
+    const dmApi = (dmWith: string) =>
+      vi.fn(
+        async (
+          method: string,
+          args?: Record<string, unknown>,
+        ): Promise<Record<string, unknown>> =>
+          method === "users.info"
+            ? { user: members[String(args?.user)] }
+            : { channel: { id: "D9", is_im: true, user: dmWith } },
+      );
+    it("refuses another person's DM unless Proactive DMs is on, even for a valid member", async () => {
+      await expect(
+        authorizeSlackChannel(authority, dmApi("UOTHER"), "D9"),
+      ).rejects.toThrow("Other people's bot DMs");
+      await expect(
+        authorizeSlackChannel(authority, dmApi("UOTHER"), "D9", {
+          allowOtherUserDm: false,
+        }),
+      ).rejects.toThrow("Other people's bot DMs");
+    });
+    it("lets reads and writes use another active full member's DM when Proactive DMs is on", async () => {
+      await expect(
+        authorizeSlackChannel(authority, dmApi("UOTHER"), "D9", {
+          allowOtherUserDm: true,
+        }),
+      ).resolves.toMatchObject({ id: "D9", user: "UOTHER" });
+    });
+    it("never allows a deactivated user, a bot, a guest or a user from another workspace", async () => {
+      for (const who of ["UGONE", "UBOTTY", "UGUEST", "UFOREIGN"])
+        await expect(
+          authorizeSlackChannel(authority, dmApi(who), "D9", {
+            allowOtherUserDm: true,
+          }),
+        ).rejects.toThrow("not an active member");
+    });
+    it("keeps the private-research rule: private content goes only to its source or the requester's DM", async () => {
+      const options = { allowOtherUserDm: true };
+      const readPrivate = fakeDb([{ payload: { channelId: "G2", requesterId: "U1" } }]);
+      // Nothing private was read: a DM with another person is fine.
+      expect(
+        await authorizeSlackWrite(fakeDb([]), authority, dmApi("UOTHER"), "D9", options),
+      ).toMatchObject({ user: "UOTHER" });
+      // Private research read in this task cannot be sent to someone else's DM...
+      await expect(
+        authorizeSlackWrite(readPrivate, authority, dmApi("UOTHER"), "D9", options),
+      ).rejects.toThrow("Private research");
+      // ...but still can be sent to the requester's own DM.
+      expect(
+        await authorizeSlackWrite(readPrivate, authority, dmApi("U1"), "D9", options),
+      ).toMatchObject({ user: "U1" });
+    });
+    it("open_dm takes an optional Slack user ID and rejects anything else", () => {
+      const openDm = SLACK_TOOLS.find((tool) => tool.name === "slack_open_dm")!;
+      const key = "9c0dc094-41b6-4d84-a2f1-1df331774489";
+      expect(openDm.schema.safeParse({ idempotencyKey: key }).success).toBe(true);
+      expect(
+        openDm.schema.safeParse({ idempotencyKey: key, user: "U012AB3CD" }).success,
+      ).toBe(true);
+      expect(
+        openDm.schema.safeParse({ idempotencyKey: key, user: "patrick" }).success,
+      ).toBe(false);
+      expect(
+        openDm.schema.safeParse({ idempotencyKey: key, users: "U012AB3CD" }).success,
+      ).toBe(false);
+    });
+  });
   it("paginates private membership and does not accept incomplete verification", async () => {
     const api = apiFor({ is_private: true });
     api.mockImplementation(async (method, args) => {
