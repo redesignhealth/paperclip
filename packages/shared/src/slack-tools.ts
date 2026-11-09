@@ -83,7 +83,7 @@ export const SLACK_TOOLS = [
       user: user
         .optional()
         .describe(
-          "Slack user ID (for example U012AB3CD) of the workspace member to DM. Omit to DM the current task's linked requester. Do not guess an ID; look it up with slack_user.",
+          "Slack user ID (for example U012AB3CD) of the workspace member to DM. Omit to DM the current task's linked requester. Do not guess an ID; use one from a mention or the request (slack_user takes an ID, it cannot search by name).",
         ),
     },
   ),

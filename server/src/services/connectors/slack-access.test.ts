@@ -128,21 +128,21 @@ describe("Slack access and publication boundaries", () => {
           }),
         ).rejects.toThrow("not an active member");
     });
-    it("writing to another person's DM follows the same private-research rule as the requester's DM", async () => {
+    it("keeps the private-research rule: private content goes only to its source or the requester's DM", async () => {
       const options = { allowOtherUserDm: true };
+      const readPrivate = fakeDb([{ payload: { channelId: "G2", requesterId: "U1" } }]);
+      // Nothing private was read: a DM with another person is fine.
       expect(
         await authorizeSlackWrite(fakeDb([]), authority, dmApi("UOTHER"), "D9", options),
       ).toMatchObject({ user: "UOTHER" });
-      // The requester's private research may still be sent to a DM, exactly as before this change.
+      // Private research read in this task cannot be sent to someone else's DM...
+      await expect(
+        authorizeSlackWrite(readPrivate, authority, dmApi("UOTHER"), "D9", options),
+      ).rejects.toThrow("Private research");
+      // ...but still can be sent to the requester's own DM.
       expect(
-        await authorizeSlackWrite(
-          fakeDb([{ payload: { channelId: "G2", requesterId: "U1" } }]),
-          authority,
-          dmApi("UOTHER"),
-          "D9",
-          options,
-        ),
-      ).toMatchObject({ user: "UOTHER" });
+        await authorizeSlackWrite(readPrivate, authority, dmApi("U1"), "D9", options),
+      ).toMatchObject({ user: "U1" });
     });
     it("open_dm takes an optional Slack user ID and rejects anything else", () => {
       const openDm = SLACK_TOOLS.find((tool) => tool.name === "slack_open_dm")!;

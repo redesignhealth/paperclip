@@ -164,7 +164,9 @@ export async function authorizeSlackWrite(
       authority.endpoint.id,
       authority.issueId,
       channelId,
-      channel.is_im === true ? authority.slackUserId : null,
+      // The existing rule: private research may only go to its source channel or a DM with the requester. A DM is
+      // delivered to its other party, so the requester's own DM matches and a DM with anyone else does not.
+      channel.is_im === true && typeof channel.user === "string" ? channel.user : null,
     ))
   )
     throw forbidden(

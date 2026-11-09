@@ -32,7 +32,7 @@ the accepted linked user's request, using normal Paperclip task tools.
 The bot must belong to a channel and the requester must have access. Allowed
 Channels controls responding and writes; another shared channel can be readable
 without being enabled for responses. Do not join existing channels or change
-connection settings to widen access. Other people's bot DMs are inaccessible.
+connection settings to widen access. Other people's bot DMs are only available when Proactive DMs is enabled.
 Private-channel material stays in that channel or a DM with the requester. Ask
 the requester to move to a DM for research spanning private channels in a Slack-origin task. Ordinary tasks must also keep private research in source channels or the requester's DM.
 
@@ -70,9 +70,10 @@ Paperclip tasks, documents, assignments and approvals.
 ## Tasks and routines
 
 For “send me a Slack message,” call `slack_open_dm` to obtain the linked responsible
-user's DM channel, then use `slack_post_message`. To message someone else, look their
-Slack user ID up with `slack_user`, call `slack_open_dm` with that `user`, then use
-`slack_post_message`. Do not guess a user or DM ID. Only message people the request
+user's DM channel, then use `slack_post_message`. To message someone else, you need their
+Slack user ID (for example from a mention or the request), call `slack_open_dm` with that
+`user`, then use `slack_post_message`. `slack_user` takes an ID, it cannot search by name.
+Do not guess a user or DM ID. Only message people the request
 names, and confirm the recipient when the name is ambiguous.
 For “at 10am,” use the normal Paperclip routine tools to schedule work, including
 the intended timezone and destination in the routine's instructions. The run uses
