@@ -116,6 +116,20 @@ Tables:
   guard, and the override is recorded in `upstream_sync_events` under that login. Note that
   every worker run shares the `upstream_sync_runner` login, so the guard cannot tell one run
   from another; per-run attribution is `upstream_sync.run_ref` in the events.
+
+  **Re-pointing `integration_sha`** (migration 0387). A squash or a late ancestry PR can
+  change which commit on `integration` contains an upstream sha, and the write-once column
+  would leave the row failing `verify`. The one sanctioned path is
+  `cli.mjs repoint --sha <upstream> --new-sha <rev> --expect-old <current integration_sha> --reason "<why>"`.
+  The tool checks git first: the new sha must descend from the old one, contain the upstream
+  sha, and be on `integration` (or already in master). The `upstream_sync_repoint_integration_sha()`
+  function then writes an append-only `upstream_sync_integration_repoints` row (row id,
+  upstream sha, old sha, new sha, actor, reason, run, time) and changes `integration_sha`
+  and nothing else; the guard accepts the change only when that audit row came from the same
+  transaction. It applies to a clean `integrated` row only: a conflict resolution's Argus
+  verdict is bound to the old sha, so that stays a human override. The database cannot read
+  git, so a caller that reaches the SQL function directly skips the ancestry check; it is
+  still audited.
   The `upstream_sync_human` role is cluster-global. If the migration login lacks `CREATEROLE`, the
   migration continues with a NOTICE and the guard has no override until an operator runs
   `CREATE ROLE upstream_sync_human NOLOGIN;` and grants it to the human logins that may override.

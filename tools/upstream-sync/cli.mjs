@@ -35,6 +35,8 @@ worker commands (JSON on stdout; common flags: --run-id, --repo, --integration-r
   record --shas A,B --status S [--path --integration-sha --delta-sha256 --review-pr --promote-pr --master-sha
          --skip-reason --argus-verdict] [--argus-round JSON] [--argus-round-cap N (default 10)]
   promote --promote-pr N  mark integrated rows now in master as promoted (after a human merged the PR)
+  repoint --sha U --new-sha N --expect-old OLD --reason TEXT
+                          audited re-point of an integrated row's integration_sha (N must descend from OLD, contain U, be on integration)
   verify                  check integrated/promoted rows against git ancestry (exit 1 on mismatch)`;
 
 const [cmd, sub, ...rest] = process.argv.slice(2);
@@ -100,7 +102,7 @@ async function status(db) {
   };
 }
 
-const WORKER_COMMANDS = new Set(["claim", "assess", "merge-plan", "delta", "record", "promote", "verify"]);
+const WORKER_COMMANDS = new Set(["claim", "assess", "merge-plan", "delta", "record", "promote", "repoint", "verify"]);
 
 async function workerCommand(db, argv) {
   const { values: v } = parseArgs({
@@ -112,7 +114,7 @@ async function workerCommand(db, argv) {
       path: { type: "string" }, "integration-sha": { type: "string" }, "delta-sha256": { type: "string" },
       "review-pr": { type: "string" }, "promote-pr": { type: "string" }, "master-sha": { type: "string" },
       "skip-reason": { type: "string" }, "argus-verdict": { type: "string" }, "argus-round": { type: "string" },
-      "argus-round-cap": { type: "string" },
+      "argus-round-cap": { type: "string" }, "new-sha": { type: "string" }, "expect-old": { type: "string" }, reason: { type: "string" },
     },
   });
   const w = cfg.worker;
@@ -146,6 +148,9 @@ async function workerCommand(db, argv) {
     }));
   }
   if (cmd === "promote") return out(await handle.promote(db, repo, { runId, promotePr: num("promote-pr"), masterRef: refs.masterRef, masterSha: v["master-sha"] ?? null }));
+  if (cmd === "repoint") {
+    return out(await handle.repoint(db, repo, { sha: v.sha, newSha: v["new-sha"], expectOld: v["expect-old"], reason: v.reason, runId, ...refs }));
+  }
   if (cmd === "verify") {
     const r = await handle.verify(db, repo, refs);
     out(r);

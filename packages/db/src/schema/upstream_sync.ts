@@ -238,3 +238,37 @@ export type UpstreamSyncStatus =
   | "promoted" // in `master`
   | "needs_human"
   | "failed";
+
+/**
+ * Audit trail for re-pointing `upstream_sync_log.integration_sha` (RED-874).
+ * Written ONLY by `upstream_sync_repoint_integration_sha()` (SECURITY DEFINER),
+ * which is the one path past the column's write-once guard; the guard accepts
+ * a change only when an audit row for that exact old -> new change was inserted
+ * by the same transaction (`txid`). Append-only. Functions, triggers and grants
+ * are hand-written in `0385_upstream_sync_integration_repoint.sql`.
+ */
+export const upstreamSyncIntegrationRepoints = pgTable(
+  "upstream_sync_integration_repoints",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    logId: bigint("log_id", { mode: "number" }).notNull(),
+    upstreamSha: text("upstream_sha").notNull(),
+    oldIntegrationSha: text("old_integration_sha").notNull(),
+    newIntegrationSha: text("new_integration_sha").notNull(),
+    // session_user of the caller (current_user inside SECURITY DEFINER is the owner).
+    actor: text("actor").notNull(),
+    reason: text("reason").notNull(),
+    runRef: text("run_ref"),
+    txid: bigint("txid", { mode: "number" }).notNull().default(sql`txid_current()`),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("upstream_sync_repoints_log_idx").on(table.logId, table.id),
+    check(
+      "upstream_sync_repoints_sha_check",
+      sql`${table.oldIntegrationSha} ~ '^[0-9a-f]{40}$' and ${table.newIntegrationSha} ~ '^[0-9a-f]{40}$'`,
+    ),
+    check("upstream_sync_repoints_changed_check", sql`${table.oldIntegrationSha} <> ${table.newIntegrationSha}`),
+    check("upstream_sync_repoints_reason_check", sql`btrim(${table.reason}) <> ''`),
+  ],
+);
