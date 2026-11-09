@@ -157,8 +157,6 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
 }
 
 export interface RunCensusCliDependencies {
-  /** @internal Test-only injection for runCensus implementation */
-  runCensusFn?: typeof runCensus;
   /** @internal Test-only option forwarded to runCensus */
   _internalSkipVectorIdentityCheck?: boolean;
 }
@@ -201,8 +199,6 @@ Options:
 `);
       return 0;
     }
-
-    validateNoUnknownFlags(argv, ALLOWED_CENSUS_FLAGS);
 
     const databaseUrl =
       parseFlagValue("--database-url", argv) ??
@@ -265,8 +261,7 @@ Options:
     const chatOutputUsdPerMillion = parseOptionalPrice("--chat-output-usd-per-mtok", process.env.CHAT_OUTPUT_USD_PER_MTOK);
     const embeddingUsdPerMillion = parseOptionalPrice("--embedding-usd-per-mtok", process.env.EMBEDDING_USD_PER_MTOK);
 
-    const runCensusFn = deps.runCensusFn ?? runCensus;
-    const report = await runCensusFn({
+    const report = await runCensus({
       databaseUrl,
       companyId,
       controlPlaneUrl,
