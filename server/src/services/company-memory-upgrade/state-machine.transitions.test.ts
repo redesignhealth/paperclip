@@ -1,13 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import {
+  companies,
+  companyMemoryUpgrades,
+  createDb,
+  type Db,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "../../__tests__/helpers/embedded-postgres.js";
+import {
+  claimUpgradeLease,
   CompanyMemoryUpgradeError,
   assertUpgradeErrorCode,
   assertValidTransition,
   isUpgradeErrorCode,
   isValidTransition,
+  openUpgrade,
+  releaseUpgradeLease,
   VALID_TRANSITIONS,
 } from "./state-machine.js";
 import { UPGRADE_STATES, type UpgradeState } from "./types.js";
+
+const support = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = support.supported ? describe : describe.skip;
 
 describe("state-machine transitions", () => {
   it("allows all explicitly documented valid transitions", () => {
@@ -209,6 +226,83 @@ describe("state-machine transitions", () => {
       expect((caught as CompanyMemoryUpgradeError).code).toBe("INVALID_ARGUMENT");
       expect(caught!.message).not.toContain("s3cret");
       expect(caught!.message).toContain("string");
+    });
+  });
+
+  describeEmbeddedPostgres("releaseUpgradeLease", () => {
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+    let db!: Db;
+    let companyId: string;
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("release-lease-test-");
+      db = createDb(tempDb.connectionString);
+      const [company] = await db
+        .insert(companies)
+        .values({ name: "Lease Co", issuePrefix: "LC" })
+        .returning();
+      companyId = company.id;
+    }, 20_000);
+
+    afterAll(async () => {
+      await db?.$client?.end();
+      await tempDb?.cleanup();
+    });
+
+    it("releases an active lease via CAS success", async () => {
+      const upgrade = await openUpgrade(db, {
+        companyId,
+        converterId: "test-converter",
+        converterVersion: 1,
+        collectionName: "mem0_memories",
+        embeddingModel: "text-embedding-3-small",
+        embeddingDimensions: 1536,
+      });
+
+      const claim = await claimUpgradeLease(db, {
+        upgradeId: upgrade.id,
+        leaseOwner: "owner-1",
+        ttlMs: 60_000,
+      });
+      expect(claim.acquired).toBe(true);
+
+      const releaseResult = await releaseUpgradeLease(db, upgrade.id, claim.leaseToken!);
+      expect(releaseResult).toEqual({ released: true });
+
+      const [after] = await db
+        .select()
+        .from(companyMemoryUpgrades)
+        .where(eq(companyMemoryUpgrades.id, upgrade.id));
+      expect(after.leaseToken).toBeNull();
+      expect(after.leaseOwner).toBeNull();
+      expect(after.leaseAcquiredAt).toBeNull();
+      expect(after.leaseExpiresAt).toBeNull();
+      expect(after.state).toBe("sweeping");
+    });
+
+    it("is a no-op when called with wrong token", async () => {
+      const [current] = await db
+        .select()
+        .from(companyMemoryUpgrades)
+        .where(eq(companyMemoryUpgrades.companyId, companyId));
+
+      const claim = await claimUpgradeLease(db, {
+        upgradeId: current.id,
+        leaseOwner: "owner-2",
+        ttlMs: 60_000,
+      });
+      expect(claim.acquired).toBe(true);
+
+      const releaseResult = await releaseUpgradeLease(db, current.id, "wrong-token-12345");
+      expect(releaseResult).toEqual({ released: false });
+
+      const [after] = await db
+        .select()
+        .from(companyMemoryUpgrades)
+        .where(eq(companyMemoryUpgrades.id, current.id));
+      expect(after.leaseToken).toBe(claim.leaseToken);
+      expect(after.leaseOwner).toBe("owner-2");
+      expect(after.state).toBe("sweeping");
     });
   });
 });

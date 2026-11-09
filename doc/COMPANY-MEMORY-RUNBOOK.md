@@ -338,6 +338,48 @@ Key Options and Environment Variables:
 
 > **Production Safety Notice**: Host locality is not proof of environment. A production database reached over an SSH tunnel or port-forward presents as a local host and will not trigger this gate. Always verify connection targets before running operational tooling.
 
+#### Conversion Sweep (TECH-8191)
+
+Paperclip provides an online, tenant-isolated sweep command to classify legacy company-scoped Mem0 memories and record outcomes in the tenant upgrade ledger:
+
+```bash
+pnpm memory:upgrade sweep \
+  --database-url <tenant-dsn> \
+  --control-plane-url <cp-dsn> \
+  --company <uuid> \
+  --confirm <uuid> \
+  [options]
+```
+
+Key Options and Safety Rules:
+- `--database-url <dsn>`: Tenant PostgreSQL DSN (or `COMPANY_MEMORY_DATABASE_URL` env var).
+- `--control-plane-url <dsn>`: Control-plane PostgreSQL DSN (or `CONTROL_PLANE_DATABASE_URL` env var).
+- `--company <uuid>`: Target company UUID (validated against control-plane binding).
+- `--confirm <uuid>`: Required confirmation matching `--company` exactly; prevents accidental cutover execution.
+- `--pause-when-active-runs <n>`: Threshold of active runs (`queued`, `scheduled_retry`, `running`) above which the sweep pauses (default: 1, set to 0 to disable).
+- `--active-run-poll-ms <int>`: Polling interval while waiting for active runs to subside (default: 15000ms).
+- `--max-pause-seconds <int>`: Bounded pause timeout before failing closed with `paused_too_long` (default: 0 = unbounded).
+- `--prod`: Flag required alongside `MEMORY_UPGRADE_ALLOW_PROD=1` for any non-localhost database host (enforced on both tenant and control-plane DSNs).
+
+Operational Invariants:
+1. **Scope and Staging in PR3a**:
+   - In PR3a, the sweep is strictly **zero network egress, zero API keys, and zero staging writes**.
+   - Live sources are evaluated through the deterministic classification pipeline: routing readiness (`unroutable`), deterministic noise (`dropped_noise`), and sensitive pattern detection (`dropped_sensitive`).
+   - Routable, non-noise, non-sensitive rows receive **no ledger row** and are counted as `pendingConversion`. LLM conversion, embedding generation, and staging table population arrive in follow-up PR3b.
+2. **Authoritative Ledger vs. Cumulative Counters**:
+   - The tenant database table `paperclip_memory_upgrade_ledger` is authoritative for source classifications, content hashes, and outcomes.
+   - Counters on `company_memory_upgrades` record cumulative activity and do not partition the live source table.
+   - A crash or lease fencing event between a tenant transaction commit and the subsequent control-plane counter flush may cause counters to undercount relative to the ledger. This is acceptable by design because recovery and resume operations rely exclusively on the tenant ledger.
+3. **Sensitive Rows are Never Auto-Pruned**:
+   - Sources identified by `detectSensitiveFamilies` are recorded with outcome `dropped_sensitive` and reason codes naming matched family categories (e.g. `apiKey,passwordAssignment`), never raw text.
+   - `dropped_sensitive` rows are **never** automatically pruned or published. They remain retained in the ledger for operator audit and manual inspection.
+4. **Active-Run Quiescence and Leases**:
+   - The active-run gate throttles polling and pauses sweep progress during active agent runs to prevent latency interference.
+   - While paused, lease heartbeat timers remain active and assert lease health every 5 seconds. If the lease lapses or is lost, the sweep aborts cleanly.
+5. **Read-Only Access to Live Collection**:
+   - The live Mem0 collection table is accessed **strictly via SELECT statements**.
+   - No UPDATE, DELETE, INSERT, or DDL index modifications are ever issued against the live Mem0 collection table during sweep.
+
 #### Safe Expand/Contract Migration Procedure
 Transitioning to a new embedding model or dimension must follow a multi-phase expand/contract lifecycle. The runtime does not support arbitrary live migrations; all data transitions require planned offline cutovers with operator verification. Never execute arbitrary or automatic production actions.
 

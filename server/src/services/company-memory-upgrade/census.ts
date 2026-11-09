@@ -536,62 +536,73 @@ export function validateDatabaseUrl(
   return parsed;
 }
 
-export async function assertNonSuperuserAndRestrictedRole(
-  tx: any,
-  connectionLabel: "tenant" | "control-plane",
-): Promise<void> {
-  const roleRows = (await tx.execute(sql`
-    SELECT
-      r.rolname,
-      r.rolsuper,
-      r.rolbypassrls,
-      r.rolcreaterole,
-      r.rolreplication,
-      (r.rolname = current_user) AS is_self,
-      pg_has_role(current_user, r.oid, 'MEMBER') AS is_member
-    FROM pg_roles r
-    WHERE (
-      r.rolname = current_user
-      OR pg_has_role(current_user, r.oid, 'MEMBER')
-    )
-    AND (
-      r.rolsuper
-      OR r.rolbypassrls
-      OR r.rolcreaterole
-      OR r.rolreplication
-      OR r.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_all_settings')
-    );
-  `)) as unknown as Array<{
-    rolname: string;
-    rolsuper: boolean;
-    rolbypassrls: boolean;
-    rolcreaterole: boolean;
-    rolreplication: boolean;
-    is_self: boolean;
-    is_member: boolean;
-  }>;
+export const ROLE_PRIVILEGE_PREFLIGHT_SQL_TEXT = `
+  SELECT
+    r.rolname,
+    r.rolsuper,
+    r.rolbypassrls,
+    r.rolcreaterole,
+    r.rolreplication,
+    (r.rolname = current_user) AS is_self,
+    pg_has_role(current_user, r.oid, 'MEMBER') AS is_member
+  FROM pg_roles r
+  WHERE (
+    r.rolname = current_user
+    OR pg_has_role(current_user, r.oid, 'MEMBER')
+  )
+  AND (
+    r.rolsuper
+    OR r.rolbypassrls
+    OR r.rolcreaterole
+    OR r.rolreplication
+    OR r.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_all_settings')
+  );
+`;
 
+export interface RolePrivilegeRow {
+  rolname: string;
+  rolsuper: boolean;
+  rolbypassrls: boolean;
+  rolcreaterole: boolean;
+  rolreplication: boolean;
+  is_self: boolean;
+  is_member: boolean;
+}
+
+export function assertNoElevatedRolePrivileges(
+  roleRows: RolePrivilegeRow[],
+  connectionLabel: "tenant" | "control-plane",
+  operationLabel: string = "memory upgrade census",
+): void {
   if (roleRows.length > 0) {
     const superOffender = roleRows.find((r) => r.rolsuper);
     if (superOffender) {
       throw new CompanyMemoryUpgradeError(
-        `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database is a superuser or member of superuser role '${superOffender.rolname}'. Dedicated non-superuser role required.`,
+        `Refusing to run ${operationLabel}: connecting role on ${connectionLabel} database is a superuser or member of superuser role '${superOffender.rolname}'. Dedicated non-superuser role required.`,
         "SUPERUSER_REJECTED",
       );
     }
     const bypassOffender = roleRows.find((r) => r.rolbypassrls);
     if (bypassOffender) {
       throw new CompanyMemoryUpgradeError(
-        `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database has or inherits BYPASSRLS privilege from role '${bypassOffender.rolname}'. Dedicated role required.`,
+        `Refusing to run ${operationLabel}: connecting role on ${connectionLabel} database has or inherits BYPASSRLS privilege from role '${bypassOffender.rolname}'. Dedicated role required.`,
         "BYPASSRLS_REJECTED",
       );
     }
     const offender = roleRows[0];
     throw new CompanyMemoryUpgradeError(
-      `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database has excessive privilege or membership in role '${offender.rolname}'. Dedicated restricted role required.`,
+      `Refusing to run ${operationLabel}: connecting role on ${connectionLabel} database has excessive privilege or membership in role '${offender.rolname}'. Dedicated restricted role required.`,
       "EXCESSIVE_PRIVILEGE_REJECTED",
     );
   }
+}
+
+export async function assertNonSuperuserAndRestrictedRole(
+  tx: any,
+  connectionLabel: "tenant" | "control-plane",
+): Promise<void> {
+  const roleRows = (await tx.execute(sql.raw(ROLE_PRIVILEGE_PREFLIGHT_SQL_TEXT))) as unknown as RolePrivilegeRow[];
+  assertNoElevatedRolePrivileges(roleRows, connectionLabel, "memory upgrade census");
 }
 
 export async function runCensus(options: CensusOptions): Promise<CensusReport> {

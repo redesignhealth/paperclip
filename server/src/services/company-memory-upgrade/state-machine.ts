@@ -295,6 +295,39 @@ export async function renewUpgradeLease(
 }
 
 /**
+ * Releases a lease on an active upgrade row using CAS on (id, leaseToken).
+ * Clears lease fields where id and token match and the state is an active pre-lapse state.
+ */
+export async function releaseUpgradeLease(
+  db: Db,
+  id: string,
+  leaseToken: string,
+  options?: { clock?: Clock },
+): Promise<{ released: boolean }> {
+  const now = options?.clock?.now() ?? new Date();
+
+  const [released] = await db
+    .update(companyMemoryUpgrades)
+    .set({
+      leaseToken: null,
+      leaseOwner: null,
+      leaseAcquiredAt: null,
+      leaseExpiresAt: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(companyMemoryUpgrades.id, id),
+        eq(companyMemoryUpgrades.leaseToken, leaseToken),
+        inArray(companyMemoryUpgrades.state, Array.from(ACTIVE_PRE_LAPSE_STATES)),
+      ),
+    )
+    .returning({ id: companyMemoryUpgrades.id });
+
+  return { released: Boolean(released) };
+}
+
+/**
  * Starts a background heartbeat timer to periodically renew the upgrade lease.
  * Requires the claimed lease expiry (`initialExpiresAt`).
  * If the lease is already expired when starting, immediately marks the heartbeat

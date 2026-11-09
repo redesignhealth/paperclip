@@ -448,6 +448,9 @@ jobs:
       - name: Verify Mem0 memory upgrade census test coverage
         run: pnpm run test:memory-upgrade-census
 
+      - name: Verify Mem0 memory upgrade sweep test coverage
+        run: pnpm run test:memory-upgrade-sweep
+
       - name: Upload CI profile timings
         continue-on-error: true
         if: always() && env.PAPERCLIP_CI_PROFILE == 'true'

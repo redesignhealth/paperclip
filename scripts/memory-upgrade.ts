@@ -12,12 +12,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   formatCensusTextReport,
+  isValidUuid,
   runCensus,
 } from "../server/src/services/company-memory-upgrade/census.js";
+import {
+  formatSweepTextReport,
+  runSweep,
+  type SweepDependencies,
+} from "../server/src/services/company-memory-upgrade/sweep.js";
 import { CompanyMemoryUpgradeError } from "../server/src/services/company-memory-upgrade/types.js";
 
 export const STUB_SUBCOMMANDS = new Set([
-  "sweep",
   "flip",
   "drain",
   "prune",
@@ -35,6 +40,28 @@ export const BOOLEAN_FLAGS = new Set([
 export const VALUE_FLAGS = new Set([
   "--database-url",
   "--company",
+  "--confirm",
+  "--control-plane-url",
+  "--output",
+  "--out",
+  "--format",
+  "--table",
+  "--long-threshold",
+  "--chat-input-usd-per-mtok",
+  "--chat-output-usd-per-mtok",
+  "--embedding-usd-per-mtok",
+  "--page-size",
+  "--max-rows",
+  "--pause-when-active-runs",
+  "--active-run-poll-ms",
+  "--max-pause-seconds",
+  "--operator-label",
+]);
+
+export const ALLOWED_CENSUS_FLAGS = new Set([
+  ...BOOLEAN_FLAGS,
+  "--database-url",
+  "--company",
   "--control-plane-url",
   "--output",
   "--out",
@@ -46,10 +73,27 @@ export const VALUE_FLAGS = new Set([
   "--embedding-usd-per-mtok",
 ]);
 
-export const ALLOWED_CENSUS_FLAGS = new Set([
+export const ALLOWED_SWEEP_FLAGS = new Set([
   ...BOOLEAN_FLAGS,
-  ...VALUE_FLAGS,
+  "--database-url",
+  "--control-plane-url",
+  "--company",
+  "--confirm",
+  "--table",
+  "--page-size",
+  "--max-rows",
+  "--pause-when-active-runs",
+  "--active-run-poll-ms",
+  "--max-pause-seconds",
+  "--operator-label",
+  "--output",
+  "--out",
+  "--format",
 ]);
+
+export function scrubDsnSecrets(text: string): string {
+  return text.replace(/(postgres(?:ql)?:\/\/[^:@\s]+):[^@\s]+@/g, "$1:***@");
+}
 
 export function isNumericString(val: string): boolean {
   return /^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(val.trim());
@@ -107,14 +151,18 @@ export function hasBooleanFlag(name: string, argv: string[]): boolean {
   return false;
 }
 
-export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>): void {
+export function validateNoUnknownFlags(
+  argv: string[],
+  allowedFlags: Set<string>,
+  commandLabel: string = "read-only census",
+): void {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith("--")) {
       const [flagName, ...rest] = arg.split("=");
       if (!allowedFlags.has(flagName)) {
         throw new CompanyMemoryUpgradeError(
-          `Unknown option '${flagName}'. Only read-only census options are accepted.`,
+          `Unknown option '${flagName}'. Only ${commandLabel} options are accepted.`,
           "INVALID_ARGUMENT",
         );
       }
@@ -148,7 +196,7 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
     } else if (arg.startsWith("-")) {
       if (!allowedFlags.has(arg)) {
         throw new CompanyMemoryUpgradeError(
-          `Unknown option '${arg}'. Only read-only census options are accepted.`,
+          `Unknown option '${arg}'. Only ${commandLabel} options are accepted.`,
           "INVALID_ARGUMENT",
         );
       }
@@ -290,7 +338,181 @@ Options:
 
     return 0;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = scrubDsnSecrets(rawMessage);
+    console.error(`Error: ${message}`);
+    return 1;
+  }
+}
+
+export interface RunSweepCliDependencies extends SweepDependencies {}
+
+export async function runSweepCli(
+  argv: string[],
+  deps: RunSweepCliDependencies = {},
+): Promise<number> {
+  try {
+    validateNoUnknownFlags(argv, ALLOWED_SWEEP_FLAGS, "sweep");
+
+    if (hasBooleanFlag("--help", argv) || hasBooleanFlag("-h", argv)) {
+      console.log(`
+Usage: pnpm memory:upgrade sweep --database-url <tenant-dsn> --control-plane-url <cp-dsn> --company <uuid> --confirm <uuid> [options]
+
+Classifies legacy Mem0 memory rows into the tenant upgrade ledger (TECH-8191).
+Accesses the live collection table strictly read-only (SELECT ONLY).
+Zero memories converted or published in this phase (conversion lands in PR3b).
+
+Required:
+  --database-url <dsn>           Tenant PostgreSQL DSN (or COMPANY_MEMORY_DATABASE_URL env var)
+  --control-plane-url <dsn>      Paperclip control-plane DSN (or CONTROL_PLANE_DATABASE_URL env var)
+  --company <uuid>               Target company UUID
+  --confirm <uuid>               Confirmation of target company UUID (must strictly equal --company)
+
+Options:
+  --table <name>                 Target Mem0 collection table name (default: "mem0_memories")
+  --page-size <int>              Keyset page size for scanning sources (default: 1000)
+  --max-rows <int>               Maximum number of live source rows to scan
+  --pause-when-active-runs <n>   Active run threshold to pause sweep (default: 1, 0 to disable)
+  --active-run-poll-ms <int>     Active run polling interval in milliseconds (default: 15000)
+  --max-pause-seconds <int>      Maximum total pause time allowed before failing (default: 0 = unbounded)
+  --operator-label <text>        Operator-provided label for upgrade record identification
+  --output, --out <path>         Write sweep report to external path (mode 0600, exclusive create)
+  --format <text|json>           Output format: human summary (text, default) or JSON (json)
+  --prod                         Flag required alongside MEMORY_UPGRADE_ALLOW_PROD=1 when target host is non-localhost
+  --help, -h                     Show this help message
+`);
+      return 0;
+    }
+
+    const databaseUrl =
+      parseFlagValue("--database-url", argv) ??
+      process.env.COMPANY_MEMORY_DATABASE_URL ??
+      null;
+
+    if (!databaseUrl) {
+      console.error(
+        "Error: Refusing to run sweep without explicit tenant --database-url (or COMPANY_MEMORY_DATABASE_URL env var).",
+      );
+      return 1;
+    }
+
+    const controlPlaneUrl =
+      parseFlagValue("--control-plane-url", argv) ??
+      process.env.CONTROL_PLANE_DATABASE_URL ??
+      null;
+
+    if (!controlPlaneUrl) {
+      console.error(
+        "Error: Refusing to run sweep without explicit control plane --control-plane-url (or CONTROL_PLANE_DATABASE_URL env var).",
+      );
+      return 1;
+    }
+
+    const companyId = parseFlagValue("--company", argv);
+    if (!companyId) {
+      console.error("Error: Flag --company <uuid> is required for sweep.");
+      return 1;
+    }
+
+    const confirmId = parseFlagValue("--confirm", argv);
+    if (!confirmId) {
+      console.error("Error: Flag --confirm <uuid> is required for sweep.");
+      return 1;
+    }
+
+    if (companyId !== confirmId) {
+      console.error("Error: Flag --confirm <uuid> must strictly match --company <uuid>.");
+      return 1;
+    }
+
+    if (!isValidUuid(companyId)) {
+      console.error("Error: Flag --company must be a valid UUID.");
+      return 1;
+    }
+
+    const tableName = parseFlagValue("--table", argv) ?? "mem0_memories";
+
+    function parsePositiveInt(name: string, defaultVal?: number): number | undefined {
+      const raw = parseFlagValue(name, argv);
+      if (raw === null) return defaultVal;
+      const num = parseInt(raw, 10);
+      if (!Number.isInteger(num) || num <= 0 || String(num) !== raw.trim()) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '${name}' requires a positive integer value.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return num;
+    }
+
+    function parseNonNegativeInt(name: string, defaultVal?: number): number | undefined {
+      const raw = parseFlagValue(name, argv);
+      if (raw === null) return defaultVal;
+      const num = parseInt(raw, 10);
+      if (!Number.isInteger(num) || num < 0 || String(num) !== raw.trim()) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '${name}' requires a non-negative integer value.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return num;
+    }
+
+    const pageSize = parsePositiveInt("--page-size", 1000);
+    const maxRows = parsePositiveInt("--max-rows", undefined);
+    const pauseWhenActiveRuns = parseNonNegativeInt("--pause-when-active-runs", 1);
+    const activeRunPollMs = parsePositiveInt("--active-run-poll-ms", 15_000);
+    const maxPauseSeconds = parseNonNegativeInt("--max-pause-seconds", 0);
+    const operatorLabel = parseFlagValue("--operator-label", argv);
+
+    const outputPath =
+      parseFlagValue("--output", argv) ??
+      parseFlagValue("--out", argv) ??
+      null;
+
+    const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
+    if (rawFormat !== "text" && rawFormat !== "json") {
+      console.error(`Error: Invalid --format "${rawFormat}". Must be "text" or "json".`);
+      return 1;
+    }
+    const format = rawFormat as "text" | "json";
+
+    const allowProd = hasBooleanFlag("--prod", argv);
+
+    const report = await runSweep(
+      {
+        databaseUrl,
+        controlPlaneUrl,
+        companyId,
+        tableName,
+        pageSize,
+        maxRows,
+        pauseWhenActiveRuns,
+        activeRunPollMs,
+        maxPauseSeconds,
+        operatorLabel,
+        allowProd,
+        outputPath,
+        format,
+      },
+      deps,
+    );
+
+    if (outputPath) {
+      const resolvedPath = path.resolve(process.cwd(), outputPath);
+      console.error(`Sweep report written to ${resolvedPath} (mode 0600, exclusive create).`);
+    } else {
+      if (format === "json") {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatSweepTextReport(report));
+      }
+    }
+
+    return 0;
+  } catch (error) {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = scrubDsnSecrets(rawMessage);
     console.error(`Error: ${message}`);
     return 1;
   }
@@ -302,12 +524,16 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (!subcommand) {
     console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-    console.error("Available subcommands: census");
+    console.error("Available subcommands: census, sweep");
     return 1;
   }
 
   if (subcommand === "census") {
     return await runCensusCli(args.slice(1));
+  }
+
+  if (subcommand === "sweep") {
+    return await runSweepCli(args.slice(1));
   }
 
   if (STUB_SUBCOMMANDS.has(subcommand)) {
@@ -321,7 +547,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census");
+  console.error("Available subcommands: census, sweep");
   return 1;
 }
 
