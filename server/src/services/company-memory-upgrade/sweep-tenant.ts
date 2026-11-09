@@ -80,7 +80,7 @@ export function validateOutcomeReason(
 ): string | null {
   if (!UPGRADE_LEDGER_OUTCOMES.includes(outcome as UpgradeLedgerOutcome)) {
     throw new CompanyMemoryUpgradeError(
-      `Invalid ledger outcome '${outcome}'. Must be one of [${UPGRADE_LEDGER_OUTCOMES.join(", ")}]`,
+      `Invalid ledger outcome: must be one of [${UPGRADE_LEDGER_OUTCOMES.join(", ")}]`,
       "INVALID_ARGUMENT",
     );
   }

@@ -13,7 +13,6 @@ import {
   openTenantClient,
   reconcileChangedContent,
   reconcileTombstones,
-  UPGRADE_LEDGER_OUTCOMES,
   VALID_NOISE_REASONS,
   VALID_UNROUTABLE_REASONS,
   validateOutcomeReason,
@@ -659,6 +658,34 @@ test("sweep-tenant ledger operations", async (t) => {
         `Outcome '${invalid}' must be rejected with INVALID_ARGUMENT`,
       );
     }
+
+    // Symbol and unbounded raw value rejection without TypeError and with marker absent
+    const marker = "sensitive_marker_symbol_or_text";
+    const symbolOutcome = Symbol(marker);
+    assert.throws(
+      () => validateOutcomeReason(symbolOutcome as any, null),
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError, "Must be CompanyMemoryUpgradeError, not TypeError");
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(!err.message.includes(marker), "Symbol marker must not be echoed in error message");
+        assert.ok(!err.message.includes("Symbol"), "Symbol string must not be echoed in error message");
+        assert.ok(err.message.includes("must be one of"), "Allowed enum must be mentioned in error message");
+        return true;
+      },
+    );
+
+    const stringMarkerOutcome = `invalid_outcome_with_${marker}`;
+    assert.throws(
+      () => validateOutcomeReason(stringMarkerOutcome as any, null),
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(!err.message.includes(marker), "Raw value marker must not be echoed in error message");
+        assert.ok(!err.message.includes(stringMarkerOutcome), "Raw outcome value must not be echoed in error message");
+        assert.ok(err.message.includes("must be one of"), "Allowed enum must be mentioned in error message");
+        return true;
+      },
+    );
 
     // 2. Literal-positive sets pinned for all 8 valid ledger outcomes
     const expectedOutcomes = [
