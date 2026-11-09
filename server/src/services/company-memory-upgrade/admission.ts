@@ -101,13 +101,13 @@ export async function assertCompanyAcceptsMemoryWork(
   const company = await lockCompanyForMemoryAdmission(tx, companyId);
   if (!company) {
     throw new CompanyMemoryUpgradeError(
-      `Company ${companyId} not found`,
+      "Target company record does not exist in control plane database.",
       "COMPANY_NOT_FOUND",
     );
   }
   if (company.deletionStartedAt !== null) {
     throw new CompanyMemoryUpgradeError(
-      `Company ${companyId} is undergoing deletion`,
+      "Target company is undergoing deletion.",
       "COMPANY_DELETION_IN_PROGRESS",
     );
   }

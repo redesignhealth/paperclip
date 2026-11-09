@@ -49,7 +49,7 @@ export function validateAndResolveTableIdentifier(
     const parts = tableName.split(".");
     if (parts.length !== 2 || !SAFE_IDENTIFIER_REGEX.test(parts[0]) || !SAFE_IDENTIFIER_REGEX.test(parts[1])) {
       throw new CompanyMemoryUpgradeError(
-        `Invalid --table value: "${tableName}". Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
+        `Invalid --table value. Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
         "INVALID_ARGUMENT",
       );
     }
@@ -63,7 +63,7 @@ export function validateAndResolveTableIdentifier(
 
   if (!SAFE_IDENTIFIER_REGEX.test(tableName)) {
     throw new CompanyMemoryUpgradeError(
-      `Invalid --table value: "${tableName}". Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
+      `Invalid --table value. Must be a valid bare identifier (e.g. "mem0_memories") or schema.identifier (e.g. "public.mem0_memories").`,
       "INVALID_ARGUMENT",
     );
   }
@@ -94,7 +94,7 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
 
   if (isPathInside(resolvedOutPath, repoRoot) || isPathInside(resolvedOutPath, realRepoRoot)) {
     throw new CompanyMemoryUpgradeError(
-      `Refusing to write output inside repository (${resolvedOutPath}). Memory census reports contain sensitive identifiers. Use an external directory such as /tmp.`,
+      `Refusing to write output inside repository. Memory reports contain sensitive identifiers. Use an external directory such as /tmp.`,
       "OUTPUT_PATH_REJECTED",
     );
   }
@@ -102,7 +102,7 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
   const parentDir = path.dirname(resolvedOutPath);
   if (!existsSync(parentDir)) {
     throw new CompanyMemoryUpgradeError(
-      `Parent directory does not exist: "${parentDir}". The output parent directory must exist prior to running census.`,
+      `Parent directory does not exist. The output parent directory must exist prior to execution.`,
       "OUTPUT_PATH_REJECTED",
     );
   }
@@ -111,9 +111,15 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
   const simulatedTargetPath = path.resolve(realParentDir, path.basename(resolvedOutPath));
   if (isPathInside(simulatedTargetPath, repoRoot) || isPathInside(simulatedTargetPath, realRepoRoot)) {
     throw new CompanyMemoryUpgradeError(
-      `Refusing to write output inside repository via symlinked parent (${resolvedOutPath}). Use an external directory such as /tmp.`,
+      `Refusing to write output inside repository via symlinked parent. Use an external directory such as /tmp.`,
       "OUTPUT_PATH_REJECTED",
     );
+  }
+
+  if (existsSync(resolvedOutPath)) {
+    const error = new Error("Output file already exists.");
+    (error as any).code = "EEXIST";
+    throw error;
   }
 
   return resolvedOutPath;
@@ -536,62 +542,73 @@ export function validateDatabaseUrl(
   return parsed;
 }
 
-export async function assertNonSuperuserAndRestrictedRole(
-  tx: any,
-  connectionLabel: "tenant" | "control-plane",
-): Promise<void> {
-  const roleRows = (await tx.execute(sql`
-    SELECT
-      r.rolname,
-      r.rolsuper,
-      r.rolbypassrls,
-      r.rolcreaterole,
-      r.rolreplication,
-      (r.rolname = current_user) AS is_self,
-      pg_has_role(current_user, r.oid, 'MEMBER') AS is_member
-    FROM pg_roles r
-    WHERE (
-      r.rolname = current_user
-      OR pg_has_role(current_user, r.oid, 'MEMBER')
-    )
-    AND (
-      r.rolsuper
-      OR r.rolbypassrls
-      OR r.rolcreaterole
-      OR r.rolreplication
-      OR r.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_all_settings')
-    );
-  `)) as unknown as Array<{
-    rolname: string;
-    rolsuper: boolean;
-    rolbypassrls: boolean;
-    rolcreaterole: boolean;
-    rolreplication: boolean;
-    is_self: boolean;
-    is_member: boolean;
-  }>;
+export const ROLE_PRIVILEGE_PREFLIGHT_SQL_TEXT = `
+  SELECT
+    r.rolname,
+    r.rolsuper,
+    r.rolbypassrls,
+    r.rolcreaterole,
+    r.rolreplication,
+    (r.rolname = current_user) AS is_self,
+    pg_has_role(current_user, r.oid, 'MEMBER') AS is_member
+  FROM pg_roles r
+  WHERE (
+    r.rolname = current_user
+    OR pg_has_role(current_user, r.oid, 'MEMBER')
+  )
+  AND (
+    r.rolsuper
+    OR r.rolbypassrls
+    OR r.rolcreaterole
+    OR r.rolreplication
+    OR r.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_all_settings')
+  );
+`;
 
+export interface RolePrivilegeRow {
+  rolname: string;
+  rolsuper: boolean;
+  rolbypassrls: boolean;
+  rolcreaterole: boolean;
+  rolreplication: boolean;
+  is_self: boolean;
+  is_member: boolean;
+}
+
+export function assertNoElevatedRolePrivileges(
+  roleRows: RolePrivilegeRow[],
+  connectionLabel: "tenant" | "control-plane",
+  operationLabel: string = "memory upgrade census",
+): void {
   if (roleRows.length > 0) {
     const superOffender = roleRows.find((r) => r.rolsuper);
     if (superOffender) {
       throw new CompanyMemoryUpgradeError(
-        `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database is a superuser or member of superuser role '${superOffender.rolname}'. Dedicated non-superuser role required.`,
+        `Refusing to run ${operationLabel}: connecting role on ${connectionLabel} database is a superuser or member of superuser role '${superOffender.rolname}'. Dedicated non-superuser role required.`,
         "SUPERUSER_REJECTED",
       );
     }
     const bypassOffender = roleRows.find((r) => r.rolbypassrls);
     if (bypassOffender) {
       throw new CompanyMemoryUpgradeError(
-        `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database has or inherits BYPASSRLS privilege from role '${bypassOffender.rolname}'. Dedicated role required.`,
+        `Refusing to run ${operationLabel}: connecting role on ${connectionLabel} database has or inherits BYPASSRLS privilege from role '${bypassOffender.rolname}'. Dedicated role required.`,
         "BYPASSRLS_REJECTED",
       );
     }
     const offender = roleRows[0];
     throw new CompanyMemoryUpgradeError(
-      `Refusing to run memory upgrade census: connecting role on ${connectionLabel} database has excessive privilege or membership in role '${offender.rolname}'. Dedicated restricted role required.`,
+      `Refusing to run ${operationLabel}: connecting role on ${connectionLabel} database has excessive privilege or membership in role '${offender.rolname}'. Dedicated restricted role required.`,
       "EXCESSIVE_PRIVILEGE_REJECTED",
     );
   }
+}
+
+export async function assertNonSuperuserAndRestrictedRole(
+  tx: any,
+  connectionLabel: "tenant" | "control-plane",
+): Promise<void> {
+  const roleRows = (await tx.execute(sql.raw(ROLE_PRIVILEGE_PREFLIGHT_SQL_TEXT))) as unknown as RolePrivilegeRow[];
+  assertNoElevatedRolePrivileges(roleRows, connectionLabel, "memory upgrade census");
 }
 
 export async function runCensus(options: CensusOptions): Promise<CensusReport> {
@@ -614,7 +631,7 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
   if (inputCompanyId !== undefined && inputCompanyId !== null) {
     if (!isValidUuid(inputCompanyId)) {
       throw new CompanyMemoryUpgradeError(
-        `Invalid --company "${inputCompanyId}". Must be a valid UUID.`,
+        "Invalid --company. Must be a valid UUID.",
         "INVALID_ARGUMENT",
       );
     }
@@ -1064,13 +1081,13 @@ export async function runCensus(options: CensusOptions): Promise<CensusReport> {
 
               if (memDbRows.length === 0) {
                 throw new CompanyMemoryUpgradeError(
-                  `Unable to infer company ID for memory database "${currentDatabase}". Please supply --company <uuid>.`,
+                  "Unable to infer company ID for memory database. Please supply --company <uuid>.",
                   "INVALID_ARGUMENT",
                 );
               }
               if (memDbRows.length > 1) {
                 throw new CompanyMemoryUpgradeError(
-                  `Ambiguous company mapping: multiple company_memory_databases records found for "${currentDatabase}". Please supply --company <uuid>.`,
+                  "Ambiguous company mapping: multiple company_memory_databases records found. Please supply --company <uuid>.",
                   "INVALID_ARGUMENT",
                 );
               }

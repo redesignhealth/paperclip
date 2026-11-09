@@ -12,12 +12,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   formatCensusTextReport,
+  isValidUuid,
   runCensus,
+  validateAndResolveTableIdentifier,
+  validateOutputPath,
 } from "../server/src/services/company-memory-upgrade/census.js";
+import {
+  formatSweepTextReport,
+  runSweep,
+  type SweepDependencies,
+} from "../server/src/services/company-memory-upgrade/sweep.js";
 import { CompanyMemoryUpgradeError } from "../server/src/services/company-memory-upgrade/types.js";
 
 export const STUB_SUBCOMMANDS = new Set([
-  "sweep",
   "flip",
   "drain",
   "prune",
@@ -35,6 +42,28 @@ export const BOOLEAN_FLAGS = new Set([
 export const VALUE_FLAGS = new Set([
   "--database-url",
   "--company",
+  "--confirm",
+  "--control-plane-url",
+  "--output",
+  "--out",
+  "--format",
+  "--table",
+  "--long-threshold",
+  "--chat-input-usd-per-mtok",
+  "--chat-output-usd-per-mtok",
+  "--embedding-usd-per-mtok",
+  "--page-size",
+  "--max-rows",
+  "--pause-when-active-runs",
+  "--active-run-poll-ms",
+  "--max-pause-seconds",
+  "--operator-label",
+]);
+
+export const ALLOWED_CENSUS_FLAGS = new Set([
+  ...BOOLEAN_FLAGS,
+  "--database-url",
+  "--company",
   "--control-plane-url",
   "--output",
   "--out",
@@ -46,10 +75,85 @@ export const VALUE_FLAGS = new Set([
   "--embedding-usd-per-mtok",
 ]);
 
-export const ALLOWED_CENSUS_FLAGS = new Set([
+export const ALLOWED_SWEEP_FLAGS = new Set([
   ...BOOLEAN_FLAGS,
-  ...VALUE_FLAGS,
+  "--database-url",
+  "--control-plane-url",
+  "--company",
+  "--confirm",
+  "--table",
+  "--page-size",
+  "--max-rows",
+  "--pause-when-active-runs",
+  "--active-run-poll-ms",
+  "--max-pause-seconds",
+  "--operator-label",
+  "--output",
+  "--out",
+  "--format",
 ]);
+
+/**
+ * Scrubs postgres/postgresql diagnostic DSN candidates from text, replacing full URL
+ * candidates with [REDACTED_DATABASE_URL], and standalone query passwords (?password=...)
+ * with ?password=***.
+ *
+ * Designed exclusively for diagnostic DSN masking; does not promise generic redaction
+ * of arbitrary standalone secrets in prose.
+ */
+export function scrubDsnSecrets(text: string): string {
+  if (!text) return "";
+
+  const lines = text.split("\n");
+  const schemeRegex = /postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\//i;
+
+  const scrubbedLines = lines.map((line) => {
+    // If the line doesn't contain a postgres scheme, skip DSN candidate processing
+    if (!schemeRegex.test(line)) {
+      return line;
+    }
+
+    // Check for suspicious postgres candidate where malformed password containing
+    // unescaped whitespace or quotes could escape the candidate bound before host '@'.
+    // E.g.: postgres://user:p ass@host or postgres://user:p"ass@host
+    // If there is an '@' after the scheme on the line, but separated from '://' by
+    // whitespace or quotes, or if an unclosed quote exists, conservatively mask the remaining
+    // line from the scheme onward to prevent secret leakage.
+    const schemeMatch = line.match(/(postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/)/i);
+    if (schemeMatch && schemeMatch.index !== undefined) {
+      const schemeStart = schemeMatch.index;
+      const afterScheme = line.slice(schemeStart + schemeMatch[0].length);
+
+      // Candidate bound stops at whitespace, quotes, or angle brackets
+      const candidateMatch = afterScheme.match(/^[^\s"'<>]+/);
+      const matchedLen = candidateMatch ? candidateMatch[0].length : 0;
+      const remainder = afterScheme.slice(matchedLen);
+
+      // Ambiguity detection: if the candidate match didn't encompass '@', but '@'
+      // appears later on the remaining line (separated by whitespace/quote),
+      // this is a malformed candidate escaping bound.
+      if (remainder.includes("@")) {
+        return line.slice(0, schemeStart) + "[REDACTED_DATABASE_URL]";
+      }
+    }
+
+    // Conservative full DSN candidate replacement:
+    // Any postgres/postgresql/+driver candidate until whitespace, quotes, or angle brackets
+    // is replaced with [REDACTED_DATABASE_URL]. No parser branch returns the input URL.
+    const urlCandidateRegex = /postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/[^\s"'<>]+/gi;
+    return line.replace(urlCandidateRegex, "[REDACTED_DATABASE_URL]");
+  });
+
+  let result = scrubbedLines.join("\n");
+
+  // Redact standalone query parameter passwords (?password=... or &password=...) anywhere in text
+  const queryParamRegex = /([?&]password=)[^&#\s]*/gi;
+  result = result.replace(queryParamRegex, (_m, prefix) => {
+    return `${prefix}***`;
+  });
+
+  return result;
+}
 
 export function isNumericString(val: string): boolean {
   return /^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(val.trim());
@@ -107,14 +211,18 @@ export function hasBooleanFlag(name: string, argv: string[]): boolean {
   return false;
 }
 
-export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>): void {
+export function validateNoUnknownFlags(
+  argv: string[],
+  allowedFlags: Set<string>,
+  commandLabel: string = "read-only census",
+): void {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg.startsWith("--")) {
       const [flagName, ...rest] = arg.split("=");
       if (!allowedFlags.has(flagName)) {
         throw new CompanyMemoryUpgradeError(
-          `Unknown option '${flagName}'. Only read-only census options are accepted.`,
+          `Unknown option '${flagName}'. Only ${commandLabel} options are accepted.`,
           "INVALID_ARGUMENT",
         );
       }
@@ -148,7 +256,7 @@ export function validateNoUnknownFlags(argv: string[], allowedFlags: Set<string>
     } else if (arg.startsWith("-")) {
       if (!allowedFlags.has(arg)) {
         throw new CompanyMemoryUpgradeError(
-          `Unknown option '${arg}'. Only read-only census options are accepted.`,
+          `Unknown option '${arg}'. Only ${commandLabel} options are accepted.`,
           "INVALID_ARGUMENT",
         );
       }
@@ -225,7 +333,7 @@ Options:
 
     const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
     if (rawFormat !== "text" && rawFormat !== "json") {
-      console.error(`Error: Invalid --format "${rawFormat}". Must be "text" or "json".`);
+      console.error(`Error: Invalid --format. Must be "text" or "json".`);
       return 1;
     }
     const format = rawFormat as "text" | "json";
@@ -237,7 +345,7 @@ Options:
     if (longThresholdStr !== null) {
       longThreshold = parseInt(longThresholdStr, 10);
       if (!Number.isInteger(longThreshold) || longThreshold <= 0 || String(longThreshold) !== longThresholdStr.trim()) {
-        console.error(`Error: Invalid --long-threshold "${longThresholdStr}". Must be a positive integer.`);
+        console.error("Error: Invalid --long-threshold. Must be a positive integer.");
         return 1;
       }
     }
@@ -250,7 +358,7 @@ Options:
       const num = parseFloat(raw);
       if (!Number.isFinite(num) || Number.isNaN(num) || num < 0) {
         throw new CompanyMemoryUpgradeError(
-          `Invalid ${flagName} "${raw}". Must be a non-negative number.`,
+          `Invalid ${flagName}. Must be a non-negative number.`,
           "INVALID_ARGUMENT",
         );
       }
@@ -290,7 +398,426 @@ Options:
 
     return 0;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sanitizeCliErrorMessage(error);
+    console.error(`Error: ${message}`);
+    return 1;
+  }
+}
+
+export interface RunSweepCliDependencies extends SweepDependencies {}
+
+const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
+  // Census & Preflight codes
+  NOT_PGVECTOR: "Target database is missing required vector extension or column is not a valid pgvector column.",
+  not_pgvector: "Target database is missing required vector extension or column is not a valid pgvector column.",
+
+  SUPERUSER_REJECTED: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
+  superuser_rejected: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
+
+  BYPASSRLS_REJECTED: "Connecting role on database has BYPASSRLS privileges. Dedicated role required.",
+  bypassrls_rejected: "Connecting role on database has BYPASSRLS privileges. Dedicated role required.",
+
+  EXCESSIVE_PRIVILEGE_REJECTED: "Connecting role on database has excessive privileges. Dedicated restricted role required.",
+  excessive_privilege_rejected: "Connecting role on database has excessive privileges. Dedicated restricted role required.",
+
+  TABLE_NOT_FOUND: "Mem0 collection table not found or has no columns in target database.",
+  table_not_found: "Mem0 collection table not found or has no columns in target database.",
+
+  SCHEMA_MISMATCH: "Mem0 collection table schema does not match required shape.",
+  schema_mismatch: "Mem0 collection table schema does not match required shape.",
+
+  EMBEDDING_DIMENSIONS_MISMATCH: "Mem0 collection embedding dimensions do not match expected 1536 dimensions.",
+  embedding_dimensions_mismatch: "Mem0 collection embedding dimensions do not match expected 1536 dimensions.",
+
+  CONTROL_PLANE_ROUTING_MISMATCH: "Company memory database routing mismatch between control plane and connected tenant.",
+  control_plane_routing_mismatch: "Company memory database routing mismatch between control plane and connected tenant.",
+
+  CONTROL_PLANE_UNREACHABLE: "Unable to reach control plane database.",
+  control_plane_unreachable: "Unable to reach control plane database.",
+
+  COMPANY_NOT_FOUND: "Target company record does not exist in control plane database.",
+  company_not_found: "Target company record does not exist in control plane database.",
+
+  COMPANY_DELETION_IN_PROGRESS: "Target company is undergoing deletion.",
+  company_deletion_in_progress: "Target company is undergoing deletion.",
+
+  ACTIVE_UPGRADE_EXISTS: "An active memory upgrade is already in progress for target company.",
+  active_upgrade_exists: "An active memory upgrade is already in progress for target company.",
+
+  UPGRADE_NOT_FOUND: "Upgrade record not found.",
+  upgrade_not_found: "Upgrade record not found.",
+
+  CONVERTER_CONTRACT_MISMATCH: "Upgrade record converter contract or collection mismatch.",
+  converter_contract_mismatch: "Upgrade record converter contract or collection mismatch.",
+
+  LEASE_FENCED_OUT: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
+  lease_fenced_out: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
+
+  LEASE_EXPIRED: "Upgrade lease has expired.",
+  lease_expired: "Upgrade lease has expired.",
+
+  LEASE_LAPSED: "Upgrade lease has lapsed.",
+  lease_lapsed: "Upgrade lease has lapsed.",
+
+  CAS_FAILED: "Failed to advance upgrade state.",
+  cas_failed: "Failed to advance upgrade state.",
+
+  INVALID_RECOVERY: "Upgrade cannot be recovered from current state.",
+  invalid_recovery: "Upgrade cannot be recovered from current state.",
+
+  INVALID_STATE: "Cannot update counters for upgrade: invalid state.",
+  invalid_state: "Cannot update counters for upgrade: invalid state.",
+
+  ILLEGAL_TRANSITION: "Illegal upgrade state transition.",
+  illegal_transition: "Illegal upgrade state transition.",
+
+  ROLLBACK_REFUSED: "Rollback refused from current state.",
+  rollback_refused: "Rollback refused from current state.",
+
+  UNSUPPORTED_SOURCE_ID: "Collection table contains unsupported source IDs (invalid UUID or case collision). Upgrade ledger requires unique valid UUID source IDs.",
+  unsupported_source_id: "Collection table contains unsupported source IDs (invalid UUID or case collision). Upgrade ledger requires unique valid UUID source IDs.",
+
+  ACTIVE_RUN_TIMEOUT: "Active heartbeat runs paused longer than limit.",
+  active_run_timeout: "Active heartbeat runs paused longer than limit.",
+  paused_too_long: "Active heartbeat runs paused longer than limit.",
+  PAUSED_TOO_LONG: "Active heartbeat runs paused longer than limit.",
+
+  DRAIN_TIMEOUT: "Drain timeout exceeded.",
+  drain_timeout: "Drain timeout exceeded.",
+
+  STAGING_WRITE_FAILED: "Failed to write to staging ledger.",
+  staging_write_failed: "Failed to write to staging ledger.",
+
+  PUBLISH_FAILED: "Failed to publish upgraded memories.",
+  publish_failed: "Failed to publish upgraded memories.",
+
+  VERIFICATION_FAILED: "Upgrade verification failed.",
+  verification_failed: "Upgrade verification failed.",
+
+  UNEXPECTED_FAILURE: "An unexpected error occurred during upgrade.",
+  unexpected_failure: "An unexpected error occurred during upgrade.",
+
+  SCHEMA_INIT_FAILED: "Failed to initialize upgrade tables in tenant schema.",
+  schema_init_failed: "Failed to initialize upgrade tables in tenant schema.",
+
+  MIGRATION_FAILED: "Upgrade migration failed.",
+  migration_failed: "Upgrade migration failed.",
+
+  SOURCE_READ_FAILED: "Failed to read sources from target collection table.",
+  source_read_failed: "Failed to read sources from target collection table.",
+
+  CONVERSION_FAILED: "Memory conversion failed.",
+  conversion_failed: "Memory conversion failed.",
+
+  EMBEDDING_FAILED: "Embedding generation failed.",
+  embedding_failed: "Embedding generation failed.",
+
+  ROLLBACK_FAILED: "Upgrade rollback failed.",
+  rollback_failed: "Upgrade rollback failed.",
+
+  ABORTED_BY_OPERATOR: "Upgrade aborted by operator.",
+  aborted_by_operator: "Upgrade aborted by operator.",
+
+  PROD_GUARD_ENFORCED: "Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1).",
+  prod_guard_enforced: "Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1).",
+};
+
+const SAFE_COMPANY_BINDING_MISMATCH_MESSAGES = new Set([
+  "No company_memory_databases record found for target company.",
+  "Company memory database binding status is not ready (refusing pending, failed, deprovisioning, archived).",
+  "Company memory database binding mismatch between control plane and connected tenant.",
+  "Company memory database binding mismatch with derived credentials.",
+  "Tenant database does not have vector extension or vector column enabled for company memory.",
+]);
+
+const SAFE_STATE_MISMATCH_MESSAGES = new Set([
+  "Upgrade is in needs_recovery. Recovery/status/rollback are unavailable in this slice.",
+  "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
+  "Cannot run sweep: active upgrade is not in sweeping state.",
+]);
+
+const SAFE_OUTPUT_PATH_REJECTED_MESSAGES = new Set([
+  "Refusing to write output inside repository. Memory reports contain sensitive identifiers. Use an external directory such as /tmp.",
+  "Parent directory does not exist. The output parent directory must exist prior to execution.",
+  "Refusing to write output inside repository via symlinked parent. Use an external directory such as /tmp.",
+]);
+
+const SAFE_INVALID_ARGUMENT_REGEXES = [
+  /^Flag '--[a-z0-9-]+' requires a (usable|positive integer|non-negative integer) value\.$/,
+  /^Boolean flag '--[a-z0-9-]+' does not take a value\.$/,
+  /^Unknown option '--?[a-zA-Z0-9_-]+'\. Only [a-zA-Z0-9_ -]+ options are accepted\.$/,
+  /^Invalid --[a-z0-9-]+\. Must be a non-negative number\.$/,
+];
+
+const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
+  "Invalid --company. Must be a valid UUID.",
+  "Invalid --long-threshold. Must be a positive integer.",
+  "Invalid --format. Must be \"text\" or \"json\".",
+  "Invalid --operator-label. Must be 1-64 characters matching [A-Za-z0-9._:@-].",
+  "Invalid --table value. Must be a valid bare identifier (e.g. \"mem0_memories\") or schema.identifier (e.g. \"public.mem0_memories\").",
+  "Invalid database URL: URL must be a non-empty string.",
+  "Invalid database URL: Unable to parse URL with standard WHATWG parser. Supported format: postgres://user:password@host:port/dbname",
+  "Refusing to run census without --company <uuid> when control plane URL is not provided.",
+  "Unable to infer company ID for memory database. Please supply --company <uuid>.",
+  "Ambiguous company mapping: multiple company_memory_databases records found. Please supply --company <uuid>.",
+]);
+
+export function sanitizeCliErrorMessage(error: unknown): string {
+  if (error && typeof error === "object") {
+    const err = error as { code?: unknown; message?: unknown };
+    const code = typeof err.code === "string" ? err.code : undefined;
+    const rawMsg = typeof err.message === "string" ? err.message : "";
+
+    if (code) {
+      if (code === "COMPANY_BINDING_MISMATCH" || code === "company_binding_mismatch") {
+        const msg = SAFE_COMPANY_BINDING_MISMATCH_MESSAGES.has(rawMsg)
+          ? rawMsg
+          : "Company memory database binding mismatch between control plane and connected tenant.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "STATE_MISMATCH" || code === "state_mismatch") {
+        const msg = SAFE_STATE_MISMATCH_MESSAGES.has(rawMsg)
+          ? rawMsg
+          : "Cannot run sweep: active upgrade is not in sweeping state.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "OUTPUT_PATH_REJECTED" || code === "output_path_rejected") {
+        const msg = SAFE_OUTPUT_PATH_REJECTED_MESSAGES.has(rawMsg)
+          ? rawMsg
+          : "Invalid --output path.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "INVALID_ARGUMENT" || code === "invalid_argument") {
+        const isSafe =
+          SAFE_INVALID_ARGUMENT_EXACT_MESSAGES.has(rawMsg) ||
+          SAFE_INVALID_ARGUMENT_REGEXES.some((re) => re.test(rawMsg));
+        const msg = isSafe ? rawMsg : "Invalid command argument.";
+        return `[${code}] ${msg}`;
+      }
+
+      if (code === "PROD_GUARD_ENFORCED" || code === "prod_guard_enforced") {
+        return `[${code}] Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1).`;
+      }
+
+      if (code === "INVALID_DATABASE_URL" || code === "invalid_database_url") {
+        return `[${code}] Invalid database URL. Must be a valid postgresql:// or postgres:// connection string.`;
+      }
+
+      if (code === "DATABASE_IDENTITY_UNAVAILABLE" || code === "database_identity_unavailable") {
+        return `[${code}] Unable to determine current database and user identity from tenant connection.`;
+      }
+
+      const generic = SWEEP_CLI_GENERIC_ERROR_MESSAGES[code];
+      if (generic) {
+        return `[${code}] ${generic}`;
+      }
+
+      if (code === "EEXIST") {
+        return "Output file already exists (flag 'wx' requires exclusive creation).";
+      }
+      if (code === "EACCES") {
+        return "Permission denied writing output file.";
+      }
+      if (code === "ENOENT") {
+        return "Output file path or parent directory not found.";
+      }
+      if (code === "ECONNREFUSED") {
+        return "Database connection refused.";
+      }
+    }
+  }
+
+  return "[unexpected_failure] An unexpected error occurred during upgrade.";
+}
+
+export async function runSweepCli(
+  argv: string[],
+  deps: RunSweepCliDependencies = {},
+): Promise<number> {
+  try {
+    if (hasBooleanFlag("--help", argv) || hasBooleanFlag("-h", argv)) {
+      console.log(`
+Usage: pnpm memory:upgrade sweep --database-url <tenant-dsn> --control-plane-url <cp-dsn> --company <uuid> --confirm <uuid> [options]
+
+Classifies legacy Mem0 memory rows into the tenant upgrade ledger (TECH-8191).
+Accesses the live collection table strictly read-only (SELECT ONLY).
+Zero memories converted or published in this phase (conversion lands in PR3b).
+
+Required:
+  --database-url <dsn>           Tenant PostgreSQL DSN (or COMPANY_MEMORY_DATABASE_URL env var)
+  --control-plane-url <dsn>      Paperclip control-plane DSN (or CONTROL_PLANE_DATABASE_URL env var)
+  --company <uuid>               Target company UUID
+  --confirm <uuid>               Confirmation of target company UUID (must strictly equal --company)
+
+Options:
+  --table <name>                 Target Mem0 collection table name (default: "mem0_memories")
+  --page-size <int>              Keyset page size for scanning sources (default: 1000)
+  --max-rows <int>               Maximum number of live source rows to scan
+  --pause-when-active-runs <n>   Active run threshold to pause sweep (default: 1, 0 to disable)
+  --active-run-poll-ms <int>     Active run polling interval in milliseconds (default: 15000)
+  --max-pause-seconds <int>      Maximum total pause time allowed before failing (default: 0 = unbounded)
+  --operator-label <text>        Operator-provided label for upgrade record identification
+  --output, --out <path>         Write sweep report to external path (mode 0600, exclusive create)
+  --format <text|json>           Output format: human summary (text, default) or JSON (json)
+  --prod                         Flag required alongside MEMORY_UPGRADE_ALLOW_PROD=1 when target host is non-localhost
+  --help, -h                     Show this help message
+`);
+      return 0;
+    }
+
+    validateNoUnknownFlags(argv, ALLOWED_SWEEP_FLAGS, "sweep");
+
+    const env = deps.env ?? process.env;
+
+    const databaseUrl =
+      parseFlagValue("--database-url", argv) ??
+      env.COMPANY_MEMORY_DATABASE_URL ??
+      null;
+
+    if (!databaseUrl) {
+      console.error(
+        "Error: Refusing to run sweep without explicit tenant --database-url (or COMPANY_MEMORY_DATABASE_URL env var).",
+      );
+      return 1;
+    }
+
+    const controlPlaneUrl =
+      parseFlagValue("--control-plane-url", argv) ??
+      env.CONTROL_PLANE_DATABASE_URL ??
+      null;
+
+    if (!controlPlaneUrl) {
+      console.error(
+        "Error: Refusing to run sweep without explicit control plane --control-plane-url (or CONTROL_PLANE_DATABASE_URL env var).",
+      );
+      return 1;
+    }
+
+    const companyId = parseFlagValue("--company", argv);
+    if (!companyId) {
+      console.error("Error: Flag --company <uuid> is required for sweep.");
+      return 1;
+    }
+
+    const confirmId = parseFlagValue("--confirm", argv);
+    if (!confirmId) {
+      console.error("Error: Flag --confirm <uuid> is required for sweep.");
+      return 1;
+    }
+
+    if (companyId !== confirmId) {
+      console.error("Error: Flag --confirm <uuid> must strictly match --company <uuid>.");
+      return 1;
+    }
+
+    if (!isValidUuid(companyId)) {
+      console.error("Error: Flag --company must be a valid UUID.");
+      return 1;
+    }
+
+    const tableName = parseFlagValue("--table", argv) ?? "mem0_memories";
+    validateAndResolveTableIdentifier(tableName);
+
+    function parsePositiveInt(name: string, defaultVal?: number): number | undefined {
+      const raw = parseFlagValue(name, argv);
+      if (raw === null) return defaultVal;
+      const num = parseInt(raw, 10);
+      if (!Number.isInteger(num) || num <= 0 || String(num) !== raw.trim()) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '${name}' requires a positive integer value.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return num;
+    }
+
+    function parseNonNegativeInt(name: string, defaultVal?: number): number | undefined {
+      const raw = parseFlagValue(name, argv);
+      if (raw === null) return defaultVal;
+      const num = parseInt(raw, 10);
+      if (!Number.isInteger(num) || num < 0 || String(num) !== raw.trim()) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '${name}' requires a non-negative integer value.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return num;
+    }
+
+    const pageSize = parsePositiveInt("--page-size", 1000);
+    const maxRows = parsePositiveInt("--max-rows", undefined);
+    const pauseWhenActiveRuns = parseNonNegativeInt("--pause-when-active-runs", 1);
+    const activeRunPollMs = parsePositiveInt("--active-run-poll-ms", 15_000);
+    const maxPauseSeconds = parseNonNegativeInt("--max-pause-seconds", 0);
+    const operatorLabel = parseFlagValue("--operator-label", argv);
+    if (operatorLabel !== null) {
+      if (
+        operatorLabel.length < 1 ||
+        operatorLabel.length > 64 ||
+        !/^[A-Za-z0-9._:@-]+$/.test(operatorLabel)
+      ) {
+        throw new CompanyMemoryUpgradeError(
+          "Invalid --operator-label. Must be 1-64 characters matching [A-Za-z0-9._:@-].",
+          "INVALID_ARGUMENT",
+        );
+      }
+    }
+
+    const outputPath =
+      parseFlagValue("--output", argv) ??
+      parseFlagValue("--out", argv) ??
+      null;
+
+    const repoRoot = deps.repoRoot ?? path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+    if (outputPath) {
+      validateOutputPath(outputPath, repoRoot);
+    }
+
+    const rawFormat = (parseFlagValue("--format", argv) ?? "text").toLowerCase();
+    if (rawFormat !== "text" && rawFormat !== "json") {
+      console.error(`Error: Invalid --format. Must be "text" or "json".`);
+      return 1;
+    }
+    const format = rawFormat as "text" | "json";
+
+    const allowProd = hasBooleanFlag("--prod", argv);
+
+    const report = await runSweep(
+      {
+        databaseUrl,
+        controlPlaneUrl,
+        companyId,
+        tableName,
+        pageSize,
+        maxRows,
+        pauseWhenActiveRuns,
+        activeRunPollMs,
+        maxPauseSeconds,
+        operatorLabel,
+        allowProd,
+        outputPath,
+        format,
+      },
+      deps,
+    );
+
+    if (outputPath) {
+      const resolvedPath = path.resolve(process.cwd(), outputPath);
+      console.error(`Sweep report written to ${resolvedPath} (mode 0600, exclusive create).`);
+    } else {
+      if (format === "json") {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatSweepTextReport(report));
+      }
+    }
+
+    return 0;
+  } catch (error) {
+    const message = sanitizeCliErrorMessage(error);
     console.error(`Error: ${message}`);
     return 1;
   }
@@ -302,12 +829,16 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (!subcommand) {
     console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-    console.error("Available subcommands: census");
+    console.error("Available subcommands: census, sweep");
     return 1;
   }
 
   if (subcommand === "census") {
     return await runCensusCli(args.slice(1));
+  }
+
+  if (subcommand === "sweep") {
+    return await runSweepCli(args.slice(1));
   }
 
   if (STUB_SUBCOMMANDS.has(subcommand)) {
@@ -321,7 +852,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census");
+  console.error("Available subcommands: census, sweep");
   return 1;
 }
 
