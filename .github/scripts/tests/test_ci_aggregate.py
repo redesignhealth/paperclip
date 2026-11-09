@@ -395,6 +395,18 @@ class EvaluateTests(unittest.TestCase):
         r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})
         self.assertEqual(r.state, "FAILURE")
 
+    def test_docker_runner_manual_jobs_skipped_is_neutral(self):
+        wf = ".github/workflows/docker-runner-check.yml"
+        jobs = [job("authorize_manual", conclusion="skipped"), job("Build and verify on Linux", conclusion="skipped")]
+        r = evaluate({wf}, [run(wf, 1)], {1: jobs})
+        self.assertEqual(r.state, "SUCCESS")
+
+    def test_docker_runner_other_skipped_or_failed_job_still_fails(self):
+        wf = ".github/workflows/docker-runner-check.yml"
+        for extra in (job("other", conclusion="skipped"), job("Build and verify on Linux", conclusion="failure")):
+            r = evaluate({wf}, [run(wf, 1)], {1: [job("authorize_manual", conclusion="skipped"), extra]})
+            self.assertEqual(r.state, "FAILURE")
+
     def test_failed_job_summary_retains_complex_safe_name(self):
         jobs = default_pr_jobs() + [job("ci / General tests (server (3/12))", conclusion="failure")]
         r = evaluate({PR_WF}, [run(PR_WF, 1)], {1: jobs})

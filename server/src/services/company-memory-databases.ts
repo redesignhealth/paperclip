@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull, lt, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import postgres from "postgres";
@@ -31,6 +31,8 @@ import {
   UnsupportedMemoryEmbeddingError,
   UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   isUnsupportedMemoryEmbeddingError,
+  CompanyMemoryDatabaseError,
+  deriveCompanyMemoryDatabaseNames,
 } from "./company-memory-constants.js";
 
 export const PROVISIONER_DEFAULT_EMBEDDING = DEFAULT_COMPANY_MEMORY_EMBEDDING;
@@ -46,14 +48,9 @@ export {
   UnsupportedMemoryEmbeddingError,
   UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   isUnsupportedMemoryEmbeddingError,
+  CompanyMemoryDatabaseError,
+  deriveCompanyMemoryDatabaseNames,
 };
-
-export class CompanyMemoryDatabaseError extends Error {
-  constructor(message: string, readonly code: string) {
-    super(message);
-    this.name = "CompanyMemoryDatabaseError";
-  }
-}
 
 export class CompanyMemorySecurityIsolationError extends CompanyMemoryDatabaseError {
   constructor(message: string) {
@@ -128,25 +125,6 @@ export interface CompanyMemoryServiceOptions {
   companyScope?: CompanyMemoryScope;
   pilotCompanyIds?: readonly string[];
   ddlExecutor?: CompanyMemoryDdlExecutor;
-}
-
-export function deriveCompanyMemoryDatabaseNames(companyId: string): {
-  databaseName: string;
-  databaseRole: string;
-} {
-  const trimmed = companyId.trim().toLowerCase();
-  if (!UUID_REGEX.test(trimmed)) {
-    throw new CompanyMemoryDatabaseError("Invalid companyId UUID", "INVALID_COMPANY_ID");
-  }
-  const hash = createHash("sha256").update(trimmed).digest("hex").slice(0, 32);
-  const databaseName = `pcmem_${hash}`;
-  const databaseRole = `pcmem_r_${hash}`;
-
-  if (!SAFE_PG_IDENTIFIER_REGEX.test(databaseName) || !SAFE_PG_IDENTIFIER_REGEX.test(databaseRole)) {
-    throw new CompanyMemoryDatabaseError("Derived database identifier failed safety allowlist", "UNSAFE_IDENTIFIER");
-  }
-
-  return { databaseName, databaseRole };
 }
 
 export function quoteIdentifier(ident: string): string {

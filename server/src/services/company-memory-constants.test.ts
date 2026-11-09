@@ -5,6 +5,10 @@ import {
   UNSUPPORTED_MEMORY_EMBEDDING_FAILURE_CODE,
   isSupportedCompanyMemoryEmbedding,
   SUPPORTED_COMPANY_MEMORY_EMBEDDINGS,
+  HERMES_ADAPTER_TYPE,
+  adapterSupportsRuntimeMemory,
+  CompanyMemoryDatabaseError,
+  deriveCompanyMemoryDatabaseNames,
 } from "./company-memory-constants.js";
 
 describe("company-memory-constants", () => {
@@ -77,6 +81,37 @@ describe("company-memory-constants", () => {
       expect(isSupportedCompanyMemoryEmbedding({ model: "text-embedding-3-small", dimensions: 3072 })).toBe(false);
       expect(isSupportedCompanyMemoryEmbedding({ model: "text-embedding-ada-002", dimensions: 1536 })).toBe(false);
       expect(isSupportedCompanyMemoryEmbedding({ model: "", dimensions: 1536 })).toBe(false);
+    });
+  });
+
+  describe("adapterSupportsRuntimeMemory", () => {
+    it("returns true only for hermes_local", () => {
+      expect(HERMES_ADAPTER_TYPE).toBe("hermes_local");
+      expect(adapterSupportsRuntimeMemory(HERMES_ADAPTER_TYPE)).toBe(true);
+      expect(adapterSupportsRuntimeMemory("hermes_local")).toBe(true);
+      expect(adapterSupportsRuntimeMemory("hermes_gateway")).toBe(false);
+      expect(adapterSupportsRuntimeMemory("claude_local")).toBe(false);
+      expect(adapterSupportsRuntimeMemory("codex_local")).toBe(false);
+      expect(adapterSupportsRuntimeMemory("")).toBe(false);
+      expect(adapterSupportsRuntimeMemory(null)).toBe(false);
+      expect(adapterSupportsRuntimeMemory(undefined)).toBe(false);
+    });
+  });
+
+  describe("deriveCompanyMemoryDatabaseNames", () => {
+    it("derives deterministic names for a valid company UUID", () => {
+      const companyId = "11111111-1111-4111-8111-111111111111";
+      const names1 = deriveCompanyMemoryDatabaseNames(companyId);
+      const names2 = deriveCompanyMemoryDatabaseNames(companyId.toUpperCase());
+      expect(names1.databaseName).toMatch(/^pcmem_[0-9a-f]{32}$/);
+      expect(names1.databaseRole).toMatch(/^pcmem_r_[0-9a-f]{32}$/);
+      expect(names1.databaseName).toBe(names2.databaseName);
+      expect(names1.databaseRole).toBe(names2.databaseRole);
+    });
+
+    it("rejects invalid UUIDs with CompanyMemoryDatabaseError", () => {
+      expect(() => deriveCompanyMemoryDatabaseNames("not-a-uuid")).toThrow(CompanyMemoryDatabaseError);
+      expect(() => deriveCompanyMemoryDatabaseNames("")).toThrow(CompanyMemoryDatabaseError);
     });
   });
 });

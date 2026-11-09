@@ -52,6 +52,7 @@ import {
 import { isUuidLike } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
 import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
+import { HERMES_ADAPTER_TYPE } from "../company-memory-constants.js";
 
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
   "execution_review_participant_recovery";
@@ -861,7 +862,7 @@ export function normalizeSessionParams(
 export type RunSessionOutcome =
   "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
-export const HERMES_ADAPTER_TYPE = "hermes_local";
+export { HERMES_ADAPTER_TYPE };
 
 const HERMES_SESSION_ID_REGEX =
   /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;

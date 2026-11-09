@@ -1258,6 +1258,124 @@ describe("AppDetail", () => {
     });
   });
 
+  it("TECH-8259: choosing 'Just agents I pick' installs the bound default-MCP agent", async () => {
+    mockParams.tab = "permissions";
+    vi.mocked(agentsApi.list).mockResolvedValueOnce([
+      { id: "agent-1", name: "Chief of Staff", title: "CEO", status: "active", metadata: { defaultMcp: { version: 1, entries: {} } } },
+    ] as unknown as Awaited<ReturnType<typeof agentsApi.list>>);
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-1",
+        entries: [
+          { effect: "include", catalogEntryId: "catalog-read" },
+          { effect: "include", catalogEntryId: "catalog-write" },
+        ],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+    getConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
+
+    await renderAppDetail();
+
+    const accessGroup = container.querySelector('[role="radiogroup"][aria-label="Which agents can use this connection"]');
+    const anyAgent = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Any agent"));
+    await act(async () => {
+      anyAgent?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    putConnectionInstallsMock.mockClear();
+    const picked = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Just agents I pick"));
+    await act(async () => {
+      picked?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [{ targetType: "agent", targetId: "agent-1" }]);
+  });
+
+  it("TECH-8259: installs a picked agent whatever its type", async () => {
+    mockParams.tab = "permissions";
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-1",
+        entries: [
+          { effect: "include", catalogEntryId: "catalog-read" },
+          { effect: "include", catalogEntryId: "catalog-write" },
+        ],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+
+    await renderAppDetail();
+
+    const accessGroup = container.querySelector('[role="radiogroup"][aria-label="Which agents can use this connection"]');
+    const anyAgent = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Any agent"));
+    await act(async () => {
+      anyAgent?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    const picked = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Just agents I pick"));
+    await act(async () => {
+      picked?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [{ targetType: "agent", targetId: "agent-1" }]);
+  });
+
+  it("TECH-8259: greys out 'Any agent' on a connection that signs in as one person", async () => {
+    mockParams.tab = "permissions";
+    getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "per_user" }));
+
+    await renderAppDetail();
+
+    const accessGroup = container.querySelector('[role="radiogroup"][aria-label="Which agents can use this connection"]');
+    const anyAgent = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Any agent")) as HTMLElement | undefined;
+    expect(anyAgent).toBeTruthy();
+    expect(anyAgent?.hasAttribute("disabled") || anyAgent?.getAttribute("aria-disabled") === "true").toBe(true);
+    expect(container.textContent).toContain("can't be shared with every agent");
+  });
+
+  it("TECH-8259: a rejected install save refreshes the installs and keeps the page usable", async () => {
+    mockParams.tab = "permissions";
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-1",
+        entries: [
+          { effect: "include", catalogEntryId: "catalog-read" },
+          { effect: "include", catalogEntryId: "catalog-write" },
+        ],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+    putConnectionInstallsMock.mockRejectedValueOnce(new Error("install refused"));
+
+    await renderAppDetail();
+
+    const accessGroup = container.querySelector('[role="radiogroup"][aria-label="Which agents can use this connection"]');
+    const anyAgent = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Any agent"));
+    await act(async () => {
+      anyAgent?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    const refetchesBefore = getConnectionInstallsMock.mock.calls.length;
+    const picked = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Just agents I pick"));
+    await act(async () => {
+      picked?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(putConnectionInstallsMock).toHaveBeenCalled();
+    expect(getConnectionInstallsMock.mock.calls.length).toBeGreaterThan(refetchesBefore);
+  });
+
   it("uses the setup-style agent access question without install terminology", async () => {
     mockParams.tab = "permissions";
     listProfilesMock.mockResolvedValue({
