@@ -10240,6 +10240,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const read = await executeSlackTool(db, binding, "slack_history", { channel: "COTHER" }, fetched as typeof fetch);
     expect(read).toMatchObject({ sourceTrust: "untrusted", nextCursor: "older", hasMore: true });
     expect(JSON.stringify(read)).toContain("UUNLINKED");
+    let directoryOutage = false;
     const directoryFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const method = String(input).split("/").at(-1);
       const args = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
@@ -10249,15 +10250,34 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           channels: [
             { id: "CGONE", is_member: true },
             { id: "CFALSE", is_member: false },
+            // users.conversations returns the bot's own memberships, so rows
+            // routinely omit is_member; only an explicit false is a non-membership.
+            { id: "DREQUESTER", is_im: true, user: "UTOOLS" },
+            { id: "DOTHERUSER", is_im: true, user: "UOTHER" },
+            { id: "DFALSE", is_im: true, is_member: false },
+            { name: "no-channel-id" },
+            { id: "CNOTMEMBER" },
+            { id: "GPRIVATE" },
+            { id: "GNOUSER" },
+            ...(directoryOutage ? [{ id: "COUTAGE" }] : []),
             { id: "COTHER" },
           ],
           response_metadata: { next_cursor: "directory-next" },
         });
       }
       if (method === "conversations.info" && args.channel === "CGONE") return Response.json({ ok: false, error: "channel_not_found" });
-      if (method === "conversations.info" && args.channel === "CFALSE") {
+      if (method === "conversations.info" && (args.channel === "CFALSE" || args.channel === "DFALSE")) {
         throw new Error("Explicit non-members must be filtered before conversations.info");
       }
+      if (method === "conversations.info" && !args.channel) {
+        throw new Error("Rows without an id must be dropped before conversations.info");
+      }
+      if (method === "conversations.info" && args.channel === "COUTAGE") return Response.json({ ok: false, error: "service_unavailable" });
+      if (method === "conversations.info" && args.channel === "CNOTMEMBER") return Response.json({ ok: true, channel: { id: "CNOTMEMBER", is_member: false } });
+      if (method === "conversations.info" && args.channel === "DREQUESTER") return Response.json({ ok: true, channel: { id: "DREQUESTER", is_im: true, user: "UTOOLS" } });
+      if (method === "conversations.info" && args.channel === "DOTHERUSER") return Response.json({ ok: true, channel: { id: "DOTHERUSER", is_im: true, user: "UOTHER" } });
+      if (method === "conversations.info" && args.channel === "GNOUSER") return Response.json({ ok: true, channel: { id: "GNOUSER", is_private: true, is_member: true } });
+      if (method === "conversations.members" && args.channel === "GNOUSER") return Response.json({ ok: true, members: ["UOTHER"] });
       return fetched(input, init);
     });
     await expect(executeSlackTool(db, binding, "slack_channels", {}, directoryFetch as typeof fetch)).resolves.toMatchObject({ channels: [{ id: "COTHER" }], nextCursor: "directory-next" });
@@ -10272,6 +10292,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(Object.fromEntries(new URLSearchParams(String(usersConversationsCalls[1][1]?.body ?? "")))).toMatchObject({
       cursor: "directory-next",
     });
+    // The loosened membership filter (absent is_member accepted) must not skip
+    // per-channel authorization: every surviving row still goes through
+    // conversations.info, where the bot-side re-check (CNOTMEMBER), requester
+    // verification (GNOUSER) and im ownership (DOTHERUSER) each deny, while
+    // the requester's own DM and an authorized private channel stay bounded
+    // out of this public-origin directory.
+    const inspectedChannels = new Set(directoryFetch.mock.calls
+      .filter(call => String(call[0]).endsWith("/conversations.info"))
+      .map(call => new URLSearchParams(String(call[1]?.body ?? "")).get("channel")));
+    expect(inspectedChannels).toEqual(new Set(["CGONE", "CNOTMEMBER", "DREQUESTER", "DOTHERUSER", "GNOUSER", "GPRIVATE", "COTHER"]));
+    const verifiedMemberships = new Set(directoryFetch.mock.calls
+      .filter(call => String(call[0]).endsWith("/conversations.members"))
+      .map(call => new URLSearchParams(String(call[1]?.body ?? "")).get("channel")));
+    expect(verifiedMemberships).toEqual(new Set(["GPRIVATE", "GNOUSER"]));
+    // Access denials omit channels, but provider failures must stay visible
+    // rather than masquerading as an empty directory.
+    directoryOutage = true;
+    await expect(executeSlackTool(db, binding, "slack_channels", {}, directoryFetch as typeof fetch)).rejects.toThrow("service_unavailable");
     await expect(executeSlackTool(db, binding, "slack_search", { channels: ["COTHER"], query: "ship Tuesday", limit: 10 }, fetched as typeof fetch)).resolves.toMatchObject({
       mode: "bounded_history", exhaustive: false,
       matches: [{ user: "UUNLINKED", ts: "7000.1" }],
