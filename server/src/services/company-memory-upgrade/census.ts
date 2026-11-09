@@ -117,7 +117,7 @@ export function validateOutputPath(outPath: string, repoRootPath?: string): stri
   }
 
   if (existsSync(resolvedOutPath)) {
-    const error = new Error(`Output file already exists: ${resolvedOutPath}`);
+    const error = new Error("Output file already exists.");
     (error as any).code = "EEXIST";
     throw error;
   }

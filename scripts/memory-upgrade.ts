@@ -102,18 +102,65 @@ export function scrubDsnSecrets(text: string): string {
   // Supports postgres://, postgresql:// and +driver variants like postgresql+asyncpg://
   const urlCandidateRegex = /(postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/)([^\s"'<>]+)/g;
   result = result.replace(urlCandidateRegex, (_fullMatch, scheme, rest) => {
-    // The authority ends at the first '/', '?', or '#'
-    const pathIdx = rest.search(/[\/?#]/);
-    const authority = pathIdx === -1 ? rest : rest.slice(0, pathIdx);
-    const remainder = pathIdx === -1 ? "" : rest.slice(pathIdx);
-
-    const lastAt = authority.lastIndexOf("@");
-    if (lastAt === -1) {
-      return scheme + authority + remainder;
+    // If no '@' exists anywhere in rest, there is no userinfo credential to redact.
+    if (!rest.includes("@")) {
+      return scheme + rest;
     }
 
-    const userinfo = authority.slice(0, lastAt);
-    const hostPort = authority.slice(lastAt + 1);
+    const firstSep = rest.search(/[\/?#]/);
+
+    let userinfo: string;
+    let hostPort: string;
+    let remainder: string;
+
+    if (firstSep === -1) {
+      // No '/', '?', or '#' in URL: authority extends to end of rest.
+      // Use the last '@' to separate userinfo and host.
+      const lastAt = rest.lastIndexOf("@");
+      userinfo = rest.slice(0, lastAt);
+      hostPort = rest.slice(lastAt + 1);
+      remainder = "";
+    } else {
+      // Check if there is an '@' before the first path/query/fragment delimiter
+      const atBeforeSep = rest.slice(0, firstSep).lastIndexOf("@");
+      if (atBeforeSep !== -1) {
+        // Standard URL: userinfo terminates at last '@' before path/query/fragment
+        userinfo = rest.slice(0, atBeforeSep);
+        hostPort = rest.slice(atBeforeSep + 1, firstSep);
+        remainder = rest.slice(firstSep);
+      } else {
+        // No '@' before firstSep.
+        // Check for malformed URL where password contains unencoded '/', '?', or '#'.
+        // Look at last '@' in rest where credential authority can be recognized.
+        const lastAt = rest.lastIndexOf("@");
+        const candidateUserinfo = rest.slice(0, lastAt);
+        const colonIdx = candidateUserinfo.indexOf(":");
+
+        // Credential authority is recognized if there is a ':' separating username and password.
+        // If the ':' is followed only by digits before firstSep (e.g. host:5432/path?email=foo@bar),
+        // it is a host:port pair rather than user:password credentials.
+        const isPortColon =
+          colonIdx !== -1 &&
+          colonIdx < firstSep &&
+          /^\d+$/.test(candidateUserinfo.slice(colonIdx + 1, firstSep));
+
+        if (colonIdx !== -1 && !isPortColon) {
+          // Credential authority recognized using last @ despite unencoded separators
+          userinfo = candidateUserinfo;
+          const hostSep = rest.slice(lastAt + 1).search(/[\/?#]/);
+          if (hostSep === -1) {
+            hostPort = rest.slice(lastAt + 1);
+            remainder = "";
+          } else {
+            hostPort = rest.slice(lastAt + 1, lastAt + 1 + hostSep);
+            remainder = rest.slice(lastAt + 1 + hostSep);
+          }
+        } else {
+          // No recognizable credentials before '@': robust fallback to firstSep authority boundary
+          return scheme + rest;
+        }
+      }
+    }
 
     const colonIdx = userinfo.indexOf(":");
     let redactedUserinfo: string;
@@ -128,11 +175,8 @@ export function scrubDsnSecrets(text: string): string {
       }
       redactedUserinfo = `${user}:***`;
     } else {
-      secrets.add(userinfo);
-      try {
-        secrets.add(decodeURIComponent(userinfo));
-      } catch {}
-      redactedUserinfo = "***";
+      // Username-only (e.g. postgres://postgres@host): do NOT collect username as secret.
+      redactedUserinfo = userinfo;
     }
 
     return `${scheme}${redactedUserinfo}@${hostPort}${remainder}`;
@@ -145,9 +189,16 @@ export function scrubDsnSecrets(text: string): string {
   });
 
   // 3. For any extracted secrets from URLs, only redact in arbitrary prose if length >= 8
-  // to avoid corrupting diagnostic codes or normal English words with short passwords like 'a'
+  // to avoid corrupting diagnostic codes or normal English words with short passwords like 'a'.
+  // Never replace common infrastructure identifiers in prose.
+  const BANNED_SECRET_PROSE_REPLACEMENTS = new Set(["postgres", "postgresql", "localhost", "127.0.0.1"]);
   for (const secret of secrets) {
-    if (secret && secret.length >= 8 && secret !== "***") {
+    if (
+      secret &&
+      secret.length >= 8 &&
+      secret !== "***" &&
+      !BANNED_SECRET_PROSE_REPLACEMENTS.has(secret.toLowerCase())
+    ) {
       result = result.replaceAll(secret, "***");
     }
   }
@@ -474,8 +525,8 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   ROLLBACK_REFUSED: "Rollback refused from current state.",
   rollback_refused: "Rollback refused from current state.",
 
-  UNSUPPORTED_SOURCE_ID: "Collection table contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.",
-  unsupported_source_id: "Collection table contains source row with non-UUID id. Upgrade ledger requires valid UUID source IDs.",
+  UNSUPPORTED_SOURCE_ID: "Collection table contains unsupported source IDs (invalid UUID or case collision). Upgrade ledger requires unique valid UUID source IDs.",
+  unsupported_source_id: "Collection table contains unsupported source IDs (invalid UUID or case collision). Upgrade ledger requires unique valid UUID source IDs.",
 
   ACTIVE_RUN_TIMEOUT: "Active heartbeat runs paused longer than limit.",
   active_run_timeout: "Active heartbeat runs paused longer than limit.",

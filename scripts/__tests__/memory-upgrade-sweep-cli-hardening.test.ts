@@ -216,6 +216,51 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
     const scrubbedEncoded = scrubDsnSecrets(encodedAt);
     assert.equal(scrubbedEncoded, "postgres://user:***@dbhost:5432/mydb");
 
+    // Unencoded '/', '?', '#' in password
+    const unencodedSlash = "postgres://user:p/a/s/s@dbhost:5432/mydb";
+    const scrubbedSlash = scrubDsnSecrets(unencodedSlash);
+    assert.equal(scrubbedSlash, "postgres://user:***@dbhost:5432/mydb");
+    assert.ok(!scrubbedSlash.includes("p/a/s/s"));
+
+    const unencodedQuestion = "postgres://user:p?a?s?s@dbhost:5432/mydb";
+    const scrubbedQuestion = scrubDsnSecrets(unencodedQuestion);
+    assert.equal(scrubbedQuestion, "postgres://user:***@dbhost:5432/mydb");
+    assert.ok(!scrubbedQuestion.includes("p?a?s?s"));
+
+    const unencodedHash = "postgres://user:p#a#s#s@dbhost:5432/mydb";
+    const scrubbedHash = scrubDsnSecrets(unencodedHash);
+    assert.equal(scrubbedHash, "postgres://user:***@dbhost:5432/mydb");
+    assert.ok(!scrubbedHash.includes("p#a#s#s"));
+
+    const unencodedMixed = "postgres://user:p/a#s?s@dbhost:5432/mydb";
+    const scrubbedMixed = scrubDsnSecrets(unencodedMixed);
+    assert.equal(scrubbedMixed, "postgres://user:***@dbhost:5432/mydb");
+    assert.ok(!scrubbedMixed.includes("p/a#s?s"));
+
+    // URL-encoded '/', '?', '#' in password
+    const encodedSlash = "postgres://user:p%2Fa%2Fs%2Fs@dbhost:5432/mydb";
+    const scrubbedEncodedSlash = scrubDsnSecrets(encodedSlash);
+    assert.equal(scrubbedEncodedSlash, "postgres://user:***@dbhost:5432/mydb");
+
+    const encodedQuestion = "postgres://user:p%3Fa%3Fs%3Fs@dbhost:5432/mydb";
+    const scrubbedEncodedQuestion = scrubDsnSecrets(encodedQuestion);
+    assert.equal(scrubbedEncodedQuestion, "postgres://user:***@dbhost:5432/mydb");
+
+    const encodedHash = "postgres://user:p%23a%23s%23s@dbhost:5432/mydb";
+    const scrubbedEncodedHash = scrubDsnSecrets(encodedHash);
+    assert.equal(scrubbedEncodedHash, "postgres://user:***@dbhost:5432/mydb");
+
+    // Username-only: postgres://postgres@host must NOT corrupt scheme into ***://
+    const usernameOnly = "postgres://postgres@host";
+    const scrubbedUserOnly = scrubDsnSecrets(usernameOnly);
+    assert.equal(scrubbedUserOnly, "postgres://postgres@host");
+    assert.ok(scrubbedUserOnly.startsWith("postgres://"), "Scheme must not be corrupted to ***://");
+
+    const usernameOnlyWithPort = "postgres://postgres@localhost:5432/mydb";
+    const scrubbedUserOnlyWithPort = scrubDsnSecrets(usernameOnlyWithPort);
+    assert.equal(scrubbedUserOnlyWithPort, "postgres://postgres@localhost:5432/mydb");
+    assert.ok(scrubbedUserOnlyWithPort.startsWith("postgres://"), "Scheme must not be corrupted to ***://");
+
     // +driver schemes
     const driverSchemes = [
       "postgresql+asyncpg://admin:supersecret@localhost:5432/proddb",

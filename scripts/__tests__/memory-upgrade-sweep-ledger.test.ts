@@ -8,10 +8,13 @@ import test from "node:test";
 import {
   commitSourceOutcome,
   ensureUpgradeTables,
+  KNOWN_SENSITIVE_FAMILY_NAMES,
   loadLedgerForSources,
   openTenantClient,
   reconcileChangedContent,
   reconcileTombstones,
+  VALID_NOISE_REASONS,
+  VALID_UNROUTABLE_REASONS,
   validateOutcomeReason,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
 import {
@@ -643,5 +646,51 @@ test("sweep-tenant ledger operations", async (t) => {
     assert.ok(!isValidVectorType("bad-ident;drop.vector(1536)"));
     assert.ok(!isValidVectorType(""));
     assert.ok(!isValidVectorType("int"));
+  });
+
+  await t.test("validateOutcomeReason direct tests: all KNOWN_SENSITIVE_FAMILY_NAMES camelCase pass", async () => {
+    // 1. Confirm each individual sensitive family in camelCase passes validation
+    for (const family of KNOWN_SENSITIVE_FAMILY_NAMES) {
+      const validated = validateOutcomeReason("dropped_sensitive", family);
+      assert.equal(validated, family, `Sensitive family ${family} must pass validation`);
+    }
+
+    // 2. Confirm sorted, deduplicated multi-token combinations pass
+    const allSorted = [...KNOWN_SENSITIVE_FAMILY_NAMES].sort().join(",");
+    const validatedAll = validateOutcomeReason("dropped_sensitive", allSorted);
+    assert.equal(validatedAll, allSorted);
+
+    const twoFamilies = [KNOWN_SENSITIVE_FAMILY_NAMES[0], KNOWN_SENSITIVE_FAMILY_NAMES[1]].sort().join(",");
+    assert.equal(validateOutcomeReason("dropped_sensitive", twoFamilies), twoFamilies);
+
+    // 3. Confirm unroutable and dropped_noise valid reasons pass
+    for (const r of VALID_UNROUTABLE_REASONS) {
+      assert.equal(validateOutcomeReason("unroutable", r), r);
+    }
+    for (const r of VALID_NOISE_REASONS) {
+      assert.equal(validateOutcomeReason("dropped_noise", r), r);
+    }
+
+    // 4. Invalids throw INVALID_ARGUMENT
+    assert.throws(
+      () => validateOutcomeReason("dropped_sensitive", "unknown_family"),
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => validateOutcomeReason("dropped_sensitive", "apiKey,apiKey"), // duplicate
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => validateOutcomeReason("dropped_sensitive", "ssn,apiKey"), // unsorted
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => validateOutcomeReason("unroutable", "bogus_unroutable"),
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
+    assert.throws(
+      () => validateOutcomeReason("dropped_noise", "bogus_noise"),
+      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+    );
   });
 });

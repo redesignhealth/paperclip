@@ -374,9 +374,10 @@ Operational Prerequisites:
 - **Crash-expiry TTL and recovery unavailability in this slice**: If a worker crashes ungracefully without releasing, its lease will expire after the lease TTL (default 10 minutes / 600s). Background reconciliation (`reconcileLapsedUpgradeLeases`) detects the expired lease on the active upgrade and transitions it to `needs_recovery`. When an upgrade is in `needs_recovery`, future sweep attempts are refused with `STATE_MISMATCH`. Recovery, status, and rollback commands (`pnpm memory:upgrade recover|status|rollback`) are unimplemented stubs that fail closed in this slice; do not attempt to run stub commands. Operators must wait for subsequent lifecycle cutover tooling to ship before recovering or resuming upgrades in `needs_recovery`.
 
 > **WARNING: NON-TERMINAL SWEEP BLOCKS COMPANY DELETION**
-> Every memory upgrade sweep creates or adopts an active non-terminal upgrade record in `sweeping` (or `needs_recovery`) state. The company deletion admission gate (`admitCompanyDeletion`) strictly refuses deletion while an active memory upgrade exists (`UPGRADE_IN_PROGRESS`). Consequently, once a company is swept in this PR slice, it CANNOT be deleted until later lifecycle completion tooling ships.
+> Every memory upgrade sweep creates or adopts an active non-terminal upgrade record in `sweeping` (or `needs_recovery`) state. The company deletion admission gate (`admitCompanyDeletion`) strictly refuses deletion while an active memory upgrade exists (`company_memory_upgrade_active`). Consequently, once a company is swept in this PR slice, it CANNOT be deleted until later lifecycle completion tooling ships.
 >
-> THIS COMMAND IS NOT READY FOR PRODUCTION USE.
+> THIS COMMAND IS NOT READY FOR PRODUCTION USE. DO NOT USE `--prod sweep` YET.
+> Even if tenant DDL fails during initialization (e.g., if the tenant role lacks CREATE privilege when executing `ensureUpgradeTables`), an active upgrade row will have already been created on the control plane, leaving the company in a non-terminal upgrade state that permanently blocks deletion until subsequent lifecycle tooling lands. Preflight CREATE privilege checks are deferred to a later PR; operators must ensure proper tenant database privileges before running sweep in non-production environments.
 > NEVER perform manual SQL bypasses (e.g. deleting or mutating `company_memory_upgrades` rows) or attempt ad-hoc auto-clearing to work around deletion blocks. Manual tampering invalidates upgrade invariants and risks catastrophic memory corruption.
 
 Operational Invariants:
