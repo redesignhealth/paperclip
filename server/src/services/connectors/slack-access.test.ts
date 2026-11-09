@@ -182,11 +182,16 @@ describe("Slack contracts and transport", () => {
     await expect(
       slackClient("bot-secret", fetcher)("admin.users.remove"),
     ).rejects.toThrow("Unsupported");
+    await expect(
+      slackClient("bot-secret", fetcher)("conversations.list"),
+    ).rejects.toThrow("Unsupported");
     expect(fetcher).not.toHaveBeenCalled();
+    const channels = SLACK_TOOLS.find((t) => t.name === "slack_channels")!;
+    expect(channels.method).toBe("users.conversations");
   });
   it("encodes Slack arguments like the official SDK, with nested values as JSON fields", async () => {
     const fetcher = vi.fn().mockImplementation(async () => Response.json({ ok: true }));
-    await slackClient("bot-secret", fetcher)("conversations.list", {
+    await slackClient("bot-secret", fetcher)("users.conversations", {
       types: "public_channel,private_channel,mpim,im", limit: 50, exclude_archived: true, cursor: undefined,
     });
     expect(fetcher.mock.calls[0][1].headers["content-type"]).toContain("application/x-www-form-urlencoded");

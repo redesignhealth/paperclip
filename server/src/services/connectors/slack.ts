@@ -218,7 +218,7 @@ export async function executeSlackTool(
     return channel;
   };
   if (name === "slack_channels") {
-    const result = await api("conversations.list", {
+    const result = await api("users.conversations", {
       ...args,
       limit: args.limit ?? 50,
       types: "public_channel,private_channel,mpim,im",
@@ -226,7 +226,7 @@ export async function executeSlackTool(
     });
     const channels: SlackObject[] = [];
     for (const channel of objects(result.channels)) {
-      if (channel.is_member !== true && channel.is_im !== true) continue;
+      if (!channel.id || channel.is_member === false) continue;
       try {
         const authorized = await authorizeSlackChannel(
           authority,

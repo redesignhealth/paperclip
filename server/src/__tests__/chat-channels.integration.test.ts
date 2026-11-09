@@ -10243,11 +10243,35 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const directoryFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const method = String(input).split("/").at(-1);
       const args = Object.fromEntries(new URLSearchParams(String(init?.body ?? "")));
-      if (method === "conversations.list") return Response.json({ ok: true, channels: [{ id: "CGONE", is_member: true }, { id: "COTHER", is_member: true }], response_metadata: { next_cursor: "directory-next" } });
+      if (method === "users.conversations") {
+        return Response.json({
+          ok: true,
+          channels: [
+            { id: "CGONE", is_member: true },
+            { id: "CFALSE", is_member: false },
+            { id: "COTHER" },
+          ],
+          response_metadata: { next_cursor: "directory-next" },
+        });
+      }
       if (method === "conversations.info" && args.channel === "CGONE") return Response.json({ ok: false, error: "channel_not_found" });
+      if (method === "conversations.info" && args.channel === "CFALSE") {
+        throw new Error("Explicit non-members must be filtered before conversations.info");
+      }
       return fetched(input, init);
     });
     await expect(executeSlackTool(db, binding, "slack_channels", {}, directoryFetch as typeof fetch)).resolves.toMatchObject({ channels: [{ id: "COTHER" }], nextCursor: "directory-next" });
+    await expect(executeSlackTool(db, binding, "slack_channels", { cursor: "directory-next" }, directoryFetch as typeof fetch)).resolves.toMatchObject({ channels: [{ id: "COTHER" }], nextCursor: "directory-next" });
+    const usersConversationsCalls = directoryFetch.mock.calls.filter(call => String(call[0]).endsWith("/users.conversations"));
+    expect(usersConversationsCalls).toHaveLength(2);
+    expect(Object.fromEntries(new URLSearchParams(String(usersConversationsCalls[0][1]?.body ?? "")))).toMatchObject({
+      types: "public_channel,private_channel,mpim,im",
+      exclude_archived: "true",
+      limit: "50",
+    });
+    expect(Object.fromEntries(new URLSearchParams(String(usersConversationsCalls[1][1]?.body ?? "")))).toMatchObject({
+      cursor: "directory-next",
+    });
     await expect(executeSlackTool(db, binding, "slack_search", { channels: ["COTHER"], query: "ship Tuesday", limit: 10 }, fetched as typeof fetch)).resolves.toMatchObject({
       mode: "bounded_history", exhaustive: false,
       matches: [{ user: "UUNLINKED", ts: "7000.1" }],
