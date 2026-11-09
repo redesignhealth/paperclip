@@ -90,7 +90,7 @@ export const SLACK_TOOLS = [
   ),
   tool(
     "channels",
-    "conversations.list",
+    "users.conversations",
     ["channels:read", "groups:read", "im:read", "mpim:read"],
     "read",
     "List channels the bot belongs to and you may read. Paginate using nextCursor.",
