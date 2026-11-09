@@ -27,6 +27,17 @@ import { type RedactionRegistry } from "./openai-key.js";
 import { estimateChatTokens, parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
 import { CompanyMemoryUpgradeError } from "./types.js";
 
+/**
+ * Exact bounded reason_code literal emitted for `dropped_sensitive` outcomes that were
+ * classified by the model itself (decision: "drop_sensitive" with no regex family match
+ * on the model's own textual output). This is a SINGLE fixed literal -- distinct from, and
+ * never combined with, the sorted comma-separated regex family CSV emitted when our own
+ * `detectSensitiveFamilies` regexes match (see sensitive-patterns.ts / converter-contract.ts
+ * `data_sensitive_echo`). Shared here as the producer constant so validateOutcomeReason in
+ * sweep-tenant.ts can permit it as an exact literal without weakening family CSV validation.
+ */
+export const MODEL_CLASSIFIED_SENSITIVE_REASON_CODE = "model_classified";
+
 export type ConversionClientResult =
   | {
       status: "convert";
@@ -58,6 +69,66 @@ export interface ConversionClient {
     text: string,
     options?: { signal?: AbortSignal },
   ): Promise<ConversionClientResult>;
+}
+
+export type ConversionChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+/** Wraps raw source memory text in the privacy-invariant <source_memory> tags. */
+export function buildConversionUserMessage(text: string): string {
+  return `<source_memory>\n${text}\n</source_memory>`;
+}
+
+/** Builds the exact initial chat messages array sent to the conversion endpoint. */
+export function buildInitialConversionMessages(text: string): ConversionChatMessage[] {
+  return [
+    { role: "system", content: CONVERSION_SYSTEM_PROMPT },
+    { role: "user", content: buildConversionUserMessage(text) },
+  ];
+}
+
+/**
+ * Builds the exact repair-retry chat messages array, given the initial messages, the
+ * (rejected) prior assistant response content, and the violated rule class being repaired.
+ */
+export function buildRepairConversionMessages(
+  initialMessages: ConversionChatMessage[],
+  priorResponseContent: string,
+  repairRuleClass: string,
+): ConversionChatMessage[] {
+  return [
+    ...initialMessages,
+    { role: "assistant", content: priorResponseContent },
+    {
+      role: "user",
+      content: `Your previous response was rejected due to rule violation: ${repairRuleClass}. Please produce a strictly compliant JSON response satisfying all rules.`,
+    },
+  ];
+}
+
+/** Mirrors the literal max_completion_tokens cap applied to every chat conversion call. */
+export const PREFLIGHT_MAX_COMPLETION_TOKENS = 600;
+
+/** Builds the exact serialized request body sent to the chat completions endpoint. */
+export function buildConversionRequestBody(
+  model: string,
+  messages: ConversionChatMessage[],
+): string {
+  return JSON.stringify({
+    model,
+    messages,
+    temperature: 0,
+    top_p: 1,
+    seed: 8191,
+    max_completion_tokens: PREFLIGHT_MAX_COMPLETION_TOKENS,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "memory_conversion",
+        strict: true,
+        schema: CONVERSION_JSON_SCHEMA,
+      },
+    },
+  });
 }
 
 export interface CreateOpenAiConversionClientOptions {
@@ -119,22 +190,7 @@ export function createOpenAiConversionClient(
 
       const lease = await limiter.acquire(estimatedTokens);
       try {
-        const body = JSON.stringify({
-          model,
-          messages,
-          temperature: 0,
-          top_p: 1,
-          seed: 8191,
-          max_completion_tokens: 600,
-          response_format: {
-            type: "json_schema",
-            json_schema: {
-              name: "memory_conversion",
-              strict: true,
-              schema: CONVERSION_JSON_SCHEMA,
-            },
-          },
-        });
+        const body = buildConversionRequestBody(model, messages);
 
         const res = await fetchImpl(endpoint, {
           method: "POST",
@@ -216,11 +272,7 @@ export function createOpenAiConversionClient(
       let totalOutputTokens = 0;
 
       // 1. Initial attempt
-      const userMessage = `<source_memory>\n${text}\n</source_memory>`;
-      const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-        { role: "system", content: CONVERSION_SYSTEM_PROMPT },
-        { role: "user", content: userMessage },
-      ];
+      const messages = buildInitialConversionMessages(text);
 
       const estimatedTokens = estimateChatTokens(text);
 
@@ -265,7 +317,7 @@ export function createOpenAiConversionClient(
         // drop_sensitive
         return {
           status: "drop_sensitive",
-          reasonCode: "model_classified",
+          reasonCode: MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
           inputTokens: totalInputTokens,
           outputTokens: totalOutputTokens,
         };
@@ -283,14 +335,7 @@ export function createOpenAiConversionClient(
 
       // 3. Schema or rule violation -> Exactly ONE repair retry naming the violated rule class
       const repairRuleClass = validation.rejectCode;
-      const repairMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-        ...messages,
-        { role: "assistant", content: responseContent },
-        {
-          role: "user",
-          content: `Your previous response was rejected due to rule violation: ${repairRuleClass}. Please produce a strictly compliant JSON response satisfying all rules.`,
-        },
-      ];
+      const repairMessages = buildRepairConversionMessages(messages, responseContent, repairRuleClass);
 
       try {
         const repairResp = await executeChatRequest(repairMessages, estimatedTokens + 100, options?.signal);
@@ -332,7 +377,7 @@ export function createOpenAiConversionClient(
         // drop_sensitive
         return {
           status: "drop_sensitive",
-          reasonCode: "model_classified",
+          reasonCode: MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
           inputTokens: totalInputTokens,
           outputTokens: totalOutputTokens,
         };

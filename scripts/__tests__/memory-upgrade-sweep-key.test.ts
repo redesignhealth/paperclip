@@ -3,8 +3,9 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -245,7 +246,7 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
     }
   });
 
-  await t.test("refuses group or other readable permissions (fail, never chmod)", async () => {
+  await t.test("refuses group or other readable permissions (fail, never chmod, mode unchanged)", async () => {
     const permissiveFile = path.join(tmpDir, `perm-key-${randomUUID().slice(0, 8)}.txt`);
     try {
       writeFileSync(permissiveFile, `${validKey}\n`, { mode: 0o644 });
@@ -265,10 +266,81 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
           return true;
         },
       );
+
+      // The implementation must NEVER chmod: mode stays exactly 0o644, unmodified.
+      const modeAfter = statSync(permissiveFile).mode & 0o777;
+      assert.equal(modeAfter, 0o644, "file mode must remain unchanged after a rejected read");
     } finally {
       if (existsSync(permissiveFile)) {
         unlinkSync(permissiveFile);
       }
+    }
+  });
+
+  await t.test("refuses a FIFO (named pipe) at the key file path without hanging", async () => {
+    const fifoPath = path.join(tmpDir, `fifo-key-${randomUUID().slice(0, 8)}`);
+    try {
+      execFileSync("mkfifo", ["-m", "600", fifoPath]);
+    } catch (err) {
+      // mkfifo unavailable on this platform/runner: skip rather than fail the suite.
+      return;
+    }
+
+    try {
+      await assert.rejects(
+        () =>
+          resolveCompanyOpenAiKey({
+            controlPlaneDb: dummyDb,
+            companyId: dummyCompanyId,
+            keyFilePath: fifoPath,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "INVALID_ARGUMENT");
+          assert.ok(!err.message.includes(fifoPath), "path must never be echoed in the error message");
+          return true;
+        },
+      );
+    } finally {
+      if (existsSync(fifoPath)) {
+        unlinkSync(fifoPath);
+      }
+    }
+  });
+
+  await t.test("refuses a key file reached through a SYMLINKED PARENT directory that resolves inside the repository", async () => {
+    // The leaf file itself is a REAL file (not a symlink); the only indirection is the
+    // symlinked PARENT directory. The lexical path (through the /tmp symlink) looks
+    // external, but it actually resolves inside the repository tree -- this must be
+    // refused by the REAL (symlink-resolved) containment check, which the lexical check
+    // alone would miss.
+    const repoRootDir = path.resolve(process.cwd());
+    const inRepoRealDir = path.join(repoRootDir, `.tmp-key-parent-${randomUUID().slice(0, 8)}`);
+    const symlinkToRepoDir = path.join(tmpDir, `symlink-to-repo-${randomUUID().slice(0, 8)}`);
+
+    try {
+      mkdirSync(inRepoRealDir, { recursive: true });
+      symlinkSync(inRepoRealDir, symlinkToRepoDir, "dir");
+
+      const leafPath = path.join(inRepoRealDir, "key.txt");
+      writeFileSync(leafPath, `${validKey}\n`, { mode: 0o600 });
+      const pathThroughSymlinkedParent = path.join(symlinkToRepoDir, "key.txt");
+
+      await assert.rejects(
+        () =>
+          resolveCompanyOpenAiKey({
+            controlPlaneDb: dummyDb,
+            companyId: dummyCompanyId,
+            keyFilePath: pathThroughSymlinkedParent,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "INVALID_ARGUMENT");
+          assert.ok(err.message.includes("inside repository"));
+          return true;
+        },
+      );
+    } finally {
+      if (existsSync(symlinkToRepoDir)) unlinkSync(symlinkToRepoDir);
+      rmSync(inRepoRealDir, { recursive: true, force: true });
     }
   });
 

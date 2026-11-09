@@ -336,7 +336,14 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(upgradeRow.unroutableCount, ledgerMap.get("unroutable"));
     assert.equal(upgradeRow.droppedNoiseCount, ledgerMap.get("dropped_noise"));
     assert.equal(upgradeRow.droppedSensitiveCount, ledgerMap.get("dropped_sensitive"));
-    assert.equal(upgradeRow.publishedCount, ledgerMap.get("published"));
+    // COUNTER finding: this sweep phase only STAGES records (published_at stays NULL); it
+    // never publishes to the live collection table, so the control-plane publishedCount
+    // column must stay zero even though the tenant ledger legitimately has 'published' rows
+    // (meaning "staged, pending publish" in this phase's vocabulary). Operators query
+    // stagedPendingPublishCount from the report, or the ledger directly (see runbook), to
+    // see this phase's staged activity.
+    assert.ok((ledgerMap.get("published") ?? 0) > 0, "sanity: ledger must have published rows to make this assertion meaningful");
+    assert.equal(upgradeRow.publishedCount, 0);
     assert.equal(upgradeRow.sweepCount, 1);
 
     // Verify NO memory text exists in ANY column of company_memory_upgrades

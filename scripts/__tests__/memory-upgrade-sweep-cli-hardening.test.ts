@@ -203,6 +203,55 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
     }
   });
 
+  await t.test("--max-cost-usd and --*-usd-per-mtok reject values exceeding the $1,000,000 operational cap", async () => {
+    let stderrLogged = "";
+    const origError = console.error;
+    console.error = (msg: string) => {
+      stderrLogged += `${msg}\n`;
+    };
+
+    try {
+      stderrLogged = "";
+      const exitMaxCost = await runSweepCli([
+        "--database-url", "postgres://usr:pw@localhost:5432/db",
+        "--control-plane-url", "postgres://usr:pw@localhost:5432/cpdb",
+        "--company", "00000000-0000-4000-8000-000000000001",
+        "--confirm", "00000000-0000-4000-8000-000000000001",
+        "--max-cost-usd", "1000001",
+      ]);
+      assert.equal(exitMaxCost, 1);
+      assert.ok(stderrLogged.includes("operational cap"));
+      assert.ok(!stderrLogged.includes("Invalid command argument"), "a bounded, specific message must surface, not the generic fallback");
+
+      stderrLogged = "";
+      const exitPrice = await runSweepCli([
+        "--database-url", "postgres://usr:pw@localhost:5432/db",
+        "--control-plane-url", "postgres://usr:pw@localhost:5432/cpdb",
+        "--company", "00000000-0000-4000-8000-000000000001",
+        "--confirm", "00000000-0000-4000-8000-000000000001",
+        "--chat-input-usd-per-mtok", "9999999",
+      ]);
+      assert.equal(exitPrice, 1);
+      assert.ok(stderrLogged.includes("operational cap"));
+
+      // A value AT the cap is accepted (parsing succeeds, so the CLI proceeds past flag
+      // validation into actual sweep execution, which fails for an unrelated reason --
+      // the bogus DSN -- but NOT with an "operational cap" or INVALID_ARGUMENT message).
+      stderrLogged = "";
+      const exitAtCap = await runSweepCli([
+        "--database-url", "postgres://usr:pw@localhost:5432/db",
+        "--control-plane-url", "postgres://usr:pw@localhost:5432/cpdb",
+        "--company", "00000000-0000-4000-8000-000000000001",
+        "--confirm", "00000000-0000-4000-8000-000000000001",
+        "--max-cost-usd", "1000000",
+      ]);
+      assert.equal(exitAtCap, 1);
+      assert.ok(!stderrLogged.includes("operational cap"), "exactly $1,000,000 must be accepted by flag validation");
+    } finally {
+      console.error = origError;
+    }
+  });
+
   // 5. Comprehensive conservative DSN scrub tests
   await t.test("scrubDsnSecrets replaces entire candidate with [REDACTED_DATABASE_URL] without leaking malformed secrets", () => {
     // Unencoded @ in password

@@ -17,6 +17,7 @@ import {
   validateAndResolveTableIdentifier,
   validateOutputPath,
 } from "../server/src/services/company-memory-upgrade/census.js";
+import { MAX_USD_CAP } from "../server/src/services/company-memory-upgrade/cost.js";
 import {
   formatSweepTextReport,
   runSweep,
@@ -573,6 +574,8 @@ const SAFE_INVALID_ARGUMENT_REGEXES = [
   /^Boolean flag '--[a-z0-9-]+' does not take a value\.$/,
   /^Unknown option '--?[a-zA-Z0-9_-]+'\. Only [a-zA-Z0-9_ -]+ options are accepted\.$/,
   /^Invalid --[a-z0-9-]+\. Must be a non-negative number\.$/,
+  /^Flag '--[a-z0-9-]+' exceeds the operational cap of \$[0-9,]+\.$/,
+  /^Invalid --[a-z0-9-]+\. Exceeds the operational cap of \$[0-9,]+\.$/,
 ];
 
 const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
@@ -833,6 +836,12 @@ Options:
           "INVALID_ARGUMENT",
         );
       }
+      if (num > MAX_USD_CAP) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '--max-cost-usd' exceeds the operational cap of $${MAX_USD_CAP.toLocaleString()}.`,
+          "INVALID_ARGUMENT",
+        );
+      }
       maxCostUsd = num;
     }
 
@@ -848,6 +857,12 @@ Options:
       if (!Number.isFinite(num) || Number.isNaN(num) || num < 0 || !isNumericString(raw)) {
         throw new CompanyMemoryUpgradeError(
           `Invalid ${flagName}. Must be a non-negative number.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      if (num > MAX_USD_CAP) {
+        throw new CompanyMemoryUpgradeError(
+          `Invalid ${flagName}. Exceeds the operational cap of $${MAX_USD_CAP.toLocaleString()}.`,
           "INVALID_ARGUMENT",
         );
       }

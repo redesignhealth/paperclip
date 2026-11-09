@@ -24,6 +24,7 @@ import {
 } from "./memory-upgrade-sweep-helpers.js";
 import { runSweep, shouldHaltOnQuarantine } from "../../server/src/services/company-memory-upgrade/sweep.js";
 import {
+  claimTenantFenceForTestSetup,
   ensureUpgradeTables,
   openTenantClient,
   reconcileChangedContent,
@@ -61,6 +62,7 @@ test("staging, deduplication, and published_at invariants", async (t) => {
   await ensureUpgradeTables(tenantSql, "text");
 
   const upgradeId = randomUUID();
+  const fence = await claimTenantFenceForTestSetup(tenantSql, upgradeId);
   const agent1 = randomUUID();
   const agent2 = randomUUID();
 
@@ -87,7 +89,7 @@ test("staging, deduplication, and published_at invariants", async (t) => {
         },
       ],
       vectorType: "text",
-    });
+    }, fence);
 
     assert.equal(resAgent1.outcome, "published");
     assert.equal(resAgent1.stagedCount, 1);
@@ -108,7 +110,7 @@ test("staging, deduplication, and published_at invariants", async (t) => {
         },
       ],
       vectorType: "text",
-    });
+    }, fence);
 
     assert.equal(resAgent2.outcome, "published");
     assert.equal(resAgent2.stagedCount, 1);
@@ -145,7 +147,7 @@ test("staging, deduplication, and published_at invariants", async (t) => {
         },
       ],
       vectorType: "text",
-    });
+    }, fence);
 
     assert.equal(resAgent1Dup.outcome, "deduplicated");
     assert.equal(resAgent1Dup.stagedCount, 0);
@@ -181,7 +183,7 @@ test("staging, deduplication, and published_at invariants", async (t) => {
         },
       ],
       vectorType: "text",
-    });
+    }, fence);
 
     // Mark published
     await tenantSql`
@@ -193,12 +195,17 @@ test("staging, deduplication, and published_at invariants", async (t) => {
     // Attempt tombstone reconciliation
     const tombResult = await reconcileTombstones(tenantSql, upgradeId, {
       tombstoneSourceIds: [sourcePub],
-    });
+    }, fence);
     assert.equal(tombResult.deletedStagingCount, 0, "Published staging rows must NEVER be deleted");
 
     // Attempt reconcileChangedContent
-    const changeResult = await reconcileChangedContent(tenantSql, upgradeId, sourcePub);
+    const changeResult = await reconcileChangedContent(tenantSql, upgradeId, sourcePub, fence);
     assert.equal(changeResult.deletedStagingCount, 0, "Published staging rows must NEVER be deleted");
+    assert.deepEqual(
+      changeResult.retainedOutputIds,
+      [outputPub],
+      "LEDGER INVARIANT: the published output id must remain referenced",
+    );
 
     const [stillExists] = await tenantSql`
       SELECT output_id FROM paperclip_memory_upgrade_staging
@@ -332,6 +339,9 @@ test("quarantine halt and budget guard in sweep orchestrator", async (t) => {
     assert.equal(upgrade.lastError, "conversion_failed");
     assert.equal(upgrade.leaseToken, null, "Lease must be cleanly released on quarantine halt");
     assert.ok(upgrade.quarantinedCount >= 51);
+    // COUNTER finding: control-plane publishedCount must stay zero even through the
+    // quarantine-halt flush path -- this phase never publishes to the live table.
+    assert.equal(upgrade.publishedCount, 0);
   });
 
   await t.test("budget guard (--max-cost-usd) aborts and releases lease", async () => {
@@ -366,7 +376,24 @@ test("quarantine halt and budget guard in sweep orchestrator", async (t) => {
 
     const clock = new ManualClock();
 
-    // Set maxCostUsd extremely low: $0.000000001
+    // Poison clients: the worst-case preflight ceiling must block BEFORE any client call.
+    let conversionCallCount = 0;
+    let embeddingCallCount = 0;
+    const poisonConversionClient = {
+      async convert() {
+        conversionCallCount++;
+        throw new Error("conversion client must never be called when the preflight ceiling already exceeds budget");
+      },
+    };
+    const poisonEmbeddingClient = {
+      async embed() {
+        embeddingCallCount++;
+        throw new Error("embedding client must never be called when the preflight ceiling already exceeds budget");
+      },
+    };
+
+    // Set maxCostUsd extremely low: $0.000000001 (1 nanodollar) -- far below the worst-case
+    // preflight ceiling for even a short source, so the sweep must abort with ZERO API calls.
     await assert.rejects(
       () =>
         runSweep(
@@ -383,8 +410,8 @@ test("quarantine halt and budget guard in sweep orchestrator", async (t) => {
             clock,
             _internalSkipVectorIdentityCheck: true,
             _internalDatabaseIdentityOverride: { database: dbName2, user: roleName2 },
-            conversionClient: createFakeConversionClient(),
-            embeddingClient: createFakeEmbeddingClient(),
+            conversionClient: poisonConversionClient as any,
+            embeddingClient: poisonEmbeddingClient as any,
           },
         ),
       (err: any) => {
@@ -392,6 +419,9 @@ test("quarantine halt and budget guard in sweep orchestrator", async (t) => {
         return true;
       },
     );
+
+    assert.equal(conversionCallCount, 0, "preflight must block before any chat completions call");
+    assert.equal(embeddingCallCount, 0, "preflight must block before any embeddings call");
 
     // Verify lease was released
     const [upgrade] = await cpDb

@@ -36,6 +36,13 @@ import { countActiveCompanyRuns, createActiveRunGate } from "./active-runs.js";
 import { assertCompanyAcceptsMemoryWork, findActiveUpgrade } from "./admission.js";
 import { CONVERSION_BUDGET_CONSTANTS } from "./budget.js";
 import {
+  buildCostRatesNanodollars,
+  ceilTokenCostNanodollars,
+  createCostTracker,
+  estimateWorstCaseSourceCostNanodollarsForText,
+  usdToNanodollars,
+} from "./cost.js";
+import {
   assertNoElevatedRolePrivileges,
   assertNonSuperuserAndRestrictedRole,
   isValidUuid,
@@ -83,6 +90,7 @@ import {
   type StageSourceRecordItem,
   type TenantSourceRow,
 } from "./sweep-tenant.js";
+import { claimTenantFenceGuarded, type TenantFence } from "./tenant-fence.js";
 import {
   type Clock,
   CompanyMemoryUpgradeError,
@@ -134,7 +142,6 @@ export interface SweepDependencies {
   conversionClient?: ConversionClient;
   embeddingClient?: EmbeddingClient;
   fetchImpl?: typeof fetch;
-  openaiApiKey?: string;
 }
 
 export interface SweepCounts {
@@ -343,6 +350,18 @@ export async function runSweep(
         "Flag '--max-cost-usd' requires a positive number value.",
         "INVALID_ARGUMENT",
       );
+    }
+    // Programmatic validation against the operational USD cap (shared with CLI parsing).
+    usdToNanodollars(options.maxCostUsd, "maxCostUsd");
+  }
+
+  for (const [priceFlag, priceValue] of [
+    ["chatInputUsdPerMillion", options.chatInputUsdPerMillion],
+    ["chatOutputUsdPerMillion", options.chatOutputUsdPerMillion],
+    ["embeddingUsdPerMillion", options.embeddingUsdPerMillion],
+  ] as const) {
+    if (priceValue !== undefined && priceValue !== null) {
+      usdToNanodollars(priceValue, priceFlag);
     }
   }
 
@@ -612,6 +631,18 @@ export async function runSweep(
     heartbeatHandle.assertActive();
     await ensureUpgradeTables(tenantSql, stagingVectorType);
 
+    // 9b. Claim the tenant-side write fence. Must happen after the CP lease is claimed and
+    // ensureUpgradeTables has run, and BEFORE any tenant data-write transaction. Every
+    // tenant mutation below (including reconciliation) must thread this exact fence value
+    // through and validate it inside the same transaction as the write.
+    heartbeatHandle.assertActive();
+    const tenantFence: TenantFence = await claimTenantFenceGuarded(cpDb, tenantSql, {
+      upgradeId,
+      cpLeaseToken: leaseToken,
+      leaseOwner,
+      now: clock.now(),
+    });
+
     // 10. Rate limiters and conversion clients
     const redaction = new RedactionRegistry();
 
@@ -642,15 +673,13 @@ export async function runSweep(
         return { conversionClient: convClient, embeddingClient: embClient };
       }
 
-      const apiKey =
-        deps.openaiApiKey ??
-        (await resolveCompanyOpenAiKey({
-          controlPlaneDb: cpDb,
-          companyId,
-          keyFilePath: options.openaiKeyFile,
-          redaction,
-          repoRoot: deps.repoRoot,
-        }));
+      const apiKey = await resolveCompanyOpenAiKey({
+        controlPlaneDb: cpDb,
+        companyId,
+        keyFilePath: options.openaiKeyFile,
+        redaction,
+        repoRoot: deps.repoRoot,
+      });
 
       if (!convClient) {
         convClient = createOpenAiConversionClient({
@@ -681,23 +710,18 @@ export async function runSweep(
     const chatInPrice = options.chatInputUsdPerMillion ?? CONVERSION_BUDGET_CONSTANTS.pricing.chatInputUsdPerMillion;
     const chatOutPrice = options.chatOutputUsdPerMillion ?? CONVERSION_BUDGET_CONSTANTS.pricing.chatOutputUsdPerMillion;
     const embPrice = options.embeddingUsdPerMillion ?? CONVERSION_BUDGET_CONSTANTS.pricing.embeddingUsdPerMillion;
-    let runningCostUsd = 0;
+    const costRates = buildCostRatesNanodollars({
+      chatInputUsdPerMillion: chatInPrice,
+      chatOutputUsdPerMillion: chatOutPrice,
+      embeddingUsdPerMillion: embPrice,
+    });
+    // Pure bigint nanodollar cost accounting (TECH-8191 finding COST). spentNanodollars is
+    // the cumulative total for the whole sweep; pageCostNanodollars is the delta since the
+    // last successful control-plane counter flush -- the two must never be conflated.
+    const costTracker = createCostTracker(options.maxCostUsd ?? null);
     let consideredCount = 0;
     let didPrintBudgetLine = false;
     const quarantinedHistogram: Record<string, number> = {};
-
-    function assertWithinMaxCost(): void {
-      if (
-        options.maxCostUsd !== null &&
-        options.maxCostUsd !== undefined &&
-        runningCostUsd >= options.maxCostUsd
-      ) {
-        throw new CompanyMemoryUpgradeError(
-          "Conversion budget exceeded --max-cost-usd limit.",
-          "ABORTED_BY_OPERATOR",
-        );
-      }
-    }
 
     // 11. Active run gate
     activeRunGate = createActiveRunGate({
@@ -778,7 +802,7 @@ export async function runSweep(
         maxSourceId: maxPageId,
         liveSourceIds: pageSourceIds,
         assertLeaseActive: () => heartbeatHandle?.assertActive(),
-      });
+      }, tenantFence);
       pageDeltas.sourceDeletedCount += tombstoneResult.tombstonesCount;
 
       // Load existing ledger rows for live sources in this page
@@ -808,7 +832,7 @@ export async function runSweep(
 
           // Content or agent assignment changed: reconcile to superseded
           heartbeatHandle.assertActive();
-          await reconcileChangedContent(tenantSql, upgradeId, canonicalSourceId);
+          await reconcileChangedContent(tenantSql, upgradeId, canonicalSourceId, tenantFence);
           pageDeltas.supersededCount++;
           // Then source re-enters classification in this same sweep
         }
@@ -823,7 +847,7 @@ export async function runSweep(
             agentId: routing.matchedAgentId,
             outcome: "unroutable",
             reasonCode: routing.unroutableReason!,
-          });
+          }, tenantFence);
           pageDeltas.unroutableCount++;
           continue;
         }
@@ -839,7 +863,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "dropped_noise",
             reasonCode: noise.reason!,
-          });
+          }, tenantFence);
           pageDeltas.droppedNoiseCount++;
           continue;
         }
@@ -860,7 +884,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "dropped_sensitive",
             reasonCode: families,
-          });
+          }, tenantFence);
           pageDeltas.droppedSensitiveCount++;
           continue;
         }
@@ -873,7 +897,17 @@ export async function runSweep(
           );
         }
 
-        assertWithinMaxCost();
+        // PREFLIGHT: compute the worst-case nanodollar cost ceiling for converting THIS
+        // source (up to 2 chat calls + up to 3 embedding calls, conservative UTF-8
+        // byte-based projection) and check the budget BEFORE resolving any API key or
+        // making any paid call. If the worst case would exceed the remaining budget, abort
+        // here with ZERO additional API calls.
+        const preflight = estimateWorstCaseSourceCostNanodollarsForText(
+          source.data,
+          options.model ?? "gpt-5.4-mini",
+          costRates,
+        );
+        costTracker.assertBudgetAllows(preflight.worstCaseNanodollars);
 
         heartbeatHandle.assertActive();
         const { conversionClient, embeddingClient } = await getClients();
@@ -882,9 +916,13 @@ export async function runSweep(
         const convRes = await conversionClient.convert(source.data ?? "");
         pageDeltas.llmInputTokens += convRes.inputTokens;
         pageDeltas.llmOutputTokens += convRes.outputTokens;
-        runningCostUsd +=
-          (convRes.inputTokens * chatInPrice + convRes.outputTokens * chatOutPrice) / 1e6;
-        assertWithinMaxCost();
+        // Actual-usage accounting (defense in depth): record real spend and re-check the
+        // budget immediately after, in addition to the preflight ceiling above.
+        costTracker.addActualCostNanodollars(
+          ceilTokenCostNanodollars(convRes.inputTokens, costRates.chatInputNanoPerMillion) +
+            ceilTokenCostNanodollars(convRes.outputTokens, costRates.chatOutputNanoPerMillion),
+        );
+        costTracker.assertBudgetAllows(0n);
 
         if (convRes.status === "drop_noise") {
           heartbeatHandle.assertActive();
@@ -895,7 +933,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "dropped_noise",
             reasonCode: "exact_placeholder_or_greeting",
-          });
+          }, tenantFence);
           pageDeltas.droppedNoiseCount++;
           continue;
         }
@@ -909,7 +947,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "dropped_sensitive",
             reasonCode: convRes.reasonCode,
-          });
+          }, tenantFence);
           pageDeltas.droppedSensitiveCount++;
           continue;
         }
@@ -923,7 +961,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "quarantined",
             reasonCode: convRes.rejectCode,
-          });
+          }, tenantFence);
           pageDeltas.quarantinedCount++;
           counts.quarantinedCount++;
           quarantinedHistogram[convRes.rejectCode] =
@@ -939,6 +977,7 @@ export async function runSweep(
             }
 
             heartbeatHandle.assertActive();
+            const quarantineFlushDeltaNano = costTracker.pageCostNanodollars;
             await updateUpgradeCounters(
               cpDb,
               upgradeId,
@@ -948,7 +987,10 @@ export async function runSweep(
                 unroutableCount: pageDeltas.unroutableCount,
                 droppedNoiseCount: pageDeltas.droppedNoiseCount,
                 droppedSensitiveCount: pageDeltas.droppedSensitiveCount,
-                publishedCount: pageDeltas.stagedCount,
+                // NOTE (COUNTER finding): publishedCount is intentionally NOT written here.
+                // The control-plane publishedCount column tracks live-published records,
+                // which this sweep phase never writes (published_at stays NULL in staging).
+                // stagedPendingPublishCount is reported locally only -- see counts below.
                 deduplicatedCount: pageDeltas.deduplicatedCount,
                 quarantinedCount: pageDeltas.quarantinedCount,
                 supersededCount: pageDeltas.supersededCount,
@@ -956,11 +998,14 @@ export async function runSweep(
                 llmInputTokens: pageDeltas.llmInputTokens > 0 ? pageDeltas.llmInputTokens : undefined,
                 llmOutputTokens: pageDeltas.llmOutputTokens > 0 ? pageDeltas.llmOutputTokens : undefined,
                 embeddingTokens: pageDeltas.embeddingTokens > 0 ? pageDeltas.embeddingTokens : undefined,
-                estimatedCostNanodollars: BigInt(Math.round(runningCostUsd * 1e9)),
+                estimatedCostNanodollars: quarantineFlushDeltaNano,
                 lastError: "conversion_failed",
               },
               { clock },
             );
+            // Only reset the page delta AFTER the control-plane flush above has
+            // succeeded; never flush the cumulative total as if it were a page delta.
+            costTracker.resetPageDelta();
 
             await heartbeatHandle.stop();
             heartbeatHandle = null;
@@ -981,8 +1026,10 @@ export async function runSweep(
           heartbeatHandle.assertActive();
           const emb = await embeddingClient.embed(rec.data);
           pageDeltas.embeddingTokens += emb.tokens;
-          runningCostUsd += (emb.tokens * embPrice) / 1e6;
-          assertWithinMaxCost();
+          costTracker.addActualCostNanodollars(
+            ceilTokenCostNanodollars(emb.tokens, costRates.embeddingNanoPerMillion),
+          );
+          costTracker.assertBudgetAllows(0n);
 
           const dataSha256 = computeRecordDataSha256(rec.data);
           const payload = buildTargetPayload({
@@ -1011,7 +1058,7 @@ export async function runSweep(
           agentId: matchedAgentId!,
           records: stageItems,
           vectorType: stagingVectorType,
-        });
+        }, tenantFence);
 
         if (stageRes.outcome === "published") {
           pageDeltas.stagedCount++;
@@ -1020,7 +1067,10 @@ export async function runSweep(
         }
       }
 
-      // Flush counter deltas for this page to control plane
+      // Flush counter deltas for this page to control plane. Read the page cost delta
+      // BEFORE the flush (never the cumulative total) and only reset it after the flush
+      // below has durably succeeded.
+      const pageFlushDeltaNano = costTracker.pageCostNanodollars;
       heartbeatHandle.assertActive();
       await updateUpgradeCounters(
         cpDb,
@@ -1032,7 +1082,13 @@ export async function runSweep(
           unroutableCount: pageDeltas.unroutableCount,
           droppedNoiseCount: pageDeltas.droppedNoiseCount,
           droppedSensitiveCount: pageDeltas.droppedSensitiveCount,
-          publishedCount: pageDeltas.stagedCount,
+          // NOTE (COUNTER finding): publishedCount is intentionally NOT written here. This
+          // sweep phase only stages records (published_at stays NULL); it never publishes
+          // to the live collection table, so the control-plane publishedCount column must
+          // stay zero through this phase (including the quarantine-halt flush above).
+          // stagedPendingPublishCount is surfaced in the report only -- see
+          // counts.stagedPendingPublishCount below, and docs/runbooks/memory-upgrade-sweep
+          // for the staging-count query operators should use instead of a CP column.
           deduplicatedCount: pageDeltas.deduplicatedCount,
           quarantinedCount: pageDeltas.quarantinedCount,
           supersededCount: pageDeltas.supersededCount,
@@ -1040,10 +1096,12 @@ export async function runSweep(
           llmInputTokens: pageDeltas.llmInputTokens > 0 ? pageDeltas.llmInputTokens : undefined,
           llmOutputTokens: pageDeltas.llmOutputTokens > 0 ? pageDeltas.llmOutputTokens : undefined,
           embeddingTokens: pageDeltas.embeddingTokens > 0 ? pageDeltas.embeddingTokens : undefined,
-          estimatedCostNanodollars: BigInt(Math.round(runningCostUsd * 1e9)),
+          estimatedCostNanodollars: pageFlushDeltaNano,
         },
         { clock },
       );
+      // Only reset the page delta AFTER the flush above has succeeded.
+      costTracker.resetPageDelta();
 
       // Accumulate into report counts
       counts.sourceSeenCount += pageDeltas.sourceSeenCount;
@@ -1059,7 +1117,7 @@ export async function runSweep(
       counts.llmInputTokens = (counts.llmInputTokens ?? 0) + pageDeltas.llmInputTokens;
       counts.llmOutputTokens = (counts.llmOutputTokens ?? 0) + pageDeltas.llmOutputTokens;
       counts.embeddingTokens = (counts.embeddingTokens ?? 0) + pageDeltas.embeddingTokens;
-      counts.estimatedCostNanodollars = Number(BigInt(Math.round(runningCostUsd * 1e9)));
+      counts.estimatedCostNanodollars = Number(costTracker.spentNanodollars);
 
       isFirstPage = false;
     }
@@ -1082,7 +1140,7 @@ export async function runSweep(
       liveTableName: tableName,
       isUuidId: shape.isUuidId,
       assertLeaseActive: () => heartbeatHandle?.assertActive(),
-    });
+    }, tenantFence);
     if (finalTombstones.tombstonesCount > 0) {
       heartbeatHandle.assertActive();
       counts.sourceDeletedCount += finalTombstones.tombstonesCount;
