@@ -99,28 +99,24 @@ describe("access draft for personal sign-in connections", () => {
 describe("installs after the agent picker changes (TECH-8259)", () => {
   const none = new Set<string>();
 
-  it("installs a picked default-MCP agent", () => {
-    expect(installsAfterPick(none, new Set(["cos"]), new Set(["cos"]))).toEqual(["cos"]);
+  it("installs a picked agent", () => {
+    expect(installsAfterPick(none, new Set(["cos"]))).toEqual(["cos"]);
   });
 
-  it("uninstalls a default-MCP agent that is cleared from the picker", () => {
-    expect(installsAfterPick(new Set(["cos"]), new Set(["cos"]), none)).toEqual([]);
+  it("uninstalls an agent that is cleared from the picker", () => {
+    expect(installsAfterPick(new Set(["cos"]), none)).toEqual([]);
   });
 
-  it("swaps one default-MCP agent for another", () => {
-    expect(installsAfterPick(new Set(["a"]), new Set(["a", "b"]), new Set(["b"]))).toEqual(["b"]);
+  it("swaps one agent for another", () => {
+    expect(installsAfterPick(new Set(["a"]), new Set(["b"]))).toEqual(["b"]);
   });
 
-  it("never touches the installs of agents that are not default-MCP managed", () => {
-    expect(installsAfterPick(new Set(["legacy"]), new Set(["cos"]), new Set(["cos"]))).toEqual(["legacy", "cos"]);
-    expect(installsAfterPick(new Set(["legacy"]), new Set(["cos"]), none)).toBeNull();
+  it("keeps an agent that stays picked and adds the new one", () => {
+    expect(installsAfterPick(new Set(["a"]), new Set(["a", "b"]))).toEqual(["a", "b"]);
   });
 
-  it("does not install a picked agent that is not default-MCP managed", () => {
-    expect(installsAfterPick(none, new Set(["cos"]), new Set(["legacy"]))).toBeNull();
-  });
-
-  it("saves nothing when the managed agents are already installed as picked", () => {
-    expect(installsAfterPick(new Set(["cos"]), new Set(["cos"]), new Set(["cos"]))).toBeNull();
+  it("saves nothing when the installs already match the picks", () => {
+    expect(installsAfterPick(new Set(["cos"]), new Set(["cos"]))).toBeNull();
+    expect(installsAfterPick(none, none)).toBeNull();
   });
 });

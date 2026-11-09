@@ -1295,7 +1295,7 @@ describe("AppDetail", () => {
     expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [{ targetType: "agent", targetId: "agent-1" }]);
   });
 
-  it("TECH-8259: leaves installs alone when the picked agent is not default-MCP managed", async () => {
+  it("TECH-8259: installs a picked agent whatever its type", async () => {
     mockParams.tab = "permissions";
     listProfilesMock.mockResolvedValue({
       profiles: [{
@@ -1324,7 +1324,21 @@ describe("AppDetail", () => {
     });
     await flushReact();
 
-    expect(putConnectionInstallsMock).not.toHaveBeenCalled();
+    expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [{ targetType: "agent", targetId: "agent-1" }]);
+  });
+
+  it("TECH-8259: greys out 'Any agent' on a connection that signs in as one person", async () => {
+    mockParams.tab = "permissions";
+    getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "per_user" }));
+
+    await renderAppDetail();
+
+    const accessGroup = container.querySelector('[role="radiogroup"][aria-label="Which agents can use this connection"]');
+    const anyAgent = Array.from(accessGroup?.querySelectorAll('[role="radio"]') ?? [])
+      .find((radio) => radio.textContent?.includes("Any agent")) as HTMLElement | undefined;
+    expect(anyAgent).toBeTruthy();
+    expect(anyAgent?.hasAttribute("disabled") || anyAgent?.getAttribute("aria-disabled") === "true").toBe(true);
+    expect(container.textContent).toContain("can't be shared with every agent");
   });
 
   it("uses the setup-style agent access question without install terminology", async () => {

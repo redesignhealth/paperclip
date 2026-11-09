@@ -39,6 +39,7 @@ export function PermissionsPanel({
   capabilities,
   permissionChangeWarning,
   anyAgentUnavailableReason,
+  pickerOwnsInstalls,
   actions,
 }: Pick<
   AppDetailSectionProps,
@@ -63,6 +64,8 @@ export function PermissionsPanel({
   permissionChangeWarning?: string;
   /** When set, "Any agent" is unavailable for this connection and the text says why (personal sign-in connections). */
   anyAgentUnavailableReason?: string;
+  /** The picker is the install: choosing an agent installs it and clearing one uninstalls it, so installs never lock a pick. */
+  pickerOwnsInstalls?: boolean;
   /** A credential-only connection can supply its account controls instead of tool actions. */
   actions?: ReactNode;
   /** Supplemental agent settings share the existing connection configuration page. */
@@ -78,6 +81,7 @@ export function PermissionsPanel({
         capabilities={capabilities}
         disabled={pending}
         anyAgentUnavailableReason={anyAgentUnavailableReason}
+        pickerOwnsInstalls={pickerOwnsInstalls}
         onSave={onSaveAccess}
       />
       {afterAgentAccess}
@@ -110,6 +114,7 @@ export function AgentAccessSection({
   capabilities,
   disabled,
   anyAgentUnavailableReason,
+  pickerOwnsInstalls,
   onSave,
 }: {
   agents: Agent[];
@@ -118,6 +123,7 @@ export function AgentAccessSection({
   capabilities: ToolConnectionCapabilities | undefined;
   disabled: boolean;
   anyAgentUnavailableReason?: string;
+  pickerOwnsInstalls?: boolean;
   onSave: (next: AccessDraft) => void;
 }) {
   const liveAgents = agents.filter((agent) => agent.status !== "terminated");
@@ -180,11 +186,11 @@ export function AgentAccessSection({
                 ? "Choose agents"
                 : `${access.agentIds.size} ${access.agentIds.size === 1 ? "agent" : "agents"} selected`}
               emptyMessage="You cannot edit any agents yet."
-              isAgentDisabled={(agent) => requiredAgentIds.has(agent.id)}
-              getDescription={(agent) => requiredAgentIds.has(agent.id) ? "Required by this connection's install setting" : agent.title}
+              isAgentDisabled={(agent) => !pickerOwnsInstalls && requiredAgentIds.has(agent.id)}
+              getDescription={(agent) => !pickerOwnsInstalls && requiredAgentIds.has(agent.id) ? "Required by this connection's install setting" : agent.title}
               onChange={(agentIds) => onSave({
                 mode: "specific",
-                agentIds: new Set([...agentIds, ...requiredAgentIds]),
+                agentIds: pickerOwnsInstalls ? new Set(agentIds) : new Set([...agentIds, ...requiredAgentIds]),
               })}
             />
           ) : null}
