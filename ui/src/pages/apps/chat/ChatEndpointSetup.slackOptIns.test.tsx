@@ -24,9 +24,8 @@ vi.mock("@/lib/router", async () => import("react-router-dom"));
 vi.mock("@/context/BreadcrumbContext", () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }),
 }));
-const company = vi.hoisted(() => ({ visibility: "private" as "private" | "shared" | null }));
 vi.mock("@/context/CompanyContext", () => ({
-  useCompany: () => ({ selectedCompanyId: "company", selectedCompany: { name: "Acme", visibility: company.visibility } }),
+  useCompany: () => ({ selectedCompanyId: "company" }),
 }));
 const pushToast = vi.hoisted(() => vi.fn());
 vi.mock("@/context/ToastContext", () => ({ useToast: () => ({ pushToast }) }));
@@ -74,7 +73,6 @@ function draft(overrides: Partial<ChatEndpoint> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  company.visibility = "private";
   api.get.mockResolvedValue(draft());
   api.slackSetupOptions.mockResolvedValue({ managedAvailable: true, defaultMethod: "managed", workspaces: [] });
   api.update.mockImplementation(async (_id: string, input: Record<string, unknown>) => ({
@@ -166,39 +164,16 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     await vi.waitFor(() => expect(serverGroups).toEqual(finalOn ? ["file_upload"] : []));
     expect(api.update.mock.calls.at(-1)![1].slackOptInScopeGroups).toEqual(finalOn ? ["file_upload"] : []);
   });
-  it("starts a new agent in a shared company with every group off", async () => {
-    company.visibility = "shared";
+  it("shows all three groups off for a new agent", async () => {
     await render();
     await openAgentStep();
+    expect(container.textContent).toContain("Extra Slack permissions");
     for (const label of ["Channel management", "Proactive DMs", "File upload"]) {
       expect(optInCheckbox(label).getAttribute("aria-checked")).toBe("false");
     }
   });
 
-  it("creates the endpoint with no groups requested in a shared company", async () => {
-    company.visibility = "shared";
-    api.create.mockResolvedValue(draft());
-    await render();
-    await openAgentStep();
-    const continueButton = [...container.querySelectorAll("button")]
-      .find((node) => node.textContent === "Continue");
-    await act(async () => continueButton!.click());
-    await vi.waitFor(() => expect(api.create).toHaveBeenCalled());
-    const [, input] = api.create.mock.calls[0]!;
-    expect(input.slackOptInScopeGroups).toEqual([]);
-  });
-
-  it("shows Proactive DMs on and the other groups off for a new agent in a private company", async () => {
-    await render();
-    await openAgentStep();
-    expect(container.textContent).toContain("Extra Slack permissions");
-    expect(optInCheckbox("Proactive DMs").getAttribute("aria-checked")).toBe("true");
-    for (const label of ["Channel management", "File upload"]) {
-      expect(optInCheckbox(label).getAttribute("aria-checked")).toBe("false");
-    }
-  });
-
-  it("creates the endpoint with Proactive DMs requested in a private company", async () => {
+  it("creates the endpoint with an explicit empty opt-in list by default", async () => {
     api.create.mockResolvedValue(draft());
     await render();
     await openAgentStep();
@@ -208,7 +183,7 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     await act(async () => continueButton!.click());
     await vi.waitFor(() => expect(api.create).toHaveBeenCalled());
     const [, input] = api.create.mock.calls[0]!;
-    expect(input.slackOptInScopeGroups).toEqual(["proactive_dms"]);
+    expect(input.slackOptInScopeGroups).toEqual([]);
   });
 
   it("creates the endpoint with the chosen group when selected before creation", async () => {
@@ -221,7 +196,7 @@ describe("Slack opt-ins on the Choose-agent step", () => {
     await act(async () => continueButton!.click());
     await vi.waitFor(() => expect(api.create).toHaveBeenCalled());
     const [, input] = api.create.mock.calls[0]!;
-    expect(input.slackOptInScopeGroups).toEqual(["proactive_dms", "file_upload"]);
+    expect(input.slackOptInScopeGroups).toEqual(["file_upload"]);
   });
 
   it("persists a toggle on an existing draft with only the opt-in field", async () => {

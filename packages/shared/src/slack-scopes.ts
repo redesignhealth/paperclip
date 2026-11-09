@@ -74,9 +74,6 @@ export const SLACK_OPT_IN_BOT_SCOPE_GROUPS = {
 export type SlackOptInScopeGroup =
   keyof typeof SLACK_OPT_IN_BOT_SCOPE_GROUPS;
 
-/** The opt-in groups a NEW Slack app starts with. Existing apps keep whatever they already requested. */
-export const SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS: readonly SlackOptInScopeGroup[] = ["proactive_dms"];
-
 export const SLACK_OPT_IN_SCOPE_GROUPS = Object.keys(
   SLACK_OPT_IN_BOT_SCOPE_GROUPS,
 ) as SlackOptInScopeGroup[];

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS,
   SLACK_DEFAULT_BOT_SCOPES,
   SLACK_OPT_IN_SCOPE_GROUPS,
   SLACK_TOOLS,
@@ -325,10 +324,5 @@ describe("Proactive DMs with other people (TECH-8286)", () => {
       ),
     ).toBe(false);
     expect(await slackOtherUserDmsEnabled(db, endpoint({ slackOptInScopeGroups: [], slackInstalledOptInScopeGroups: [] }))).toBe(false);
-  });
-
-  it("new Slack apps start with Proactive DMs and nothing else", () => {
-    expect([...SLACK_DEFAULT_OPT_IN_SCOPE_GROUPS]).toEqual(["proactive_dms"]);
-    expect(SLACK_OPT_IN_SCOPE_GROUPS).toContain("proactive_dms");
   });
 });
