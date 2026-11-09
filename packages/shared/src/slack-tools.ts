@@ -77,8 +77,15 @@ export const SLACK_TOOLS = [
     "conversations.open",
     ["im:write"],
     "write",
-    "Open or resume this bot's DM with the current task's linked requester. Returns a channel ID for slack_post_message. Never opens another person's DM.",
-    write,
+    "Open or resume this bot's DM with the current task's linked requester, or with another active workspace member when you pass their Slack user ID in `user`. Returns a channel ID for slack_post_message. Never DMs bots, deactivated users, guests or people outside this workspace.",
+    {
+      ...write,
+      user: user
+        .optional()
+        .describe(
+          "Slack user ID (for example U012AB3CD) of the workspace member to DM. Omit to DM the current task's linked requester. Do not guess an ID; use one from a mention or the request (slack_user takes an ID, it cannot search by name).",
+        ),
+    },
   ),
   tool(
     "delivery",

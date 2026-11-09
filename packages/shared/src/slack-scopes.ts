@@ -60,7 +60,7 @@ export const SLACK_OPT_IN_BOT_SCOPE_GROUPS = {
   proactive_dms: {
     label: "Proactive DMs",
     description:
-      "Open a direct message with the person this agent is working for. Enabling this sends this agent's Slack install to admin review.",
+      "Send direct messages to people in your Slack workspace, including the person this agent is working for. Enabling this sends this agent's Slack install to admin review.",
     scopes: ["im:write"],
   },
   file_upload: {

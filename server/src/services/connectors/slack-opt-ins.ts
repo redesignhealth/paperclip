@@ -259,6 +259,20 @@ export async function slackEndpointOptInsForGating(
   };
 }
 
+/**
+ * True when this endpoint's install holds Proactive DMs, the opt-in that lets the bot DM other workspace members
+ * (not only the person the task is for). Same requested-and-installed rule as tool gating.
+ */
+export async function slackOtherUserDmsEnabled(
+  db: SlackReadExecutor,
+  endpoint: { id: string; companyId: string; setup: SlackSetupOptIns | null },
+): Promise<boolean> {
+  return slackEnabledOptInGroups(
+    endpoint.setup,
+    await slackEndpointOptInsForGating(db, endpoint),
+  ).includes("proactive_dms");
+}
+
 /** Capability/tool listing that must match runtime gating exactly. */
 export async function slackEnabledToolsForEndpoint(
   db: Db,

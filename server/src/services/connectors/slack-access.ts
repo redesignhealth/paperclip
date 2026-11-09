@@ -10,10 +10,34 @@ import {
 } from "./slack-client.js";
 
 type Api = ReturnType<typeof slackClient>;
+export type SlackChannelAuthorizationOptions = {
+  /** Proactive DMs is enabled: a DM with another active workspace member may be read and written. */
+  allowOtherUserDm?: boolean;
+};
+
+/** An active, full member of the bot's own workspace: not deleted, not a bot, not a guest, not from another team. */
+async function assertActiveWorkspaceMember(
+  authority: Pick<SlackTaskAuthority, "endpoint">,
+  api: Api,
+  userId: string,
+) {
+  const other = object((await api("users.info", { user: userId })).user);
+  if (
+    other.id !== userId ||
+    other.deleted === true ||
+    other.is_bot === true ||
+    other.is_restricted === true ||
+    other.is_ultra_restricted === true ||
+    other.team_id !== authority.endpoint.providerAccountId
+  )
+    throw forbidden("That Slack user is not an active member of this workspace");
+}
+
 export async function authorizeSlackChannel(
   authority: Pick<SlackTaskAuthority, "endpoint" | "slackUserId">,
   api: Api,
   channelId: string,
+  options: SlackChannelAuthorizationOptions = {},
 ) {
   let channel: SlackObject;
   try {
@@ -53,8 +77,11 @@ export async function authorizeSlackChannel(
       "The linked Slack user is no longer an active workspace member",
     );
   if (channel.is_im === true) {
-    if (channel.user !== authority.slackUserId)
-      throw forbidden("Other people's bot DMs are not accessible");
+    if (channel.user !== authority.slackUserId) {
+      if (options.allowOtherUserDm !== true || typeof channel.user !== "string")
+        throw forbidden("Other people's bot DMs are not accessible");
+      await assertActiveWorkspaceMember(authority, api, channel.user);
+    }
     return channel;
   }
   // Public channels follow workspace rules. Guests and Slack Connect users need
@@ -104,8 +131,9 @@ export async function authorizeSlackWrite(
   authority: SlackTaskAuthority,
   api: Api,
   channelId: string,
+  options: SlackChannelAuthorizationOptions = {},
 ) {
-  const channel = await authorizeSlackChannel(authority, api, channelId);
+  const channel = await authorizeSlackChannel(authority, api, channelId, options);
   if (channel.is_archived === true)
     throw forbidden("This Slack channel is archived");
   if (channel.is_im === true) {
@@ -136,7 +164,9 @@ export async function authorizeSlackWrite(
       authority.endpoint.id,
       authority.issueId,
       channelId,
-      channel.is_im === true ? authority.slackUserId : null,
+      // The existing rule: private research may only go to its source channel or a DM with the requester. A DM is
+      // delivered to its other party, so the requester's own DM matches and a DM with anyone else does not.
+      channel.is_im === true && typeof channel.user === "string" ? channel.user : null,
     ))
   )
     throw forbidden(
