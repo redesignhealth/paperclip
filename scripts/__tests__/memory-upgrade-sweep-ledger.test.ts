@@ -13,6 +13,7 @@ import {
   openTenantClient,
   reconcileChangedContent,
   reconcileTombstones,
+  UPGRADE_LEDGER_OUTCOMES,
   VALID_NOISE_REASONS,
   VALID_UNROUTABLE_REASONS,
   validateOutcomeReason,
@@ -648,49 +649,98 @@ test("sweep-tenant ledger operations", async (t) => {
     assert.ok(!isValidVectorType("int"));
   });
 
-  await t.test("validateOutcomeReason direct tests: all KNOWN_SENSITIVE_FAMILY_NAMES camelCase pass", async () => {
-    // 1. Confirm each individual sensitive family in camelCase passes validation
-    for (const family of KNOWN_SENSITIVE_FAMILY_NAMES) {
-      const validated = validateOutcomeReason("dropped_sensitive", family);
-      assert.equal(validated, family, `Sensitive family ${family} must pass validation`);
+  await t.test("validateOutcomeReason runtime outcome allowlist validation and reason rules", async () => {
+    // 1. Runtime reject unknown/invalid outcome before branching
+    const invalidOutcomes = ["", " ", "   ", "\t\n", "bogus_outcome", "DROPPED_NOISE", "published ", null, undefined];
+    for (const invalid of invalidOutcomes) {
+      assert.throws(
+        () => validateOutcomeReason(invalid as any, null),
+        (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+        `Outcome '${invalid}' must be rejected with INVALID_ARGUMENT`,
+      );
     }
 
-    // 2. Confirm sorted, deduplicated multi-token combinations pass
-    const allSorted = [...KNOWN_SENSITIVE_FAMILY_NAMES].sort().join(",");
-    const validatedAll = validateOutcomeReason("dropped_sensitive", allSorted);
-    assert.equal(validatedAll, allSorted);
+    // 2. Literal-positive sets pinned for all 8 valid ledger outcomes
+    const expectedOutcomes = [
+      "published",
+      "dropped_noise",
+      "deduplicated",
+      "dropped_sensitive",
+      "unroutable",
+      "quarantined",
+      "superseded",
+      "source_deleted",
+    ];
+    assert.deepEqual([...UPGRADE_LEDGER_OUTCOMES], expectedOutcomes);
 
-    const twoFamilies = [KNOWN_SENSITIVE_FAMILY_NAMES[0], KNOWN_SENSITIVE_FAMILY_NAMES[1]].sort().join(",");
-    assert.equal(validateOutcomeReason("dropped_sensitive", twoFamilies), twoFamilies);
-
-    // 3. Confirm unroutable and dropped_noise valid reasons pass
-    for (const r of VALID_UNROUTABLE_REASONS) {
-      assert.equal(validateOutcomeReason("unroutable", r), r);
-    }
+    // Literal-positive: dropped_noise
     for (const r of VALID_NOISE_REASONS) {
       assert.equal(validateOutcomeReason("dropped_noise", r), r);
     }
+    // Literal-positive: unroutable
+    for (const r of VALID_UNROUTABLE_REASONS) {
+      assert.equal(validateOutcomeReason("unroutable", r), r);
+    }
+    // Literal-positive: dropped_sensitive (individual and sorted multi-token)
+    for (const family of KNOWN_SENSITIVE_FAMILY_NAMES) {
+      assert.equal(validateOutcomeReason("dropped_sensitive", family), family);
+    }
+    const allSensitiveSorted = [...KNOWN_SENSITIVE_FAMILY_NAMES].sort().join(",");
+    assert.equal(validateOutcomeReason("dropped_sensitive", allSensitiveSorted), allSensitiveSorted);
+    const twoSensitiveSorted = [KNOWN_SENSITIVE_FAMILY_NAMES[0], KNOWN_SENSITIVE_FAMILY_NAMES[1]].sort().join(",");
+    assert.equal(validateOutcomeReason("dropped_sensitive", twoSensitiveSorted), twoSensitiveSorted);
 
-    // 4. Invalids throw INVALID_ARGUMENT
-    assert.throws(
-      () => validateOutcomeReason("dropped_sensitive", "unknown_family"),
-      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
-    );
-    assert.throws(
-      () => validateOutcomeReason("dropped_sensitive", "apiKey,apiKey"), // duplicate
-      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
-    );
-    assert.throws(
-      () => validateOutcomeReason("dropped_sensitive", "ssn,apiKey"), // unsorted
-      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
-    );
-    assert.throws(
-      () => validateOutcomeReason("unroutable", "bogus_unroutable"),
-      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
-    );
-    assert.throws(
-      () => validateOutcomeReason("dropped_noise", "bogus_noise"),
-      (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
-    );
+    // Literal-positive: published, deduplicated, quarantined permit null or valid string reason
+    for (const o of ["published", "deduplicated", "quarantined"] as const) {
+      assert.equal(validateOutcomeReason(o, null), null);
+      assert.equal(validateOutcomeReason(o, undefined), null);
+      assert.equal(validateOutcomeReason(o, "valid_reason_code"), "valid_reason_code");
+    }
+
+    // Literal-positive: superseded and source_deleted only permit null/undefined
+    for (const o of ["superseded", "source_deleted"] as const) {
+      assert.equal(validateOutcomeReason(o, null), null);
+      assert.equal(validateOutcomeReason(o, undefined), null);
+    }
+
+    // 3. Cross-outcome negative tests
+    const crossNegatives: Array<[any, any]> = [
+      ["dropped_noise", "no_routable_text"], // unroutable reason given to dropped_noise
+      ["unroutable", "empty"], // noise reason given to unroutable
+      ["dropped_noise", "apiKey"], // sensitive family given to dropped_noise
+      ["dropped_sensitive", "exact_placeholder_or_greeting"], // noise reason given to dropped_sensitive
+      ["superseded", "some_reason"], // superseded forbids reason
+      ["source_deleted", "some_reason"], // source_deleted forbids reason
+    ];
+    for (const [outcome, reason] of crossNegatives) {
+      assert.throws(
+        () => validateOutcomeReason(outcome, reason),
+        (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+      );
+    }
+
+    // 4. Empty, whitespace, unsorted, duplicate, and unknown reasonCode negatives
+    const reasonNegatives: Array<[any, any]> = [
+      ["unroutable", ""],
+      ["unroutable", "  "],
+      ["unroutable", "bogus_unroutable"],
+      ["dropped_noise", ""],
+      ["dropped_noise", " "],
+      ["dropped_noise", "bogus_noise"],
+      ["dropped_sensitive", ""],
+      ["dropped_sensitive", "   "],
+      ["dropped_sensitive", "unknown_family"],
+      ["dropped_sensitive", "apiKey,apiKey"], // duplicate
+      ["dropped_sensitive", "ssn,apiKey"], // unsorted
+      ["published", ""], // empty reason string
+      ["published", "   "], // whitespace reason string
+      ["published", 12345], // non-string reason
+    ];
+    for (const [outcome, reason] of reasonNegatives) {
+      assert.throws(
+        () => validateOutcomeReason(outcome, reason),
+        (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+      );
+    }
   });
 });

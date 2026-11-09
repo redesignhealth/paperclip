@@ -93,115 +93,64 @@ export const ALLOWED_SWEEP_FLAGS = new Set([
   "--format",
 ]);
 
+/**
+ * Scrubs postgres/postgresql diagnostic DSN candidates from text, replacing full URL
+ * candidates with [REDACTED_DATABASE_URL], and standalone query passwords (?password=...)
+ * with ?password=***.
+ *
+ * Designed exclusively for diagnostic DSN masking; does not promise generic redaction
+ * of arbitrary standalone secrets in prose.
+ */
 export function scrubDsnSecrets(text: string): string {
   if (!text) return "";
-  let result = text;
-  const secrets = new Set<string>();
 
-  // 1. Identify URL candidates and redact credentials in-place.
-  // Supports postgres://, postgresql:// and +driver variants like postgresql+asyncpg://
-  const urlCandidateRegex = /(postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/)([^\s"'<>]+)/g;
-  result = result.replace(urlCandidateRegex, (_fullMatch, scheme, rest) => {
-    // If no '@' exists anywhere in rest, there is no userinfo credential to redact.
-    if (!rest.includes("@")) {
-      return scheme + rest;
+  const lines = text.split("\n");
+  const schemeRegex = /postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\//i;
+
+  const scrubbedLines = lines.map((line) => {
+    // If the line doesn't contain a postgres scheme, skip DSN candidate processing
+    if (!schemeRegex.test(line)) {
+      return line;
     }
 
-    const firstSep = rest.search(/[\/?#]/);
+    // Check for suspicious postgres candidate where malformed password containing
+    // unescaped whitespace or quotes could escape the candidate bound before host '@'.
+    // E.g.: postgres://user:p ass@host or postgres://user:p"ass@host
+    // If there is an '@' after the scheme on the line, but separated from '://' by
+    // whitespace or quotes, or if an unclosed quote exists, conservatively mask the remaining
+    // line from the scheme onward to prevent secret leakage.
+    const schemeMatch = line.match(/(postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/)/i);
+    if (schemeMatch && schemeMatch.index !== undefined) {
+      const schemeStart = schemeMatch.index;
+      const afterScheme = line.slice(schemeStart + schemeMatch[0].length);
 
-    let userinfo: string;
-    let hostPort: string;
-    let remainder: string;
+      // Candidate bound stops at whitespace, quotes, or angle brackets
+      const candidateMatch = afterScheme.match(/^[^\s"'<>]+/);
+      const matchedLen = candidateMatch ? candidateMatch[0].length : 0;
+      const remainder = afterScheme.slice(matchedLen);
 
-    if (firstSep === -1) {
-      // No '/', '?', or '#' in URL: authority extends to end of rest.
-      // Use the last '@' to separate userinfo and host.
-      const lastAt = rest.lastIndexOf("@");
-      userinfo = rest.slice(0, lastAt);
-      hostPort = rest.slice(lastAt + 1);
-      remainder = "";
-    } else {
-      // Check if there is an '@' before the first path/query/fragment delimiter
-      const atBeforeSep = rest.slice(0, firstSep).lastIndexOf("@");
-      if (atBeforeSep !== -1) {
-        // Standard URL: userinfo terminates at last '@' before path/query/fragment
-        userinfo = rest.slice(0, atBeforeSep);
-        hostPort = rest.slice(atBeforeSep + 1, firstSep);
-        remainder = rest.slice(firstSep);
-      } else {
-        // No '@' before firstSep.
-        // Check for malformed URL where password contains unencoded '/', '?', or '#'.
-        // Look at last '@' in rest where credential authority can be recognized.
-        const lastAt = rest.lastIndexOf("@");
-        const candidateUserinfo = rest.slice(0, lastAt);
-        const colonIdx = candidateUserinfo.indexOf(":");
-
-        // Credential authority is recognized if there is a ':' separating username and password.
-        // If the ':' is followed only by digits before firstSep (e.g. host:5432/path?email=foo@bar),
-        // it is a host:port pair rather than user:password credentials.
-        const isPortColon =
-          colonIdx !== -1 &&
-          colonIdx < firstSep &&
-          /^\d+$/.test(candidateUserinfo.slice(colonIdx + 1, firstSep));
-
-        if (colonIdx !== -1 && !isPortColon) {
-          // Credential authority recognized using last @ despite unencoded separators
-          userinfo = candidateUserinfo;
-          const hostSep = rest.slice(lastAt + 1).search(/[\/?#]/);
-          if (hostSep === -1) {
-            hostPort = rest.slice(lastAt + 1);
-            remainder = "";
-          } else {
-            hostPort = rest.slice(lastAt + 1, lastAt + 1 + hostSep);
-            remainder = rest.slice(lastAt + 1 + hostSep);
-          }
-        } else {
-          // No recognizable credentials before '@': robust fallback to firstSep authority boundary
-          return scheme + rest;
-        }
+      // Ambiguity detection: if the candidate match didn't encompass '@', but '@'
+      // appears later on the remaining line (separated by whitespace/quote),
+      // this is a malformed candidate escaping bound.
+      if (remainder.includes("@")) {
+        return line.slice(0, schemeStart) + "[REDACTED_DATABASE_URL]";
       }
     }
 
-    const colonIdx = userinfo.indexOf(":");
-    let redactedUserinfo: string;
-    if (colonIdx !== -1) {
-      const user = userinfo.slice(0, colonIdx);
-      const pass = userinfo.slice(colonIdx + 1);
-      if (pass) {
-        secrets.add(pass);
-        try {
-          secrets.add(decodeURIComponent(pass));
-        } catch {}
-      }
-      redactedUserinfo = `${user}:***`;
-    } else {
-      // Username-only (e.g. postgres://postgres@host): do NOT collect username as secret.
-      redactedUserinfo = userinfo;
-    }
-
-    return `${scheme}${redactedUserinfo}@${hostPort}${remainder}`;
+    // Conservative full DSN candidate replacement:
+    // Any postgres/postgresql/+driver candidate until whitespace, quotes, or angle brackets
+    // is replaced with [REDACTED_DATABASE_URL]. No parser branch returns the input URL.
+    const urlCandidateRegex = /postgres(?:ql)?(?:\+[a-zA-Z0-9_.-]+)?:\/\/[^\s"'<>]+/gi;
+    return line.replace(urlCandidateRegex, "[REDACTED_DATABASE_URL]");
   });
 
-  // 2. Redact query parameter passwords (?password=... or &password=...) anywhere in text
+  let result = scrubbedLines.join("\n");
+
+  // Redact standalone query parameter passwords (?password=... or &password=...) anywhere in text
   const queryParamRegex = /([?&]password=)[^&#\s]*/gi;
   result = result.replace(queryParamRegex, (_m, prefix) => {
     return `${prefix}***`;
   });
-
-  // 3. For any extracted secrets from URLs, only redact in arbitrary prose if length >= 8
-  // to avoid corrupting diagnostic codes or normal English words with short passwords like 'a'.
-  // Never replace common infrastructure identifiers in prose.
-  const BANNED_SECRET_PROSE_REPLACEMENTS = new Set(["postgres", "postgresql", "localhost", "127.0.0.1"]);
-  for (const secret of secrets) {
-    if (
-      secret &&
-      secret.length >= 8 &&
-      secret !== "***" &&
-      !BANNED_SECRET_PROSE_REPLACEMENTS.has(secret.toLowerCase())
-    ) {
-      result = result.replaceAll(secret, "***");
-    }
-  }
 
   return result;
 }
@@ -568,6 +517,9 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
 
   ABORTED_BY_OPERATOR: "Upgrade aborted by operator.",
   aborted_by_operator: "Upgrade aborted by operator.",
+
+  PROD_GUARD_ENFORCED: "Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1).",
+  prod_guard_enforced: "Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1).",
 };
 
 const SAFE_COMPANY_BINDING_MISMATCH_MESSAGES = new Set([
@@ -647,7 +599,7 @@ export function sanitizeCliErrorMessage(error: unknown): string {
       }
 
       if (code === "PROD_GUARD_ENFORCED" || code === "prod_guard_enforced") {
-        return `[${code}] ${scrubDsnSecrets(rawMsg)}`;
+        return `[${code}] Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1).`;
       }
 
       if (code === "INVALID_DATABASE_URL" || code === "invalid_database_url") {

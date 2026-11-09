@@ -36,26 +36,32 @@ test("sweep CLI validation and flags", async (t) => {
     const raw = "Connection failed to postgres://app_user:super_secret_password@db.internal.net:5432/db_prod";
     const scrubbed = scrubDsnSecrets(raw);
     assert.ok(!scrubbed.includes("super_secret_password"));
-    assert.ok(scrubbed.includes("postgres://app_user:***@db.internal.net:5432/db_prod"));
+    assert.equal(scrubbed, "Connection failed to [REDACTED_DATABASE_URL]");
 
     // Empty username
     const emptyUser = "postgres://:secret_pass_123@localhost:5432/mydb";
     assert.ok(!scrubDsnSecrets(emptyUser).includes("secret_pass_123"));
-    assert.ok(scrubDsnSecrets(emptyUser).includes("postgres://:***@localhost:5432/mydb"));
+    assert.equal(scrubDsnSecrets(emptyUser), "[REDACTED_DATABASE_URL]");
 
     // Password containing @ or special characters
     const passWithAt = "postgres://u:pass%40word123@localhost:5432/mydb";
     const scrubbedAt = scrubDsnSecrets(passWithAt);
     assert.ok(!scrubbedAt.includes("pass%40word123"));
     assert.ok(!scrubbedAt.includes("pass@word123"));
-    assert.ok(scrubbedAt.includes("postgres://u:***@localhost:5432/mydb"));
+    assert.equal(scrubbedAt, "[REDACTED_DATABASE_URL]");
 
-    // Query param password
+    // Query param password inside DSN candidate is whole-URL masked
     const queryPass = "postgres://u:pass1@localhost:5432/mydb?password=query_secret_456&ssl=true";
     const scrubbedQuery = scrubDsnSecrets(queryPass);
     assert.ok(!scrubbedQuery.includes("query_secret_456"));
     assert.ok(!scrubbedQuery.includes("pass1"));
-    assert.ok(scrubbedQuery.includes("password=***"));
+    assert.equal(scrubbedQuery, "[REDACTED_DATABASE_URL]");
+
+    // Standalone query param password
+    const standaloneQuery = "Details: ?password=query_secret_456&ssl=true";
+    const scrubbedStandalone = scrubDsnSecrets(standaloneQuery);
+    assert.ok(!scrubbedStandalone.includes("query_secret_456"));
+    assert.equal(scrubbedStandalone, "Details: ?password=***&ssl=true");
   });
 
   await t.test("--help works even with unexpected or unknown flags", async () => {
@@ -190,8 +196,9 @@ test("sweep CLI validation and flags", async (t) => {
         "--confirm", validUuid,
       ], { env: {} });
       assert.equal(exitA, 1);
-      assert.ok(stderr.includes("Refusing to connect to non-local host 'rds.us-east-1.amazonaws.com' without --prod flag and MEMORY_UPGRADE_ALLOW_PROD=1"));
-      assert.ok(!stderr.includes("secret123")); // Password scrubbed!
+      assert.ok(stderr.includes("[PROD_GUARD_ENFORCED] Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1)."));
+      assert.ok(!stderr.includes("secret123")); // Password scrubbed
+      assert.ok(!stderr.includes("rds.us-east-1.amazonaws.com")); // Downstream host not echoed
 
       // Case B: Remote tenant DSN with flag only
       stderr = "";
@@ -203,7 +210,9 @@ test("sweep CLI validation and flags", async (t) => {
         "--prod",
       ], { env: {} });
       assert.equal(exitB, 1);
-      assert.ok(stderr.includes("Refusing to connect to non-local host 'rds.us-east-1.amazonaws.com' without MEMORY_UPGRADE_ALLOW_PROD=1"));
+      assert.ok(stderr.includes("[PROD_GUARD_ENFORCED] Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1)."));
+      assert.ok(!stderr.includes("secret123"));
+      assert.ok(!stderr.includes("rds.us-east-1.amazonaws.com"));
 
       // Case C: Remote tenant DSN with env only
       stderr = "";
@@ -214,7 +223,9 @@ test("sweep CLI validation and flags", async (t) => {
         "--confirm", validUuid,
       ], { env: { MEMORY_UPGRADE_ALLOW_PROD: "1" } });
       assert.equal(exitC, 1);
-      assert.ok(stderr.includes("Refusing to connect to non-local host 'rds.us-east-1.amazonaws.com' without --prod flag"));
+      assert.ok(stderr.includes("[PROD_GUARD_ENFORCED] Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1)."));
+      assert.ok(!stderr.includes("secret123"));
+      assert.ok(!stderr.includes("rds.us-east-1.amazonaws.com"));
 
       // Case D: Remote control-plane DSN without flag or env
       stderr = "";
@@ -225,8 +236,9 @@ test("sweep CLI validation and flags", async (t) => {
         "--confirm", validUuid,
       ], { env: {} });
       assert.equal(exitD, 1);
-      assert.ok(stderr.includes("Refusing to connect to non-local host 'rds.us-east-1.amazonaws.com' without --prod flag and MEMORY_UPGRADE_ALLOW_PROD=1"));
+      assert.ok(stderr.includes("[PROD_GUARD_ENFORCED] Refusing to connect to non-local database target without production confirmation (--prod and MEMORY_UPGRADE_ALLOW_PROD=1)."));
       assert.ok(!stderr.includes("secret123"));
+      assert.ok(!stderr.includes("rds.us-east-1.amazonaws.com"));
     } finally {
       console.error = origError;
     }

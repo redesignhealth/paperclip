@@ -109,6 +109,7 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
       "SOURCE_READ_FAILED",
       "DATABASE_IDENTITY_UNAVAILABLE",
       "INVALID_DATABASE_URL",
+      "PROD_GUARD_ENFORCED",
     ];
 
     for (const code of requiredCodes) {
@@ -202,66 +203,112 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
     }
   });
 
-  // 5. Comprehensive DSN scrub tests
-  await t.test("scrubDsnSecrets handles unencoded @, +driver, empty user/query, and short passwords", () => {
+  // 5. Comprehensive conservative DSN scrub tests
+  await t.test("scrubDsnSecrets replaces entire candidate with [REDACTED_DATABASE_URL] without leaking malformed secrets", () => {
     // Unencoded @ in password
     const unencodedAt = "postgres://user:p@ss@word@dbhost:5432/mydb";
     const scrubbedUnencoded = scrubDsnSecrets(unencodedAt);
-    assert.equal(scrubbedUnencoded, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedUnencoded, "[REDACTED_DATABASE_URL]");
     assert.ok(!scrubbedUnencoded.includes("p@ss"));
     assert.ok(!scrubbedUnencoded.includes("word"));
 
     // URL-encoded @ in password
     const encodedAt = "postgres://user:p%40ss%40word@dbhost:5432/mydb";
     const scrubbedEncoded = scrubDsnSecrets(encodedAt);
-    assert.equal(scrubbedEncoded, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedEncoded, "[REDACTED_DATABASE_URL]");
 
     // Unencoded '/', '?', '#' in password
     const unencodedSlash = "postgres://user:p/a/s/s@dbhost:5432/mydb";
     const scrubbedSlash = scrubDsnSecrets(unencodedSlash);
-    assert.equal(scrubbedSlash, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedSlash, "[REDACTED_DATABASE_URL]");
     assert.ok(!scrubbedSlash.includes("p/a/s/s"));
 
     const unencodedQuestion = "postgres://user:p?a?s?s@dbhost:5432/mydb";
     const scrubbedQuestion = scrubDsnSecrets(unencodedQuestion);
-    assert.equal(scrubbedQuestion, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedQuestion, "[REDACTED_DATABASE_URL]");
     assert.ok(!scrubbedQuestion.includes("p?a?s?s"));
 
     const unencodedHash = "postgres://user:p#a#s#s@dbhost:5432/mydb";
     const scrubbedHash = scrubDsnSecrets(unencodedHash);
-    assert.equal(scrubbedHash, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedHash, "[REDACTED_DATABASE_URL]");
     assert.ok(!scrubbedHash.includes("p#a#s#s"));
 
     const unencodedMixed = "postgres://user:p/a#s?s@dbhost:5432/mydb";
     const scrubbedMixed = scrubDsnSecrets(unencodedMixed);
-    assert.equal(scrubbedMixed, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedMixed, "[REDACTED_DATABASE_URL]");
     assert.ok(!scrubbedMixed.includes("p/a#s?s"));
 
     // URL-encoded '/', '?', '#' in password
     const encodedSlash = "postgres://user:p%2Fa%2Fs%2Fs@dbhost:5432/mydb";
     const scrubbedEncodedSlash = scrubDsnSecrets(encodedSlash);
-    assert.equal(scrubbedEncodedSlash, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedEncodedSlash, "[REDACTED_DATABASE_URL]");
 
     const encodedQuestion = "postgres://user:p%3Fa%3Fs%3Fs@dbhost:5432/mydb";
     const scrubbedEncodedQuestion = scrubDsnSecrets(encodedQuestion);
-    assert.equal(scrubbedEncodedQuestion, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedEncodedQuestion, "[REDACTED_DATABASE_URL]");
 
     const encodedHash = "postgres://user:p%23a%23s%23s@dbhost:5432/mydb";
     const scrubbedEncodedHash = scrubDsnSecrets(encodedHash);
-    assert.equal(scrubbedEncodedHash, "postgres://user:***@dbhost:5432/mydb");
+    assert.equal(scrubbedEncodedHash, "[REDACTED_DATABASE_URL]");
 
-    // Username-only: postgres://postgres@host must NOT corrupt scheme into ***://
+    // Literal required shape: digit-leading user:1234/abcd@host
+    const digitLeading = "postgres://user:1234/abcd@host:5432/mydb";
+    const scrubbedDigitLeading = scrubDsnSecrets(digitLeading);
+    assert.equal(scrubbedDigitLeading, "[REDACTED_DATABASE_URL]");
+    assert.ok(!scrubbedDigitLeading.includes("1234"));
+    assert.ok(!scrubbedDigitLeading.includes("abcd"));
+
+    // Literal required shape: combined @+separator p@ss/word@host
+    const combinedAtSep = "postgres://user:p@ss/word@host:5432/mydb";
+    const scrubbedCombinedAtSep = scrubDsnSecrets(combinedAtSep);
+    assert.equal(scrubbedCombinedAtSep, "[REDACTED_DATABASE_URL]");
+    assert.ok(!scrubbedCombinedAtSep.includes("p@ss"));
+    assert.ok(!scrubbedCombinedAtSep.includes("word"));
+
+    // Literal required shape: IPv6
+    const ipv6Standard = "postgres://user:pass@[::1]:5432/mydb";
+    const scrubbedIpv6 = scrubDsnSecrets(ipv6Standard);
+    assert.equal(scrubbedIpv6, "[REDACTED_DATABASE_URL]");
+
+    const ipv6Full = "postgres://user:pass@[2001:db8::1]:5432/mydb";
+    const scrubbedIpv6Full = scrubDsnSecrets(ipv6Full);
+    assert.equal(scrubbedIpv6Full, "[REDACTED_DATABASE_URL]");
+
+    // Literal required shape: Query email cases
+    const queryEmailUserinfo = "postgres://user:pass@dbhost:5432/mydb?contact=foo@example.com";
+    const scrubbedQueryEmailUser = scrubDsnSecrets(queryEmailUserinfo);
+    assert.equal(scrubbedQueryEmailUser, "[REDACTED_DATABASE_URL]");
+
+    const queryEmailBare = "postgres://dbhost:5432/mydb?contact=foo@example.com";
+    const scrubbedQueryEmailBare = scrubDsnSecrets(queryEmailBare);
+    assert.equal(scrubbedQueryEmailBare, "[REDACTED_DATABASE_URL]");
+
+    // Malformed passwords with quote or space escaping candidate bound: conservative remaining line mask
+    const spaceMalformed = "postgres://user:p ass@dbhost:5432/mydb";
+    const scrubbedSpace = scrubDsnSecrets(spaceMalformed);
+    assert.equal(scrubbedSpace, "[REDACTED_DATABASE_URL]");
+    assert.ok(!scrubbedSpace.includes("p ass"));
+
+    const doubleQuoteMalformed = 'postgres://user:p"ass@dbhost:5432/mydb';
+    const scrubbedDoubleQuote = scrubDsnSecrets(doubleQuoteMalformed);
+    assert.equal(scrubbedDoubleQuote, "[REDACTED_DATABASE_URL]");
+    assert.ok(!scrubbedDoubleQuote.includes('p"ass'));
+
+    const singleQuoteMalformed = "postgres://user:p'ass@dbhost:5432/mydb";
+    const scrubbedSingleQuote = scrubDsnSecrets(singleQuoteMalformed);
+    assert.equal(scrubbedSingleQuote, "[REDACTED_DATABASE_URL]");
+    assert.ok(!scrubbedSingleQuote.includes("p'ass"));
+
+    // Username-only: safely whole-URL masked to [REDACTED_DATABASE_URL]
     const usernameOnly = "postgres://postgres@host";
     const scrubbedUserOnly = scrubDsnSecrets(usernameOnly);
-    assert.equal(scrubbedUserOnly, "postgres://postgres@host");
-    assert.ok(scrubbedUserOnly.startsWith("postgres://"), "Scheme must not be corrupted to ***://");
+    assert.equal(scrubbedUserOnly, "[REDACTED_DATABASE_URL]");
 
     const usernameOnlyWithPort = "postgres://postgres@localhost:5432/mydb";
     const scrubbedUserOnlyWithPort = scrubDsnSecrets(usernameOnlyWithPort);
-    assert.equal(scrubbedUserOnlyWithPort, "postgres://postgres@localhost:5432/mydb");
-    assert.ok(scrubbedUserOnlyWithPort.startsWith("postgres://"), "Scheme must not be corrupted to ***://");
+    assert.equal(scrubbedUserOnlyWithPort, "[REDACTED_DATABASE_URL]");
 
-    // +driver schemes
+    // +driver schemes: all fully masked
     const driverSchemes = [
       "postgresql+asyncpg://admin:supersecret@localhost:5432/proddb",
       "postgres+psycopg2://admin:supersecret@localhost:5432/proddb",
@@ -269,28 +316,42 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
     ];
     for (const dsn of driverSchemes) {
       const scrubbed = scrubDsnSecrets(dsn);
+      assert.equal(scrubbed, "[REDACTED_DATABASE_URL]");
       assert.ok(!scrubbed.includes("supersecret"));
-      assert.ok(scrubbed.includes(":***@"));
     }
 
     // Empty user
     const emptyUser = "postgres://:mysecret@localhost:5432/mydb";
     const scrubbedEmptyUser = scrubDsnSecrets(emptyUser);
-    assert.equal(scrubbedEmptyUser, "postgres://:***@localhost:5432/mydb");
+    assert.equal(scrubbedEmptyUser, "[REDACTED_DATABASE_URL]");
 
-    // Empty query param password
+    // Empty query param password inside DSN
     const emptyQueryParam = "postgres://localhost:5432/mydb?password=&sslmode=require";
     const scrubbedEmptyQuery = scrubDsnSecrets(emptyQueryParam);
-    assert.equal(scrubbedEmptyQuery, "postgres://localhost:5432/mydb?password=***&sslmode=require");
+    assert.equal(scrubbedEmptyQuery, "[REDACTED_DATABASE_URL]");
+
+    // Standalone query param password masking retained (outside DSN)
+    const standaloneQuery = "Failed connecting to database: details at ?password=supersecret123&timeout=30";
+    const scrubbedStandaloneQuery = scrubDsnSecrets(standaloneQuery);
+    assert.equal(scrubbedStandaloneQuery, "Failed connecting to database: details at ?password=***&timeout=30");
+    assert.ok(!scrubbedStandaloneQuery.includes("supersecret123"));
 
     // Password 'a' does NOT corrupt diagnostic code text
     const singleCharPass = "[PROD_GUARD_ENFORCED] Target postgresql://app_user:a@localhost:5432/app_db failed admission";
     const scrubbedSingle = scrubDsnSecrets(singleCharPass);
     assert.equal(
       scrubbedSingle,
-      "[PROD_GUARD_ENFORCED] Target postgresql://app_user:***@localhost:5432/app_db failed admission",
+      "[PROD_GUARD_ENFORCED] Target [REDACTED_DATABASE_URL] failed admission",
     );
     assert.ok(scrubbedSingle.includes("[PROD_GUARD_ENFORCED]"), "Code text must not be corrupted by short password 'a'");
+
+    // Regular usernames like 'postgres' or 'admin' in prose don't get corrupted
+    const proseWithUsernames = "[SUPERUSER_REJECTED] The role postgres cannot connect to postgresql://postgres:pass@localhost:5432/db";
+    const scrubbedProse = scrubDsnSecrets(proseWithUsernames);
+    assert.equal(
+      scrubbedProse,
+      "[SUPERUSER_REJECTED] The role postgres cannot connect to [REDACTED_DATABASE_URL]",
+    );
   });
 });
 

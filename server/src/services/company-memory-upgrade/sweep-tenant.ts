@@ -18,9 +18,13 @@ import {
   validateAndResolveTableIdentifier,
 } from "./census.js";
 import { ensureUpgradeTables } from "./tenant-tables.js";
-import { CompanyMemoryUpgradeError, type UpgradeLedgerOutcome } from "./types.js";
+import {
+  CompanyMemoryUpgradeError,
+  UPGRADE_LEDGER_OUTCOMES,
+  type UpgradeLedgerOutcome,
+} from "./types.js";
 
-export { ensureUpgradeTables };
+export { ensureUpgradeTables, UPGRADE_LEDGER_OUTCOMES };
 
 export interface TenantSourceRow {
   id: string;
@@ -74,6 +78,13 @@ export function validateOutcomeReason(
   outcome: UpgradeLedgerOutcome,
   reasonCode: unknown,
 ): string | null {
+  if (!UPGRADE_LEDGER_OUTCOMES.includes(outcome as UpgradeLedgerOutcome)) {
+    throw new CompanyMemoryUpgradeError(
+      `Invalid ledger outcome '${outcome}'. Must be one of [${UPGRADE_LEDGER_OUTCOMES.join(", ")}]`,
+      "INVALID_ARGUMENT",
+    );
+  }
+
   if (outcome === "unroutable") {
     if (typeof reasonCode !== "string" || !VALID_UNROUTABLE_REASONS.includes(reasonCode as UnroutableReasonCode)) {
       throw new CompanyMemoryUpgradeError(
