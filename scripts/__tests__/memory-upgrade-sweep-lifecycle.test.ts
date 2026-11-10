@@ -675,6 +675,18 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
     assert.equal(mapSweepErrorCode("unknown_garbage_code"), "unexpected_failure");
     assert.equal(mapSweepErrorCode(null), "unexpected_failure");
 
+    // Mapping table assertions for conversion and key errors
+    assert.equal(mapSweepErrorCode("COMPANY_OPENAI_KEY_MISSING"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("company_openai_key_missing"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("COMPANY_OPENAI_KEY_PROVIDER_UNSUPPORTED"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("company_openai_key_provider_unsupported"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("COMPANY_OPENAI_KEY_REJECTED"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("company_openai_key_rejected"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("COMPANY_OPENAI_QUOTA_EXHAUSTED"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("company_openai_quota_exhausted"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("LLM_REQUEST_REJECTED"), "conversion_failed");
+    assert.equal(mapSweepErrorCode("llm_request_rejected"), "conversion_failed");
+
     // All mapped values belong to UPGRADE_ERROR_CODES
     for (const code of Object.values(SWEEP_ERROR_CODE_MAP)) {
       assert.ok(UPGRADE_ERROR_CODES.includes(code));

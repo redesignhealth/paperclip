@@ -5,7 +5,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -181,14 +182,12 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
   const dummyCompanyId = randomUUID();
   const validKey = "sk-external-file-key-12345678901234567890";
 
-  const tmpDir = "/tmp";
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "openai-key-test-"));
   const safeFilePath = path.join(tmpDir, `openai-key-${randomUUID().slice(0, 8)}.txt`);
   writeFileSync(safeFilePath, `${validKey}\n`, { mode: 0o600 });
 
   t.after(() => {
-    if (existsSync(safeFilePath)) {
-      unlinkSync(safeFilePath);
-    }
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   await t.test("resolves trimmed valid key from external 0600 file", async () => {
@@ -281,8 +280,9 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
     const fifoPath = path.join(tmpDir, `fifo-key-${randomUUID().slice(0, 8)}`);
     try {
       execFileSync("mkfifo", ["-m", "600", fifoPath]);
-    } catch (err) {
+    } catch {
       // mkfifo unavailable on this platform/runner: skip rather than fail the suite.
+      t.skip("mkfifo unavailable");
       return;
     }
 
@@ -309,12 +309,11 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
 
   await t.test("refuses a key file reached through a SYMLINKED PARENT directory that resolves inside the repository", async () => {
     // The leaf file itself is a REAL file (not a symlink); the only indirection is the
-    // symlinked PARENT directory. The lexical path (through the /tmp symlink) looks
-    // external, but it actually resolves inside the repository tree -- this must be
-    // refused by the REAL (symlink-resolved) containment check, which the lexical check
-    // alone would miss.
-    const repoRootDir = path.resolve(process.cwd());
-    const inRepoRealDir = path.join(repoRootDir, `.tmp-key-parent-${randomUUID().slice(0, 8)}`);
+    // symlinked PARENT directory. The lexical path looks external, but it actually resolves
+    // inside the repository tree via repoRoot -- this must be refused by the REAL
+    // (symlink-resolved) containment check, which the lexical check alone would miss.
+    const fakeRepoRoot = mkdtempSync(path.join(os.tmpdir(), "fake-repo-root-"));
+    const inRepoRealDir = path.join(fakeRepoRoot, `internal-dir-${randomUUID().slice(0, 8)}`);
     const symlinkToRepoDir = path.join(tmpDir, `symlink-to-repo-${randomUUID().slice(0, 8)}`);
 
     try {
@@ -331,6 +330,7 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
             controlPlaneDb: dummyDb,
             companyId: dummyCompanyId,
             keyFilePath: pathThroughSymlinkedParent,
+            repoRoot: fakeRepoRoot,
           }),
         (err: any) => {
           assert.equal(err.code, "INVALID_ARGUMENT");
@@ -340,8 +340,47 @@ test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {
       );
     } finally {
       if (existsSync(symlinkToRepoDir)) unlinkSync(symlinkToRepoDir);
-      rmSync(inRepoRealDir, { recursive: true, force: true });
+      rmSync(fakeRepoRoot, { recursive: true, force: true });
     }
+  });
+
+  await t.test("refuses key file exceeding 4096 bytes", async () => {
+    const largeFilePath = path.join(tmpDir, `large-key-${randomUUID().slice(0, 8)}.txt`);
+    try {
+      writeFileSync(largeFilePath, "A".repeat(4097), { mode: 0o600 });
+      await assert.rejects(
+        () =>
+          resolveCompanyOpenAiKey({
+            controlPlaneDb: dummyDb,
+            companyId: dummyCompanyId,
+            keyFilePath: largeFilePath,
+          }),
+        (err: any) => {
+          assert.equal(err.code, "INVALID_ARGUMENT");
+          assert.ok(err.message.includes("4096 bytes"));
+          return true;
+        },
+      );
+    } finally {
+      if (existsSync(largeFilePath)) unlinkSync(largeFilePath);
+    }
+  });
+
+  await t.test("fails closed if repository root cannot be resolved", async () => {
+    await assert.rejects(
+      () =>
+        resolveCompanyOpenAiKey({
+          controlPlaneDb: dummyDb,
+          companyId: dummyCompanyId,
+          keyFilePath: safeFilePath,
+          repoRoot: "/nonexistent-repo-root-dir-that-fails-realpath-12345",
+        }),
+      (err: any) => {
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(err.message.includes("Repository root directory could not be resolved"));
+        return true;
+      },
+    );
   });
 
   await t.test("refuses key with invalid length or non-printable ASCII", async () => {

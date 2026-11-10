@@ -11,6 +11,9 @@
  */
 
 import { type MonotonicClock, type Sleeper } from "./clock.js";
+import { CompanyMemoryUpgradeError } from "./types.js";
+
+export const MAX_RETRY_AFTER_MS = 300_000;
 
 export interface RateLimiterOptions {
   rpm: number;
@@ -31,10 +34,38 @@ export interface RateLimiter {
 
 export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
   const { rpm, tpm, clock, sleeper } = options;
-  const maxConcurrency = Math.min(options.concurrency ?? 2, 2);
+  if (typeof rpm !== "number" || !Number.isFinite(rpm) || rpm <= 0) {
+    throw new CompanyMemoryUpgradeError(
+      `Rate limiter rpm must be a finite positive number, received ${rpm}`,
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (typeof tpm !== "number" || !Number.isFinite(tpm) || tpm <= 0) {
+    throw new CompanyMemoryUpgradeError(
+      `Rate limiter tpm must be a finite positive number, received ${tpm}`,
+      "INVALID_ARGUMENT",
+    );
+  }
+  const rawConcurrency = options.concurrency ?? 2;
+  if (typeof rawConcurrency !== "number" || !Number.isFinite(rawConcurrency) || rawConcurrency < 1) {
+    throw new CompanyMemoryUpgradeError(
+      `Rate limiter concurrency must be a finite number >= 1, received ${rawConcurrency}`,
+      "INVALID_ARGUMENT",
+    );
+  }
+  const maxConcurrency = Math.min(rawConcurrency, 2);
 
   let inFlight = 0;
   const waiters: Array<() => void> = [];
+
+  function releaseSlot(): void {
+    const next = waiters.shift();
+    if (next) {
+      next();
+    } else {
+      inFlight--;
+    }
+  }
 
   let reqTokens = rpm;
   let dataTokens = tpm;
@@ -54,49 +85,65 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 
   return {
     async acquire(estimatedTokens: number): Promise<RateLimitLease> {
+      if (typeof estimatedTokens !== "number" || !Number.isFinite(estimatedTokens) || estimatedTokens < 0) {
+        throw new CompanyMemoryUpgradeError(
+          `estimatedTokens must be a finite non-negative number, received ${estimatedTokens}`,
+          "INVALID_ARGUMENT",
+        );
+      }
+
       // 1. Wait for concurrency slot
-      while (inFlight >= maxConcurrency) {
+      if (inFlight >= maxConcurrency || waiters.length > 0) {
         await new Promise<void>((resolve) => {
           waiters.push(resolve);
         });
+      } else {
+        inFlight++;
       }
-      inFlight++;
 
       // 2. Wait for token bucket deficit
-      while (true) {
-        refill();
+      try {
+        while (true) {
+          refill();
 
-        const reqDeficit = Math.max(0, 1 - reqTokens);
-        const tokDeficit = Math.max(0, estimatedTokens - dataTokens);
+          const reqDeficit = Math.max(0, 1 - reqTokens);
+          const tokensForWait = Math.min(estimatedTokens, tpm);
+          const tokDeficit = Math.max(0, tokensForWait - dataTokens);
 
-        const reqWaitMs = reqDeficit > 0 ? reqDeficit / reqRefillPerMs : 0;
-        const tokWaitMs = tokDeficit > 0 ? tokDeficit / dataRefillPerMs : 0;
-        const sleepMs = Math.max(reqWaitMs, tokWaitMs);
+          const reqWaitMs = reqDeficit > 0 ? reqDeficit / reqRefillPerMs : 0;
+          const tokWaitMs = tokDeficit > 0 ? tokDeficit / dataRefillPerMs : 0;
+          const sleepMs = Math.max(reqWaitMs, tokWaitMs);
 
-        if (sleepMs > 0) {
-          await sleeper.sleep(Math.ceil(sleepMs));
-        } else {
-          reqTokens -= 1;
-          dataTokens -= estimatedTokens;
-          break;
+          if (sleepMs > 0) {
+            await sleeper.sleep(Math.ceil(sleepMs));
+          } else {
+            reqTokens -= 1;
+            dataTokens -= estimatedTokens;
+            break;
+          }
         }
+      } catch (err) {
+        releaseSlot();
+        throw err;
       }
 
       let released = false;
+      let settled = false;
 
       return {
         settle(actualTokens: number): void {
+          if (settled || released) return;
+          if (typeof actualTokens !== "number" || !Number.isFinite(actualTokens) || actualTokens < 0) {
+            return;
+          }
+          settled = true;
           const diff = actualTokens - estimatedTokens;
           dataTokens -= diff;
         },
         release(): void {
           if (!released) {
             released = true;
-            inFlight--;
-            const next = waiters.shift();
-            if (next) {
-              next();
-            }
+            releaseSlot();
           }
         },
       };
@@ -130,7 +177,83 @@ function getHeaderValue(
 }
 
 /**
+ * Parses duration strings with repeated-unit grammar (e.g. "6m0s", "1m30s", "2m", "500ms", "1.5s").
+ * Bare unit-less numbers are interpreted as seconds per HTTP Retry-After RFC 7231 §7.1.3.
+ * Any unmatched residue, negative value, or invalid format returns null.
+ */
+export function parseDurationMs(str: string): number | null {
+  if (str.startsWith("-")) return null;
+
+  // Bare unit-less number: seconds
+  if (/^\d+(?:\.\d+)?$/.test(str)) {
+    const s = Number(str);
+    if (Number.isFinite(s) && s >= 0) {
+      return Math.ceil(s * 1000);
+    }
+    return null;
+  }
+
+  // Repeated-unit grammar: (\d+(?:\.\d+)?)(ms|s|m|h)
+  const unitRegex = /^(\d+(?:\.\d+)?)(ms|s|m|h)/;
+  let remaining = str;
+  let totalMs = 0;
+  let matchedAny = false;
+
+  while (remaining.length > 0) {
+    const match = remaining.match(unitRegex);
+    if (!match) {
+      return null; // unmatched residue -> invalid
+    }
+    matchedAny = true;
+    const amount = parseFloat(match[1]);
+    const unit = match[2];
+    if (!Number.isFinite(amount) || amount < 0) return null;
+
+    switch (unit) {
+      case "ms":
+        totalMs += amount;
+        break;
+      case "s":
+        totalMs += amount * 1000;
+        break;
+      case "m":
+        totalMs += amount * 60 * 1000;
+        break;
+      case "h":
+        totalMs += amount * 3600 * 1000;
+        break;
+      default:
+        return null;
+    }
+    remaining = remaining.slice(match[0].length).trim();
+  }
+
+  return matchedAny ? Math.ceil(totalMs) : null;
+}
+
+function parseCandidateHeaderValue(value: string, nowMs: number): number | null {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.startsWith("-")) return null;
+
+  const durationMs = parseDurationMs(trimmed);
+  if (durationMs !== null) {
+    return durationMs;
+  }
+
+  // Attempt HTTP-date parse only if string contains non-digit characters that could be a date
+  if (/[a-zA-Z]/.test(trimmed)) {
+    const parsedDate = Date.parse(trimmed);
+    if (!Number.isNaN(parsedDate)) {
+      return Math.max(0, Math.ceil(parsedDate - nowMs));
+    }
+  }
+
+  return null;
+}
+
+/**
  * Parses Retry-After or OpenAI rate-limit reset headers into milliseconds.
+ * Takes the MAX over every candidate that parses and clamps to MAX_RETRY_AFTER_MS.
  */
 export function parseRetryAfterMs(
   headers: Headers | Record<string, string | string[] | undefined> | null | undefined,
@@ -138,48 +261,28 @@ export function parseRetryAfterMs(
 ): number | null {
   if (!headers) return null;
 
-  const retryAfter = getHeaderValue(headers, "retry-after");
-  if (retryAfter) {
-    const trimmed = retryAfter.trim();
-    const seconds = Number(trimmed);
-    if (!Number.isNaN(seconds) && Number.isFinite(seconds) && seconds >= 0) {
-      return Math.ceil(seconds * 1000);
-    }
-    const parsedDate = Date.parse(trimmed);
-    if (!Number.isNaN(parsedDate)) {
-      return Math.max(0, Math.ceil(parsedDate - nowMs));
-    }
-  }
-
-  // Check x-ratelimit-reset-requests / x-ratelimit-reset-tokens
-  for (const headerName of [
+  const candidateHeaderNames = [
+    "retry-after",
     "x-ratelimit-reset-requests",
     "x-ratelimit-reset-tokens",
-  ]) {
-    const val = getHeaderValue(headers, headerName);
+  ];
+
+  let maxMs: number | null = null;
+
+  for (const name of candidateHeaderNames) {
+    const val = getHeaderValue(headers, name);
     if (val) {
-      const trimmed = val.trim();
-      // Handle durations like "6ms", "1s", "500ms"
-      if (trimmed.endsWith("ms")) {
-        const ms = parseFloat(trimmed.slice(0, -2));
-        if (!Number.isNaN(ms) && Number.isFinite(ms) && ms >= 0) {
-          return Math.ceil(ms);
+      const parsed = parseCandidateHeaderValue(val, nowMs);
+      if (parsed !== null && parsed >= 0) {
+        if (maxMs === null || parsed > maxMs) {
+          maxMs = parsed;
         }
-      }
-      if (trimmed.endsWith("s")) {
-        const s = parseFloat(trimmed.slice(0, -1));
-        if (!Number.isNaN(s) && Number.isFinite(s) && s >= 0) {
-          return Math.ceil(s * 1000);
-        }
-      }
-      const s = Number(trimmed);
-      if (!Number.isNaN(s) && Number.isFinite(s) && s >= 0) {
-        return Math.ceil(s * 1000);
       }
     }
   }
 
-  return null;
+  if (maxMs === null) return null;
+  return Math.min(maxMs, MAX_RETRY_AFTER_MS);
 }
 
 /**

@@ -5,6 +5,7 @@
  * - Re-embeds target text using text-embedding-3-small (1536 dimensions).
  * - Shape validation: response must contain exactly 1 embedding array of 1536 finite numbers,
  *   and model must start with 'text-embedding-3-small'.
+ * - Failed-attempt token refunds: deliberately NOT implemented (over-debiting is safe).
  * - Any failure (transport exhaustion, bad shape, unexpected model, non-finite vectors)
  *   throws CompanyMemoryUpgradeError('EMBEDDING_FAILED'), which ABORTS the sweep,
  *   never quarantines.
@@ -33,9 +34,10 @@ export interface CreateOpenAiEmbeddingClientOptions {
   clock: MonotonicClock;
   redaction?: RedactionRegistry;
   maxAttempts?: number;
+  random?: () => number;
 }
 
-export function assertEmbeddingShape(data: unknown): number[] {
+export function assertEmbeddingShape(data: unknown, redaction?: RedactionRegistry): number[] {
   if (!data || typeof data !== "object") {
     throw new CompanyMemoryUpgradeError(
       "Invalid embeddings response: expected object",
@@ -46,8 +48,9 @@ export function assertEmbeddingShape(data: unknown): number[] {
   const obj = data as Record<string, unknown>;
 
   if (typeof obj.model !== "string" || !obj.model.startsWith("text-embedding-3-small")) {
+    const modelStr = redaction ? redaction.scrub(String(obj.model)) : String(obj.model);
     throw new CompanyMemoryUpgradeError(
-      `Invalid embeddings model: expected model starting with 'text-embedding-3-small', got '${obj.model}'`,
+      `Invalid embeddings model: expected model starting with 'text-embedding-3-small', got '${modelStr}'`,
       "EMBEDDING_FAILED",
     );
   }
@@ -100,11 +103,16 @@ export function createOpenAiEmbeddingClient(
     clock,
     redaction,
     maxAttempts = 5,
+    random = Math.random,
   } = options;
 
   redaction?.add(apiKey);
 
   const endpoint = `${baseUrl.replace(/\/+$/, "")}/embeddings`;
+
+  type AttemptResult =
+    | { kind: "ok"; data: EmbeddingResult }
+    | { kind: "retry"; delayMs: number };
 
   return {
     async embed(text: string, embedOptions?: { signal?: AbortSignal }): Promise<EmbeddingResult> {
@@ -112,14 +120,11 @@ export function createOpenAiEmbeddingClient(
       let baseDelayMs = 500;
       const estimatedTokens = Math.max(1, Math.ceil(text.length / 4));
 
-      while (attempt < maxAttempts) {
-        if (embedOptions?.signal?.aborted) {
-          throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
-        }
-
-        attempt++;
+      async function performSingleAttempt(
+        currentAttempt: number,
+        currentBaseDelayMs: number,
+      ): Promise<AttemptResult> {
         const lease = await limiter.acquire(estimatedTokens);
-
         try {
           const body = JSON.stringify({
             model: "text-embedding-3-small",
@@ -128,68 +133,108 @@ export function createOpenAiEmbeddingClient(
             encoding_format: "float",
           });
 
-          const res = await fetchImpl(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey}`,
-            },
-            body,
-            signal: embedOptions?.signal,
-          });
+          let res: Response;
+          try {
+            res = await fetchImpl(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${apiKey}`,
+              },
+              body,
+              signal: embedOptions?.signal,
+            });
+          } catch (fetchErr: any) {
+            if (embedOptions?.signal?.aborted) {
+              throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
+            }
+            if (currentAttempt >= maxAttempts) {
+              const rawMsg = fetchErr?.message ? String(fetchErr.message) : "network error";
+              const scrubbed = redaction ? redaction.scrub(rawMsg) : rawMsg;
+              throw new CompanyMemoryUpgradeError(
+                `OpenAI embedding request failed after ${maxAttempts} attempts: ${scrubbed}`,
+                "EMBEDDING_FAILED",
+              );
+            }
+            const jitter = Math.floor(random() * 50);
+            const delay = currentBaseDelayMs + jitter;
+            return { kind: "retry", delayMs: delay };
+          }
 
-          const nowMs = clock.nowMs();
-          const retryAfterMs = parseRetryAfterMs(res.headers, nowMs);
+          if (embedOptions?.signal?.aborted) {
+            throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
+          }
 
-          if (res.status === 429 || res.status >= 500) {
-            if (attempt >= maxAttempts) {
+          if (res.status === 429) {
+            const errBody = await res.text().catch(() => "");
+            if (errBody.includes("insufficient_quota")) {
+              const msg = redaction
+                ? redaction.scrub("OpenAI embeddings failed with HTTP 429: insufficient_quota")
+                : "OpenAI embeddings failed with HTTP 429: insufficient_quota";
+              throw new CompanyMemoryUpgradeError(msg, "COMPANY_OPENAI_QUOTA_EXHAUSTED");
+            }
+            if (currentAttempt >= maxAttempts) {
+              throw new CompanyMemoryUpgradeError(
+                `OpenAI embeddings failed with HTTP 429 after ${maxAttempts} attempts.`,
+                "EMBEDDING_FAILED",
+              );
+            }
+            const nowMs = clock.nowMs();
+            const retryAfterMs = parseRetryAfterMs(res.headers, nowMs);
+            const jitter = Math.floor(random() * 50);
+            const delay = Math.max(retryAfterMs ?? 0, currentBaseDelayMs) + jitter;
+            return { kind: "retry", delayMs: delay };
+          }
+
+          if (res.status >= 500 || res.status === 408 || res.status === 409) {
+            if (currentAttempt >= maxAttempts) {
               throw new CompanyMemoryUpgradeError(
                 `OpenAI embeddings failed with HTTP ${res.status} after ${maxAttempts} attempts.`,
                 "EMBEDDING_FAILED",
               );
             }
-            const jitter = Math.floor(Math.random() * 50);
-            const delay = Math.max(retryAfterMs ?? 0, baseDelayMs) + jitter;
-            baseDelayMs *= 2;
-            await sleeper.sleep(delay);
-            continue;
+            const nowMs = clock.nowMs();
+            const retryAfterMs = parseRetryAfterMs(res.headers, nowMs);
+            const jitter = Math.floor(random() * 50);
+            const delay = Math.max(retryAfterMs ?? 0, currentBaseDelayMs) + jitter;
+            return { kind: "retry", delayMs: delay };
           }
 
           if (!res.ok) {
-            throw new CompanyMemoryUpgradeError(
-              `OpenAI embeddings request failed with HTTP ${res.status}`,
-              "EMBEDDING_FAILED",
-            );
+            const msg = redaction
+              ? redaction.scrub(`OpenAI embeddings request failed with HTTP ${res.status}`)
+              : `OpenAI embeddings request failed with HTTP ${res.status}`;
+            throw new CompanyMemoryUpgradeError(msg, "EMBEDDING_FAILED");
           }
 
           const data: any = await res.json();
-          const tokens = data.usage?.prompt_tokens ?? estimatedTokens;
+          const embedding = assertEmbeddingShape(data, redaction);
+
+          const rawTokens = data.usage?.prompt_tokens;
+          const tokens =
+            typeof rawTokens === "number" && Number.isFinite(rawTokens) && rawTokens >= 0
+              ? rawTokens
+              : estimatedTokens;
           lease.settle(tokens);
 
-          const embedding = assertEmbeddingShape(data);
-          return { embedding, tokens };
-        } catch (err: any) {
-          if (embedOptions?.signal?.aborted) {
-            throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
-          }
-          if (err instanceof CompanyMemoryUpgradeError) {
-            if (err.code === "ABORTED_BY_OPERATOR" || err.code === "EMBEDDING_FAILED") {
-              throw err;
-            }
-          }
-          if (attempt >= maxAttempts) {
-            throw new CompanyMemoryUpgradeError(
-              `OpenAI embedding request failed after ${maxAttempts} attempts: ${err.message}`,
-              "EMBEDDING_FAILED",
-            );
-          }
-          const jitter = Math.floor(Math.random() * 50);
-          const delay = baseDelayMs + jitter;
-          baseDelayMs *= 2;
-          await sleeper.sleep(delay);
+          return { kind: "ok", data: { embedding, tokens } };
         } finally {
           lease.release();
         }
+      }
+
+      while (attempt < maxAttempts) {
+        if (embedOptions?.signal?.aborted) {
+          throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
+        }
+
+        attempt++;
+        const result = await performSingleAttempt(attempt, baseDelayMs);
+        if (result.kind === "ok") {
+          return result.data;
+        }
+        baseDelayMs *= 2;
+        await sleeper.sleep(result.delayMs);
       }
 
       throw new CompanyMemoryUpgradeError(

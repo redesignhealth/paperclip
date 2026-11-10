@@ -8,8 +8,10 @@
  *   agent name, company ID, company name, or source row ID.
  * - Transport failures (429/5xx/network/timeout) are retried with Retry-After-aware
  *   exponential backoff + jitter. If exhausted, resolves to outcome 'llm_unavailable'.
- * - Schema violations trigger exactly ONE repair retry naming only the violated rule class
- *   (never echoing the model's output text).
+ * - Failed-attempt token refunds: deliberately NOT implemented (over-debiting is safe).
+ * - Schema violations trigger exactly ONE repair retry naming the violated rule class
+ *   and appending the prior assistant turn (note: secrets are stripped prior to repair turn
+ *   so no secret is echoed back to the provider).
  * - Sensitive data detected in model output (data_sensitive_echo) maps to drop_sensitive,
  *   not quarantine.
  */
@@ -25,7 +27,14 @@ import {
 import { type MonotonicClock, type Sleeper } from "./clock.js";
 import { type RedactionRegistry } from "./openai-key.js";
 import { estimateChatTokens, parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
-import { CompanyMemoryUpgradeError } from "./types.js";
+import { CompanyMemoryUpgradeError, TERMINAL_LLM_ERROR_CODES } from "./types.js";
+
+/**
+ * Exact bounded reason_code literal emitted for `dropped_noise` outcomes that were
+ * classified by the model itself (decision: "drop_noise"). Shared as the producer constant
+ * so validators can permit it as an exact literal.
+ */
+export const MODEL_CLASSIFIED_NOISE_REASON_CODE = "model_classified_noise";
 
 /**
  * Exact bounded reason_code literal emitted for `dropped_sensitive` outcomes that were
@@ -141,6 +150,7 @@ export interface CreateOpenAiConversionClientOptions {
   clock: MonotonicClock;
   redaction?: RedactionRegistry;
   maxAttempts?: number;
+  random?: () => number;
 }
 
 export function createOpenAiConversionClient(
@@ -156,6 +166,7 @@ export function createOpenAiConversionClient(
     clock,
     redaction,
     maxAttempts = 5,
+    random = Math.random,
   } = options;
 
   if (!SUPPORTED_CONVERTER_MODELS.includes(model as SupportedConverterModel)) {
@@ -169,6 +180,10 @@ export function createOpenAiConversionClient(
 
   const endpoint = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
+  type AttemptResult =
+    | { kind: "ok"; data: { content: string; inputTokens: number; outputTokens: number } }
+    | { kind: "retry"; delayMs: number };
+
   async function executeChatRequest(
     messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
     estimatedTokens: number,
@@ -181,80 +196,155 @@ export function createOpenAiConversionClient(
     let attempt = 0;
     let baseDelayMs = 500;
 
+    async function performSingleAttempt(
+      currentAttempt: number,
+      currentBaseDelayMs: number,
+    ): Promise<AttemptResult> {
+      const lease = await limiter.acquire(estimatedTokens);
+      try {
+        const body = buildConversionRequestBody(model, messages);
+        let res: Response;
+        try {
+          res = await fetchImpl(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body,
+            signal,
+          });
+        } catch (fetchErr: any) {
+          if (signal?.aborted) {
+            throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
+          }
+          if (currentAttempt >= maxAttempts) {
+            const rawMsg = fetchErr?.message ? String(fetchErr.message) : "network error";
+            const scrubbed = redaction ? redaction.scrub(rawMsg) : rawMsg;
+            throw new CompanyMemoryUpgradeError(
+              `OpenAI request failed after ${maxAttempts} attempts: ${scrubbed}`,
+              "LLM_UNAVAILABLE",
+            );
+          }
+          const jitter = Math.floor(random() * 50);
+          const delay = currentBaseDelayMs + jitter;
+          return { kind: "retry", delayMs: delay };
+        }
+
+        if (signal?.aborted) {
+          throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
+        }
+
+        if (!res.ok) {
+          const status = res.status;
+          const isRetryable = status === 408 || status === 409 || status >= 500;
+
+          if (status === 429) {
+            const errBody = await res.text().catch(() => "");
+            if (errBody.includes("insufficient_quota")) {
+              const msg = redaction
+                ? redaction.scrub("OpenAI chat completions failed with HTTP 429: insufficient_quota")
+                : "OpenAI chat completions failed with HTTP 429: insufficient_quota";
+              throw new CompanyMemoryUpgradeError(msg, "COMPANY_OPENAI_QUOTA_EXHAUSTED");
+            }
+            if (currentAttempt >= maxAttempts) {
+              throw new CompanyMemoryUpgradeError(
+                `OpenAI chat completions failed with HTTP 429 after ${maxAttempts} attempts.`,
+                "LLM_UNAVAILABLE",
+              );
+            }
+            const nowMs = clock.nowMs();
+            const retryAfterMs = parseRetryAfterMs(res.headers, nowMs);
+            const jitter = Math.floor(random() * 50);
+            const delay = Math.max(retryAfterMs ?? 0, currentBaseDelayMs) + jitter;
+            return { kind: "retry", delayMs: delay };
+          }
+
+          if (isRetryable) {
+            if (currentAttempt >= maxAttempts) {
+              throw new CompanyMemoryUpgradeError(
+                `OpenAI chat completions failed with HTTP ${status} after ${maxAttempts} attempts.`,
+                "LLM_UNAVAILABLE",
+              );
+            }
+            const nowMs = clock.nowMs();
+            const retryAfterMs = parseRetryAfterMs(res.headers, nowMs);
+            const jitter = Math.floor(random() * 50);
+            const delay = Math.max(retryAfterMs ?? 0, currentBaseDelayMs) + jitter;
+            return { kind: "retry", delayMs: delay };
+          }
+
+          // Terminal 4xx:
+          if (status === 401 || status === 403) {
+            const msg = redaction
+              ? redaction.scrub(`OpenAI chat completions request rejected with HTTP ${status}`)
+              : `OpenAI chat completions request rejected with HTTP ${status}`;
+            throw new CompanyMemoryUpgradeError(msg, "COMPANY_OPENAI_KEY_REJECTED");
+          }
+
+          // Any other terminal 4xx (400, 402, 404, 413, 422, etc.)
+          const msg = redaction
+            ? redaction.scrub(`OpenAI chat completions request rejected with HTTP ${status}`)
+            : `OpenAI chat completions request rejected with HTTP ${status}`;
+          throw new CompanyMemoryUpgradeError(msg, "LLM_REQUEST_REJECTED");
+        }
+
+        // res.ok
+        const data: any = await res.json();
+        const content = data.choices?.[0]?.message?.content;
+        if (typeof content !== "string") {
+          if (currentAttempt >= maxAttempts) {
+            throw new CompanyMemoryUpgradeError(
+              `OpenAI chat completions failed: missing string content after ${maxAttempts} attempts`,
+              "LLM_UNAVAILABLE",
+            );
+          }
+          const jitter = Math.floor(random() * 50);
+          const delay = currentBaseDelayMs + jitter;
+          return { kind: "retry", delayMs: delay };
+        }
+
+        const rawPromptTokens = data.usage?.prompt_tokens;
+        const inputTokens =
+          typeof rawPromptTokens === "number" && Number.isFinite(rawPromptTokens) && rawPromptTokens >= 0
+            ? rawPromptTokens
+            : Buffer.byteLength(body, "utf8");
+
+        const rawCompletionTokens = data.usage?.completion_tokens;
+        const outputTokens =
+          typeof rawCompletionTokens === "number" && Number.isFinite(rawCompletionTokens) && rawCompletionTokens >= 0
+            ? rawCompletionTokens
+            : PREFLIGHT_MAX_COMPLETION_TOKENS;
+
+        const rawTotalTokens = data.usage?.total_tokens;
+        const totalTokens =
+          typeof rawTotalTokens === "number" && Number.isFinite(rawTotalTokens) && rawTotalTokens >= 0
+            ? rawTotalTokens
+            : inputTokens + outputTokens;
+
+        lease.settle(totalTokens);
+
+        return {
+          kind: "ok",
+          data: { content, inputTokens, outputTokens },
+        };
+      } finally {
+        lease.release();
+      }
+    }
+
     while (attempt < maxAttempts) {
       if (signal?.aborted) {
         throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
       }
 
       attempt++;
-
-      const lease = await limiter.acquire(estimatedTokens);
-      try {
-        const body = buildConversionRequestBody(model, messages);
-
-        const res = await fetchImpl(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body,
-          signal,
-        });
-
-        const nowMs = clock.nowMs();
-        const retryAfterMs = parseRetryAfterMs(res.headers, nowMs);
-
-        if (res.status === 429 || res.status >= 500) {
-          if (attempt >= maxAttempts) {
-            throw new CompanyMemoryUpgradeError(
-              `OpenAI chat completions failed with HTTP ${res.status} after ${maxAttempts} attempts.`,
-              "LLM_UNAVAILABLE",
-            );
-          }
-          const jitter = Math.floor(Math.random() * 50);
-          const delay = Math.max(retryAfterMs ?? 0, baseDelayMs) + jitter;
-          baseDelayMs *= 2;
-          await sleeper.sleep(delay);
-          continue;
-        }
-
-        if (!res.ok) {
-          throw new CompanyMemoryUpgradeError(
-            `OpenAI chat completions request failed with HTTP ${res.status}`,
-            "LLM_UNAVAILABLE",
-          );
-        }
-
-        const data: any = await res.json();
-        const inputTokens = data.usage?.prompt_tokens ?? estimatedTokens;
-        const outputTokens = data.usage?.completion_tokens ?? 0;
-        const totalTokens = data.usage?.total_tokens ?? (inputTokens + outputTokens);
-
-        lease.settle(totalTokens);
-
-        const content = data.choices?.[0]?.message?.content ?? "";
-        return { content, inputTokens, outputTokens };
-      } catch (err: any) {
-        if (signal?.aborted) {
-          throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
-        }
-        if (err instanceof CompanyMemoryUpgradeError && err.code === "ABORTED_BY_OPERATOR") {
-          throw err;
-        }
-        if (attempt >= maxAttempts) {
-          throw new CompanyMemoryUpgradeError(
-            `OpenAI request failed after ${maxAttempts} attempts: ${err.message}`,
-            "LLM_UNAVAILABLE",
-          );
-        }
-        const jitter = Math.floor(Math.random() * 50);
-        const delay = baseDelayMs + jitter;
-        baseDelayMs *= 2;
-        await sleeper.sleep(delay);
-      } finally {
-        lease.release();
+      const result = await performSingleAttempt(attempt, baseDelayMs);
+      if (result.kind === "ok") {
+        return result.data;
       }
+      baseDelayMs *= 2;
+      await sleeper.sleep(result.delayMs);
     }
 
     throw new CompanyMemoryUpgradeError(
@@ -283,7 +373,10 @@ export function createOpenAiConversionClient(
         totalOutputTokens += resp.outputTokens;
         responseContent = resp.content;
       } catch (err: any) {
-        if (err instanceof CompanyMemoryUpgradeError && err.code === "ABORTED_BY_OPERATOR") {
+        if (
+          err instanceof CompanyMemoryUpgradeError &&
+          (err.code === "ABORTED_BY_OPERATOR" || TERMINAL_LLM_ERROR_CODES.has(err.code))
+        ) {
           throw err;
         }
         return {
@@ -309,7 +402,7 @@ export function createOpenAiConversionClient(
         if (validation.decision === "drop_noise") {
           return {
             status: "drop_noise",
-            reasonCode: "exact_placeholder_or_greeting",
+            reasonCode: MODEL_CLASSIFIED_NOISE_REASON_CODE,
             inputTokens: totalInputTokens,
             outputTokens: totalOutputTokens,
           };
@@ -343,7 +436,10 @@ export function createOpenAiConversionClient(
         totalOutputTokens += repairResp.outputTokens;
         responseContent = repairResp.content;
       } catch (err: any) {
-        if (err instanceof CompanyMemoryUpgradeError && err.code === "ABORTED_BY_OPERATOR") {
+        if (
+          err instanceof CompanyMemoryUpgradeError &&
+          (err.code === "ABORTED_BY_OPERATOR" || TERMINAL_LLM_ERROR_CODES.has(err.code))
+        ) {
           throw err;
         }
         return {
@@ -369,7 +465,7 @@ export function createOpenAiConversionClient(
         if (validation.decision === "drop_noise") {
           return {
             status: "drop_noise",
-            reasonCode: "exact_placeholder_or_greeting",
+            reasonCode: MODEL_CLASSIFIED_NOISE_REASON_CODE,
             inputTokens: totalInputTokens,
             outputTokens: totalOutputTokens,
           };

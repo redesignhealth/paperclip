@@ -17,9 +17,13 @@
  */
 
 import {
+  CONVERSION_REJECT_CODES,
+} from "./converter-contract.js";
+import {
   buildConversionRequestBody,
   buildInitialConversionMessages,
   buildRepairConversionMessages,
+  PREFLIGHT_MAX_COMPLETION_TOKENS,
 } from "./llm-converter.js";
 import { CompanyMemoryUpgradeError } from "./types.js";
 
@@ -38,6 +42,11 @@ export const MAX_USD_CAP = 1_000_000;
 /** Max 32-bit-safe-ish cap for raw token counts supplied to cost functions. */
 const MAX_TOKEN_COUNT = 1_000_000_000_000; // 1e12 tokens; generous, prevents overflow abuse
 
+const LONGEST_REJECT_CODE = CONVERSION_REJECT_CODES.reduce(
+  (longest, code) => (code.length > longest.length ? code : longest),
+  "",
+);
+
 function assertFiniteNumber(value: unknown, fieldName: string): asserts value is number {
   if (typeof value !== "number" || !Number.isFinite(value) || Number.isNaN(value)) {
     throw new CompanyMemoryUpgradeError(
@@ -50,8 +59,16 @@ function assertFiniteNumber(value: unknown, fieldName: string): asserts value is
 /**
  * Validates and converts a USD amount into bigint nanodollars.
  * Rejects non-finite values, negative values, and values exceeding MAX_USD_CAP.
+ *
+ * ASYMMETRY CONTRACT:
+ * - Prices (rate per million tokens) use roundingMode = "ceil" so token costs are never underestimated.
+ * - Budget cap (--max-cost-usd) uses roundingMode = "floor" in createCostTracker so allowed spending is never rounded up.
  */
-export function usdToNanodollars(usd: number, fieldName: string = "usd"): bigint {
+export function usdToNanodollars(
+  usd: number,
+  fieldName: string = "usd",
+  roundingMode: "ceil" | "floor" = "ceil",
+): bigint {
   assertFiniteNumber(usd, fieldName);
   if (usd < 0) {
     throw new CompanyMemoryUpgradeError(
@@ -67,7 +84,8 @@ export function usdToNanodollars(usd: number, fieldName: string = "usd"): bigint
   }
   // Scale with enough precision to represent sub-cent USD inputs (e.g. 0.000000001)
   // without losing significant digits to floating point rounding before converting to bigint.
-  const nanodollars = Math.round(usd * 1e9);
+  const scaled = usd * 1e9;
+  const nanodollars = roundingMode === "floor" ? Math.floor(scaled) : Math.ceil(scaled);
   return BigInt(nanodollars);
 }
 
@@ -161,7 +179,7 @@ export function utf8ByteLength(text: string | null | undefined): number {
 // --- Preflight worst-case per-source cost ceiling -----------------------------------------
 
 /** Converter contract caps max_completion_tokens at 600 for both the initial and repair chat calls. */
-export const PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL = 600;
+export const PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL = PREFLIGHT_MAX_COMPLETION_TOKENS;
 /** At most one initial chat call plus exactly one repair retry. */
 export const PREFLIGHT_MAX_CHAT_CALLS = 2;
 /** The converter contract allows between 1 and 3 converted records per source, each re-embedded once. */
@@ -172,8 +190,6 @@ export const PREFLIGHT_MAX_RECORD_DATA_CHARS = 400;
 export const UTF8_MAX_BYTES_PER_CHAR = 4;
 
 export interface PreflightCostInput {
-  /** The raw (unconverted) source memory text that will be sent to the chat conversion endpoint. */
-  sourceText: string | null | undefined;
   /** The exact serialized initial chat request body (JSON.stringify of the real request payload). */
   initialRequestBodyBytes: number;
   /** The exact serialized repair-retry chat request body (JSON.stringify of the real repair payload). */
@@ -202,7 +218,7 @@ export interface PreflightCostEstimate {
  * This is an OPERATIONAL ESTIMATE used purely to gate spend before any API key is resolved or
  * any paid call is made. It is deliberately conservative (an over-estimate) and is NOT a
  * billing guarantee -- actual OpenAI billing is authoritative and is reconciled after each
- * real call via the actual-usage accounting in sweep.ts.
+ * real call via the actual-usage accounting in sweep.ts (addActualCostNanodollars at sweep.ts:921/1029).
  */
 export function estimateWorstCaseSourceCostNanodollars(input: PreflightCostInput): PreflightCostEstimate {
   const { rates } = input;
@@ -255,7 +271,7 @@ export function projectWorstCaseConversionRequestBytes(
 
   const worstCaseEchoBytes = PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
   const placeholderPriorResponse = "x".repeat(worstCaseEchoBytes);
-  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, "data_not_atomic");
+  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, LONGEST_REJECT_CODE);
   const repairBody = buildConversionRequestBody(model, repairMessages);
   const repairRequestBodyBytes = utf8ByteLength(repairBody);
 
@@ -277,7 +293,6 @@ export function estimateWorstCaseSourceCostNanodollarsForText(
     model,
   );
   return estimateWorstCaseSourceCostNanodollars({
-    sourceText,
     initialRequestBodyBytes,
     repairRequestBodyBytes,
     rates,
@@ -289,7 +304,7 @@ export function estimateWorstCaseSourceCostNanodollarsForText(
 export interface CostTracker {
   /** Total nanodollars spent so far across the whole sweep (never reset). */
   readonly spentNanodollars: bigint;
-  /** Nanodollars spent since the last successful flushPageDelta() call. */
+  /** Nanodollars spent since the last successful resetPageDelta() call. */
   readonly pageCostNanodollars: bigint;
   /** The configured budget cap in nanodollars, or null if unbounded. */
   readonly maxCostNanodollars: bigint | null;
@@ -297,9 +312,10 @@ export interface CostTracker {
   addActualCostNanodollars(nano: bigint): void;
   /**
    * Throws ABORTED_BY_OPERATOR if spending `projectedNano` MORE nanodollars, on top of
-   * spend already recorded, would meet or exceed the configured budget. Intended to be
-   * called with a worst-case PREFLIGHT estimate BEFORE any paid call is issued (so the
-   * abort happens with zero additional API calls), and again with zero projected delta
+   * spend already recorded, would exceed the configured budget (strictly greater than
+   * maxCostNanodollars; exact match to budget is permitted as a deliberate choice).
+   * Intended to be called with a worst-case PREFLIGHT estimate BEFORE any paid call is issued
+   * (so the abort happens with zero additional API calls), and again with zero projected delta
    * immediately after recording actual spend (defense in depth).
    */
   assertBudgetAllows(projectedNano: bigint): void;
@@ -317,7 +333,9 @@ export interface CostTracker {
 
 export function createCostTracker(maxCostUsd: number | null | undefined): CostTracker {
   const maxCostNanodollars =
-    maxCostUsd === null || maxCostUsd === undefined ? null : usdToNanodollars(maxCostUsd, "maxCostUsd");
+    maxCostUsd === null || maxCostUsd === undefined
+      ? null
+      : usdToNanodollars(maxCostUsd, "maxCostUsd", "floor");
 
   let spentNanodollars = 0n;
   let pageCostNanodollars = 0n;

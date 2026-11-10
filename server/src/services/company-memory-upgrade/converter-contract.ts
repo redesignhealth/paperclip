@@ -80,13 +80,25 @@ export const CONVERSION_JSON_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+export const CANONICAL_CONVERSION_PARAMS = Object.freeze({
+  temperature: 0,
+  top_p: 1,
+  seed: 8191,
+  max_completion_tokens: 600,
+});
+
 export function computeConverterContractSha256(): string {
   return createHash("sha256")
-    .update(CONVERSION_SYSTEM_PROMPT + JSON.stringify(CONVERSION_JSON_SCHEMA) + SUPPORTED_CONVERTER_MODELS.join(","))
+    .update(
+      CONVERSION_SYSTEM_PROMPT +
+        JSON.stringify(CONVERSION_JSON_SCHEMA) +
+        SUPPORTED_CONVERTER_MODELS.join(",") +
+        JSON.stringify(CANONICAL_CONVERSION_PARAMS),
+    )
     .digest("hex");
 }
 
-export const CONVERTER_CONTRACT_SHA256 = "2612137680b3711d352e7e1bb140b246ec7ddf094165f524cbe56066b8711145";
+export const CONVERTER_CONTRACT_SHA256 = "9fe03e311eeb765d3dd59ab5a21b32c4cf707a2b924484246afbb33287c70d50";
 
 export const CONVERSION_REJECT_CODES = [
   "not_json",
@@ -184,6 +196,44 @@ export function validateConversionOutput(raw: unknown): ConversionValidationResu
     return { ok: false, rejectCode: "too_many_records" };
   }
 
+  // Pass 1 (whole array, before any other per-record check):
+  // For each record scan rec.data and rec.subject when strings.
+  // Union family hits across both fields and all records; if non-empty return data_sensitive_echo.
+  // No short-circuit — CSV must be the complete sorted/deduped union.
+  const sensitiveFamilies = new Set<SensitiveFamilyName>();
+
+  for (const item of records) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.data === "string") {
+        const sensitive = detectSensitiveFamilies(rec.data);
+        if (sensitive.isSensitive) {
+          for (const [fam, hit] of Object.entries(sensitive.matches) as Array<[SensitiveFamilyName, boolean]>) {
+            if (hit) sensitiveFamilies.add(fam);
+          }
+        }
+      }
+      if (typeof rec.subject === "string") {
+        const sensitive = detectSensitiveFamilies(rec.subject);
+        if (sensitive.isSensitive) {
+          for (const [fam, hit] of Object.entries(sensitive.matches) as Array<[SensitiveFamilyName, boolean]>) {
+            if (hit) sensitiveFamilies.add(fam);
+          }
+        }
+      }
+    }
+  }
+
+  if (sensitiveFamilies.size > 0) {
+    const families = Array.from(sensitiveFamilies).sort().join(",");
+    return {
+      ok: false,
+      rejectCode: "data_sensitive_echo",
+      sensitiveReasonCode: families,
+    };
+  }
+
+  // Pass 2: Per-record validation
   const validatedRecords: ConversionRecord[] = [];
 
   for (const item of records) {
@@ -217,21 +267,6 @@ export function validateConversionOutput(raw: unknown): ConversionValidationResu
       /\band also\b/i.test(rec.data)
     ) {
       return { ok: false, rejectCode: "data_not_atomic" };
-    }
-
-    // Sensitive data detection on model output
-    const sensitive = detectSensitiveFamilies(rec.data);
-    if (sensitive.isSensitive) {
-      const families = (Object.entries(sensitive.matches) as Array<[SensitiveFamilyName, boolean]>)
-        .filter(([, hit]) => hit)
-        .map(([fam]) => fam)
-        .sort()
-        .join(",");
-      return {
-        ok: false,
-        rejectCode: "data_sensitive_echo",
-        sensitiveReasonCode: families,
-      };
     }
 
     if (

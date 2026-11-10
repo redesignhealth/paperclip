@@ -19,6 +19,10 @@ import {
   SUPPORTED_CONVERTER_MODELS,
   validateConversionOutput,
 } from "../../server/src/services/company-memory-upgrade/converter-contract.js";
+import {
+  buildInitialConversionMessages,
+  buildRepairConversionMessages,
+} from "../../server/src/services/company-memory-upgrade/llm-converter.js";
 
 test("converter contract invariants and pins", async (t) => {
   await t.test("contract IDs, models, and types", () => {
@@ -37,7 +41,7 @@ test("converter contract invariants and pins", async (t) => {
     );
     assert.equal(
       CONVERTER_CONTRACT_SHA256,
-      "2612137680b3711d352e7e1bb140b246ec7ddf094165f524cbe56066b8711145",
+      "9fe03e311eeb765d3dd59ab5a21b32c4cf707a2b924484246afbb33287c70d50",
       "Frozen contract pin must match historical sha256",
     );
   });
@@ -387,5 +391,147 @@ test("buildTargetPayload invariants", async (t) => {
     const vec = [0.123, -0.456, 0.789];
     const literal = formatPgVectorLiteral(vec);
     assert.equal(literal, "[0.123,-0.456,0.789]");
+  });
+});
+
+test("two-pass sensitive scan validates subject and data before all other checks (TECH-8191 P0)", async (t) => {
+  await t.test("secret in subject only triggers data_sensitive_echo", () => {
+    const res = validateConversionOutput({
+      decision: "convert",
+      records: [
+        {
+          data: "The organization holds security reviews quarterly.",
+          type: "procedure",
+          subject: "password = superSecretPassword123",
+          confidence: 0.9,
+        },
+      ],
+    });
+    assert.equal(res.ok, false);
+    if (!res.ok) {
+      assert.equal(res.rejectCode, "data_sensitive_echo");
+      assert.equal(res.sensitiveReasonCode, "passwordAssignment");
+    }
+  });
+
+  await t.test("secret in data + non-atomic returns data_sensitive_echo not data_not_atomic", () => {
+    const res = validateConversionOutput({
+      decision: "convert",
+      records: [
+        {
+          data: "password = superSecretPassword123; and also here is a second clause.",
+          type: "fact",
+          subject: "secret fact",
+          confidence: 0.9,
+        },
+      ],
+    });
+    assert.equal(res.ok, false);
+    if (!res.ok) {
+      assert.equal(res.rejectCode, "data_sensitive_echo", "Pass 1 sensitive scan must precede atomicity check");
+      assert.equal(res.sensitiveReasonCode, "passwordAssignment");
+    }
+  });
+
+  await t.test("secret + data_too_long returns data_sensitive_echo not data_too_long", () => {
+    const res = validateConversionOutput({
+      decision: "convert",
+      records: [
+        {
+          data: `Use key sk-123456789012345678901234567890 ${"A".repeat(500)}`,
+          type: "fact",
+          subject: "long secret",
+          confidence: 0.9,
+        },
+      ],
+    });
+    assert.equal(res.ok, false);
+    if (!res.ok) {
+      assert.equal(res.rejectCode, "data_sensitive_echo", "Pass 1 sensitive scan must precede length check");
+      assert.equal(res.sensitiveReasonCode, "apiKey");
+    }
+  });
+
+  await t.test("record[1] sensitive while record[0] non-atomic returns data_sensitive_echo", () => {
+    const res = validateConversionOutput({
+      decision: "convert",
+      records: [
+        {
+          data: "First record is not atomic; because it has a semicolon.",
+          type: "fact",
+          subject: "non atomic record",
+          confidence: 0.9,
+        },
+        {
+          data: "Second record has sk-123456789012345678901234567890 key.",
+          type: "fact",
+          subject: "sensitive record",
+          confidence: 0.9,
+        },
+      ],
+    });
+    assert.equal(res.ok, false);
+    if (!res.ok) {
+      assert.equal(res.rejectCode, "data_sensitive_echo");
+      assert.equal(res.sensitiveReasonCode, "apiKey");
+    }
+  });
+
+  await t.test("two records different families produce sorted deduped CSV union", () => {
+    const res = validateConversionOutput({
+      decision: "convert",
+      records: [
+        {
+          data: "First record has password = adminSecretPassword123 here.",
+          type: "fact",
+          subject: "db password",
+          confidence: 0.9,
+        },
+        {
+          data: "Second record uses sk-123456789012345678901234567890 key.",
+          type: "fact",
+          subject: "api key",
+          confidence: 0.9,
+        },
+      ],
+    });
+    assert.equal(res.ok, false);
+    if (!res.ok) {
+      assert.equal(res.rejectCode, "data_sensitive_echo");
+      // "apiKey" and "passwordAssignment" sorted:
+      assert.equal(res.sensitiveReasonCode, "apiKey,passwordAssignment");
+    }
+  });
+
+  await t.test("clean input is completely unaffected by pass 1 scan", () => {
+    const res = validateConversionOutput({
+      decision: "convert",
+      records: [
+        {
+          data: "Clean and atomic fact about configuration management.",
+          type: "fact",
+          subject: "configuration management",
+          confidence: 0.95,
+        },
+      ],
+    });
+    assert.equal(res.ok, true);
+  });
+});
+
+test("repair prompt and contract documentation invariants", async (t) => {
+  await t.test("buildRepairConversionMessages appends prior assistant turn and repair rule class", () => {
+    const initial = buildInitialConversionMessages("Source text here.");
+    const priorResponse = JSON.stringify({ decision: "convert", records: [] });
+    const repairMessages = buildRepairConversionMessages(initial, priorResponse, "empty_records");
+
+    assert.equal(repairMessages.length, initial.length + 2);
+    const assistantTurn = repairMessages[repairMessages.length - 2];
+    assert.equal(assistantTurn.role, "assistant");
+    assert.equal(assistantTurn.content, priorResponse);
+
+    const userTurn = repairMessages[repairMessages.length - 1];
+    assert.equal(userTurn.role, "user");
+    assert.ok(userTurn.content.includes("empty_records"));
   });
 });

@@ -2,7 +2,7 @@
  * Shared test helpers for company memory upgrade sweep tests (TECH-8191).
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   agents,
   companies,
@@ -144,22 +144,41 @@ export function createFakeConversionClient(
     async convert(text: string): Promise<ConversionClientResult> {
       if (handler) {
         const custom = handler(text);
-        if (custom.status) {
-          const defaultRecords = custom.status === "convert"
-            ? [
-                {
-                  data: `Converted durable fact: ${text}`.slice(0, 100),
-                  type: "fact" as const,
-                  subject: "test preference",
-                  confidence: 0.95,
-                },
-              ]
-            : [];
+        if (custom.status === "convert") {
           return {
-            status: custom.status as any,
-            records: (custom as any).records ?? defaultRecords,
-            reasonCode: (custom as any).reasonCode ?? "",
-            rejectCode: (custom as any).rejectCode ?? "",
+            status: "convert",
+            records: custom.records ?? [
+              {
+                data: `Converted durable fact: ${text}`.slice(0, 100),
+                type: "fact",
+                subject: "test preference",
+                confidence: 0.95,
+              },
+            ],
+            inputTokens: custom.inputTokens ?? 650,
+            outputTokens: custom.outputTokens ?? 80,
+          };
+        }
+        if (custom.status === "drop_noise") {
+          return {
+            status: "drop_noise",
+            reasonCode: custom.reasonCode ?? "exact_placeholder_or_greeting",
+            inputTokens: custom.inputTokens ?? 650,
+            outputTokens: custom.outputTokens ?? 80,
+          };
+        }
+        if (custom.status === "drop_sensitive") {
+          return {
+            status: "drop_sensitive",
+            reasonCode: custom.reasonCode ?? "model_classified",
+            inputTokens: custom.inputTokens ?? 650,
+            outputTokens: custom.outputTokens ?? 80,
+          };
+        }
+        if (custom.status === "quarantined") {
+          return {
+            status: "quarantined",
+            rejectCode: custom.rejectCode ?? "not_json",
             inputTokens: custom.inputTokens ?? 650,
             outputTokens: custom.outputTokens ?? 80,
           };
@@ -288,12 +307,14 @@ export async function insertCompanyOpenAiSecret(
     material = prepared.material;
   }
 
+  const keyHash = createHash("sha256").update(key).digest("hex");
+
   await db.insert(companySecretVersions).values({
     secretId,
     version: 1,
     material,
-    valueSha256: "dummy-sha256",
-    fingerprintSha256: "dummy-fingerprint",
+    valueSha256: keyHash,
+    fingerprintSha256: keyHash,
     status: "current",
   });
 }

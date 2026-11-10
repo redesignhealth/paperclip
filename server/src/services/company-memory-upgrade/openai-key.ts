@@ -31,7 +31,7 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { companySecrets, companySecretVersions, type Db } from "@paperclipai/db";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { getSecretProvider } from "../../secrets/provider-registry.js";
 import { isPathInside } from "./census.js";
 import { CompanyMemoryUpgradeError } from "./types.js";
@@ -96,11 +96,14 @@ export async function resolveCompanyOpenAiKey(
     const resolvedPath = path.resolve(process.cwd(), keyFilePath);
     const repoRootDir = repoRoot ?? path.resolve(fileURLToPath(new URL("../../../..", import.meta.url)));
 
-    let realRepoRoot = repoRootDir;
+    let realRepoRoot: string;
     try {
       realRepoRoot = realpathSync(repoRootDir);
     } catch {
-      // fallback
+      throw new CompanyMemoryUpgradeError(
+        "Repository root directory could not be resolved.",
+        "INVALID_ARGUMENT",
+      );
     }
 
     // LEXICAL repo containment check, against both the as-given repo root and its
@@ -165,6 +168,13 @@ export async function resolveCompanyOpenAiKey(
     try {
       const fdStat = fstatSync(fd);
 
+      if (fdStat.size > 4096) {
+        throw new CompanyMemoryUpgradeError(
+          "Key file exceeds maximum allowed size of 4096 bytes.",
+          "INVALID_ARGUMENT",
+        );
+      }
+
       if (!fdStat.isFile()) {
         throw new CompanyMemoryUpgradeError(
           "Key file must be a regular file.",
@@ -190,8 +200,15 @@ export async function resolveCompanyOpenAiKey(
       let realStat;
       try {
         const realpathNow = realpathSync(resolvedPath);
+        if (isPathInside(realpathNow, repoRootDir) || isPathInside(realpathNow, realRepoRoot)) {
+          throw new CompanyMemoryUpgradeError(
+            "Refusing to read key file inside repository. API keys must not reside in the repository tree.",
+            "INVALID_ARGUMENT",
+          );
+        }
         realStat = statSync(realpathNow);
-      } catch {
+      } catch (err: any) {
+        if (err instanceof CompanyMemoryUpgradeError) throw err;
         throw new CompanyMemoryUpgradeError(
           "Key file identity could not be verified.",
           "INVALID_ARGUMENT",
@@ -260,6 +277,7 @@ export async function resolveCompanyOpenAiKey(
         isNull(companySecretVersions.revokedAt),
       ),
     )
+    .orderBy(desc(companySecretVersions.version))
     .limit(1);
 
   if (rows.length === 0) {
@@ -272,17 +290,26 @@ export async function resolveCompanyOpenAiKey(
   const row = rows[0];
 
   if (row.provider !== "local_encrypted") {
+    const providerStr = redaction ? redaction.scrub(String(row.provider)) : String(row.provider);
     throw new CompanyMemoryUpgradeError(
-      `Company openai_api_key uses provider '${row.provider}'. Only 'local_encrypted' is supported directly. Use --openai-key-file to supply an external key file.`,
+      `Company openai_api_key uses provider '${providerStr}'. Only 'local_encrypted' is supported directly. Use --openai-key-file to supply an external key file.`,
       "COMPANY_OPENAI_KEY_PROVIDER_UNSUPPORTED",
     );
   }
 
   const secretProvider = getSecretProvider("local_encrypted");
-  const decrypted = await secretProvider.resolveVersion({
-    material: row.material as any,
-    externalRef: null,
-  });
+  let decrypted: unknown;
+  try {
+    decrypted = await secretProvider.resolveVersion({
+      material: row.material,
+      externalRef: null,
+    });
+  } catch {
+    throw new CompanyMemoryUpgradeError(
+      "Failed to resolve company openai_api_key secret version.",
+      "COMPANY_OPENAI_KEY_MISSING",
+    );
+  }
 
   if (typeof decrypted !== "string" || !isPrintableNonWhitespaceAscii(decrypted.trim())) {
     throw new CompanyMemoryUpgradeError(
