@@ -1,6 +1,7 @@
 import { authorizeSlackDocument } from "./slack-document.js";
 import { slackDelivery } from "./slack-delivery.js";
 import { slackMessage } from "./slack-message.js";
+import { findSlackUsers } from "./slack-user-search.js";
 import { executeSlackWrite } from "./slack-writes.js";
 import { slackBotCatalogIsCurrent, syncSlackBotTools } from "./slack-catalog.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
@@ -291,6 +292,13 @@ export async function executeSlackTool(
       bot: result.is_bot,
     };
   }
+  if (name === "slack_find_user")
+    return findSlackUsers(
+      upstream,
+      authority.endpoint.id,
+      String(args.query),
+      typeof args.limit === "number" ? args.limit : undefined,
+    );
   if (name === "slack_emoji") return { emoji: (await api("emoji.list")).emoji };
   if (name === "slack_search") {
     const channels = args.channels as string[];
