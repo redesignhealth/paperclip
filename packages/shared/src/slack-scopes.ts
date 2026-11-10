@@ -10,6 +10,9 @@ import { z } from "zod";
  * Scopes that are deliberately not Low risk live in
  * `SLACK_OPT_IN_BOT_SCOPE_GROUPS` and are requested per agent on request.
  *
+ * `users:read.email` lets `slack_find_user` match a person by email. Existing apps
+ * keep the scopes they were created with until an admin updates them.
+ *
  * Channel reading and replying stay here (`*:history`, `chat:write`), so an
  * agent added to a channel can still read its full history and answer.
  */
@@ -41,6 +44,7 @@ export const SLACK_DEFAULT_BOT_SCOPES = [
   "reactions:read",
   "reactions:write",
   "users:read",
+  "users:read.email",
 ] as const;
 
 const defaultScopeSet = new Set<string>(SLACK_DEFAULT_BOT_SCOPES);

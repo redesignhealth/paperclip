@@ -27,8 +27,9 @@ not constitute successful configuration.
 ## Per-agent permission opt-ins
 
 Each agent's Slack app requests only the workspace's **Low risk** bot scopes by
-default: 27 scopes that cover reading channels and DMs, replying, reactions,
-pins, bookmarks, canvases, lists, and topics. Slack's app-approval rule can
+default: 28 scopes that cover reading channels and DMs, replying, reactions,
+pins, bookmarks, canvases, lists, topics, and looking up workspace members
+(`users:read`, plus `users:read.email` so `slack_find_user` can match by email). Slack's app-approval rule can
 therefore auto-approve a managed or own-app install without a human review. This
 is a security boundary: a scope stays in the default set only when it is safe to
 grant every agent.
