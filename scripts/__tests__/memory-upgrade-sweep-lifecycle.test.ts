@@ -11,6 +11,8 @@ import {
   companyMemoryDatabases,
   companyMemoryUpgrades,
   createDb,
+  createFakeConversionClient,
+  createFakeEmbeddingClient,
   eq,
   getEmbeddedPostgresTestSupport,
   handleEmbeddedPostgresUnsupported,
@@ -128,7 +130,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
       [memoryId],
     );
 
-    // Sweep 2: detects change, supersedes (+1 transition), deletes stale ledger row, and marks pendingConversion
+    // Sweep 2: detects change, supersedes (+1 transition), deletes stale ledger row, and converts to staging
     const report2 = await runSweep(
       {
         databaseUrl: tenantWorkerUrl.toString(),
@@ -143,17 +145,20 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
         clock,
         _internalSkipVectorIdentityCheck: true,
         _internalDatabaseIdentityOverride: { database: dbName, user: role },
+        conversionClient: createFakeConversionClient(),
+        embeddingClient: createFakeEmbeddingClient(),
       },
     );
     assert.equal(report2.counts.supersededCount, 1);
-    assert.equal(report2.counts.pendingConversionCount, 1);
+    assert.equal(report2.counts.stagedPendingPublishCount, 1);
 
-    // Verify ledger row was deleted (pending rows have no ledger row)
+    // Verify ledger row was updated to published with output_ids
     const [staleLedger] = await tenantWorkerSql`
-      SELECT outcome FROM paperclip_memory_upgrade_ledger
+      SELECT outcome, output_ids FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${report1.upgradeId}::uuid AND source_id = ${memoryId}::uuid;
     `;
-    assert.equal(staleLedger, undefined, "Stale superseded ledger row must be deleted");
+    assert.ok(staleLedger, "Superseded row reclassifies and commits new ledger row");
+    assert.equal(staleLedger.outcome, "published");
 
     // Sweep 3: UNCHANGED re-run on unchanged data: zero superseded increments!
     const report3 = await runSweep(
@@ -170,9 +175,12 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
         clock,
         _internalSkipVectorIdentityCheck: true,
         _internalDatabaseIdentityOverride: { database: dbName, user: role },
+        conversionClient: createFakeConversionClient(),
+        embeddingClient: createFakeEmbeddingClient(),
       },
     );
     assert.equal(report3.counts.supersededCount, 0, "Unchanged re-run must cause zero superseded increments");
+    assert.equal(report3.counts.skippedUnchangedCount, 1, "Unchanged row is skipped");
 
     // Cumulative check on control plane: supersededCount remains exactly 1 from sweep 2
     const [cpRow] = await cpWorkerDb

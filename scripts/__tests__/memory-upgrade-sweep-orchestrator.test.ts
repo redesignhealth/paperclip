@@ -11,6 +11,8 @@ import {
   companyMemoryDatabases,
   companyMemoryUpgrades,
   createDb,
+  createFakeConversionClient,
+  createFakeEmbeddingClient,
   eq,
   getEmbeddedPostgresTestSupport,
   handleEmbeddedPostgresUnsupported,
@@ -229,6 +231,19 @@ test("sweep orchestrator integration", async (t) => {
     });
 
     const clock = new ManualClock();
+    let llmCalls = 0;
+    let embCalls = 0;
+    const conversionClient = createFakeConversionClient(() => {
+      llmCalls++;
+      return { status: "convert" };
+    });
+    const embeddingClient = createFakeEmbeddingClient();
+    const origEmbed = embeddingClient.embed;
+    embeddingClient.embed = async (txt: string) => {
+      embCalls++;
+      return origEmbed(txt);
+    };
+
     const report: SweepReport = await runSweep(
       {
         databaseUrl: tenantWorkerUrl.toString(),
@@ -242,26 +257,39 @@ test("sweep orchestrator integration", async (t) => {
         tenantSql: tenantWorkerSql,
         clock,
         _internalSkipVectorIdentityCheck: true,
+        conversionClient,
+        embeddingClient,
       },
     );
 
     // Assert counts
     assert.equal(report.status, "completed");
     assert.equal(report.counts.sourceSeenCount, 10);
-    assert.equal(report.counts.pendingConversionCount, 2); // substantiveId + pausedSubstantiveId
+    assert.equal(report.counts.stagedPendingPublishCount, 2); // substantiveId + pausedSubstantiveId
     assert.equal(report.counts.droppedNoiseCount, 2); // empty + greeting
     assert.equal(report.counts.droppedSensitiveCount, 1); // sensitive
     assert.equal(report.counts.unroutableCount, 5); // missing, malformed, unknown, terminated, nonMemory
     assert.equal(report.counts.supersededCount, 0);
     assert.equal(report.counts.sourceDeletedCount, 0);
 
-    // Verify routable non-noise non-sensitive rows get NO ledger row!
+    // Verify routable non-noise non-sensitive rows get ledger rows with published and output_ids!
     const substantiveLedger = await tenantWorkerSql`
       SELECT * FROM paperclip_memory_upgrade_ledger
       WHERE upgrade_id = ${report.upgradeId}::uuid
-        AND source_id IN (${substantiveId}::uuid, ${pausedSubstantiveId}::uuid);
+        AND source_id = ANY(${[substantiveId, pausedSubstantiveId]}::uuid[]);
     `;
-    assert.equal(substantiveLedger.length, 0);
+    assert.equal(substantiveLedger.length, 2);
+    assert.equal(substantiveLedger[0].outcome, "published");
+    assert.equal(substantiveLedger[1].outcome, "published");
+
+    const stagedRows = await tenantWorkerSql`
+      SELECT * FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${report.upgradeId}::uuid
+        AND source_id = ANY(${[substantiveId, pausedSubstantiveId]}::uuid[]);
+    `;
+    assert.equal(stagedRows.length, 2);
+    assert.equal(stagedRows[0].published_at, null);
+    assert.equal(stagedRows[1].published_at, null);
 
     // Verify sensitive row has family names only in reason_code, NEVER matched text
     const sensitiveLedger = await tenantWorkerSql`
@@ -308,6 +336,14 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(upgradeRow.unroutableCount, ledgerMap.get("unroutable"));
     assert.equal(upgradeRow.droppedNoiseCount, ledgerMap.get("dropped_noise"));
     assert.equal(upgradeRow.droppedSensitiveCount, ledgerMap.get("dropped_sensitive"));
+    // COUNTER finding: this sweep phase only STAGES records (published_at stays NULL); it
+    // never publishes to the live collection table, so the control-plane publishedCount
+    // column must stay zero even though the tenant ledger legitimately has 'published' rows
+    // (meaning "staged, pending publish" in this phase's vocabulary). Operators query
+    // stagedPendingPublishCount from the report, or the ledger directly (see runbook), to
+    // see this phase's staged activity.
+    assert.ok((ledgerMap.get("published") ?? 0) > 0, "sanity: ledger must have published rows to make this assertion meaningful");
+    assert.equal(upgradeRow.publishedCount, 0);
     assert.equal(upgradeRow.sweepCount, 1);
 
     // Verify NO memory text exists in ANY column of company_memory_upgrades
@@ -321,7 +357,9 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(rowsAfter.length, initialLiveCount + 10);
     assert.deepEqual([...rowsAfter.slice(0, initialLiveCount)], [...rowsBefore]);
 
-    // Idempotent re-run test: makes zero new ledger writes
+    // Idempotent re-run test: makes ZERO new LLM calls and ZERO embedding calls
+    const prevLlmCalls = llmCalls;
+    const prevEmbCalls = embCalls;
     const ledgerRowsBeforeRerun = await tenantWorkerSql`SELECT count(*)::int AS count FROM paperclip_memory_upgrade_ledger WHERE upgrade_id = ${report.upgradeId}::uuid`;
 
     const rerunReport = await runSweep(
@@ -337,13 +375,17 @@ test("sweep orchestrator integration", async (t) => {
         tenantSql: tenantWorkerSql,
         clock,
         _internalSkipVectorIdentityCheck: true,
+        conversionClient,
+        embeddingClient,
       },
     );
 
     const ledgerRowsAfterRerun = await tenantWorkerSql`SELECT count(*)::int AS count FROM paperclip_memory_upgrade_ledger WHERE upgrade_id = ${report.upgradeId}::uuid`;
     assert.equal(ledgerRowsAfterRerun[0].count, ledgerRowsBeforeRerun[0].count);
-    assert.equal(rerunReport.counts.skippedUnchangedCount, 8); // 8 non-pending rows skipped
-    assert.equal(rerunReport.counts.pendingConversionCount, 2);
+    assert.equal(rerunReport.counts.skippedUnchangedCount, 10); // All 10 rows skipped!
+    assert.equal(rerunReport.counts.stagedPendingPublishCount, 0);
+    assert.equal(llmCalls, prevLlmCalls, "Completed re-run makes ZERO LLM calls");
+    assert.equal(embCalls, prevEmbCalls, "Completed re-run makes ZERO embedding calls");
 
     // Verify unchanged rerun does NOT duplicate outcome increments on control plane
     const [upgradeRowRerun] = await cpWorkerDb
@@ -354,6 +396,7 @@ test("sweep orchestrator integration", async (t) => {
     assert.equal(upgradeRowRerun.unroutableCount, upgradeRow.unroutableCount);
     assert.equal(upgradeRowRerun.droppedNoiseCount, upgradeRow.droppedNoiseCount);
     assert.equal(upgradeRowRerun.droppedSensitiveCount, upgradeRow.droppedSensitiveCount);
+    assert.equal(upgradeRowRerun.publishedCount, upgradeRow.publishedCount);
     assert.equal(upgradeRowRerun.supersededCount, 0);
     assert.equal(upgradeRowRerun.sourceDeletedCount, 0);
   });
@@ -468,6 +511,178 @@ test("sweep orchestrator integration", async (t) => {
 
     assert.equal(readsAfterLoss, 0, "No next read occurs after lease loss");
     assert.equal(writesAfterLoss, 0, "No next write occurs after lease loss");
+  });
+
+  await t.test("terminal LLM key error aborts the sweep with lastError=conversion_failed and zero ledger/staging rows for that source", async () => {
+    const [comp5] = await cpDb.insert(companies).values({ name: "Company 5", issuePrefix: "C5" }).returning();
+    const dbName5 = `tenant_db_${comp5.id.slice(0, 8)}`;
+    const role5 = `${tenantInfo.usr}_5`;
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: comp5.id,
+      databaseName: dbName5,
+      databaseRole: role5,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    const [agent5] = await cpDb.insert(agents).values({
+      companyId: comp5.id,
+      name: "Terminal Key Error Agent",
+      adapterType: "hermes_local",
+      status: "active",
+    }).returning();
+
+    const sourceId = await insertTenantMemoryRow(tenantWorkerSql, {
+      agentId: agent5.id,
+      data: "A substantive durable fact that will never reach conversion.",
+    });
+
+    const clock = new ManualClock();
+    const terminalError = new CompanyMemoryUpgradeError(
+      "OpenAI chat completions request rejected with HTTP 401",
+      "COMPANY_OPENAI_KEY_REJECTED",
+    );
+    const conversionClient = {
+      async convert() {
+        throw terminalError;
+      },
+    };
+    const embeddingClient = createFakeEmbeddingClient();
+
+    await assert.rejects(
+      async () => {
+        await runSweep(
+          {
+            databaseUrl: tenantWorkerUrl.toString(),
+            controlPlaneUrl: cpWorkerUrl.toString(),
+            companyId: comp5.id,
+            pageSize: 5,
+            pauseWhenActiveRuns: 0,
+          },
+          {
+            controlPlaneDb: cpWorkerDb,
+            tenantSql: tenantWorkerSql,
+            clock,
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: dbName5, user: role5 },
+            conversionClient,
+            embeddingClient,
+          },
+        );
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        // The ORIGINAL raw thrown code propagates to the caller unchanged; only the
+        // persisted lastError column is mapped to the bounded UPGRADE_ERROR_CODES vocabulary.
+        assert.equal(err.code, "COMPANY_OPENAI_KEY_REJECTED");
+        return true;
+      },
+    );
+
+    const [upgrade] = await cpDb
+      .select()
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.companyId, comp5.id));
+    assert.ok(upgrade, "upgrade record must exist for the aborted sweep");
+    assert.equal(upgrade.lastError, "conversion_failed");
+
+    const ledgerRows = await tenantWorkerSql`
+      SELECT * FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgrade.id}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(ledgerRows.length, 0, "no ledger row for the in-flight source when the sweep aborts mid-call");
+
+    const stagingRows = await tenantWorkerSql`
+      SELECT * FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgrade.id}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(stagingRows.length, 0, "no staging row for the in-flight source when the sweep aborts mid-call");
+  });
+
+  await t.test("terminal embedding key error aborts the sweep without recording a per-source outcome", async () => {
+    const [compEmb] = await cpDb.insert(companies).values({ name: "Emb Key Error Co", issuePrefix: "EK" }).returning();
+    const dbNameEmb = `tenant_db_${compEmb.id.slice(0, 8)}`;
+    const roleEmb = `${tenantInfo.usr}_ek`;
+
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: compEmb.id,
+      databaseName: dbNameEmb,
+      databaseRole: roleEmb,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    const [agentEmb] = await cpDb.insert(agents).values({
+      companyId: compEmb.id,
+      name: "Emb Terminal Key Error Agent",
+      adapterType: "hermes_local",
+      status: "active",
+    }).returning();
+
+    const sourceId = await insertTenantMemoryRow(tenantWorkerSql, {
+      agentId: agentEmb.id,
+      data: "A substantive durable fact that converts cleanly but fails at embedding.",
+    });
+
+    const clock = new ManualClock();
+    const conversionClient = createFakeConversionClient();
+    const embeddingClient = {
+      async embed() {
+        throw new CompanyMemoryUpgradeError(
+          "OpenAI embeddings request rejected with HTTP 401",
+          "COMPANY_OPENAI_KEY_REJECTED",
+        );
+      },
+    };
+
+    await assert.rejects(
+      async () => {
+        await runSweep(
+          {
+            databaseUrl: tenantWorkerUrl.toString(),
+            controlPlaneUrl: cpWorkerUrl.toString(),
+            companyId: compEmb.id,
+            pageSize: 5,
+            pauseWhenActiveRuns: 0,
+          },
+          {
+            controlPlaneDb: cpWorkerDb,
+            tenantSql: tenantWorkerSql,
+            clock,
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: dbNameEmb, user: roleEmb },
+            conversionClient,
+            embeddingClient,
+          },
+        );
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "COMPANY_OPENAI_KEY_REJECTED");
+        return true;
+      },
+    );
+
+    const [upgrade] = await cpDb
+      .select()
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.companyId, compEmb.id));
+    assert.ok(upgrade, "upgrade record must exist for the aborted sweep");
+    assert.equal(upgrade.lastError, "conversion_failed");
+
+    const ledgerRows = await tenantWorkerSql`
+      SELECT * FROM paperclip_memory_upgrade_ledger
+      WHERE upgrade_id = ${upgrade.id}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(ledgerRows.length, 0, "no ledger row for the in-flight source when embedding fails with key rejected");
+
+    const stagingRows = await tenantWorkerSql`
+      SELECT * FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgrade.id}::uuid AND source_id = ${sourceId}::uuid;
+    `;
+    assert.equal(stagingRows.length, 0, "no staging row for the in-flight source when embedding fails with key rejected");
   });
 
   await t.test("active-run gate pauses then resumes during sweep", async () => {
