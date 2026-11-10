@@ -26,7 +26,11 @@ import {
   type TenantFence,
   validateTenantFence,
 } from "./tenant-fence.js";
-import { ensureUpgradeTables, quoteVectorType } from "./tenant-tables.js";
+import {
+  assertSupportedStagingVectorType,
+  ensureUpgradeTables,
+  quoteVectorType,
+} from "./tenant-tables.js";
 
 export type { TenantFence } from "./tenant-fence.js";
 import {
@@ -402,6 +406,7 @@ export async function introspectCollection(
   const cleanedVectorType = options?.skipVectorIdentityCheck
     ? vectorCol.formatted_type.trim().replace(/^"|"$/g, "")
     : vectorCol.formatted_type.trim();
+  // Introspection describes schema-qualified vector types; assertSupportedStagingVectorType enforces unqualified vector(1536) / text before staging.
   const vectorMatch = cleanedVectorType.match(
     /^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?vector\((\d+)\)$/i,
   );
@@ -1054,15 +1059,13 @@ export async function stageSourceRecords(
     );
   }
 
-  if (params.vectorType !== undefined && params.vectorType.toLowerCase().trim() !== "text") {
+  const normalizedVectorType = params.vectorType?.trim().toLowerCase();
+  const isTextVector = normalizedVectorType === "text";
+
+  if (!isTextVector) {
     // TECH-8191 follow-up: the staging INSERT hardcodes an unqualified ::vector(1536) cast;
     // schema-qualified or non-1536 pgvector is unsupported until the cast is parameterised.
-    if (quoteVectorType(params.vectorType) !== "vector(1536)") {
-      throw new CompanyMemoryUpgradeError(
-        "Unsupported staging vectorType: only vector(1536) or text is currently supported",
-        "INVALID_ARGUMENT",
-      );
-    }
+    assertSupportedStagingVectorType(params.vectorType ?? "vector(1536)");
     for (const record of records) {
       if (!Array.isArray(record.embedding) || record.embedding.length !== 1536) {
         throw new CompanyMemoryUpgradeError(
@@ -1144,7 +1147,7 @@ export async function stageSourceRecords(
     // 4. Stage won records (published_at IS NULL)
     for (const won of wonRecords) {
       const vectorLiteral = JSON.stringify(won.embedding);
-      if (params.vectorType === "text") {
+      if (isTextVector) {
         await tx`
           INSERT INTO paperclip_memory_upgrade_staging (
             upgrade_id,

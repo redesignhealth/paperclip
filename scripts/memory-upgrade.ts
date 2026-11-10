@@ -406,6 +406,9 @@ Options:
 
 export interface RunSweepCliDependencies extends SweepDependencies {}
 
+const TENANT_FENCE_CLAIM_FAILED_MESSAGE =
+  "Upgrade fence claim failed (tenant database unreachable, refused or stalled, or the control-plane admission transaction was terminated). No memories were staged and no ledger rows were written; the tenant fence epoch may have been bumped, which is safe — the next successful claim supersedes it. Retry after checking the tenant database and the tenant role's privileges on paperclip_memory_upgrade_fence.";
+
 const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   // Census & Preflight codes
   NOT_PGVECTOR: "Target database is missing required vector extension or column is not a valid pgvector column.",
@@ -453,8 +456,8 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   LEASE_FENCED_OUT: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
   lease_fenced_out: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
 
-  TENANT_FENCE_CLAIM_FAILED: "Tenant-side upgrade fence claim failed (tenant database unreachable, refused, or stalled). The sweep made no tenant writes; retry after checking the tenant database and the tenant role's privileges on paperclip_memory_upgrade_fence.",
-  tenant_fence_claim_failed: "Tenant-side upgrade fence claim failed (tenant database unreachable, refused, or stalled). The sweep made no tenant writes; retry after checking the tenant database and the tenant role's privileges on paperclip_memory_upgrade_fence.",
+  TENANT_FENCE_CLAIM_FAILED: TENANT_FENCE_CLAIM_FAILED_MESSAGE,
+  tenant_fence_claim_failed: TENANT_FENCE_CLAIM_FAILED_MESSAGE,
 
   LEASE_EXPIRED: "Upgrade lease has expired.",
   lease_expired: "Upgrade lease has expired.",

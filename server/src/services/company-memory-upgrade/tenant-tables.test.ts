@@ -6,6 +6,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
 import {
+  assertSupportedStagingVectorType,
   ensureUpgradeTables,
   isValidVectorType,
   UPGRADE_LEDGER_OUTCOMES,
@@ -81,6 +82,37 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
       }),
     );
     await expect(ensureUpgradeTables(sql, "vector(16001)")).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+  });
+
+  it("assertSupportedStagingVectorType and ensureUpgradeTables enforce unqualified vector(1536) or text (R2-F7)", async () => {
+    expect(() => assertSupportedStagingVectorType("text")).not.toThrow();
+    expect(() => assertSupportedStagingVectorType("TEXT")).not.toThrow();
+    expect(() => assertSupportedStagingVectorType("vector(1536)")).not.toThrow();
+
+    expect(() => assertSupportedStagingVectorType("public.vector(1536)")).toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+    expect(() => assertSupportedStagingVectorType("vector(512)")).toThrowError(
+      expect.objectContaining({
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+
+    // ensureUpgradeTables preflights at startup before any conversion
+    await expect(ensureUpgradeTables(sql, "public.vector(1536)")).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "INVALID_ARGUMENT",
+      }),
+    );
+    await expect(ensureUpgradeTables(sql, "vector(512)")).rejects.toThrowError(
       expect.objectContaining({
         name: "CompanyMemoryUpgradeError",
         code: "INVALID_ARGUMENT",

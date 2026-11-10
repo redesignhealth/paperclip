@@ -53,23 +53,27 @@
  * the tenant claim outright -- it can never become "the latest claimant" after the fact.
  *
  * The CP round trip to the tenant database is wall-clock bounded by four coordinated layers:
- *   1. Tenant transaction timeouts (statement_timeout, lock_timeout, idle_in_transaction_session_timeout
- *      all set to boundMs) ensure stalled tenant-side statements or locks fail quickly server-side.
- *   2. Client-side timeout race (boundMs + CLIENT_GRACE_MS) acts as a process-liveness backstop so
- *      a hung client/driver surfaces an error instead of hanging the Node process indefinitely.
- *      (This client-side race does NOT cancel in-flight tenant work or release server-side locks).
- *   3. Control-plane idle_in_transaction_session_timeout (boundMs + CP_IDLE_GRACE_MS) is the load-bearing
- *      bound: while the worker awaits the tenant round trip, the CP backend is idle in transaction,
- *      so Postgres terminates the CP backend server-side and releases the row lock even if the client wedged.
- *   4. Control-plane lock_timeout bounds waiting for the initial CP row lock.
+ *   1. Tenant transaction timeouts: statement_timeout and lock_timeout are per statement; the tenant claim
+ *      transaction contains two potentially-blocking statements (the L0 advisory lock wait and the fence upsert),
+ *      each capped at boundMs / 2, so its server-enforced blocking time is bounded by boundMs (round-trip latency
+ *      and BEGIN/COMMIT are not server-bounded). idle_in_transaction_session_timeout is set to boundMs as a wedged-client backstop.
+ *   2. Client-side timeout race (boundMs + CLIENT_GRACE_MS) acts as a process-liveness backstop that does NOT cancel
+ *      in-flight tenant work and does not release any lock.
+ *   3. Control-plane idle_in_transaction_session_timeout (boundMs + CP_IDLE_GRACE_MS, default 20s) is the load-bearing
+ *      bound that releases the CP row lock server-side when the worker process is wedged.
+ *   4. Control-plane lock_timeout bounds only the initial CP row-lock wait.
  *
  * Ordering invariant:
- *   tenant statement_timeout (boundMs, 10s) < client race (boundMs + CLIENT_GRACE_MS, 15s)
+ *   tenant per-statement timeout (boundMs / 2, 5s) < tenant statement budget (boundMs, 10s)
+ *   < client race (boundMs + CLIENT_GRACE_MS, 15s)
  *   < CP idle_in_transaction_session_timeout (boundMs + CP_IDLE_GRACE_MS, 20s) < CP lock_timeout (30s).
  *
- * Honest residual: if the control-plane socket itself black-holes mid-statement, the CP row lock survives
- * until TCP keepalive death. That is a control-plane outage domain, not a tenant-stall domain, and cannot
- * be resolved purely client-side.
+ * Honest residuals:
+ *   (a) if the control-plane socket itself black-holes mid-statement, the CP row lock survives until TCP keepalive death
+ *       (a control-plane outage domain, not a tenant-stall domain, and cannot be resolved purely client-side);
+ *   (b) a failed claim may still have committed a tenant fence_epoch bump server-side — this is safe and liveness-only:
+ *       the minted pair is held by no worker and the next successful claim supersedes it, though an interim successor
+ *       will fail closed with LEASE_FENCED_OUT and self-heal on the next recovery cycle (see orphan-epoch analysis).
  *
  * GUARANTEE ACTUALLY PROVIDED: at most one (token, epoch) pair is “live” at a time, and a
  * worker can only mint a new one while it is provably still the current CP-admitted holder
@@ -125,8 +129,51 @@ export const TENANT_FENCE_CP_IDLE_GRACE_MS = 10_000;
 /** Timeout for acquiring the CP admission row lock. */
 export const TENANT_FENCE_CP_LOCK_TIMEOUT_MS = 30_000;
 
-/** SQLSTATEs that mean "someone else is mid-claim", i.e. benign retryable contention. */
-const FENCE_CONTENTION_SQLSTATES = new Set(["57014", "55P03"]); // query_canceled (statement_timeout), lock_not_available (lock_timeout)
+/**
+ * Potentially-blocking statements inside the tenant claim transaction:
+ * the L0 advisory lock wait and the fence upsert. statement_timeout and lock_timeout are
+ * PER STATEMENT, not transaction-wide, so the per-statement budget must be boundMs/N for the
+ * transaction's blocking time to stay within boundMs.
+ */
+const TENANT_CLAIM_BLOCKING_STATEMENTS = 2;
+
+/**
+ * SQLSTATEs that mean "someone else is mid-claim on the control plane", i.e. benign retryable contention.
+ * Used ONLY on the control-plane side.
+ */
+const CP_LOCK_CONTENTION_SQLSTATES = new Set(["57014", "55P03"]); // query_canceled (statement_timeout), lock_not_available (lock_timeout)
+
+const MAX_CAUSE_DEPTH = 5;
+
+/** Reads a driver error code from err.code, walking the cause chain (drizzle wraps driver errors). */
+function extractErrorCode(err: unknown): string | undefined {
+  let current: unknown = err;
+  let depth = 0;
+  while (current && depth <= MAX_CAUSE_DEPTH) {
+    if (typeof current === "object" && current !== null && "code" in current && typeof (current as any).code === "string") {
+      return (current as any).code;
+    }
+    if (typeof current === "object" && current !== null && "cause" in current) {
+      current = (current as any).cause;
+      depth++;
+    } else {
+      break;
+    }
+  }
+  return undefined;
+}
+
+/** CP backend terminated or connection lost mid-claim: the claim failed, it is not lease contention. */
+const CP_TERMINATION_CODES = new Set([
+  "25P03", // idle_in_transaction_session_timeout
+  "57P01", // admin_shutdown
+  "08006", // connection_failure
+  "08003", // connection_does_not_exist
+  "CONNECTION_CLOSED",
+  "CONNECTION_ENDED",
+  "CONNECTION_DESTROYED",
+  "ECONNRESET", // postgres.js / node
+]);
 
 const TAKEOVER_LOCK_NAMESPACE = "paperclip:memory-upgrade-fence-takeover";
 const SOURCE_LOCK_NAMESPACE = "paperclip:memory-upgrade-source";
@@ -152,10 +199,13 @@ export async function INTERNAL_claimTenantFenceUnguarded(
   leaseOwner: string,
   boundMs: number,
 ): Promise<TenantFence> {
-  const timeoutMs = Math.max(1, Math.floor(boundMs));
-  await tx.unsafe(`SET LOCAL statement_timeout = ${timeoutMs}`);
-  await tx.unsafe(`SET LOCAL lock_timeout = ${timeoutMs}`);
-  await tx.unsafe(`SET LOCAL idle_in_transaction_session_timeout = ${timeoutMs}`);
+  const totalMs = Math.max(TENANT_CLAIM_BLOCKING_STATEMENTS, Math.floor(boundMs));
+  const perStatementMs = Math.max(1, Math.floor(totalMs / TENANT_CLAIM_BLOCKING_STATEMENTS));
+  await tx.unsafe(`SET LOCAL statement_timeout = ${perStatementMs}`);
+  await tx.unsafe(`SET LOCAL lock_timeout = ${perStatementMs}`);
+  // Wedged-client backstop, deliberately NOT part of the latency budget: this fires only when
+  // the client stops issuing statements mid-transaction.
+  await tx.unsafe(`SET LOCAL idle_in_transaction_session_timeout = ${totalMs}`);
   await tx`SELECT pg_advisory_xact_lock(hashtextextended(${takeoverLockKey(upgradeId)}, 0))`;
 
   const newToken = randomUUID();
@@ -284,20 +334,15 @@ export async function claimTenantFenceGuarded(
         if (err instanceof CompanyMemoryUpgradeError) {
           normalizedErr = err;
         } else {
-          const sqlState = typeof err === "object" && err !== null && "code" in err ? String(err.code) : undefined;
-          if (sqlState && FENCE_CONTENTION_SQLSTATES.has(sqlState)) {
-            normalizedErr = new CompanyMemoryUpgradeError(
-              "Tenant fence claim contention: statement or lock timeout exceeded while holding control-plane admission lock",
-              "LEASE_FENCED_OUT",
-              { cause: err },
-            );
-          } else {
-            normalizedErr = new CompanyMemoryUpgradeError(
-              "Tenant fence claim failed while holding control-plane admission lock",
-              "TENANT_FENCE_CLAIM_FAILED",
-              { cause: err },
-            );
-          }
+          // A benign concurrent claimant cannot reach the tenant side at all (it would have
+          // failed in-lock CP validation first), so any tenant-side error (including 57014/55P03)
+          // represents a stalled or stale claimant and must be classified as TENANT_FENCE_CLAIM_FAILED
+          // so it is recorded in last_error rather than suppressed as lease contention.
+          normalizedErr = new CompanyMemoryUpgradeError(
+            "Tenant fence claim failed while holding control-plane admission lock",
+            "TENANT_FENCE_CLAIM_FAILED",
+            { cause: err },
+          );
         }
         capturedError = normalizedErr;
         throw normalizedErr;
@@ -316,11 +361,18 @@ export async function claimTenantFenceGuarded(
     if (outerErr instanceof CompanyMemoryUpgradeError) {
       throw outerErr;
     }
-    const sqlState = typeof outerErr === "object" && outerErr !== null && "code" in outerErr ? String(outerErr.code) : undefined;
-    if (sqlState && FENCE_CONTENTION_SQLSTATES.has(sqlState)) {
+    const code = extractErrorCode(outerErr);
+    if (code && CP_LOCK_CONTENTION_SQLSTATES.has(code)) {
       throw new CompanyMemoryUpgradeError(
         "Control-plane admission lock contention: another worker holds the upgrade row lock",
         "LEASE_FENCED_OUT",
+        { cause: outerErr },
+      );
+    }
+    if (code && CP_TERMINATION_CODES.has(code)) {
+      throw new CompanyMemoryUpgradeError(
+        "Control-plane admission transaction was terminated while claiming tenant fence",
+        "TENANT_FENCE_CLAIM_FAILED",
         { cause: outerErr },
       );
     }
@@ -373,7 +425,9 @@ export async function acquireSourceAdvisoryLocksAscending(
   upgradeId: string,
   sourceIds: string[],
 ): Promise<void> {
-  const sorted = [...new Set(sourceIds)].sort();
+  // Sort on the CANONICAL key (sourceLockKey lowercases), never the raw id: sorting raw ids
+  // would let two transactions take the same locks in opposite order and deadlock (40P01).
+  const sorted = [...new Set(sourceIds.map((s) => s.toLowerCase()))].sort();
   for (const sourceId of sorted) {
     await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
   }

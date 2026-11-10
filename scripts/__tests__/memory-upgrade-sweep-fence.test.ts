@@ -3,14 +3,17 @@
  */
 
 import assert from "node:assert/strict";
+import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   claimUpgradeLease,
   openUpgrade,
 } from "../../server/src/services/company-memory-upgrade/state-machine.js";
 import {
   acquireSourceAdvisoryLock,
+  acquireSourceAdvisoryLocksAscending,
   claimTenantFenceGuarded,
 } from "../../server/src/services/company-memory-upgrade/tenant-fence.js";
 import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
@@ -31,6 +34,7 @@ import {
   eq,
   getEmbeddedPostgresTestSupport,
   handleEmbeddedPostgresUnsupported,
+  sql as dsql,
   startEmbeddedPostgresTestDatabase,
 } from "./memory-upgrade-sweep-helpers.js";
 
@@ -255,8 +259,21 @@ test("tenant fence: same source, two concurrent separate clients -- no orphaned 
     eitherSettled = true;
   });
 
-  // Assert both writers are still pending while the barrier holds L1
-  await new Promise((r) => setTimeout(r, 60));
+  // Assert both writers are still pending while the barrier holds L1:
+  // poll from sqlClientBarrier (opened with max: 2) until two ungranted advisory locks are visible (R2-T5)
+  const pollDeadline = Date.now() + 5000;
+  let waitingLocks = 0;
+  while (Date.now() < pollDeadline) {
+    const [row] = await sqlClientBarrier`
+      SELECT count(*)::int AS waiting FROM pg_locks WHERE locktype = 'advisory' AND NOT granted;
+    `;
+    waitingLocks = row.waiting;
+    if (waitingLocks >= 2) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(waitingLocks >= 2, true, `Expected >= 2 ungranted advisory locks, found ${waitingLocks}`);
   assert.equal(eitherSettled, false, "both concurrent writers must be blocked waiting on L1 advisory lock held by barrier");
 
   // Release the barrier
@@ -482,7 +499,7 @@ test("tenant fence claim error mapping and timeouts (F1/F2)", async (t) => {
   const claim = await claimUpgradeLease(cpDb, { upgradeId: upgrade.id, leaseOwner: "test-worker" });
   assert.ok(claim.acquired && claim.leaseToken);
 
-  // 1. tenant begin throws { code: "57014" } -> LEASE_FENCED_OUT, err.cause preserved, no driver text in message
+  // 1. tenant begin throws { code: "57014" } -> TENANT_FENCE_CLAIM_FAILED, err.cause preserved, no driver text in message (R2-F3)
   const fakeTenantSql57014 = {
     begin: async () => {
       const err = new Error("canceling statement due to statement timeout (driver specific details)");
@@ -500,7 +517,7 @@ test("tenant fence claim error mapping and timeouts (F1/F2)", async (t) => {
       }),
     (err: any) => {
       assert.ok(err instanceof CompanyMemoryUpgradeError);
-      assert.equal(err.code, "LEASE_FENCED_OUT");
+      assert.equal(err.code, "TENANT_FENCE_CLAIM_FAILED");
       assert.ok(err.cause);
       assert.equal((err.cause as any).code, "57014");
       assert.ok(!err.message.includes("canceling statement"));
@@ -534,7 +551,7 @@ test("tenant fence claim error mapping and timeouts (F1/F2)", async (t) => {
     },
   );
 
-  // 3. tenant begin returns a never-settling promise, boundMs: 200 -> rejects TENANT_FENCE_CLAIM_FAILED in < 1s
+  // 3. client-race path (CP backstop covered separately): tenant begin returns a never-settling promise, boundMs: 200 -> rejects TENANT_FENCE_CLAIM_FAILED in < 1s
   // and CP row lock is released immediately (verified by SELECT ... FOR UPDATE NOWAIT)
   const fakeTenantSqlStall = {
     begin: () => new Promise(() => {}),
@@ -750,4 +767,349 @@ test("tenant fence: lease expired by CP DB clock is refused even when params.now
       return true;
     },
   );
+});
+
+test("CP idle-in-transaction backstop: mechanism releases row lock server-side (R2-T1)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const cpFixture = await startEmbeddedPostgresTestDatabase("fence-r2t1-cp-");
+  const cpDb = createDb(cpFixture.connectionString);
+
+  t.after(async () => {
+    await cpDb.$client?.end();
+    await cpFixture.cleanup();
+  });
+
+  const [company] = await cpDb.insert(companies).values({
+    name: "CP Idle Mechanism Co",
+    issuePrefix: "CIM",
+  }).returning();
+
+  const upgrade = await openUpgrade(cpDb, {
+    companyId: company.id,
+    converterId: "paperclip.memory-upgrade.atomic-converter",
+    converterVersion: 1,
+    collectionName: "mem0_memories",
+    embeddingModel: "text-embedding-3-small",
+    embeddingDimensions: 1536,
+  });
+
+  // Open cpDb transaction, set idle timeout 200ms, lock row FOR UPDATE, sleep 900ms, then execute another statement
+  let caughtErr: any;
+  try {
+    await cpDb.transaction(async (tx) => {
+      await tx.execute(dsql.raw("SET LOCAL idle_in_transaction_session_timeout = 200"));
+      await tx
+        .select({ id: companyMemoryUpgrades.id })
+        .from(companyMemoryUpgrades)
+        .where(eq(companyMemoryUpgrades.id, upgrade.id))
+        .for("update");
+
+      await delay(900);
+      await tx.execute(dsql.raw("SELECT 1"));
+    });
+  } catch (err: any) {
+    caughtErr = err;
+  }
+
+  assert.ok(caughtErr, "Transaction must reject after idle_in_transaction_session_timeout terminates backend");
+  const terminationCodes = new Set([
+    "25P03",
+    "57P01",
+    "08006",
+    "08003",
+    "CONNECTION_CLOSED",
+    "CONNECTION_ENDED",
+    "CONNECTION_DESTROYED",
+    "ECONNRESET",
+  ]);
+  let codeFound: string | undefined;
+  let curr = caughtErr;
+  for (let depth = 0; depth < 5 && curr; depth++) {
+    if (typeof curr.code === "string") {
+      codeFound = curr.code;
+      if (terminationCodes.has(curr.code)) break;
+    }
+    curr = curr.cause;
+  }
+  assert.ok(
+    codeFound && terminationCodes.has(codeFound),
+    `Expected termination code (e.g. 25P03), got ${codeFound}`,
+  );
+
+  // Assert a second connection immediately gets the row with SELECT ... FOR UPDATE NOWAIT without error
+  const cpClient2 = openTenantClient(cpFixture.connectionString);
+  try {
+    await cpClient2.begin(async (tx) => {
+      const [row] = await tx`
+        SELECT id
+        FROM company_memory_upgrades
+        WHERE id = ${upgrade.id}::uuid
+        FOR UPDATE NOWAIT;
+      `;
+      assert.equal(row.id, upgrade.id);
+    });
+  } finally {
+    await cpClient2.end();
+  }
+});
+
+test("CP backstop end-to-end with a wedged client (R2-T2)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const cpFixture = await startEmbeddedPostgresTestDatabase("fence-r2t2-cp-");
+  const cpDb = createDb(cpFixture.connectionString);
+
+  t.after(async () => {
+    await cpDb.$client?.end();
+    await cpFixture.cleanup();
+  });
+
+  const [company] = await cpDb.insert(companies).values({
+    name: "CP Wedged Client Co",
+    issuePrefix: "CWC",
+  }).returning();
+
+  const upgrade = await openUpgrade(cpDb, {
+    companyId: company.id,
+    converterId: "paperclip.memory-upgrade.atomic-converter",
+    converterVersion: 1,
+    collectionName: "mem0_memories",
+    embeddingModel: "text-embedding-3-small",
+    embeddingDimensions: 1536,
+  });
+
+  const claim = await claimUpgradeLease(cpDb, { upgradeId: upgrade.id, leaseOwner: "test-worker" });
+  assert.ok(claim.acquired && claim.leaseToken);
+
+  // Synchronously block the event loop for 1.2s to simulate a wedged worker process that layer 3 exists for
+  const fakeTenantSqlWedged = {
+    begin: () => {
+      execSync("sleep 1.2");
+      return new Promise(() => {});
+    },
+  } as any;
+
+  await assert.rejects(
+    () =>
+      claimTenantFenceGuarded(cpDb, fakeTenantSqlWedged, {
+        upgradeId: upgrade.id,
+        cpLeaseToken: claim.leaseToken!,
+        leaseOwner: "test-worker",
+        boundMs: 150,
+      }),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "TENANT_FENCE_CLAIM_FAILED");
+      return true;
+    },
+  );
+
+  // Fresh CP connection can immediately SELECT ... FOR UPDATE NOWAIT
+  const cpClient2 = openTenantClient(cpFixture.connectionString);
+  try {
+    await cpClient2.begin(async (tx) => {
+      const [row] = await tx`
+        SELECT state, lease_token
+        FROM company_memory_upgrades
+        WHERE id = ${upgrade.id}::uuid
+        FOR UPDATE NOWAIT;
+      `;
+      assert.equal(row.state, "sweeping");
+      assert.equal(row.lease_token, claim.leaseToken);
+    });
+  } finally {
+    await cpClient2.end();
+  }
+});
+
+test("split per-statement budget is applied in tenant claim transaction (R2-T3)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const fixture = await startEmbeddedPostgresTestDatabase("fence-r2t3-budget-");
+  const sqlClientA = openTenantClient(fixture.connectionString);
+  const sqlClientB = openTenantClient(fixture.connectionString);
+
+  t.after(async () => {
+    await sqlClientA.end();
+    await sqlClientB.end();
+    await fixture.cleanup();
+  });
+
+  await ensureUpgradeTables(sqlClientA, "text");
+  const upgradeId = randomUUID();
+
+  let lockAcquiredByA: () => void;
+  const lockPromiseA = new Promise<void>((resolve) => {
+    lockAcquiredByA = resolve;
+  });
+  let releaseA: () => void;
+  const holdPromiseA = new Promise<void>((resolve) => {
+    releaseA = resolve;
+  });
+
+  const txA = sqlClientA.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`paperclip:memory-upgrade-fence-takeover:${upgradeId.toLowerCase()}`}, 0))`;
+    lockAcquiredByA();
+    await holdPromiseA;
+  });
+
+  await lockPromiseA;
+
+  // Session B calls claimTenantFenceForTestSetup with boundMs: 400 (perStatementMs = boundMs / 2 = 200ms).
+  // It must block on L0 and reject with 55P03 (lock_timeout) or 57014 (statement_timeout) in well under 1s.
+  try {
+    const startMs = Date.now();
+    await assert.rejects(
+      () => claimTenantFenceForTestSetup(sqlClientB, upgradeId, "owner-b", 400),
+      (err: any) => {
+        assert.ok(
+          err?.code === "55P03" || err?.code === "57014",
+          `Expected SQLSTATE 55P03 or 57014, got ${err?.code}`,
+        );
+        return true;
+      },
+    );
+    const elapsedMs = Date.now() - startMs;
+    assert.ok(elapsedMs < 1000, `Expected rejection in well under 1s, took ${elapsedMs}ms`);
+  } finally {
+    releaseA!();
+    await txA;
+  }
+});
+
+test("orphan-epoch recovery: superseded worker fails closed, legitimate successor self-heals (R2-T4)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const cpFixture = await startEmbeddedPostgresTestDatabase("fence-r2t4-cp-");
+  const tenantFixture = await startEmbeddedPostgresTestDatabase("fence-r2t4-tenant-");
+  const cpDb = createDb(cpFixture.connectionString);
+  const tenantSql = openTenantClient(tenantFixture.connectionString);
+
+  t.after(async () => {
+    await tenantSql.end();
+    await cpDb.$client?.end();
+    await tenantFixture.cleanup();
+    await cpFixture.cleanup();
+  });
+
+  await ensureUpgradeTables(tenantSql, "text");
+
+  const [company] = await cpDb.insert(companies).values({
+    name: "Orphan Epoch Co",
+    issuePrefix: "OEC",
+  }).returning();
+
+  const upgrade = await openUpgrade(cpDb, {
+    companyId: company.id,
+    converterId: "paperclip.memory-upgrade.atomic-converter",
+    converterVersion: 1,
+    collectionName: "mem0_memories",
+    embeddingModel: "text-embedding-3-small",
+    embeddingDimensions: 1536,
+  });
+
+  const claim = await claimUpgradeLease(cpDb, { upgradeId: upgrade.id, leaseOwner: "legit-worker" });
+  assert.ok(claim.acquired && claim.leaseToken);
+
+  // 1. Legitimate worker claims guarded fence (epoch 1)
+  const fence1 = await claimTenantFenceGuarded(cpDb, tenantSql, {
+    upgradeId: upgrade.id,
+    cpLeaseToken: claim.leaseToken!,
+    leaseOwner: "legit-worker",
+  });
+  assert.equal(fence1.fenceEpoch, "1");
+
+  // 2. Simulate an orphan epoch bump (e.g. from an uncoordinated / late transaction bumping epoch to 2)
+  const orphanFence = await claimTenantFenceForTestSetup(tenantSql, upgrade.id, "orphan-owner");
+  assert.equal(orphanFence.fenceEpoch, "2");
+
+  // 3. (a) Assert the older fence is now rejected on commitSourceOutcome with LEASE_FENCED_OUT
+  const sourceId1 = randomUUID();
+  const agentId = randomUUID();
+  await assert.rejects(
+    () =>
+      commitSourceOutcome(
+        tenantSql,
+        {
+          upgradeId: upgrade.id,
+          sourceId: sourceId1,
+          sourceContentSha256: "sha-test-1",
+          agentId,
+          outcome: "dropped_noise",
+          reasonCode: "empty",
+        },
+        fence1,
+      ),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "LEASE_FENCED_OUT");
+      return true;
+    },
+  );
+
+  // 4. (b) A fresh claimTenantFenceGuarded by the CP-admitted worker mints a strictly greater epoch (epoch 3)
+  const fence3 = await claimTenantFenceGuarded(cpDb, tenantSql, {
+    upgradeId: upgrade.id,
+    cpLeaseToken: claim.leaseToken!,
+    leaseOwner: "legit-worker",
+  });
+  assert.ok(
+    parseInt(fence3.fenceEpoch, 10) > parseInt(orphanFence.fenceEpoch, 10),
+    `New epoch ${fence3.fenceEpoch} must strictly exceed orphan epoch ${orphanFence.fenceEpoch}`,
+  );
+
+  // And its write succeeds
+  const sourceId2 = randomUUID();
+  await commitSourceOutcome(
+    tenantSql,
+    {
+      upgradeId: upgrade.id,
+      sourceId: sourceId2,
+      sourceContentSha256: "sha-test-2",
+      agentId,
+      outcome: "dropped_noise",
+      reasonCode: "empty",
+    },
+    fence3,
+  );
+
+  const [row] = await tenantSql`
+    SELECT outcome FROM paperclip_memory_upgrade_ledger
+    WHERE upgrade_id = ${upgrade.id}::uuid AND source_id = ${sourceId2}::uuid;
+  `;
+  assert.equal(row.outcome, "dropped_noise");
+});
+
+test("acquireSourceAdvisoryLocksAscending: sorts on canonical key and dedupes case variants (R2-T8)", async () => {
+  const capturedKeys: string[] = [];
+  const stubTx = ((strings: TemplateStringsArray, ...values: any[]) => {
+    capturedKeys.push(values[0]);
+    return Promise.resolve();
+  }) as any;
+
+  const upgradeId = "MyUpgradeId";
+  const sourceIds = [
+    "b0000000-0000-0000-0000-000000000002",
+    "A0000000-0000-0000-0000-000000000001",
+    "a0000000-0000-0000-0000-000000000001",
+    "B0000000-0000-0000-0000-000000000002",
+  ];
+
+  await acquireSourceAdvisoryLocksAscending(stubTx, upgradeId, sourceIds);
+
+  assert.equal(capturedKeys.length, 2, "Must deduplicate case variants");
+  assert.equal(
+    capturedKeys[0],
+    "paperclip:memory-upgrade-source:myupgradeid:a0000000-0000-0000-0000-000000000001",
+  );
+  assert.equal(
+    capturedKeys[1],
+    "paperclip:memory-upgrade-source:myupgradeid:b0000000-0000-0000-0000-000000000002",
+  );
+  assert.ok(capturedKeys[0] < capturedKeys[1], "Keys must be in strictly ascending order");
 });

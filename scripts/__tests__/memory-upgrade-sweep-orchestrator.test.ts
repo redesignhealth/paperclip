@@ -757,21 +757,43 @@ test("sweep orchestrator integration", async (t) => {
       status: "ready",
     });
 
-    let beginCallCount = 0;
     const proxiedTenantSql = new Proxy(tenantWorkerSql, {
       get(target, prop, receiver) {
         if (prop === "begin") {
           return async (cb: any) => {
-            beginCallCount++;
-            // The guarded fence claim is the first .begin() after ensureUpgradeTables (call #2)
-            if (beginCallCount === 2) {
-              const err = Object.assign(
-                new Error("permission denied for table paperclip_memory_upgrade_fence"),
-                { code: "42501" },
-              );
-              throw err;
-            }
-            return target.begin(cb);
+            return target.begin(async (realTx: any) => {
+              const proxiedTx = new Proxy(realTx, {
+                apply(tTx, thisArg, argArray) {
+                  const strings = argArray[0];
+                  const queryText = Array.isArray(strings) ? strings.join(" ") : String(strings ?? "");
+                  if (queryText.includes("paperclip_memory_upgrade_fence")) {
+                    throw Object.assign(
+                      new Error("permission denied for table paperclip_memory_upgrade_fence"),
+                      { code: "42501" },
+                    );
+                  }
+                  return Reflect.apply(tTx, thisArg, argArray);
+                },
+                get(tTx, p, r) {
+                  if (p === "unsafe") {
+                    return (unsafeQuery: string, ...args: any[]) => {
+                      if (
+                        String(unsafeQuery).includes("paperclip_memory_upgrade_fence") &&
+                        !String(unsafeQuery).includes("CREATE TABLE")
+                      ) {
+                        throw Object.assign(
+                          new Error("permission denied for table paperclip_memory_upgrade_fence"),
+                          { code: "42501" },
+                        );
+                      }
+                      return tTx.unsafe(unsafeQuery, ...args);
+                    };
+                  }
+                  return Reflect.get(tTx, p, r);
+                },
+              });
+              return cb(proxiedTx);
+            });
           };
         }
         return Reflect.get(target, prop, receiver);
@@ -804,9 +826,13 @@ test("sweep orchestrator integration", async (t) => {
     );
 
     const [upgradeRecord] = await cpDb
-      .select({ lastError: companyMemoryUpgrades.lastError })
+      .select({
+        lastError: companyMemoryUpgrades.lastError,
+        leaseToken: companyMemoryUpgrades.leaseToken,
+      })
       .from(companyMemoryUpgrades)
       .where(eq(companyMemoryUpgrades.companyId, compFence.id));
     assert.equal(upgradeRecord?.lastError, "tenant_fence_claim_failed");
+    assert.equal(upgradeRecord?.leaseToken, null);
   });
 });

@@ -317,9 +317,24 @@ test("sweep-tenant ledger operations", async (t) => {
         (${upgradeId}::uuid, ${sourceId}::uuid, ${outputUnpublished}::uuid, ${agentId}::uuid, '{"data": "unpub"}'::jsonb, 'vec', 'h-unpub', null);
     `;
 
+    await sql`
+      INSERT INTO paperclip_memory_upgrade_dedupe (
+        upgrade_id, agent_id, data_sha256, output_id
+      ) VALUES
+        (${upgradeId}::uuid, ${agentId}::uuid, 'h-pub', ${outputPublished}::uuid),
+        (${upgradeId}::uuid, ${agentId}::uuid, 'h-unpub', ${outputUnpublished}::uuid);
+    `;
+
     const res = await reconcileChangedContent(sql, upgradeId, sourceId, fence);
     assert.equal(res.deletedStagingCount, 1);
     assert.deepEqual(res.retainedOutputIds, [outputPublished]);
+
+    const dedupeRows = await sql`
+      SELECT output_id, data_sha256 FROM paperclip_memory_upgrade_dedupe
+      WHERE upgrade_id = ${upgradeId}::uuid;
+    `;
+    assert.equal(dedupeRows.length, 1);
+    assert.equal(dedupeRows[0].output_id, outputPublished);
 
     const [ledgerRow] = await sql`
       SELECT outcome, reason_code, output_ids FROM paperclip_memory_upgrade_ledger

@@ -50,6 +50,23 @@ export function quoteVectorType(vectorType: string): string {
   return `vector(${parsed.dimensions})`;
 }
 
+/**
+ * The staging INSERT in sweep-tenant.ts hardcodes an unqualified `::vector(1536)` cast, so the
+ * staging column must be `text` or an unqualified `vector(1536)`. A schema-qualified type means
+ * pgvector is not visible in the connection's search_path (format_type only qualifies in that
+ * case) — we refuse up front instead of failing on the first staging write.
+ * TECH-8191 follow-up: parameterise the cast + add a real-pgvector fixture, then relax this.
+ */
+export function assertSupportedStagingVectorType(vectorType: string): void {
+  const quoted = quoteVectorType(vectorType);
+  if (quoted !== "text" && quoted !== "vector(1536)") {
+    throw new CompanyMemoryUpgradeError(
+      `Unsupported staging vectorType: only unqualified vector(1536) (visible in search_path) or text is currently supported, received "${quoted}".`,
+      "INVALID_ARGUMENT",
+    );
+  }
+}
+
 export interface SqlClient {
   unsafe(query: string, args?: unknown[]): Promise<unknown>;
 }
@@ -84,6 +101,7 @@ export async function ensureUpgradeTables(
       "INVALID_ARGUMENT",
     );
   }
+  assertSupportedStagingVectorType(normalizedVectorType);
   const quotedVectorType = quoteVectorType(normalizedVectorType);
 
   const outcomesList = UPGRADE_LEDGER_OUTCOMES.map((o) => `'${o}'`).join(", ");
