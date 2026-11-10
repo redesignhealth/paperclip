@@ -242,16 +242,17 @@ export function estimateWorstCaseSourceCostNanodollars(input: PreflightCostInput
 }
 
 /**
- * Worst-case assumed bytes-per-output-token when projecting the size of the model's own
+ * Worst-case assumed bytes-per-output-token heuristic when projecting the size of the model's own
  * prior (rejected) response as it gets echoed back into the repair-retry request.
+ * Heuristic allowance (24 bytes/token) enforced at runtime by the actual-body fail-closed guard.
  */
 export { PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN };
 
 /**
- * Builds the ACTUAL serialized initial request body, and a worst-case serialized repair
- * request body (with a maximally-sized placeholder standing in for the not-yet-known prior
- * model response), so byte projections reflect the real wrapper/prompt/schema overhead
- * instead of a guessed constant.
+ * Builds the ACTUAL serialized initial request body, and projects a worst-case serialized repair
+ * request body (serializing a base repair body with an empty echo and adding an analytical echo allowance
+ * of PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN), so byte projections
+ * reflect the real wrapper/prompt/schema overhead instead of a guessed constant.
  */
 export function projectWorstCaseConversionRequestBytes(
   sourceText: string | null | undefined,

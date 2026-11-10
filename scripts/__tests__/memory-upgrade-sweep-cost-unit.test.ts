@@ -30,7 +30,6 @@ import {
   estimateWorstCaseSourceCostNanodollarsForText,
   MAX_USD_CAP,
   PREFLIGHT_MAX_EMBEDDING_CALLS,
-  PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL,
   priceUsdPerMillionToNanodollars,
   projectWorstCaseConversionRequestBytes,
   usdToNanodollars,

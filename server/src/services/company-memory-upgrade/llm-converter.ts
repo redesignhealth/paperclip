@@ -148,13 +148,13 @@ const LONGEST_REJECT_CODE = CONVERSION_REJECT_CODES.reduce(
 );
 
 /**
- * Worst-case assumed bytes-per-output-token when projecting the size of the model's own
+ * Worst-case assumed bytes-per-output-token heuristic when projecting the size of the model's own
  * prior (rejected) response as it gets echoed back into the repair-retry request.
  *
- * Conservative ceiling: assumes an average of up to 4 characters per token, with each
+ * Heuristic allowance: assumes an average of up to 4 characters per token, with each
  * character expanding to up to 6 bytes under JSON string escaping (e.g. \u00XX control codes),
- * yielding 4 * 6 = 24 bytes/token. This ensures the preflight projection strictly bounds
- * realistic and adversarial escaped echoes within PREFLIGHT_MAX_COMPLETION_TOKENS.
+ * yielding 4 * 6 = 24 bytes/token. This is a heuristic allowance enforced by the actual-body
+ * fail-closed guard (isRepairRequestBodyOversize), not a mathematically proven token ceiling.
  */
 export const PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN = 24;
 
@@ -544,7 +544,11 @@ export function createOpenAiConversionClient(
       }
 
       try {
-        const repairResp = await executeChatRequest(repairMessages, estimatedTokens + 100, options?.signal, repairBody);
+        const repairEstimatedTokens = Math.max(
+          estimatedTokens + 100,
+          repairRequestBodyBytes + PREFLIGHT_MAX_COMPLETION_TOKENS,
+        );
+        const repairResp = await executeChatRequest(repairMessages, repairEstimatedTokens, options?.signal, repairBody);
         totalInputTokens += repairResp.inputTokens;
         totalOutputTokens += repairResp.outputTokens;
         if (repairResp.kind === "unusable") {

@@ -990,6 +990,101 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(res.outputTokens, 600 + 50);
   });
 
+  await t.test("repair call rate-limiter reservation covers actual serialized repair request body bytes plus PREFLIGHT_MAX_COMPLETION_TOKENS with no billed200 retries", async () => {
+    let callCount = 0;
+    const requests: Array<{ url: string; init?: RequestInit; body: string }> = [];
+    const acquiredEstimates: number[] = [];
+    const subClock = new ManualClock();
+    const baseLimiter = setupTestLimiter(subClock);
+
+    const trackingLimiter = {
+      async acquire(est: number) {
+        acquiredEstimates.push(est);
+        return baseLimiter.acquire(est);
+      },
+    };
+
+    const sourceText = "User discussed quarterly planning and product milestones";
+    const model = "gpt-5.4-mini";
+
+    const schemaInvalidContent = JSON.stringify({
+      unexpected_key: "invalid schema payload",
+      details: "triggers schema validation rejection and repair turn",
+    });
+
+    const customFetch: typeof fetch = async (url, init) => {
+      callCount++;
+      requests.push({ url: String(url), init, body: String(init?.body ?? "") });
+      if (callCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            choices: [{ message: { content: schemaInvalidContent } }],
+            usage: { prompt_tokens: 110, completion_tokens: 65 },
+          }),
+        } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  decision: "convert",
+                  records: [
+                    {
+                      data: "User planned product milestones for Q3",
+                      type: "fact",
+                      subject: "user",
+                      confidence: 0.92,
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 165, completion_tokens: 40 },
+        }),
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      model,
+      fetchImpl: customFetch,
+      limiter: trackingLimiter,
+      sleeper: subClock,
+      clock: subClock,
+      maxAttempts: 3,
+    });
+
+    const res = await client.convert(sourceText);
+
+    // Call 1 succeeded with HTTP 200 (billed) so it must never be retried at the transport layer;
+    // Exactly 2 fetches dispatched: initial attempt + single repair attempt.
+    assert.equal(callCount, 2, "Exactly 2 fetches dispatched: initial attempt + single repair turn (no billed 200 retries)");
+    assert.equal(requests.length, 2, "No spurious retries dispatched");
+    assert.equal(acquiredEstimates.length, 2, "Exactly 2 limiter acquire calls recorded");
+
+    const repairRequestBody = requests[1].body;
+    const actualRepairBytes = Buffer.byteLength(repairRequestBody, "utf8");
+    const repairAcquiredEstimate = acquiredEstimates[1];
+
+    assert.ok(
+      repairAcquiredEstimate >= actualRepairBytes + PREFLIGHT_MAX_COMPLETION_TOKENS,
+      `Repair acquire estimate (${repairAcquiredEstimate}) must cover actual repair body bytes (${actualRepairBytes}) + PREFLIGHT_MAX_COMPLETION_TOKENS (${PREFLIGHT_MAX_COMPLETION_TOKENS})`,
+    );
+
+    assert.equal(res.status, "convert");
+    assert.equal(res.inputTokens, 110 + 165);
+    assert.equal(res.outputTokens, 65 + 40);
+  });
+
   await t.test("abort-during-body-read rejects ABORTED_BY_OPERATOR not quarantine", async () => {
     const controller = new AbortController();
     const abortingFetch: typeof fetch = async () => {
