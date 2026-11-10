@@ -742,4 +742,70 @@ test("sweep orchestrator integration", async (t) => {
       (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
     );
   });
+
+  await t.test("tenant fence claim failure (42501 permission denied) aborts and records tenant_fence_claim_failed in last_error (F1/F8)", async () => {
+    const [compFence] = await cpDb.insert(companies).values({ name: "Fence Claim Perm Denied Co", issuePrefix: "FCP" }).returning();
+    const dbNameFence = `tenant_db_${compFence.id.slice(0, 8)}`;
+    const roleFence = `${tenantInfo.usr}_fence`;
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: compFence.id,
+      databaseName: dbNameFence,
+      databaseRole: roleFence,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    let beginCallCount = 0;
+    const proxiedTenantSql = new Proxy(tenantWorkerSql, {
+      get(target, prop, receiver) {
+        if (prop === "begin") {
+          return async (cb: any) => {
+            beginCallCount++;
+            // The guarded fence claim is the first .begin() after ensureUpgradeTables (call #2)
+            if (beginCallCount === 2) {
+              const err = Object.assign(
+                new Error("permission denied for table paperclip_memory_upgrade_fence"),
+                { code: "42501" },
+              );
+              throw err;
+            }
+            return target.begin(cb);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    await assert.rejects(
+      async () => {
+        await runSweep(
+          {
+            databaseUrl: tenantWorkerUrl.toString(),
+            controlPlaneUrl: cpWorkerUrl.toString(),
+            companyId: compFence.id,
+            pageSize: 5,
+            pauseWhenActiveRuns: 0,
+          },
+          {
+            controlPlaneDb: cpWorkerDb,
+            tenantSql: proxiedTenantSql,
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: dbNameFence, user: roleFence },
+          },
+        );
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "TENANT_FENCE_CLAIM_FAILED");
+        return true;
+      },
+    );
+
+    const [upgradeRecord] = await cpDb
+      .select({ lastError: companyMemoryUpgrades.lastError })
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.companyId, compFence.id));
+    assert.equal(upgradeRecord?.lastError, "tenant_fence_claim_failed");
+  });
 });

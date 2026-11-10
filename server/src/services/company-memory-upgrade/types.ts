@@ -22,6 +22,7 @@ export const UPGRADE_ERROR_CODES = [
   "lease_lapsed",
   "lease_expired",
   "lease_fenced_out",
+  "tenant_fence_claim_failed",
   "paused_too_long",
   "state_mismatch",
   "migration_failed",
@@ -44,6 +45,8 @@ export const SWEEP_ERROR_CODE_MAP: Record<string, UpgradeErrorCode> = {
   // Lease
   LEASE_FENCED_OUT: "lease_fenced_out",
   lease_fenced_out: "lease_fenced_out",
+  TENANT_FENCE_CLAIM_FAILED: "tenant_fence_claim_failed",
+  tenant_fence_claim_failed: "tenant_fence_claim_failed",
   LEASE_EXPIRED: "lease_expired",
   lease_expired: "lease_expired",
   LEASE_LAPSED: "lease_lapsed",
@@ -175,8 +178,8 @@ export const TERMINAL_LLM_ERROR_CODES = Object.freeze(
 export class CompanyMemoryUpgradeError extends Error {
   readonly code: string;
 
-  constructor(message: string, code: string) {
-    super(message);
+  constructor(message: string, code: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "CompanyMemoryUpgradeError";
     this.code = code;
   }

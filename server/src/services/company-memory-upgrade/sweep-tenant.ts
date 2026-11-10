@@ -26,10 +26,9 @@ import {
   type TenantFence,
   validateTenantFence,
 } from "./tenant-fence.js";
-import { ensureUpgradeTables } from "./tenant-tables.js";
+import { ensureUpgradeTables, quoteVectorType } from "./tenant-tables.js";
 
 export type { TenantFence } from "./tenant-fence.js";
-export { claimTenantFenceForTestSetup } from "./tenant-fence.js";
 import {
   CompanyMemoryUpgradeError,
   UPGRADE_LEDGER_OUTCOMES,
@@ -545,6 +544,7 @@ export async function* iterateSourcePages(
           rawPayload = r.raw_payload;
         } else if (typeof r.raw_payload === "string") {
           try {
+            // Note: postgres.js parses json/jsonb columns natively; this fallback is defensive and consumed downstream by conversion.
             rawPayload = JSON.parse(r.raw_payload);
           } catch {
             rawPayload = null;
@@ -1052,6 +1052,25 @@ export async function stageSourceRecords(
       "stageSourceRecords requires a valid tenant fence for this upgrade.",
       "INVALID_ARGUMENT",
     );
+  }
+
+  if (params.vectorType !== undefined && params.vectorType.toLowerCase().trim() !== "text") {
+    // TECH-8191 follow-up: the staging INSERT hardcodes an unqualified ::vector(1536) cast;
+    // schema-qualified or non-1536 pgvector is unsupported until the cast is parameterised.
+    if (quoteVectorType(params.vectorType) !== "vector(1536)") {
+      throw new CompanyMemoryUpgradeError(
+        "Unsupported staging vectorType: only vector(1536) or text is currently supported",
+        "INVALID_ARGUMENT",
+      );
+    }
+    for (const record of records) {
+      if (!Array.isArray(record.embedding) || record.embedding.length !== 1536) {
+        throw new CompanyMemoryUpgradeError(
+          "Embedding dimensions mismatch: records must contain exactly 1536 dimensions",
+          "INVALID_ARGUMENT",
+        );
+      }
+    }
   }
 
   let resultOutcome: "published" | "deduplicated" = "published";

@@ -8,7 +8,6 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
-  claimTenantFenceForTestSetup,
   commitSourceOutcome,
   ensureUpgradeTables,
   KNOWN_SENSITIVE_FAMILY_NAMES,
@@ -19,6 +18,7 @@ import {
   VALID_UNROUTABLE_REASONS,
   validateOutcomeReason,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
 import {
   MODEL_CLASSIFIED_NOISE_REASON_CODE,
   MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,

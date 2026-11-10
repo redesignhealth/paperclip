@@ -10,9 +10,10 @@ import {
   openUpgrade,
 } from "../../server/src/services/company-memory-upgrade/state-machine.js";
 import {
-  claimTenantFenceForTestSetup,
+  acquireSourceAdvisoryLock,
   claimTenantFenceGuarded,
 } from "../../server/src/services/company-memory-upgrade/tenant-fence.js";
+import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
 import {
   commitSourceOutcome,
   ensureUpgradeTables,
@@ -171,8 +172,10 @@ test("tenant fence: same source, two concurrent separate clients -- no orphaned 
   const fixture = await startEmbeddedPostgresTestDatabase("fence-concurrent-");
   const sqlClientA = openTenantClient(fixture.connectionString, { max: 2 });
   const sqlClientB = openTenantClient(fixture.connectionString, { max: 2 });
+  const sqlClientBarrier = openTenantClient(fixture.connectionString, { max: 2 });
 
   t.after(async () => {
+    await sqlClientBarrier.end();
     await sqlClientA.end();
     await sqlClientB.end();
     await fixture.cleanup();
@@ -185,6 +188,20 @@ test("tenant fence: same source, two concurrent separate clients -- no orphaned 
   const sourceId = randomUUID();
   const fence = await claimTenantFenceForTestSetup(sqlClientA, upgradeId, "shared-owner");
 
+  // Open a third client, take the L1 advisory lock on (upgradeId, sourceId) before
+  // launching the concurrent writers, and assert both remain blocked until the barrier releases.
+  let barrierAcquired: () => void;
+  const barrierReady = new Promise<void>((r) => { barrierAcquired = r; });
+  let releaseBarrier: () => void;
+  const barrierHold = new Promise<void>((r) => { releaseBarrier = r; });
+
+  const barrierTx = sqlClientBarrier.begin(async (tx) => {
+    await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
+    barrierAcquired();
+    await barrierHold;
+  });
+  await barrierReady;
+
   // Two fully separate postgres.js client connections racing stageSourceRecords for the
   // SAME source concurrently. The per-source advisory lock (L1) must fully serialize
   // these two transactions against each other -- neither hangs (deadlock), and the
@@ -193,6 +210,7 @@ test("tenant fence: same source, two concurrent separate clients -- no orphaned 
   const dataA = "Concurrent durable fact variant A for source race.";
   const dataB = "Concurrent durable fact variant B for source race.";
 
+  let eitherSettled = false;
   const callA = stageSourceRecords(
     sqlClientA,
     {
@@ -211,7 +229,9 @@ test("tenant fence: same source, two concurrent separate clients -- no orphaned 
       vectorType: "text",
     },
     fence,
-  );
+  ).finally(() => {
+    eitherSettled = true;
+  });
 
   const callB = stageSourceRecords(
     sqlClientB,
@@ -231,7 +251,17 @@ test("tenant fence: same source, two concurrent separate clients -- no orphaned 
       vectorType: "text",
     },
     fence,
-  );
+  ).finally(() => {
+    eitherSettled = true;
+  });
+
+  // Assert both writers are still pending while the barrier holds L1
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(eitherSettled, false, "both concurrent writers must be blocked waiting on L1 advisory lock held by barrier");
+
+  // Release the barrier
+  releaseBarrier!();
+  await barrierTx;
 
   const results = await Promise.race([
     Promise.all([callA, callB]),
@@ -421,4 +451,242 @@ test("tenant fence: claimTenantFenceGuarded succeeds for the current legitimate 
     SELECT fence_epoch::text AS fence_epoch FROM paperclip_memory_upgrade_fence WHERE upgrade_id = ${upgrade.id}::uuid;
   `;
   assert.equal(fenceRow.fence_epoch, "2");
+});
+
+test("tenant fence claim error mapping and timeouts (F1/F2)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const cpFixture = await startEmbeddedPostgresTestDatabase("fence-f1f2-cp-");
+  const cpDb = createDb(cpFixture.connectionString);
+
+  t.after(async () => {
+    await cpDb.$client?.end();
+    await cpFixture.cleanup();
+  });
+
+  const [company] = await cpDb.insert(companies).values({
+    name: "Error Mapping Co",
+    issuePrefix: "EM",
+  }).returning();
+
+  const upgrade = await openUpgrade(cpDb, {
+    companyId: company.id,
+    converterId: "paperclip.memory-upgrade.atomic-converter",
+    converterVersion: 1,
+    collectionName: "mem0_memories",
+    embeddingModel: "text-embedding-3-small",
+    embeddingDimensions: 1536,
+  });
+
+  const claim = await claimUpgradeLease(cpDb, { upgradeId: upgrade.id, leaseOwner: "test-worker" });
+  assert.ok(claim.acquired && claim.leaseToken);
+
+  // 1. tenant begin throws { code: "57014" } -> LEASE_FENCED_OUT, err.cause preserved, no driver text in message
+  const fakeTenantSql57014 = {
+    begin: async () => {
+      const err = new Error("canceling statement due to statement timeout (driver specific details)");
+      (err as any).code = "57014";
+      throw err;
+    },
+  } as any;
+
+  await assert.rejects(
+    () =>
+      claimTenantFenceGuarded(cpDb, fakeTenantSql57014, {
+        upgradeId: upgrade.id,
+        cpLeaseToken: claim.leaseToken!,
+        leaseOwner: "test-worker",
+      }),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "LEASE_FENCED_OUT");
+      assert.ok(err.cause);
+      assert.equal((err.cause as any).code, "57014");
+      assert.ok(!err.message.includes("canceling statement"));
+      return true;
+    },
+  );
+
+  // 2. tenant begin throws { code: "42501" } -> TENANT_FENCE_CLAIM_FAILED, cause preserved, fixed message
+  const fakeTenantSql42501 = {
+    begin: async () => {
+      const err = new Error("permission denied for table paperclip_memory_upgrade_fence (internal role info)");
+      (err as any).code = "42501";
+      throw err;
+    },
+  } as any;
+
+  await assert.rejects(
+    () =>
+      claimTenantFenceGuarded(cpDb, fakeTenantSql42501, {
+        upgradeId: upgrade.id,
+        cpLeaseToken: claim.leaseToken!,
+        leaseOwner: "test-worker",
+      }),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "TENANT_FENCE_CLAIM_FAILED");
+      assert.ok(err.cause);
+      assert.equal((err.cause as any).code, "42501");
+      assert.ok(!err.message.includes("permission denied"));
+      return true;
+    },
+  );
+
+  // 3. tenant begin returns a never-settling promise, boundMs: 200 -> rejects TENANT_FENCE_CLAIM_FAILED in < 1s
+  // and CP row lock is released immediately (verified by SELECT ... FOR UPDATE NOWAIT)
+  const fakeTenantSqlStall = {
+    begin: () => new Promise(() => {}),
+  } as any;
+
+  const startMs = Date.now();
+  await assert.rejects(
+    () =>
+      claimTenantFenceGuarded(cpDb, fakeTenantSqlStall, {
+        upgradeId: upgrade.id,
+        cpLeaseToken: claim.leaseToken!,
+        leaseOwner: "test-worker",
+        boundMs: 200,
+      }),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "TENANT_FENCE_CLAIM_FAILED");
+      return true;
+    },
+  );
+  const elapsedMs = Date.now() - startMs;
+  assert.ok(elapsedMs < 1000, `Expected rejection in well under a second, took ${elapsedMs}ms`);
+
+  // Immediately afterwards a second CP connection can SELECT ... FOR UPDATE NOWAIT without error
+  const cpClient2 = openTenantClient(cpFixture.connectionString);
+  try {
+    await cpClient2.begin(async (tx) => {
+      const [row] = await tx`
+        SELECT state, lease_token
+        FROM company_memory_upgrades
+        WHERE id = ${upgrade.id}::uuid
+        FOR UPDATE NOWAIT;
+      `;
+      assert.equal(row.state, "sweeping");
+      assert.equal(row.lease_token, claim.leaseToken);
+    });
+  } finally {
+    await cpClient2.end();
+  }
+});
+
+test("advisory lock key canonicalisation: case collision on sourceId serializes (F4)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const fixture = await startEmbeddedPostgresTestDatabase("fence-case-collision-");
+  const sqlClientA = openTenantClient(fixture.connectionString);
+  const sqlClientB = openTenantClient(fixture.connectionString);
+
+  t.after(async () => {
+    await sqlClientA.end();
+    await sqlClientB.end();
+    await fixture.cleanup();
+  });
+
+  const upgradeId = randomUUID();
+  const sourceId = randomUUID();
+
+  let lockAcquiredByA: () => void;
+  const lockPromiseA = new Promise<void>((resolve) => {
+    lockAcquiredByA = resolve;
+  });
+  let releaseA: () => void;
+  const holdPromiseA = new Promise<void>((resolve) => {
+    releaseA = resolve;
+  });
+
+  const txA = sqlClientA.begin(async (tx) => {
+    await acquireSourceAdvisoryLock(tx, upgradeId, sourceId.toUpperCase());
+    lockAcquiredByA();
+    await holdPromiseA;
+  });
+
+  await lockPromiseA;
+
+  // Session B attempts to acquire the lock using lowercase UUID with lock_timeout = 300ms -> must fail with 55P03
+  await assert.rejects(
+    () =>
+      sqlClientB.begin(async (tx) => {
+        await tx.unsafe("SET LOCAL lock_timeout = 300");
+        await acquireSourceAdvisoryLock(tx, upgradeId, sourceId.toLowerCase());
+      }),
+    (err: any) => {
+      const code = (err as any)?.code;
+      assert.equal(code, "55P03");
+      return true;
+    },
+  );
+
+  releaseA!();
+  await txA;
+});
+
+test("stageSourceRecords: fail-closed validation on vectorType and embedding dimensions (F9)", async () => {
+  const upgradeId = randomUUID();
+  const sourceId = randomUUID();
+  const agentId = randomUUID();
+  const fakeFence: any = {
+    upgradeId,
+    leaseToken: "test-token",
+    fenceEpoch: "1",
+    leaseOwner: "test-owner",
+  };
+  const fakeSql: any = {};
+
+  // 1. vectorType: "public.vector(1536)" -> INVALID_ARGUMENT (schema-qualified unsupported)
+  await assert.rejects(
+    () =>
+      stageSourceRecords(
+        fakeSql,
+        {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: "sha-test",
+          agentId,
+          records: [dummyStageItem()],
+          vectorType: "public.vector(1536)",
+        },
+        fakeFence,
+      ),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "INVALID_ARGUMENT");
+      return true;
+    },
+  );
+
+  // 2. vectorType: "vector(1536)" with a 512-length embedding -> INVALID_ARGUMENT
+  const wrongDimItem = {
+    outputId: randomUUID(),
+    dataSha256: computeRecordDataSha256("fact"),
+    payload: { data: "fact" },
+    embedding: new Array(512).fill(0.01),
+  };
+  await assert.rejects(
+    () =>
+      stageSourceRecords(
+        fakeSql,
+        {
+          upgradeId,
+          sourceId,
+          sourceContentSha256: "sha-test",
+          agentId,
+          records: [wrongDimItem],
+          vectorType: "vector(1536)",
+        },
+        fakeFence,
+      ),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "INVALID_ARGUMENT");
+      return true;
+    },
+  );
 });

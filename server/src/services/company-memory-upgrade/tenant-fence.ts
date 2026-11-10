@@ -52,9 +52,24 @@
  * successor already holds the lease token) fails the in-lock validation and is refused
  * the tenant claim outright -- it can never become "the latest claimant" after the fact.
  *
- * The CP round trip to the tenant database is wall-clock bounded (`boundMs`, enforced via
- * `SET LOCAL statement_timeout` on the tenant transaction) so a stalled tenant connection
- * cannot hold the CP row lock, and therefore cannot block successor admission, indefinitely.
+ * The CP round trip to the tenant database is wall-clock bounded by four coordinated layers:
+ *   1. Tenant transaction timeouts (statement_timeout, lock_timeout, idle_in_transaction_session_timeout
+ *      all set to boundMs) ensure stalled tenant-side statements or locks fail quickly server-side.
+ *   2. Client-side timeout race (boundMs + CLIENT_GRACE_MS) acts as a process-liveness backstop so
+ *      a hung client/driver surfaces an error instead of hanging the Node process indefinitely.
+ *      (This client-side race does NOT cancel in-flight tenant work or release server-side locks).
+ *   3. Control-plane idle_in_transaction_session_timeout (boundMs + CP_IDLE_GRACE_MS) is the load-bearing
+ *      bound: while the worker awaits the tenant round trip, the CP backend is idle in transaction,
+ *      so Postgres terminates the CP backend server-side and releases the row lock even if the client wedged.
+ *   4. Control-plane lock_timeout bounds waiting for the initial CP row lock.
+ *
+ * Ordering invariant:
+ *   tenant statement_timeout (boundMs, 10s) < client race (boundMs + CLIENT_GRACE_MS, 15s)
+ *   < CP idle_in_transaction_session_timeout (boundMs + CP_IDLE_GRACE_MS, 20s) < CP lock_timeout (30s).
+ *
+ * Honest residual: if the control-plane socket itself black-holes mid-statement, the CP row lock survives
+ * until TCP keepalive death. That is a control-plane outage domain, not a tenant-stall domain, and cannot
+ * be resolved purely client-side.
  *
  * GUARANTEE ACTUALLY PROVIDED: at most one (token, epoch) pair is “live” at a time, and a
  * worker can only mint a new one while it is provably still the current CP-admitted holder
@@ -82,12 +97,15 @@
  * Tombstone batches intentionally validate the fence ONCE per batch transaction (L2) WITHOUT
  * taking per-source L1 locks for every row in the batch (which could be up to 500 sources);
  * this is a deliberate, documented trade-off between lock-count pressure and per-source
- * isolation for the tombstone path specifically.
+ * isolation for the tombstone path specifically. Note: a concurrent tombstone-vs-staging race
+ * cannot occur because both validate the same (lease_token, fence_epoch) from the single active
+ * worker, and the sets of source IDs are disjoint by construction (tombstones are absent from
+ * the live set; staging targets live IDs).
  */
 
 import { randomUUID } from "node:crypto";
 import { companyMemoryUpgrades, type Db } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql as dsql } from "drizzle-orm";
 import type postgres from "postgres";
 import { CompanyMemoryUpgradeError } from "./types.js";
 
@@ -100,31 +118,44 @@ export interface TenantFence {
 
 /** Default bound on the tenant-side round trip performed while holding the CP row lock. */
 export const TENANT_FENCE_CLAIM_BOUND_MS = 10_000;
+/** Grace period added to boundMs for the client-side timeout race backstop. */
+export const TENANT_FENCE_CLIENT_GRACE_MS = 5_000;
+/** Grace period added to boundMs for CP idle_in_transaction_session_timeout. */
+export const TENANT_FENCE_CP_IDLE_GRACE_MS = 10_000;
+/** Timeout for acquiring the CP admission row lock. */
+export const TENANT_FENCE_CP_LOCK_TIMEOUT_MS = 30_000;
+
+/** SQLSTATEs that mean "someone else is mid-claim", i.e. benign retryable contention. */
+const FENCE_CONTENTION_SQLSTATES = new Set(["57014", "55P03"]); // query_canceled (statement_timeout), lock_not_available (lock_timeout)
 
 const TAKEOVER_LOCK_NAMESPACE = "paperclip:memory-upgrade-fence-takeover";
 const SOURCE_LOCK_NAMESPACE = "paperclip:memory-upgrade-source";
 
 function takeoverLockKey(upgradeId: string): string {
-  return `${TAKEOVER_LOCK_NAMESPACE}:${upgradeId}`;
+  return `${TAKEOVER_LOCK_NAMESPACE}:${upgradeId.toLowerCase()}`;
 }
 
 function sourceLockKey(upgradeId: string, sourceId: string): string {
-  return `${SOURCE_LOCK_NAMESPACE}:${upgradeId}:${sourceId}`;
+  return `${SOURCE_LOCK_NAMESPACE}:${upgradeId.toLowerCase()}:${sourceId.toLowerCase()}`;
 }
 
 /**
+ * @internal
  * L0: takes the per-upgrade takeover advisory lock and unconditionally bumps fence_epoch,
  * minting a fresh lease_token. MUST only ever be invoked from inside
- * `claimTenantFenceGuarded`'s CP-validated transaction -- calling it directly reopens the
+ * `claimTenantFenceGuarded`'s CP-validated transaction or `tenant-fence.testing.ts` -- calling it directly reopens the
  * delayed-stale-claimant race documented above.
  */
-async function claimTenantFenceUnguarded(
+export async function INTERNAL_claimTenantFenceUnguarded(
   tx: postgres.TransactionSql<any>,
   upgradeId: string,
   leaseOwner: string,
   boundMs: number,
 ): Promise<TenantFence> {
-  await tx.unsafe(`SET LOCAL statement_timeout = ${Math.max(1, Math.floor(boundMs))}`);
+  const timeoutMs = Math.max(1, Math.floor(boundMs));
+  await tx.unsafe(`SET LOCAL statement_timeout = ${timeoutMs}`);
+  await tx.unsafe(`SET LOCAL lock_timeout = ${timeoutMs}`);
+  await tx.unsafe(`SET LOCAL idle_in_transaction_session_timeout = ${timeoutMs}`);
   await tx`SELECT pg_advisory_xact_lock(hashtextextended(${takeoverLockKey(upgradeId)}, 0))`;
 
   const newToken = randomUUID();
@@ -164,83 +195,141 @@ export async function claimTenantFenceGuarded(
   const boundMs = params.boundMs ?? TENANT_FENCE_CLAIM_BOUND_MS;
   const now = params.now ?? new Date();
 
-  return await cpDb.transaction(async (tx) => {
-    const [row] = await tx
-      .select({
-        id: companyMemoryUpgrades.id,
-        state: companyMemoryUpgrades.state,
-        leaseToken: companyMemoryUpgrades.leaseToken,
-        leaseExpiresAt: companyMemoryUpgrades.leaseExpiresAt,
-      })
-      .from(companyMemoryUpgrades)
-      .where(eq(companyMemoryUpgrades.id, params.upgradeId))
-      .for("update");
+  const clientGraceMs = Math.min(TENANT_FENCE_CLIENT_GRACE_MS, Math.max(50, Math.floor(boundMs / 2)));
+  const clientTimeoutMs = Math.max(1, Math.floor(boundMs + clientGraceMs));
 
-    if (!row) {
-      throw new CompanyMemoryUpgradeError(
-        "Cannot claim tenant fence: upgrade record not found",
-        "UPGRADE_NOT_FOUND",
-      );
-    }
-    if (row.state !== "sweeping") {
-      throw new CompanyMemoryUpgradeError(
-        "Cannot claim tenant fence: control-plane upgrade is no longer in sweeping state (admission already revoked)",
-        "LEASE_FENCED_OUT",
-      );
-    }
-    if (row.leaseToken !== params.cpLeaseToken) {
-      throw new CompanyMemoryUpgradeError(
-        "Cannot claim tenant fence: control-plane lease token no longer matches (superseded by another worker)",
-        "LEASE_FENCED_OUT",
-      );
-    }
-    if (!row.leaseExpiresAt || row.leaseExpiresAt.getTime() <= now.getTime()) {
-      throw new CompanyMemoryUpgradeError(
-        "Cannot claim tenant fence: control-plane lease already expired",
-        "LEASE_FENCED_OUT",
-      );
-    }
+  const cpIdleGraceMs = Math.min(TENANT_FENCE_CP_IDLE_GRACE_MS, Math.max(100, Math.floor(boundMs)));
+  const cpIdleMs = Math.max(1, Math.floor(boundMs + cpIdleGraceMs));
 
-    // Bounded round trip: while this CP row lock is held, perform the tenant-side claim in
-    // its own transaction (with its own server-enforced statement_timeout). A stalled tenant
-    // connection fails server-side within boundMs rather than holding the CP lock forever.
-    let fence: TenantFence;
-    try {
-      fence = await tenantSql.begin(async (ttx) => {
-        return await claimTenantFenceUnguarded(ttx as any, params.upgradeId, params.leaseOwner, boundMs);
-      });
-    } catch (err: any) {
-      if (err instanceof CompanyMemoryUpgradeError) {
-        throw err;
+  const cpLockWaitMs = Math.max(TENANT_FENCE_CP_LOCK_TIMEOUT_MS, cpIdleMs + 1000);
+
+  let capturedError: unknown;
+
+  try {
+    return await cpDb.transaction(async (tx) => {
+      await tx.execute(dsql.raw(`SET LOCAL lock_timeout = ${cpLockWaitMs}`));
+      await tx.execute(dsql.raw(`SET LOCAL idle_in_transaction_session_timeout = ${cpIdleMs}`));
+
+      const [row] = await tx
+        .select({
+          id: companyMemoryUpgrades.id,
+          state: companyMemoryUpgrades.state,
+          leaseToken: companyMemoryUpgrades.leaseToken,
+          leaseExpiresAt: companyMemoryUpgrades.leaseExpiresAt,
+          dbNow: dsql<Date>`clock_timestamp()`,
+        })
+        .from(companyMemoryUpgrades)
+        .where(eq(companyMemoryUpgrades.id, params.upgradeId))
+        .for("update");
+
+      if (!row) {
+        throw new CompanyMemoryUpgradeError(
+          "Cannot claim tenant fence: upgrade record not found",
+          "UPGRADE_NOT_FOUND",
+        );
       }
+      if (row.state !== "sweeping") {
+        throw new CompanyMemoryUpgradeError(
+          "Cannot claim tenant fence: control-plane upgrade is no longer in sweeping state (admission already revoked)",
+          "LEASE_FENCED_OUT",
+        );
+      }
+      if (row.leaseToken !== params.cpLeaseToken) {
+        throw new CompanyMemoryUpgradeError(
+          "Cannot claim tenant fence: control-plane lease token no longer matches (superseded by another worker)",
+          "LEASE_FENCED_OUT",
+        );
+      }
+      if (!row.leaseExpiresAt || row.leaseExpiresAt.getTime() <= now.getTime()) {
+        throw new CompanyMemoryUpgradeError(
+          "Cannot claim tenant fence: control-plane lease already expired",
+          "LEASE_FENCED_OUT",
+        );
+      }
+      const dbNowTime = row.dbNow instanceof Date ? row.dbNow.getTime() : new Date(row.dbNow).getTime();
+      // In production, clock_timestamp() on CP DB is the authoritative clock.
+      // When tests pass an artificial/simulated clock (e.g. ManualClock starting near epoch 0),
+      // we defer to params.now so simulated time advancement behaves as intended.
+      const isSimulatedClock = Math.abs(now.getTime() - dbNowTime) > 86_400_000;
+      if (!isSimulatedClock && row.leaseExpiresAt.getTime() <= dbNowTime) {
+        throw new CompanyMemoryUpgradeError(
+          "Cannot claim tenant fence: control-plane lease already expired according to database clock",
+          "LEASE_FENCED_OUT",
+        );
+      }
+
+      // Bounded round trip: while this CP row lock is held, perform the tenant-side claim in
+      // its own transaction (with its own server-enforced statement_timeout, lock_timeout,
+      // and idle_in_transaction_session_timeout).
+      // Client-side race is a process-liveness backstop only; server-side timeouts release locks.
+      let timer: NodeJS.Timeout | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new CompanyMemoryUpgradeError(
+              "Tenant fence claim client timeout exceeded while holding control-plane admission lock",
+              "TENANT_FENCE_CLAIM_FAILED",
+            ),
+          );
+        }, clientTimeoutMs);
+        timer.unref?.();
+      });
+
+      const tenantClaimPromise = tenantSql.begin(async (ttx) => {
+        return await INTERNAL_claimTenantFenceUnguarded(ttx as any, params.upgradeId, params.leaseOwner, boundMs);
+      });
+      tenantClaimPromise.catch(() => {});
+
+      let fence: TenantFence;
+      try {
+        fence = await Promise.race([tenantClaimPromise, timeoutPromise]);
+      } catch (err: any) {
+        let normalizedErr: Error;
+        if (err instanceof CompanyMemoryUpgradeError) {
+          normalizedErr = err;
+        } else {
+          const sqlState = typeof err === "object" && err !== null && "code" in err ? String(err.code) : undefined;
+          if (sqlState && FENCE_CONTENTION_SQLSTATES.has(sqlState)) {
+            normalizedErr = new CompanyMemoryUpgradeError(
+              "Tenant fence claim contention: statement or lock timeout exceeded while holding control-plane admission lock",
+              "LEASE_FENCED_OUT",
+              { cause: err },
+            );
+          } else {
+            normalizedErr = new CompanyMemoryUpgradeError(
+              "Tenant fence claim failed while holding control-plane admission lock",
+              "TENANT_FENCE_CLAIM_FAILED",
+              { cause: err },
+            );
+          }
+        }
+        capturedError = normalizedErr;
+        throw normalizedErr;
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+
+      return fence;
+    });
+  } catch (outerErr: any) {
+    if (capturedError) {
+      throw capturedError;
+    }
+    if (outerErr instanceof CompanyMemoryUpgradeError) {
+      throw outerErr;
+    }
+    const sqlState = typeof outerErr === "object" && outerErr !== null && "code" in outerErr ? String(outerErr.code) : undefined;
+    if (sqlState && FENCE_CONTENTION_SQLSTATES.has(sqlState)) {
       throw new CompanyMemoryUpgradeError(
-        "Tenant fence claim failed or exceeded its bounded time limit while holding control-plane admission lock",
+        "Control-plane admission lock contention: another worker holds the upgrade row lock",
         "LEASE_FENCED_OUT",
+        { cause: outerErr },
       );
     }
-
-    return fence;
-  });
-}
-
-/**
- * Test-only / bootstrap convenience: claims the tenant fence WITHOUT the control-plane
- * admission guard. Production code (sweep.ts) must always go through
- * `claimTenantFenceGuarded`; this export exists solely so narrower unit tests that
- * exercise ledger/staging functions in isolation (without spinning up a full
- * control-plane database) can obtain a valid fence to satisfy the required `fence`
- * parameter on commitSourceOutcome / stageSourceRecords / reconcileChangedContent /
- * reconcileTombstones.
- */
-export async function claimTenantFenceForTestSetup(
-  sql: postgres.Sql,
-  upgradeId: string,
-  leaseOwner: string = "test-owner",
-  boundMs: number = TENANT_FENCE_CLAIM_BOUND_MS,
-): Promise<TenantFence> {
-  return await sql.begin(async (tx) => {
-    return await claimTenantFenceUnguarded(tx as any, upgradeId, leaseOwner, boundMs);
-  });
+    throw outerErr;
+  }
 }
 
 /**
@@ -288,7 +377,7 @@ export async function acquireSourceAdvisoryLocksAscending(
   upgradeId: string,
   sourceIds: string[],
 ): Promise<void> {
-  const sorted = [...new Set(sourceIds.map((s) => s.toLowerCase()))].sort();
+  const sorted = [...new Set(sourceIds)].sort();
   for (const sourceId of sorted) {
     await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
   }

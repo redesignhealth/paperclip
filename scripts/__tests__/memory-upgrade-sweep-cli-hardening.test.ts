@@ -89,6 +89,7 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
       "UPGRADE_NOT_FOUND",
       "CONVERTER_CONTRACT_MISMATCH",
       "LEASE_FENCED_OUT",
+      "TENANT_FENCE_CLAIM_FAILED",
       "LEASE_EXPIRED",
       "LEASE_LAPSED",
       "CAS_FAILED",

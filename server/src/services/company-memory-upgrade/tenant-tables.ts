@@ -134,6 +134,8 @@ export async function ensureUpgradeTables(
 
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_fence" (
       "upgrade_id" uuid PRIMARY KEY,
+      -- Note: DEFAULT 0 is retained because CREATE TABLE IF NOT EXISTS has no migration path
+      -- and claim inserts 1 explicitly.
       "fence_epoch" bigint NOT NULL DEFAULT 0,
       "lease_token" text NOT NULL,
       "lease_owner" text NOT NULL,

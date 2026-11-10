@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
-  claimTenantFenceForTestSetup,
   commitSourceOutcome,
   ensureUpgradeTables,
   loadLedgerForSources,
@@ -14,6 +13,7 @@ import {
   reconcileChangedContent,
   reconcileTombstones,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
 import { computeSourceContentSha256 } from "../../server/src/services/company-memory-upgrade/source-hash.js";
 import { UPGRADE_LEDGER_OUTCOMES } from "../../server/src/services/company-memory-upgrade/types.js";
 import {
@@ -237,7 +237,7 @@ test("sweep-tenant ledger operations", async (t) => {
     assert.equal(secondResult.tombstonesCount, 0);
   });
 
-  await t.test("content change -> superseded and clears unpublished staging and dedupe", async () => {
+  await t.test("content change with NO published rows -> stale ledger row deleted, clears unpublished staging and dedupe", async () => {
     const upgradeId = randomUUID();
     const fence = await claimTenantFenceForTestSetup(sql, upgradeId);
     const sourceId = randomUUID();
