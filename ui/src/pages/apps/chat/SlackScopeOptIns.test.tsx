@@ -73,7 +73,7 @@ describe("SlackScopeOptIns", () => {
 
   it("states that enabling a group needs admin approval and states the default scope count", async () => {
     await render({ idPrefix: prefix("review") });
-    expect(container.textContent).toContain("27 low-risk scopes");
+    expect(container.textContent).toContain("28 low-risk scopes");
     expect(container.textContent).toContain("approve");
     // Each group is above Low risk, so the copy must say so plainly.
     expect(container.textContent).toContain("not Low risk");

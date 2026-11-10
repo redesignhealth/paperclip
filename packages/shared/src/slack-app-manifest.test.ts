@@ -71,9 +71,9 @@ describe("Slack app manifest", () => {
       "channels:write.topic", "chat:write", "commands", "emoji:read", "files:read",
       "groups:history", "groups:read", "groups:write.topic", "im:history", "im:read",
       "lists:read", "lists:write", "mpim:history", "mpim:read", "pins:read",
-      "pins:write", "reactions:read", "reactions:write", "users:read",
+      "pins:write", "reactions:read", "reactions:write", "users:read", "users:read.email",
     ]);
-    expect(SLACK_DEFAULT_BOT_SCOPES).toHaveLength(27);
+    expect(SLACK_DEFAULT_BOT_SCOPES).toHaveLength(28);
     // Read history and reply in any invited channel stay in the default set.
     for (const scope of ["channels:history", "groups:history", "im:history", "mpim:history", "chat:write"]) {
       expect(SLACK_DEFAULT_BOT_SCOPES).toContain(scope);
