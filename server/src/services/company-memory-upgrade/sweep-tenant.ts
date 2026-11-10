@@ -728,16 +728,19 @@ export async function reconcileTombstones(
   let deletedDedupeCount = 0;
   let actualTombstonesCount = 0;
 
-  const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : 500;
+  const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : 200;
 
   for (let i = 0; i < tombstoneIds.length; i += batchSize) {
     options.assertLeaseActive?.();
     const batch = tombstoneIds.slice(i, i + batchSize);
 
     await sql.begin(async (tx: any) => {
-      // Fence row SHARE lock (L2), held to commit. Tombstone batches deliberately validate
-      // the fence ONCE per batch transaction rather than taking up to `batchSize` (up to 500)
-      // individual per-source advisory locks (L1) -- see module doc in tenant-fence.ts.
+      // L1: per-source advisory locks in ascending canonical order via one unnest() statement
+      const sortedKeys = [...new Set(batch.map((s) => `paperclip:memory-upgrade-source:${upgradeId.toLowerCase()}:${s.toLowerCase()}`))].sort();
+      if (sortedKeys.length > 0) {
+        await tx`SELECT pg_advisory_xact_lock(hashtextextended(k, 0)) FROM unnest(${sortedKeys}::text[]) AS k`;
+      }
+      // L2: fence row SHARE lock, held to commit
       await validateTenantFence(tx, fence);
 
       // 1. Find unpublished staging output_ids
@@ -805,21 +808,60 @@ export async function reconcileTombstones(
   };
 }
 
+export interface ReconcileChangedContentParams {
+  upgradeId: string;
+  sourceId: string;
+  sourceContentSha256?: string;
+  agentId?: string | null;
+}
+
 /**
  * Reconciles changed content for a single source.
  * Clears unpublished staging and dedupe rows, and deletes the stale ledger row so
  * the source can reclassify cleanly without leaving stale superseded rows.
+ * If published rows remain, the ledger row is marked 'superseded' with the new
+ * hash and agent (if provided) and retained output_ids.
  */
 export async function reconcileChangedContent(
   sql: postgres.Sql,
-  upgradeId: string,
-  sourceId: string,
-  fence: TenantFence,
+  paramsOrUpgradeId: ReconcileChangedContentParams | string,
+  sourceIdOrFence: string | TenantFence,
+  fenceMaybe?: TenantFence,
 ): Promise<{ deletedStagingCount: number; deletedDedupeCount: number; retainedOutputIds: string[] }> {
+  let upgradeId: string;
+  let sourceId: string;
+  let sourceContentSha256: string | undefined;
+  let agentId: string | null | undefined;
+  let fence: TenantFence;
+
+  if (typeof paramsOrUpgradeId === "string") {
+    upgradeId = paramsOrUpgradeId;
+    sourceId = sourceIdOrFence as string;
+    fence = fenceMaybe!;
+  } else {
+    upgradeId = paramsOrUpgradeId.upgradeId;
+    sourceId = paramsOrUpgradeId.sourceId;
+    sourceContentSha256 = paramsOrUpgradeId.sourceContentSha256;
+    agentId = paramsOrUpgradeId.agentId;
+    fence = sourceIdOrFence as TenantFence;
+  }
+
   if (!isValidUuid(sourceId)) {
     throw new CompanyMemoryUpgradeError(
       "sourceId must be a valid UUID string.",
       "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(
+      "upgradeId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (agentId && !isValidUuid(agentId)) {
+    throw new CompanyMemoryUpgradeError(
+      "agentId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
     );
   }
   if (!fence || fence.upgradeId !== upgradeId) {
@@ -893,16 +935,48 @@ export async function reconcileChangedContent(
     } else {
       // Published rows remain live and must stay referenced by SOME ledger row: mark the
       // row 'superseded' (rather than deleting it) and retain exactly the ids still staged.
-      await tx`
-        UPDATE paperclip_memory_upgrade_ledger
-        SET
-          outcome = 'superseded',
-          reason_code = NULL,
-          output_ids = ${retainedOutputIds}::uuid[],
-          updated_at = now()
-        WHERE upgrade_id = ${upgradeId}::uuid
-          AND source_id = ${sourceId}::uuid;
-      `;
+      // If the new content hash and agent were provided, update them onto the row so the
+      // ledger accurately describes the source at the time it was superseded.
+      if (sourceContentSha256 !== undefined) {
+        if (agentId !== undefined) {
+          const agentSql = agentId ? sql`${agentId}::uuid` : null;
+          await tx`
+            UPDATE paperclip_memory_upgrade_ledger
+            SET
+              outcome = 'superseded',
+              reason_code = NULL,
+              output_ids = ${retainedOutputIds}::uuid[],
+              source_content_sha256 = ${sourceContentSha256},
+              agent_id = ${agentSql},
+              updated_at = now()
+            WHERE upgrade_id = ${upgradeId}::uuid
+              AND source_id = ${sourceId}::uuid;
+          `;
+        } else {
+          await tx`
+            UPDATE paperclip_memory_upgrade_ledger
+            SET
+              outcome = 'superseded',
+              reason_code = NULL,
+              output_ids = ${retainedOutputIds}::uuid[],
+              source_content_sha256 = ${sourceContentSha256},
+              updated_at = now()
+            WHERE upgrade_id = ${upgradeId}::uuid
+              AND source_id = ${sourceId}::uuid;
+          `;
+        }
+      } else {
+        await tx`
+          UPDATE paperclip_memory_upgrade_ledger
+          SET
+            outcome = 'superseded',
+            reason_code = NULL,
+            output_ids = ${retainedOutputIds}::uuid[],
+            updated_at = now()
+          WHERE upgrade_id = ${upgradeId}::uuid
+            AND source_id = ${sourceId}::uuid;
+        `;
+      }
     }
   });
 
@@ -977,7 +1051,12 @@ export async function commitSourceOutcome(
         ${agentId ? sql`${agentId}::uuid` : null},
         ${outcome},
         ${validatedReason},
-        '{}',
+        COALESCE((
+          SELECT array_agg(s.output_id ORDER BY s.output_id)
+          FROM paperclip_memory_upgrade_staging s
+          WHERE s.upgrade_id = ${upgradeId}::uuid
+            AND s.source_id = ${sourceId}::uuid
+        ), '{}'),
         now(),
         now()
       )
@@ -986,6 +1065,12 @@ export async function commitSourceOutcome(
         agent_id = EXCLUDED.agent_id,
         outcome = EXCLUDED.outcome,
         reason_code = EXCLUDED.reason_code,
+        output_ids = COALESCE((
+          SELECT array_agg(s.output_id ORDER BY s.output_id)
+          FROM paperclip_memory_upgrade_staging s
+          WHERE s.upgrade_id = paperclip_memory_upgrade_ledger.upgrade_id
+            AND s.source_id = paperclip_memory_upgrade_ledger.source_id
+        ), '{}'),
         updated_at = now();
     `;
   });

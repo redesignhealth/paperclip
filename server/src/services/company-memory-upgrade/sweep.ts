@@ -88,8 +88,12 @@ import {
   CompanyMemoryUpgradeError,
   mapSweepErrorCode,
   type UpgradeErrorCode,
+  type UpgradeLedgerOutcome,
   UPGRADE_ERROR_CODES,
 } from "./types.js";
+
+export const RECONVERTIBLE_LEDGER_OUTCOMES: ReadonlySet<UpgradeLedgerOutcome> =
+  new Set(["superseded"]);
 
 export function shouldHaltOnQuarantine(quarantined: number, considered: number): boolean {
   return quarantined > 50 || (considered >= 200 && (quarantined / considered) > 0.02);
@@ -640,18 +644,33 @@ export async function runSweep(
         const matchedAgentId = routing.matchedAgentId;
 
         if (existingLedger) {
-          if (
+          const isContentAndAgentMatch =
             existingLedger.sourceContentSha256 === contentSha256 &&
-            existingLedger.agentId === matchedAgentId
+            existingLedger.agentId === matchedAgentId;
+
+          if (
+            isContentAndAgentMatch &&
+            !RECONVERTIBLE_LEDGER_OUTCOMES.has(existingLedger.outcome)
           ) {
             pageDeltas.skippedUnchangedCount++;
             continue;
           }
 
-          // Content or agent assignment changed: reconcile to superseded
-          heartbeatHandle.assertActive();
-          await reconcileChangedContent(tenantSql, upgradeId, canonicalSourceId, tenantFence);
-          pageDeltas.supersededCount++;
+          if (!isContentAndAgentMatch) {
+            // Content or agent assignment changed: reconcile to superseded
+            heartbeatHandle.assertActive();
+            await reconcileChangedContent(
+              tenantSql,
+              {
+                upgradeId,
+                sourceId: canonicalSourceId,
+                sourceContentSha256: contentSha256,
+                agentId: matchedAgentId,
+              },
+              tenantFence,
+            );
+            pageDeltas.supersededCount++;
+          }
           // Then source re-enters classification in this same sweep
         }
 
