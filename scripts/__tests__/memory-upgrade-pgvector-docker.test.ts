@@ -1,0 +1,113 @@
+/**
+ * Real pgvector Docker integration tests (TECH-8191 PR 4a).
+ * Tests 24, 25, 27 from §7.4.
+ *
+ * Gated on PAPERCLIP_RUN_DOCKER_PGVECTOR_TESTS === "true".
+ */
+
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import test from "node:test";
+import {
+  ensureUpgradeTables,
+  introspectCollection,
+  openTenantClient,
+  stageSourceRecords,
+} from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
+
+test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGVECTOR_TESTS !== "true" }, async (t) => {
+  const dockerDsn = process.env.PAPERCLIP_TEST_DOCKER_PGVECTOR_URL;
+  if (!dockerDsn) {
+    return;
+  }
+
+  const sql = openTenantClient(dockerDsn);
+  t.after(async () => {
+    await sql.end();
+  });
+
+  const uniqueSuffix = Date.now().toString(36);
+  const liveTable = `mem0_docker_live_${uniqueSuffix}`;
+  const upgradeId = randomUUID();
+  const agentId = randomUUID();
+  const sourceId = randomUUID();
+
+  // Test 24: CREATE EXTENSION IF NOT EXISTS vector, create live table with vector(1536), ensureUpgradeTables with vector(1536)
+  await t.test("Test 24: ensureUpgradeTables creates real pgvector(1536) staging column", async () => {
+    await sql.unsafe("CREATE EXTENSION IF NOT EXISTS vector;");
+    await sql.unsafe(`
+      CREATE TABLE IF NOT EXISTS "${liveTable}" (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        payload jsonb NOT NULL,
+        vector vector(1536) NOT NULL
+      );
+    `);
+
+    await ensureUpgradeTables(sql, "vector(1536)");
+
+    const stagingColRows = (await sql`
+      SELECT
+        format_type(a.atttypid, a.atttypmod) AS formatted_type
+      FROM pg_attribute a
+      WHERE a.attrelid = to_regclass('paperclip_memory_upgrade_staging')
+        AND a.attname = 'embedding'
+        AND a.attnum > 0
+        AND NOT a.attisdropped;
+    `) as Array<{ formatted_type: string }>;
+
+    assert.equal(stagingColRows.length, 1);
+    assert.equal(stagingColRows[0].formatted_type, "vector(1536)");
+  });
+
+  // Test 27: introspectCollection with NO skipVectorIdentityCheck
+  await t.test("Test 27: introspectCollection passes pgvector identity check and returns embeddingTypeRaw === 'vector(1536)'", async () => {
+    const shape = await introspectCollection(sql, liveTable, { skipVectorIdentityCheck: false });
+    assert.equal(shape.embeddingType, "vector(1536)");
+    assert.equal(shape.embeddingTypeRaw, "vector(1536)");
+    assert.equal(shape.embeddingDims, 1536);
+    assert.equal(shape.isUuidId, true);
+  });
+
+  // Test 25: stageSourceRecords with a real 1536-float embedding and NO vectorType: "text"
+  await t.test("Test 25: stageSourceRecords parameterised cast inserts real vector and vector_dims returns 1536", async () => {
+    const fence = await claimTenantFenceForTestSetup(sql, upgradeId);
+    const fakeEmbedding = Array.from({ length: 1536 }, (_, i) => (i % 100) / 100);
+    const outputId = randomUUID();
+
+    const stageRes = await stageSourceRecords(
+      sql,
+      {
+        upgradeId,
+        sourceId,
+        sourceContentSha256: "real_pgvector_sha",
+        agentId,
+        records: [
+          {
+            outputId,
+            dataSha256: "real_vector_rec_sha",
+            payload: { text: "real pgvector memory", migration_id: upgradeId, migrated_from: sourceId },
+            embedding: fakeEmbedding,
+          },
+        ],
+        vectorType: "vector(1536)",
+      },
+      fence,
+    );
+
+    assert.equal(stageRes.outcome, "published");
+    assert.equal(stageRes.stagedCount, 1);
+
+    // Verify vector_dims on the inserted staging row
+    const dimsRows = (await sql`
+      SELECT
+        vector_dims(embedding) AS dims,
+        (embedding)::text AS vec_text
+      FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgradeId}::uuid AND output_id = ${outputId}::uuid;
+    `) as Array<{ dims: number; vec_text: string }>;
+
+    assert.equal(dimsRows.length, 1);
+    assert.equal(dimsRows[0].dims, 1536);
+  });
+});

@@ -2,7 +2,7 @@
  * Tenant SQL operations for company memory upgrade sweep (TECH-8191).
  *
  * ARCHITECTURAL INVARIANTS:
- * - All tenant SQL operations live in this file.
+ * - All tenant SQL operations live in this file and in publish-tenant.ts.
  * - postgres.js is used directly for tenant connections (required for multi-statement DDL via simple protocol).
  * - The ONLY statement class issued against the LIVE collection table is SELECT.
  *   Every live table query includes a header comment documenting this invariant.
@@ -27,8 +27,10 @@ import {
   validateTenantFence,
 } from "./tenant-fence.js";
 import {
+  assertSafeCatalogTypeCast,
   assertSupportedStagingVectorType,
   ensureUpgradeTables,
+  introspectStagingEmbeddingType,
 } from "./tenant-tables.js";
 
 export type { TenantFence } from "./tenant-fence.js";
@@ -54,6 +56,7 @@ export interface TenantCollectionShape {
   embeddingColumn: string;
   embeddingDims: number;
   embeddingType: string;
+  embeddingTypeRaw: string;
   payloadType: "jsonb" | "json";
   rowCount: number;
   isUuidId: boolean;
@@ -402,9 +405,12 @@ export async function introspectCollection(
     }
   }
 
+  const rawVectorType = vectorCol.formatted_type.trim();
+  assertSafeCatalogTypeCast(rawVectorType);
+
   const cleanedVectorType = options?.skipVectorIdentityCheck
-    ? vectorCol.formatted_type.trim().replace(/^"|"$/g, "")
-    : vectorCol.formatted_type.trim();
+    ? rawVectorType.replace(/^"|"$/g, "")
+    : rawVectorType;
   // Introspection describes schema-qualified vector types; assertSupportedStagingVectorType enforces unqualified vector(1536) / text before staging.
   const vectorMatch = cleanedVectorType.match(
     /^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?vector\((\d+)\)$/i,
@@ -447,6 +453,7 @@ export async function introspectCollection(
     embeddingColumn: vectorColName,
     embeddingDims: 1536,
     embeddingType: cleanedVectorType,
+    embeddingTypeRaw: rawVectorType,
     payloadType: payloadType as "jsonb" | "json",
     rowCount,
     isUuidId,
@@ -1229,9 +1236,16 @@ export async function stageSourceRecords(
     }
 
     // 4. Stage won records (published_at IS NULL)
+    let resolvedCastType = "vector(1536)";
+    if (!isTextVector) {
+      const detectedStagingType = await introspectStagingEmbeddingType(tx);
+      resolvedCastType = detectedStagingType ?? params.vectorType ?? "vector(1536)";
+      assertSafeCatalogTypeCast(resolvedCastType);
+    }
+
     for (const won of wonRecords) {
       const vectorLiteral = JSON.stringify(won.embedding);
-      if (isTextVector) {
+      if (isTextVector || resolvedCastType.toLowerCase() === "text") {
         await tx`
           INSERT INTO paperclip_memory_upgrade_staging (
             upgrade_id,
@@ -1256,7 +1270,8 @@ export async function stageSourceRecords(
           );
         `;
       } else {
-        await tx`
+        await tx.unsafe(
+          `
           INSERT INTO paperclip_memory_upgrade_staging (
             upgrade_id,
             source_id,
@@ -1268,17 +1283,27 @@ export async function stageSourceRecords(
             published_at,
             created_at
           ) VALUES (
-            ${upgradeId}::uuid,
-            ${sourceId}::uuid,
-            ${won.outputId}::uuid,
-            ${agentId}::uuid,
-            ${JSON.stringify(won.payload)}::jsonb,
-            ${vectorLiteral}::vector(1536),
-            ${won.dataSha256},
+            $1::uuid,
+            $2::uuid,
+            $3::uuid,
+            $4::uuid,
+            $5::jsonb,
+            $6::${resolvedCastType},
+            $7,
             NULL,
             now()
           );
-        `;
+        `,
+          [
+            upgradeId,
+            sourceId,
+            won.outputId,
+            agentId,
+            JSON.stringify(won.payload),
+            vectorLiteral,
+            won.dataSha256,
+          ],
+        );
       }
     }
 
