@@ -6,6 +6,50 @@ export { UPGRADE_LEDGER_OUTCOMES, type UpgradeLedgerOutcome };
 
 const VECTOR_TYPE_PARSER = /^(?:(?:"([a-zA-Z_][a-zA-Z0-9_]*)"|([a-zA-Z_][a-zA-Z0-9_]*))\.)?(?:"?vector"?)\((\d{1,5})\)$/i;
 
+const SAFE_CATALOG_TYPE =
+  /^(?:(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)\.)?(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)(?:\(\d{1,5}(?:,\d{1,5})?\))?$/;
+
+/**
+ * Validates that a type name from the database catalog is safe to interpolate as a SQL cast target.
+ */
+export function assertSafeCatalogTypeCast(typeName: string): void {
+  if (
+    typeof typeName !== "string" ||
+    typeName.length === 0 ||
+    typeName.length > 128 ||
+    !SAFE_CATALOG_TYPE.test(typeName)
+  ) {
+    throw new CompanyMemoryUpgradeError(
+      `Unsafe catalog type name "${typeName}" cannot be used as a SQL cast target.`,
+      "UNSAFE_CATALOG_TYPE",
+    );
+  }
+}
+
+/**
+ * Queries the staging table's `embedding` column format_type from pg_attribute.
+ * Returns null if the staging table does not exist or has no embedding column.
+ */
+export async function introspectStagingEmbeddingType(
+  sql: SqlClient | ReturnType<typeof postgres> | { unsafe(query: string, args?: unknown[]): Promise<unknown> },
+): Promise<string | null> {
+  const rows = (await sql.unsafe(`
+    SELECT format_type(a.atttypid, a.atttypmod) AS formatted_type
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass('paperclip_memory_upgrade_staging')
+      AND a.attname = 'embedding'
+      AND a.attnum > 0
+      AND NOT a.attisdropped;
+  `)) as Array<{ formatted_type: string }>;
+
+  if (!rows || rows.length === 0 || !rows[0]?.formatted_type) {
+    return null;
+  }
+  const rawType = rows[0].formatted_type.trim();
+  assertSafeCatalogTypeCast(rawType);
+  return rawType;
+}
+
 export function parseVectorType(vectorType: string): { schema: string | null; dimensions: number } | null {
   const normalized = vectorType.trim();
   if (normalized.toLowerCase() === "text") {
@@ -51,11 +95,11 @@ export function quoteVectorType(vectorType: string): string {
 }
 
 /**
- * The staging INSERT in sweep-tenant.ts hardcodes an unqualified `::vector(1536)` cast, so the
- * staging column must be `text` or an unqualified `vector(1536)`. A schema-qualified type means
- * pgvector is not visible in the connection's search_path (format_type only qualifies in that
+ * The staging INSERT in sweep-tenant.ts parameterises the vector cast from the staging column's
+ * resolved type, so the staging column must be `text` or an unqualified `vector(1536)`. A schema-qualified
+ * type means pgvector is not visible in the connection's search_path (format_type only qualifies in that
  * case) — we refuse up front instead of failing on the first staging write.
- * TECH-8191 follow-up: parameterise the cast + add a real-pgvector fixture, then relax this.
+ * TECH-8191 follow-up: the cast is now parameterised and only the schema-qualified pgvector fixture is missing.
  */
 export function assertSupportedStagingVectorType(vectorType: string): void {
   const quoted = quoteVectorType(vectorType);
@@ -121,6 +165,10 @@ export async function ensureUpgradeTables(
 
     CREATE INDEX IF NOT EXISTS "pmu_staging_src_idx"
     ON "paperclip_memory_upgrade_staging" ("upgrade_id", "source_id");
+
+    CREATE INDEX IF NOT EXISTS "pmu_staging_unpublished_idx"
+    ON "paperclip_memory_upgrade_staging" ("upgrade_id", "source_id", "output_id")
+    WHERE "published_at" IS NULL;
 
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_ledger" (
       "upgrade_id" uuid NOT NULL,

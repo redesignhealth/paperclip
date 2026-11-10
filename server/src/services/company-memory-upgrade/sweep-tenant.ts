@@ -2,7 +2,7 @@
  * Tenant SQL operations for company memory upgrade sweep (TECH-8191).
  *
  * ARCHITECTURAL INVARIANTS:
- * - All tenant SQL operations live in this file.
+ * - All tenant SQL operations live in this file and in publish-tenant.ts.
  * - postgres.js is used directly for tenant connections (required for multi-statement DDL via simple protocol).
  * - The ONLY statement class issued against the LIVE collection table is SELECT.
  *   Every live table query includes a header comment documenting this invariant.
@@ -27,8 +27,10 @@ import {
   validateTenantFence,
 } from "./tenant-fence.js";
 import {
+  assertSafeCatalogTypeCast,
   assertSupportedStagingVectorType,
   ensureUpgradeTables,
+  introspectStagingEmbeddingType,
 } from "./tenant-tables.js";
 
 export type { TenantFence } from "./tenant-fence.js";
@@ -54,6 +56,7 @@ export interface TenantCollectionShape {
   embeddingColumn: string;
   embeddingDims: number;
   embeddingType: string;
+  embeddingTypeRaw: string;
   payloadType: "jsonb" | "json";
   rowCount: number;
   isUuidId: boolean;
@@ -402,9 +405,12 @@ export async function introspectCollection(
     }
   }
 
+  const rawVectorType = vectorCol.formatted_type.trim();
+  assertSafeCatalogTypeCast(rawVectorType);
+
   const cleanedVectorType = options?.skipVectorIdentityCheck
-    ? vectorCol.formatted_type.trim().replace(/^"|"$/g, "")
-    : vectorCol.formatted_type.trim();
+    ? rawVectorType.replace(/^"|"$/g, "")
+    : rawVectorType;
   // Introspection describes schema-qualified vector types; assertSupportedStagingVectorType enforces unqualified vector(1536) / text before staging.
   const vectorMatch = cleanedVectorType.match(
     /^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?vector\((\d+)\)$/i,
@@ -447,6 +453,7 @@ export async function introspectCollection(
     embeddingColumn: vectorColName,
     embeddingDims: 1536,
     embeddingType: cleanedVectorType,
+    embeddingTypeRaw: rawVectorType,
     payloadType: payloadType as "jsonb" | "json",
     rowCount,
     isUuidId,
@@ -728,16 +735,19 @@ export async function reconcileTombstones(
   let deletedDedupeCount = 0;
   let actualTombstonesCount = 0;
 
-  const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : 500;
+  const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : 200;
 
   for (let i = 0; i < tombstoneIds.length; i += batchSize) {
     options.assertLeaseActive?.();
     const batch = tombstoneIds.slice(i, i + batchSize);
 
     await sql.begin(async (tx: any) => {
-      // Fence row SHARE lock (L2), held to commit. Tombstone batches deliberately validate
-      // the fence ONCE per batch transaction rather than taking up to `batchSize` (up to 500)
-      // individual per-source advisory locks (L1) -- see module doc in tenant-fence.ts.
+      // L1: per-source advisory locks in ascending canonical order via one unnest() statement
+      const sortedKeys = [...new Set(batch.map((s) => `paperclip:memory-upgrade-source:${upgradeId.toLowerCase()}:${s.toLowerCase()}`))].sort();
+      if (sortedKeys.length > 0) {
+        await tx`SELECT pg_advisory_xact_lock(hashtextextended(k, 0)) FROM unnest(${sortedKeys}::text[]) AS k`;
+      }
+      // L2: fence row SHARE lock, held to commit
       await validateTenantFence(tx, fence);
 
       // 1. Find unpublished staging output_ids
@@ -805,21 +815,60 @@ export async function reconcileTombstones(
   };
 }
 
+export interface ReconcileChangedContentParams {
+  upgradeId: string;
+  sourceId: string;
+  sourceContentSha256?: string;
+  agentId?: string | null;
+}
+
 /**
  * Reconciles changed content for a single source.
  * Clears unpublished staging and dedupe rows, and deletes the stale ledger row so
  * the source can reclassify cleanly without leaving stale superseded rows.
+ * If published rows remain, the ledger row is marked 'superseded' with the new
+ * hash and agent (if provided) and retained output_ids.
  */
 export async function reconcileChangedContent(
   sql: postgres.Sql,
-  upgradeId: string,
-  sourceId: string,
-  fence: TenantFence,
+  paramsOrUpgradeId: ReconcileChangedContentParams | string,
+  sourceIdOrFence: string | TenantFence,
+  fenceMaybe?: TenantFence,
 ): Promise<{ deletedStagingCount: number; deletedDedupeCount: number; retainedOutputIds: string[] }> {
+  let upgradeId: string;
+  let sourceId: string;
+  let sourceContentSha256: string | undefined;
+  let agentId: string | null | undefined;
+  let fence: TenantFence;
+
+  if (typeof paramsOrUpgradeId === "string") {
+    upgradeId = paramsOrUpgradeId;
+    sourceId = sourceIdOrFence as string;
+    fence = fenceMaybe!;
+  } else {
+    upgradeId = paramsOrUpgradeId.upgradeId;
+    sourceId = paramsOrUpgradeId.sourceId;
+    sourceContentSha256 = paramsOrUpgradeId.sourceContentSha256;
+    agentId = paramsOrUpgradeId.agentId;
+    fence = sourceIdOrFence as TenantFence;
+  }
+
   if (!isValidUuid(sourceId)) {
     throw new CompanyMemoryUpgradeError(
       "sourceId must be a valid UUID string.",
       "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(
+      "upgradeId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (agentId && !isValidUuid(agentId)) {
+    throw new CompanyMemoryUpgradeError(
+      "agentId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
     );
   }
   if (!fence || fence.upgradeId !== upgradeId) {
@@ -893,16 +942,48 @@ export async function reconcileChangedContent(
     } else {
       // Published rows remain live and must stay referenced by SOME ledger row: mark the
       // row 'superseded' (rather than deleting it) and retain exactly the ids still staged.
-      await tx`
-        UPDATE paperclip_memory_upgrade_ledger
-        SET
-          outcome = 'superseded',
-          reason_code = NULL,
-          output_ids = ${retainedOutputIds}::uuid[],
-          updated_at = now()
-        WHERE upgrade_id = ${upgradeId}::uuid
-          AND source_id = ${sourceId}::uuid;
-      `;
+      // If the new content hash and agent were provided, update them onto the row so the
+      // ledger accurately describes the source at the time it was superseded.
+      if (sourceContentSha256 !== undefined) {
+        if (agentId !== undefined) {
+          const agentSql = agentId ? sql`${agentId}::uuid` : null;
+          await tx`
+            UPDATE paperclip_memory_upgrade_ledger
+            SET
+              outcome = 'superseded',
+              reason_code = NULL,
+              output_ids = ${retainedOutputIds}::uuid[],
+              source_content_sha256 = ${sourceContentSha256},
+              agent_id = ${agentSql},
+              updated_at = now()
+            WHERE upgrade_id = ${upgradeId}::uuid
+              AND source_id = ${sourceId}::uuid;
+          `;
+        } else {
+          await tx`
+            UPDATE paperclip_memory_upgrade_ledger
+            SET
+              outcome = 'superseded',
+              reason_code = NULL,
+              output_ids = ${retainedOutputIds}::uuid[],
+              source_content_sha256 = ${sourceContentSha256},
+              updated_at = now()
+            WHERE upgrade_id = ${upgradeId}::uuid
+              AND source_id = ${sourceId}::uuid;
+          `;
+        }
+      } else {
+        await tx`
+          UPDATE paperclip_memory_upgrade_ledger
+          SET
+            outcome = 'superseded',
+            reason_code = NULL,
+            output_ids = ${retainedOutputIds}::uuid[],
+            updated_at = now()
+          WHERE upgrade_id = ${upgradeId}::uuid
+            AND source_id = ${sourceId}::uuid;
+        `;
+      }
     }
   });
 
@@ -977,7 +1058,12 @@ export async function commitSourceOutcome(
         ${agentId ? sql`${agentId}::uuid` : null},
         ${outcome},
         ${validatedReason},
-        '{}',
+        COALESCE((
+          SELECT array_agg(s.output_id ORDER BY s.output_id)
+          FROM paperclip_memory_upgrade_staging s
+          WHERE s.upgrade_id = ${upgradeId}::uuid
+            AND s.source_id = ${sourceId}::uuid
+        ), '{}'),
         now(),
         now()
       )
@@ -986,6 +1072,12 @@ export async function commitSourceOutcome(
         agent_id = EXCLUDED.agent_id,
         outcome = EXCLUDED.outcome,
         reason_code = EXCLUDED.reason_code,
+        output_ids = COALESCE((
+          SELECT array_agg(s.output_id ORDER BY s.output_id)
+          FROM paperclip_memory_upgrade_staging s
+          WHERE s.upgrade_id = paperclip_memory_upgrade_ledger.upgrade_id
+            AND s.source_id = paperclip_memory_upgrade_ledger.source_id
+        ), '{}'),
         updated_at = now();
     `;
   });
@@ -1144,9 +1236,16 @@ export async function stageSourceRecords(
     }
 
     // 4. Stage won records (published_at IS NULL)
+    let resolvedCastType = "vector(1536)";
+    if (!isTextVector) {
+      const detectedStagingType = await introspectStagingEmbeddingType(tx);
+      resolvedCastType = detectedStagingType ?? params.vectorType ?? "vector(1536)";
+      assertSafeCatalogTypeCast(resolvedCastType);
+    }
+
     for (const won of wonRecords) {
       const vectorLiteral = JSON.stringify(won.embedding);
-      if (isTextVector) {
+      if (isTextVector || resolvedCastType.toLowerCase() === "text") {
         await tx`
           INSERT INTO paperclip_memory_upgrade_staging (
             upgrade_id,
@@ -1171,7 +1270,8 @@ export async function stageSourceRecords(
           );
         `;
       } else {
-        await tx`
+        await tx.unsafe(
+          `
           INSERT INTO paperclip_memory_upgrade_staging (
             upgrade_id,
             source_id,
@@ -1183,17 +1283,27 @@ export async function stageSourceRecords(
             published_at,
             created_at
           ) VALUES (
-            ${upgradeId}::uuid,
-            ${sourceId}::uuid,
-            ${won.outputId}::uuid,
-            ${agentId}::uuid,
-            ${JSON.stringify(won.payload)}::jsonb,
-            ${vectorLiteral}::vector(1536),
-            ${won.dataSha256},
+            $1::uuid,
+            $2::uuid,
+            $3::uuid,
+            $4::uuid,
+            $5::jsonb,
+            $6::${resolvedCastType},
+            $7,
             NULL,
             now()
           );
-        `;
+        `,
+          [
+            upgradeId,
+            sourceId,
+            won.outputId,
+            agentId,
+            JSON.stringify(won.payload),
+            vectorLiteral,
+            won.dataSha256,
+          ],
+        );
       }
     }
 
