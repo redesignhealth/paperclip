@@ -62,7 +62,7 @@ export function assertSupportedStagingVectorType(vectorType: string): void {
   if (quoted !== "text" && quoted !== "vector(1536)") {
     throw new CompanyMemoryUpgradeError(
       `Unsupported staging vectorType: only unqualified vector(1536) (visible in search_path) or text is currently supported, received "${quoted}".`,
-      "INVALID_ARGUMENT",
+      "UNSUPPORTED_VECTOR_TYPE",
     );
   }
 }

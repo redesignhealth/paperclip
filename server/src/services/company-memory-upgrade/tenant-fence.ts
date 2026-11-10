@@ -143,37 +143,72 @@ const TENANT_CLAIM_BLOCKING_STATEMENTS = 2;
  */
 const CP_LOCK_CONTENTION_SQLSTATES = new Set(["57014", "55P03"]); // query_canceled (statement_timeout), lock_not_available (lock_timeout)
 
-const MAX_CAUSE_DEPTH = 5;
+/**
+ * SQLSTATE class 08 — connection_exception (08000, 08001, 08003, 08004, 08006, 08007, 08P01).
+ * Matched by prefix because the class as a whole means "this connection is gone".
+ * 08007 (transaction_resolution_unknown) is deliberately included: the control-plane
+ * transaction performs no writes (SELECT ... FOR UPDATE only), so an unknown COMMIT
+ * resolution leaves no control-plane residual, and failing the claim closed is correct.
+ */
+const CP_CONNECTION_EXCEPTION_CLASS = "08";
 
-/** Reads a driver error code from err.code, walking the cause chain (drizzle wraps driver errors). */
-function extractErrorCode(err: unknown): string | undefined {
-  let current: unknown = err;
-  let depth = 0;
-  while (current && depth <= MAX_CAUSE_DEPTH) {
-    if (typeof current === "object" && current !== null && "code" in current && typeof (current as any).code === "string") {
-      return (current as any).code;
-    }
-    if (typeof current === "object" && current !== null && "cause" in current) {
-      current = (current as any).cause;
-      depth++;
-    } else {
-      break;
-    }
-  }
-  return undefined;
-}
-
-/** CP backend terminated or connection lost mid-claim: the claim failed, it is not lease contention. */
-const CP_TERMINATION_CODES = new Set([
+/** Backend terminated server-side while the admission transaction was open. */
+const CP_TERMINATION_SQLSTATES = new Set([
   "25P03", // idle_in_transaction_session_timeout
   "57P01", // admin_shutdown
-  "08006", // connection_failure
-  "08003", // connection_does_not_exist
+  "57P02", // crash_shutdown
+  "57P03", // cannot_connect_now
+]);
+
+/** postgres.js and Node socket-level codes for a control-plane connection that died or never came up. */
+const CP_SOCKET_ERROR_CODES = new Set([
   "CONNECTION_CLOSED",
   "CONNECTION_ENDED",
   "CONNECTION_DESTROYED",
-  "ECONNRESET", // postgres.js / node
+  "CONNECTION_CONNECT_TIMEOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
 ]);
+
+const MAX_CAUSE_DEPTH = 5;
+
+/** Bounded classification of a control-plane-side claim failure. */
+export type CpClaimFailureKind = "cp_lock_contention" | "cp_terminated" | "unclassified";
+
+/**
+ * @internal Exported for tests.
+ * Walks the cause chain (drizzle wraps driver errors) and returns the FIRST RECOGNISED
+ * classification, not the first `.code` present: a wrapper that carries its own
+ * non-SQLSTATE `.code` must not mask the driver code below it. Same shape as
+ * `isUniqueViolation` in server/src/db-errors.ts. Depth-limited because cause chains
+ * can cycle.
+ *
+ * Only ever called on the CONTROL-PLANE side: a tenant-side failure is normalised in the
+ * inner catch and rethrown via `capturedError`, which short-circuits the outer catch.
+ */
+export function classifyCpClaimFailure(err: unknown): CpClaimFailureKind {
+  let current: unknown = err;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (typeof candidate.code === "string") {
+      const code = candidate.code;
+      if (CP_LOCK_CONTENTION_SQLSTATES.has(code)) {
+        return "cp_lock_contention";
+      }
+      if (
+        CP_TERMINATION_SQLSTATES.has(code) ||
+        (code.startsWith(CP_CONNECTION_EXCEPTION_CLASS) && code.length === 5) ||
+        CP_SOCKET_ERROR_CODES.has(code)
+      ) {
+        return "cp_terminated";
+      }
+    }
+    current = candidate.cause;
+  }
+  return "unclassified";
+}
 
 const TAKEOVER_LOCK_NAMESPACE = "paperclip:memory-upgrade-fence-takeover";
 const SOURCE_LOCK_NAMESPACE = "paperclip:memory-upgrade-source";
@@ -361,17 +396,17 @@ export async function claimTenantFenceGuarded(
     if (outerErr instanceof CompanyMemoryUpgradeError) {
       throw outerErr;
     }
-    const code = extractErrorCode(outerErr);
-    if (code && CP_LOCK_CONTENTION_SQLSTATES.has(code)) {
+    const failureKind = classifyCpClaimFailure(outerErr);
+    if (failureKind === "cp_lock_contention") {
       throw new CompanyMemoryUpgradeError(
         "Control-plane admission lock contention: another worker holds the upgrade row lock",
         "LEASE_FENCED_OUT",
         { cause: outerErr },
       );
     }
-    if (code && CP_TERMINATION_CODES.has(code)) {
+    if (failureKind === "cp_terminated") {
       throw new CompanyMemoryUpgradeError(
-        "Control-plane admission transaction was terminated while claiming tenant fence",
+        "Control-plane admission transaction failed or was terminated while claiming the tenant fence",
         "TENANT_FENCE_CLAIM_FAILED",
         { cause: outerErr },
       );

@@ -3,7 +3,6 @@
  */
 
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -15,6 +14,7 @@ import {
   acquireSourceAdvisoryLock,
   acquireSourceAdvisoryLocksAscending,
   claimTenantFenceGuarded,
+  classifyCpClaimFailure,
 } from "../../server/src/services/company-memory-upgrade/tenant-fence.js";
 import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
 import {
@@ -573,7 +573,10 @@ test("tenant fence claim error mapping and timeouts (F1/F2)", async (t) => {
     },
   );
   const elapsedMs = Date.now() - startMs;
-  assert.ok(elapsedMs < 1000, `Expected rejection in well under a second, took ${elapsedMs}ms`);
+  // 3s, not 1s: this repo's embedded-postgres helper records a measured 4.9x slowdown on a
+  // contended CI runner. 3s still separates the 300ms client race / 200ms lock timeout from
+  // the 10s default bound and from a hang.
+  assert.ok(elapsedMs < 3000, `Expected rejection in well under 3s, took ${elapsedMs}ms`);
 
   // Immediately afterwards a second CP connection can SELECT ... FOR UPDATE NOWAIT without error
   const cpClient2 = openTenantClient(cpFixture.connectionString);
@@ -657,7 +660,7 @@ test("stageSourceRecords: fail-closed validation on vectorType and embedding dim
   };
   const fakeSql: any = {};
 
-  // 1. vectorType: "public.vector(1536)" -> INVALID_ARGUMENT (schema-qualified unsupported)
+  // 1. vectorType: "public.vector(1536)" -> UNSUPPORTED_VECTOR_TYPE (schema-qualified unsupported)
   await assert.rejects(
     () =>
       stageSourceRecords(
@@ -674,7 +677,7 @@ test("stageSourceRecords: fail-closed validation on vectorType and embedding dim
       ),
     (err: any) => {
       assert.ok(err instanceof CompanyMemoryUpgradeError);
-      assert.equal(err.code, "INVALID_ARGUMENT");
+      assert.equal(err.code, "UNSUPPORTED_VECTOR_TYPE");
       return true;
     },
   );
@@ -814,28 +817,10 @@ test("CP idle-in-transaction backstop: mechanism releases row lock server-side (
   }
 
   assert.ok(caughtErr, "Transaction must reject after idle_in_transaction_session_timeout terminates backend");
-  const terminationCodes = new Set([
-    "25P03",
-    "57P01",
-    "08006",
-    "08003",
-    "CONNECTION_CLOSED",
-    "CONNECTION_ENDED",
-    "CONNECTION_DESTROYED",
-    "ECONNRESET",
-  ]);
-  let codeFound: string | undefined;
-  let curr = caughtErr;
-  for (let depth = 0; depth < 5 && curr; depth++) {
-    if (typeof curr.code === "string") {
-      codeFound = curr.code;
-      if (terminationCodes.has(curr.code)) break;
-    }
-    curr = curr.cause;
-  }
-  assert.ok(
-    codeFound && terminationCodes.has(codeFound),
-    `Expected termination code (e.g. 25P03), got ${codeFound}`,
+  assert.equal(
+    classifyCpClaimFailure(caughtErr),
+    "cp_terminated",
+    "idle_in_transaction_session_timeout must be classified as a control-plane termination",
   );
 
   // Assert a second connection immediately gets the row with SELECT ... FOR UPDATE NOWAIT without error
@@ -887,7 +872,7 @@ test("CP backstop end-to-end with a wedged client (R2-T2)", async (t) => {
   // Synchronously block the event loop for 1.2s to simulate a wedged worker process that layer 3 exists for
   const fakeTenantSqlWedged = {
     begin: () => {
-      execSync("sleep 1.2");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
       return new Promise(() => {});
     },
   } as any;
@@ -974,7 +959,10 @@ test("split per-statement budget is applied in tenant claim transaction (R2-T3)"
       },
     );
     const elapsedMs = Date.now() - startMs;
-    assert.ok(elapsedMs < 1000, `Expected rejection in well under 1s, took ${elapsedMs}ms`);
+    // 3s, not 1s: this repo's embedded-postgres helper records a measured 4.9x slowdown on a
+    // contended CI runner. 3s still separates the 300ms client race / 200ms lock timeout from
+    // the 10s default bound and from a hang.
+    assert.ok(elapsedMs < 3000, `Expected rejection in well under 3s, took ${elapsedMs}ms`);
   } finally {
     releaseA!();
     await txA;
@@ -1112,4 +1100,27 @@ test("acquireSourceAdvisoryLocksAscending: sorts on canonical key and dedupes ca
     "paperclip:memory-upgrade-source:myupgradeid:b0000000-0000-0000-0000-000000000002",
   );
   assert.ok(capturedKeys[0] < capturedKeys[1], "Keys must be in strictly ascending order");
+});
+
+test("classifyCpClaimFailure: bounds cause chains and matches expected error taxonomy (R3-F6)", () => {
+  // Wrapper carrying non-SQLSTATE code with cause carrying 25P03
+  const wrappedTermination = {
+    code: "SOME_WRAPPER_CODE",
+    cause: { code: "25P03" },
+  };
+  assert.equal(classifyCpClaimFailure(wrappedTermination), "cp_terminated");
+
+  // SQLSTATE 08007 transaction_resolution_unknown -> cp_terminated
+  assert.equal(classifyCpClaimFailure({ code: "08007" }), "cp_terminated");
+
+  // SQLSTATE 55P03 lock_not_available -> cp_lock_contention
+  assert.equal(classifyCpClaimFailure({ code: "55P03" }), "cp_lock_contention");
+
+  // SQLSTATE 42501 insufficient_privilege -> unclassified
+  assert.equal(classifyCpClaimFailure({ code: "42501" }), "unclassified");
+
+  // Self-referential cause cycle terminates and returns unclassified
+  const cycle: any = { code: "UNRECOGNIZED_1" };
+  cycle.cause = { code: "UNRECOGNIZED_2", cause: cycle };
+  assert.equal(classifyCpClaimFailure(cycle), "unclassified");
 });

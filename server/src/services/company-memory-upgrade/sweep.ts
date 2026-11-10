@@ -58,6 +58,7 @@ import {
   updateUpgradeCounters,
 } from "./state-machine.js";
 import {
+  assertSupportedStagingVectorType,
   assertTenantRolePreflight,
   commitSourceOutcome,
   ensureUpgradeTables,
@@ -415,6 +416,12 @@ export async function runSweep(
     const stagingVectorType = deps._internalSkipVectorIdentityCheck
       ? "text"
       : shape.embeddingType;
+
+    // Preflight BEFORE any control-plane side effect: a staging column we cannot write to must
+    // not open or resume an upgrade row. A non-terminal upgrade row blocks company deletion in
+    // this slice (see the runbook WARNING), so failing after openUpgrade/claimUpgradeLease is
+    // strictly worse than failing here. ensureUpgradeTables re-asserts this as defence in depth.
+    assertSupportedStagingVectorType(stagingVectorType);
 
     // 5. Pre-load company agents for routing
     const agentRows = await cpDb

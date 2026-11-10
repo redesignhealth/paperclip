@@ -762,34 +762,20 @@ test("sweep orchestrator integration", async (t) => {
         if (prop === "begin") {
           return async (cb: any) => {
             return target.begin(async (realTx: any) => {
+              // 42501 is injected on the fence-claim upsert only. `ensureUpgradeTables` also runs
+              // through `tenantSql.begin`, so a looser match would break table initialisation instead
+              // and the test would assert the wrong failure.
               const proxiedTx = new Proxy(realTx, {
                 apply(tTx, thisArg, argArray) {
                   const strings = argArray[0];
                   const queryText = Array.isArray(strings) ? strings.join(" ") : String(strings ?? "");
-                  if (queryText.includes("paperclip_memory_upgrade_fence")) {
+                  if (/INSERT\s+INTO\s+paperclip_memory_upgrade_fence/i.test(queryText)) {
                     throw Object.assign(
                       new Error("permission denied for table paperclip_memory_upgrade_fence"),
                       { code: "42501" },
                     );
                   }
                   return Reflect.apply(tTx, thisArg, argArray);
-                },
-                get(tTx, p, r) {
-                  if (p === "unsafe") {
-                    return (unsafeQuery: string, ...args: any[]) => {
-                      if (
-                        String(unsafeQuery).includes("paperclip_memory_upgrade_fence") &&
-                        !String(unsafeQuery).includes("CREATE TABLE")
-                      ) {
-                        throw Object.assign(
-                          new Error("permission denied for table paperclip_memory_upgrade_fence"),
-                          { code: "42501" },
-                        );
-                      }
-                      return tTx.unsafe(unsafeQuery, ...args);
-                    };
-                  }
-                  return Reflect.get(tTx, p, r);
                 },
               });
               return cb(proxiedTx);

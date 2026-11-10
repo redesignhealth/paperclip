@@ -29,7 +29,6 @@ import {
 import {
   assertSupportedStagingVectorType,
   ensureUpgradeTables,
-  quoteVectorType,
 } from "./tenant-tables.js";
 
 export type { TenantFence } from "./tenant-fence.js";
@@ -39,7 +38,7 @@ import {
   type UpgradeLedgerOutcome,
 } from "./types.js";
 
-export { ensureUpgradeTables, UPGRADE_LEDGER_OUTCOMES };
+export { assertSupportedStagingVectorType, ensureUpgradeTables, UPGRADE_LEDGER_OUTCOMES };
 
 export interface TenantSourceRow {
   id: string;

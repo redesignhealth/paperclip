@@ -69,6 +69,8 @@ export const SWEEP_ERROR_CODE_MAP: Record<string, UpgradeErrorCode> = {
   migration_failed: "migration_failed",
   NOT_PGVECTOR: "schema_init_failed",
   not_pgvector: "schema_init_failed",
+  UNSUPPORTED_VECTOR_TYPE: "schema_init_failed",
+  unsupported_vector_type: "schema_init_failed",
   SCHEMA_MISMATCH: "schema_init_failed",
   schema_mismatch: "schema_init_failed",
   EMBEDDING_DIMENSIONS_MISMATCH: "schema_init_failed",

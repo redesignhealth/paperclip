@@ -96,12 +96,12 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
 
     expect(() => assertSupportedStagingVectorType("public.vector(1536)")).toThrowError(
       expect.objectContaining({
-        code: "INVALID_ARGUMENT",
+        code: "UNSUPPORTED_VECTOR_TYPE",
       }),
     );
     expect(() => assertSupportedStagingVectorType("vector(512)")).toThrowError(
       expect.objectContaining({
-        code: "INVALID_ARGUMENT",
+        code: "UNSUPPORTED_VECTOR_TYPE",
       }),
     );
 
@@ -109,13 +109,13 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     await expect(ensureUpgradeTables(sql, "public.vector(1536)")).rejects.toThrowError(
       expect.objectContaining({
         name: "CompanyMemoryUpgradeError",
-        code: "INVALID_ARGUMENT",
+        code: "UNSUPPORTED_VECTOR_TYPE",
       }),
     );
     await expect(ensureUpgradeTables(sql, "vector(512)")).rejects.toThrowError(
       expect.objectContaining({
         name: "CompanyMemoryUpgradeError",
-        code: "INVALID_ARGUMENT",
+        code: "UNSUPPORTED_VECTOR_TYPE",
       }),
     );
   });
@@ -410,5 +410,30 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
         )
       `,
     ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("pre-provisioned tables + DML-only non-owner role: ensureUpgradeTables fails 42501 before any fence claim (R3-F4)", async () => {
+    await ensureUpgradeTables(sql, "text"); // owner (superuser) provisions
+
+    await sql.unsafe(`CREATE ROLE pmu_dml_only WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;`);
+    await sql.unsafe(`GRANT USAGE ON SCHEMA public TO pmu_dml_only;`); // USAGE only, no CREATE
+    await sql.unsafe(`GRANT SELECT, INSERT, UPDATE ON paperclip_memory_upgrade_fence TO pmu_dml_only;`);
+    await sql.unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON paperclip_memory_upgrade_ledger, paperclip_memory_upgrade_staging, paperclip_memory_upgrade_dedupe TO pmu_dml_only;`);
+
+    const url = new URL(tempDb!.connectionString);
+    url.username = "pmu_dml_only";
+    url.password = "pass123";
+    const dmlSql = postgres(url.toString(), { max: 1, onnotice: () => {} });
+    try {
+      // (a) the DML the runbook promises is sufficient really does work
+      await dmlSql`INSERT INTO paperclip_memory_upgrade_fence (upgrade_id, fence_epoch, lease_token, lease_owner)
+                   VALUES (${randomUUID()}::uuid, 1, 'tok', 'owner')`;
+      // (b) but ensureUpgradeTables still issues DDL and is refused
+      await expect(ensureUpgradeTables(dmlSql, "text")).rejects.toMatchObject({ code: "42501" });
+    } finally {
+      await dmlSql.end();
+      await sql.unsafe(`DROP OWNED BY pmu_dml_only;`); // drops the grants
+      await sql.unsafe(`DROP ROLE IF EXISTS pmu_dml_only;`);
+    }
   });
 });
