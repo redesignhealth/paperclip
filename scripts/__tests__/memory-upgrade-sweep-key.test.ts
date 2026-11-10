@@ -175,6 +175,42 @@ test("resolveCompanyOpenAiKey from company_secrets database", async (t) => {
       (err: any) => err.code === "COMPANY_OPENAI_KEY_MISSING",
     );
   });
+
+  await t.test("resolveVersion failure throws COMPANY_OPENAI_KEY_MISSING", async () => {
+    const [compCorrupt] = await cpDb.insert(companies).values({
+      name: "Corrupt Secret Co",
+      issuePrefix: "CS",
+    }).returning();
+
+    const secId = randomUUID();
+    await cpDb.insert(companySecrets).values({
+      id: secId,
+      companyId: compCorrupt.id,
+      scope: "company",
+      key: "openai_api_key",
+      name: "OpenAI Key",
+      provider: "local_encrypted",
+      status: "active",
+      latestVersion: 1,
+    });
+    await cpDb.insert(companySecretVersions).values({
+      secretId: secId,
+      version: 1,
+      material: { corrupted: "bad-material-data" },
+      valueSha256: "dummy-sha",
+      fingerprintSha256: "dummy-fp",
+      status: "current",
+    });
+
+    await assert.rejects(
+      () => resolveCompanyOpenAiKey({ controlPlaneDb: cpDb, companyId: compCorrupt.id }),
+      (err: any) => {
+        assert.equal(err.code, "COMPANY_OPENAI_KEY_MISSING");
+        assert.equal(err.message, "Failed to resolve company openai_api_key secret version.");
+        return true;
+      },
+    );
+  });
 });
 
 test("resolveCompanyOpenAiKey via --openai-key-file", async (t) => {

@@ -3,7 +3,7 @@
  *
  * These are pure, dependency-free tests (no embedded postgres, no network). The single
  * end-to-end multi-page accounting test that exercises runSweep() against an embedded
- * postgres fixture stays in memory-upgrade-sweep-cost.test.ts alongside the rest of the
+ * postgres fixture stays in memory-upgrade-sweep-orchestrator.test.ts alongside the rest of the
  * sweep orchestrator integration tests.
  */
 
@@ -19,6 +19,7 @@ import {
   buildCostRatesNanodollars,
   ceilTokenCostNanodollars,
   createCostTracker,
+  estimateWorstCaseSourceCostNanodollars,
   estimateWorstCaseSourceCostNanodollarsForText,
   MAX_USD_CAP,
   PREFLIGHT_MAX_EMBEDDING_CALLS,
@@ -176,6 +177,30 @@ test("estimateWorstCaseSourceCostNanodollarsForText includes real serialized cha
   // Longer source text must increase the projection (wrapper overhead is additive, not
   // replacing the source text).
   assert.ok(longer.projectedChatInputTokens > empty.projectedChatInputTokens);
+});
+
+test("estimateWorstCaseSourceCostNanodollars direct calculation", () => {
+  const rates = buildCostRatesNanodollars({
+    chatInputUsdPerMillion: 0.15,
+    chatOutputUsdPerMillion: 0.6,
+    embeddingUsdPerMillion: 0.02,
+  });
+
+  const estimate = estimateWorstCaseSourceCostNanodollars({
+    initialRequestBodyBytes: 1000,
+    repairRequestBodyBytes: 2000,
+    rates,
+  });
+
+  assert.equal(estimate.projectedChatInputTokens, 3000);
+  assert.equal(estimate.projectedChatOutputTokens, 1200); // 600 * 2
+  assert.equal(estimate.projectedEmbeddingTokens, 4800); // 400 * 4 * 3
+
+  // chatInputCost: ceilTokenCostNanodollars(3000, 150_000_000) = 3000 * 150 = 450,000 nanodollars
+  // chatOutputCost: ceilTokenCostNanodollars(1200, 600_000_000) = 1200 * 600 = 720,000 nanodollars
+  // embeddingCost: ceilTokenCostNanodollars(4800, 20_000_000) = 4800 * 20 = 96,000 nanodollars
+  // worstCaseNanodollars: 450,000 + 720,000 + 96,000 = 1,266,000n
+  assert.equal(estimate.worstCaseNanodollars, 1_266_000n);
 });
 
 test("projectWorstCaseConversionRequestBytes sizes the repair body using the LONGEST CONVERSION_REJECT_CODE, not a hardcoded 15-char placeholder", () => {

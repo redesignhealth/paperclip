@@ -182,11 +182,12 @@ function getHeaderValue(
  * Any unmatched residue, negative value, or invalid format returns null.
  */
 export function parseDurationMs(str: string): number | null {
-  if (str.startsWith("-")) return null;
+  const trimmed = typeof str === "string" ? str.trim() : "";
+  if (!trimmed || trimmed.startsWith("-")) return null;
 
   // Bare unit-less number: seconds
-  if (/^\d+(?:\.\d+)?$/.test(str)) {
-    const s = Number(str);
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const s = Number(trimmed);
     if (Number.isFinite(s) && s >= 0) {
       return Math.ceil(s * 1000);
     }
@@ -195,7 +196,7 @@ export function parseDurationMs(str: string): number | null {
 
   // Repeated-unit grammar: (\d+(?:\.\d+)?)(ms|s|m|h)
   const unitRegex = /^(\d+(?:\.\d+)?)(ms|s|m|h)/;
-  let remaining = str;
+  let remaining = trimmed;
   let totalMs = 0;
   let matchedAny = false;
 

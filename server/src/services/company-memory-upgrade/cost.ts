@@ -218,7 +218,7 @@ export interface PreflightCostEstimate {
  * This is an OPERATIONAL ESTIMATE used purely to gate spend before any API key is resolved or
  * any paid call is made. It is deliberately conservative (an over-estimate) and is NOT a
  * billing guarantee -- actual OpenAI billing is authoritative and is reconciled after each
- * real call via the actual-usage accounting in sweep.ts (addActualCostNanodollars at sweep.ts:921/1029).
+ * real call via the actual-usage accounting in runMemoryUpgradeSweep (costTracker.addActualCostNanodollars).
  */
 export function estimateWorstCaseSourceCostNanodollars(input: PreflightCostInput): PreflightCostEstimate {
   const { rates } = input;

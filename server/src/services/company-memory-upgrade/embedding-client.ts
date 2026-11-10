@@ -6,9 +6,11 @@
  * - Shape validation: response must contain exactly 1 embedding array of 1536 finite numbers,
  *   and model must start with 'text-embedding-3-small'.
  * - Failed-attempt token refunds: deliberately NOT implemented (over-debiting is safe).
- * - Any failure (transport exhaustion, bad shape, unexpected model, non-finite vectors)
- *   throws CompanyMemoryUpgradeError('EMBEDDING_FAILED'), which ABORTS the sweep,
- *   never quarantines.
+ * - Terminal failures (401/403 -> COMPANY_OPENAI_KEY_REJECTED, 429 insufficient_quota -> COMPANY_OPENAI_QUOTA_EXHAUSTED,
+ *   other terminal 4xx or shape/validation failures -> EMBEDDING_FAILED) throw CompanyMemoryUpgradeError,
+ *   which ABORTS the sweep, never quarantines.
+ * - Retryable failures (408/409/plain 429/5xx/network) are retried with Retry-After-aware exponential
+ *   backoff + jitter. If exhausted, throws EMBEDDING_FAILED.
  */
 
 import { type MonotonicClock, type Sleeper } from "./clock.js";
@@ -91,6 +93,23 @@ export function assertEmbeddingShape(data: unknown, redaction?: RedactionRegistr
   return vector as number[];
 }
 
+function isInsufficientQuotaError(rawBody: string): boolean {
+  try {
+    const parsed = JSON.parse(rawBody);
+    const err = parsed?.error;
+    if (err && typeof err === "object") {
+      if (err.code === "insufficient_quota" || err.type === "insufficient_quota") {
+        return true;
+      }
+    }
+  } catch {
+    if (rawBody.includes("insufficient_quota")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function createOpenAiEmbeddingClient(
   options: CreateOpenAiEmbeddingClientOptions,
 ): EmbeddingClient {
@@ -134,6 +153,7 @@ export function createOpenAiEmbeddingClient(
           });
 
           let res: Response;
+          let data: any;
           try {
             res = await fetchImpl(endpoint, {
               method: "POST",
@@ -144,7 +164,18 @@ export function createOpenAiEmbeddingClient(
               body,
               signal: embedOptions?.signal,
             });
+
+            if (embedOptions?.signal?.aborted) {
+              throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
+            }
+
+            if (res.ok) {
+              data = await res.json();
+            }
           } catch (fetchErr: any) {
+            if (fetchErr instanceof CompanyMemoryUpgradeError) {
+              throw fetchErr;
+            }
             if (embedOptions?.signal?.aborted) {
               throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
             }
@@ -167,7 +198,7 @@ export function createOpenAiEmbeddingClient(
 
           if (res.status === 429) {
             const errBody = await res.text().catch(() => "");
-            if (errBody.includes("insufficient_quota")) {
+            if (isInsufficientQuotaError(errBody)) {
               const msg = redaction
                 ? redaction.scrub("OpenAI embeddings failed with HTTP 429: insufficient_quota")
                 : "OpenAI embeddings failed with HTTP 429: insufficient_quota";
@@ -201,13 +232,19 @@ export function createOpenAiEmbeddingClient(
           }
 
           if (!res.ok) {
+            if (res.status === 401 || res.status === 403) {
+              const msg = redaction
+                ? redaction.scrub(`OpenAI embeddings request rejected with HTTP ${res.status}`)
+                : `OpenAI embeddings request rejected with HTTP ${res.status}`;
+              throw new CompanyMemoryUpgradeError(msg, "COMPANY_OPENAI_KEY_REJECTED");
+            }
+
             const msg = redaction
               ? redaction.scrub(`OpenAI embeddings request failed with HTTP ${res.status}`)
               : `OpenAI embeddings request failed with HTTP ${res.status}`;
             throw new CompanyMemoryUpgradeError(msg, "EMBEDDING_FAILED");
           }
 
-          const data: any = await res.json();
           const embedding = assertEmbeddingShape(data, redaction);
 
           const rawTokens = data.usage?.prompt_tokens;

@@ -150,10 +150,27 @@ export type ConversionValidationResult =
 
 /**
  * Validates raw model output against the converter contract invariants.
+ *
+ * Runs detectSensitiveFamilies over the raw model response text before any structural
+ * validation (not_json, too_many_records, records_not_empty_on_drop, etc.). If sensitive
+ * tokens are detected, immediately returns data_sensitive_echo with the sorted deduped family CSV.
+ * Also keeps the per-record pass for structured inputs before structural record checks.
  */
 export function validateConversionOutput(raw: unknown): ConversionValidationResult {
   let parsed: unknown = raw;
   if (typeof raw === "string") {
+    const rawSensitive = detectSensitiveFamilies(raw);
+    if (rawSensitive.isSensitive) {
+      const sensitiveFamilies = new Set<SensitiveFamilyName>();
+      for (const [fam, hit] of Object.entries(rawSensitive.matches) as Array<[SensitiveFamilyName, boolean]>) {
+        if (hit) sensitiveFamilies.add(fam);
+      }
+      return {
+        ok: false,
+        rejectCode: "data_sensitive_echo",
+        sensitiveReasonCode: Array.from(sensitiveFamilies).sort().join(","),
+      };
+    }
     try {
       parsed = JSON.parse(raw);
     } catch {
@@ -181,22 +198,7 @@ export function validateConversionOutput(raw: unknown): ConversionValidationResu
     return { ok: false, rejectCode: "records_not_array" };
   }
 
-  if (decision === "drop_noise" || decision === "drop_sensitive") {
-    if (records.length !== 0) {
-      return { ok: false, rejectCode: "records_not_empty_on_drop" };
-    }
-    return { ok: true, decision, records: [] };
-  }
-
-  // decision === "convert"
-  if (records.length === 0) {
-    return { ok: false, rejectCode: "empty_records" };
-  }
-  if (records.length > 3) {
-    return { ok: false, rejectCode: "too_many_records" };
-  }
-
-  // Pass 1 (whole array, before any other per-record check):
+  // Pass 1 (whole array, before any structural checks on records):
   // For each record scan rec.data and rec.subject when strings.
   // Union family hits across both fields and all records; if non-empty return data_sensitive_echo.
   // No short-circuit — CSV must be the complete sorted/deduped union.
@@ -231,6 +233,21 @@ export function validateConversionOutput(raw: unknown): ConversionValidationResu
       rejectCode: "data_sensitive_echo",
       sensitiveReasonCode: families,
     };
+  }
+
+  if (decision === "drop_noise" || decision === "drop_sensitive") {
+    if (records.length !== 0) {
+      return { ok: false, rejectCode: "records_not_empty_on_drop" };
+    }
+    return { ok: true, decision, records: [] };
+  }
+
+  // decision === "convert"
+  if (records.length === 0) {
+    return { ok: false, rejectCode: "empty_records" };
+  }
+  if (records.length > 3) {
+    return { ok: false, rejectCode: "too_many_records" };
   }
 
   // Pass 2: Per-record validation

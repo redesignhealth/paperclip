@@ -10,13 +10,15 @@
  *   exponential backoff + jitter. If exhausted, resolves to outcome 'llm_unavailable'.
  * - Failed-attempt token refunds: deliberately NOT implemented (over-debiting is safe).
  * - Schema violations trigger exactly ONE repair retry naming the violated rule class
- *   and appending the prior assistant turn (note: secrets are stripped prior to repair turn
- *   so no secret is echoed back to the provider).
+ *   and appending the prior assistant turn. If sensitive content is detected in the raw
+ *   model response, no repair turn is issued; it maps immediately to drop_sensitive
+ *   (data_sensitive_echo) so sensitive text is never echoed back to the provider.
  * - Sensitive data detected in model output (data_sensitive_echo) maps to drop_sensitive,
  *   not quarantine.
  */
 
 import {
+  CANONICAL_CONVERSION_PARAMS,
   CONVERSION_JSON_SCHEMA,
   CONVERSION_SYSTEM_PROMPT,
   type ConversionRecord,
@@ -114,8 +116,25 @@ export function buildRepairConversionMessages(
   ];
 }
 
+function isInsufficientQuotaError(rawBody: string): boolean {
+  try {
+    const parsed = JSON.parse(rawBody);
+    const err = parsed?.error;
+    if (err && typeof err === "object") {
+      if (err.code === "insufficient_quota" || err.type === "insufficient_quota") {
+        return true;
+      }
+    }
+  } catch {
+    if (rawBody.includes("insufficient_quota")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Mirrors the literal max_completion_tokens cap applied to every chat conversion call. */
-export const PREFLIGHT_MAX_COMPLETION_TOKENS = 600;
+export const PREFLIGHT_MAX_COMPLETION_TOKENS = CANONICAL_CONVERSION_PARAMS.max_completion_tokens;
 
 /** Builds the exact serialized request body sent to the chat completions endpoint. */
 export function buildConversionRequestBody(
@@ -125,10 +144,7 @@ export function buildConversionRequestBody(
   return JSON.stringify({
     model,
     messages,
-    temperature: 0,
-    top_p: 1,
-    seed: 8191,
-    max_completion_tokens: PREFLIGHT_MAX_COMPLETION_TOKENS,
+    ...CANONICAL_CONVERSION_PARAMS,
     response_format: {
       type: "json_schema",
       json_schema: {
@@ -204,6 +220,7 @@ export function createOpenAiConversionClient(
       try {
         const body = buildConversionRequestBody(model, messages);
         let res: Response;
+        let data: any;
         try {
           res = await fetchImpl(endpoint, {
             method: "POST",
@@ -214,7 +231,18 @@ export function createOpenAiConversionClient(
             body,
             signal,
           });
+
+          if (signal?.aborted) {
+            throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
+          }
+
+          if (res.ok) {
+            data = await res.json();
+          }
         } catch (fetchErr: any) {
+          if (fetchErr instanceof CompanyMemoryUpgradeError) {
+            throw fetchErr;
+          }
           if (signal?.aborted) {
             throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
           }
@@ -241,7 +269,7 @@ export function createOpenAiConversionClient(
 
           if (status === 429) {
             const errBody = await res.text().catch(() => "");
-            if (errBody.includes("insufficient_quota")) {
+            if (isInsufficientQuotaError(errBody)) {
               const msg = redaction
                 ? redaction.scrub("OpenAI chat completions failed with HTTP 429: insufficient_quota")
                 : "OpenAI chat completions failed with HTTP 429: insufficient_quota";
@@ -290,7 +318,6 @@ export function createOpenAiConversionClient(
         }
 
         // res.ok
-        const data: any = await res.json();
         const content = data.choices?.[0]?.message?.content;
         if (typeof content !== "string") {
           if (currentAttempt >= maxAttempts) {

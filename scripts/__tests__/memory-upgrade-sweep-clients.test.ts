@@ -5,8 +5,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildConversionRequestBody,
+  buildInitialConversionMessages,
   createOpenAiConversionClient,
+  PREFLIGHT_MAX_COMPLETION_TOKENS,
 } from "../../server/src/services/company-memory-upgrade/llm-converter.js";
+import { CANONICAL_CONVERSION_PARAMS } from "../../server/src/services/company-memory-upgrade/converter-contract.js";
 import {
   assertEmbeddingShape,
   createOpenAiEmbeddingClient,
@@ -25,6 +29,18 @@ function setupTestLimiter(clock: ManualClock) {
     sleeper: clock,
   });
 }
+
+test("canonical conversion request body params match contract", () => {
+  const messages = buildInitialConversionMessages("Sample memory text");
+  const bodyJson = buildConversionRequestBody("gpt-5.4-mini", messages);
+  const parsed = JSON.parse(bodyJson);
+
+  assert.equal(parsed.temperature, CANONICAL_CONVERSION_PARAMS.temperature);
+  assert.equal(parsed.top_p, CANONICAL_CONVERSION_PARAMS.top_p);
+  assert.equal(parsed.seed, CANONICAL_CONVERSION_PARAMS.seed);
+  assert.equal(parsed.max_completion_tokens, CANONICAL_CONVERSION_PARAMS.max_completion_tokens);
+  assert.equal(PREFLIGHT_MAX_COMPLETION_TOKENS, CANONICAL_CONVERSION_PARAMS.max_completion_tokens);
+});
 
 test("LLM conversion client privacy invariant", async () => {
   const clock = new ManualClock();
@@ -361,6 +377,56 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     );
   });
 
+  await t.test("429 insufficient_quota detected via error.type and non-JSON substring fallback", async () => {
+    // 1. error.type without error.code
+    const typeQuotaBody = JSON.stringify({
+      error: {
+        message: "You have run out of credits",
+        type: "insufficient_quota",
+      },
+    });
+
+    const { fetch: fetch1 } = createRecordingFetch([
+      { status: 429, body: typeQuotaBody },
+    ]);
+
+    const client1 = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: fetch1,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    await assert.rejects(
+      () => client1.convert("Memory"),
+      (err: any) => err.code === "COMPANY_OPENAI_QUOTA_EXHAUSTED",
+    );
+
+    // 2. Non-JSON substring fallback
+    const rawSubstringBody = "<html><body>error: insufficient_quota for project</body></html>";
+    const { fetch: fetch2 } = createRecordingFetch([
+      { status: 429, body: rawSubstringBody },
+    ]);
+
+    const client2 = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: fetch2,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    await assert.rejects(
+      () => client2.convert("Memory"),
+      (err: any) => {
+        assert.equal(err.code, "COMPANY_OPENAI_QUOTA_EXHAUSTED");
+        assert.ok(!err.message.includes(rawSubstringBody), "Must never interpolate error body");
+        return true;
+      },
+    );
+  });
+
   await t.test("plain 429 and 408/409 are retried", async () => {
     let sleepCalls = 0;
     const sleeper = {
@@ -543,6 +609,122 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(res.status, "drop_sensitive");
     assert.equal(res.reasonCode, "passwordAssignment");
     assert.equal(requests.length, 1, "fetchImpl must be called exactly once; never echo secret in repair turn");
+  });
+
+  await t.test("malformed JSON containing a credential -> drop_sensitive with fetchImpl called exactly once", async () => {
+    const malformedBodyWithKey = '{ "decision": "convert", "records": [ invalid json sk-123456789012345678901234567890 ';
+    const { fetch: recordingFetch, requests } = createRecordingFetch([
+      {
+        status: 200,
+        body: {
+          choices: [{ message: { content: malformedBodyWithKey } }],
+          usage: { prompt_tokens: 500, completion_tokens: 20 },
+        },
+      },
+    ]);
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: recordingFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    const res = await client.convert("Some memory text with malformed LLM response");
+    assert.equal(res.status, "drop_sensitive");
+    assert.equal(res.reasonCode, "apiKey");
+    assert.equal(requests.length, 1, "fetchImpl must be called exactly once; must not issue repair turn on sensitive raw output");
+  });
+
+  await t.test("too_many_records + secret -> drop_sensitive with fetchImpl called exactly once", async () => {
+    const tooManyRecordsWithSecret = {
+      decision: "convert",
+      records: [
+        { data: "First record has secret password = superSecretPassword123", type: "fact", subject: "s1", confidence: 0.9 },
+        { data: "Second clean record data text.", type: "fact", subject: "s2", confidence: 0.9 },
+        { data: "Third clean record data text.", type: "fact", subject: "s3", confidence: 0.9 },
+        { data: "Fourth clean record data text.", type: "fact", subject: "s4", confidence: 0.9 },
+      ],
+    };
+
+    const { fetch: recordingFetch, requests } = createRecordingFetch([
+      {
+        status: 200,
+        body: {
+          choices: [{ message: { content: JSON.stringify(tooManyRecordsWithSecret) } }],
+          usage: { prompt_tokens: 500, completion_tokens: 50 },
+        },
+      },
+    ]);
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: recordingFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    const res = await client.convert("Some memory text");
+    assert.equal(res.status, "drop_sensitive");
+    assert.equal(res.reasonCode, "passwordAssignment");
+    assert.equal(requests.length, 1, "fetchImpl must be called exactly once; must not issue repair turn on sensitive raw output");
+  });
+
+  await t.test("first 200 body json() rejects, second succeeds -> success with 2 calls", async () => {
+    let callCount = 0;
+    const customFetch: typeof fetch = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => {
+            throw new Error("Premature EOF during body read with key sk-secret-1234567890");
+          },
+        } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  decision: "convert",
+                  records: [
+                    {
+                      data: "Valid atomic record after body retry.",
+                      type: "fact",
+                      subject: "body retry",
+                      confidence: 0.9,
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 50 },
+        }),
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: customFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+      maxAttempts: 3,
+    });
+
+    const res = await client.convert("Input text");
+    assert.equal(res.status, "convert");
+    assert.equal(callCount, 2, "Must retry failed body json() and succeed on second call");
   });
 
   await t.test("failed attempt token refunds: retried request debits twice without refund", async () => {
@@ -778,5 +960,250 @@ test("Embedding client assertions and shape validation", async (t) => {
     );
 
     assert.equal(settled, false, "Lease must NOT be settled when response shape validation fails");
+  });
+
+  await t.test("first 200 body json() rejects, second succeeds -> success with 2 calls", async () => {
+    let callCount = 0;
+    const customFetch: typeof fetch = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => {
+            throw new Error("Premature EOF during body read with key sk-secret-1234567890");
+          },
+        } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          model: "text-embedding-3-small",
+          data: [{ embedding: new Array(1536).fill(0.01) }],
+          usage: { prompt_tokens: 12 },
+        }),
+      } as any;
+    };
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: customFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+      maxAttempts: 3,
+    });
+
+    const res = await embClient.embed("Text to embed");
+    assert.equal(res.tokens, 12);
+    assert.equal(callCount, 2, "Must retry failed body json() and succeed on second attempt");
+  });
+
+  await t.test("retries on 5xx (500/502/503) and 408/409", async () => {
+    let sleepCalls = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        sleepCalls++;
+        clock.advance(ms);
+      },
+    };
+
+    const { fetch: recordingFetch, requests } = createRecordingFetch([
+      { status: 500, body: "internal error" },
+      { status: 502, body: "bad gateway" },
+      { status: 408, body: "timeout" },
+      { status: 409, body: "conflict" },
+      {
+        status: 200,
+        body: {
+          model: "text-embedding-3-small",
+          data: [{ embedding: new Array(1536).fill(0.01) }],
+          usage: { prompt_tokens: 10 },
+        },
+      },
+    ]);
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: recordingFetch,
+      limiter,
+      sleeper,
+      clock,
+      maxAttempts: 6,
+    });
+
+    const res = await embClient.embed("Text to embed");
+    assert.equal(res.tokens, 10);
+    assert.equal(requests.length, 5);
+    assert.equal(sleepCalls, 4);
+  });
+
+  await t.test("retries on network error", async () => {
+    let callCount = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        clock.advance(ms);
+      },
+    };
+    const networkFetch: typeof fetch = async () => {
+      callCount++;
+      if (callCount === 1) {
+        throw new Error("DNS resolution failed");
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          model: "text-embedding-3-small",
+          data: [{ embedding: new Array(1536).fill(0.01) }],
+          usage: { prompt_tokens: 8 },
+        }),
+      } as any;
+    };
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: networkFetch,
+      limiter,
+      sleeper,
+      clock,
+      maxAttempts: 3,
+    });
+
+    const res = await embClient.embed("Text to embed");
+    assert.equal(res.tokens, 8);
+    assert.equal(callCount, 2);
+  });
+
+  await t.test("attempt exhaustion throws EMBEDDING_FAILED", async () => {
+    let sleepCalls = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        sleepCalls++;
+        clock.advance(ms);
+      },
+    };
+
+    const { fetch: recordingFetch, requests } = createRecordingFetch([
+      { status: 503, body: "service unavailable" },
+      { status: 503, body: "service unavailable" },
+      { status: 503, body: "service unavailable" },
+    ]);
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: recordingFetch,
+      limiter,
+      sleeper,
+      clock,
+      maxAttempts: 3,
+    });
+
+    await assert.rejects(
+      () => embClient.embed("Text to embed"),
+      (err: any) => {
+        assert.equal(err.code, "EMBEDDING_FAILED");
+        assert.equal(requests.length, 3);
+        assert.equal(sleepCalls, 2);
+        return true;
+      },
+    );
+  });
+
+  await t.test("aborts immediately when AbortSignal is triggered", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const { fetch: recordingFetch, requests } = createRecordingFetch([
+      {
+        status: 200,
+        body: {
+          model: "text-embedding-3-small",
+          data: [{ embedding: new Array(1536).fill(0.01) }],
+          usage: { prompt_tokens: 10 },
+        },
+      },
+    ]);
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: recordingFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    await assert.rejects(
+      () => embClient.embed("Text to embed", { signal: controller.signal }),
+      (err: any) => {
+        assert.equal(err.code, "ABORTED_BY_OPERATOR");
+        assert.equal(requests.length, 0);
+        return true;
+      },
+    );
+  });
+
+  await t.test("terminal 401/403 throws COMPANY_OPENAI_KEY_REJECTED without retrying", async () => {
+    let sleepCalls = 0;
+    const sleeper = { sleep: async () => { sleepCalls++; } };
+
+    for (const status of [401, 403]) {
+      const { fetch: recordingFetch, requests } = createRecordingFetch([
+        { status, body: "Unauthorized" },
+      ]);
+
+      const embClient = createOpenAiEmbeddingClient({
+        apiKey: "sk-mock-key-12345678901234567890",
+        fetchImpl: recordingFetch,
+        limiter,
+        sleeper,
+        clock,
+        maxAttempts: 5,
+      });
+
+      await assert.rejects(
+        () => embClient.embed("Text to embed"),
+        (err: any) => {
+          assert.equal(err.code, "COMPANY_OPENAI_KEY_REJECTED");
+          assert.equal(requests.length, 1);
+          assert.equal(sleepCalls, 0);
+          return true;
+        },
+      );
+    }
+  });
+
+  await t.test("other terminal 4xx throws EMBEDDING_FAILED without retrying", async () => {
+    let sleepCalls = 0;
+    const sleeper = { sleep: async () => { sleepCalls++; } };
+
+    for (const status of [400, 404, 422]) {
+      const { fetch: recordingFetch, requests } = createRecordingFetch([
+        { status, body: "Bad request" },
+      ]);
+
+      const embClient = createOpenAiEmbeddingClient({
+        apiKey: "sk-mock-key-12345678901234567890",
+        fetchImpl: recordingFetch,
+        limiter,
+        sleeper,
+        clock,
+        maxAttempts: 5,
+      });
+
+      await assert.rejects(
+        () => embClient.embed("Text to embed"),
+        (err: any) => {
+          assert.equal(err.code, "EMBEDDING_FAILED");
+          assert.equal(requests.length, 1);
+          assert.equal(sleepCalls, 0);
+          return true;
+        },
+      );
+    }
   });
 });

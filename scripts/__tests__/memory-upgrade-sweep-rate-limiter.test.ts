@@ -28,6 +28,8 @@ test("parseRetryAfterMs header parsing", async (t) => {
   await t.test("table-driven duration parsing via parseDurationMs", () => {
     assert.equal(parseDurationMs("6m0s"), 360_000);
     assert.equal(parseDurationMs("1m30s"), 90_000);
+    assert.equal(parseDurationMs("  1m30s  "), 90_000, "trims leading and trailing whitespace");
+    assert.equal(parseDurationMs("  3  "), 3000, "trims leading and trailing whitespace on bare seconds");
     assert.equal(parseDurationMs("2m"), 120_000);
     assert.equal(parseDurationMs("500ms"), 500);
     assert.equal(parseDurationMs("1.5s"), 1500);
@@ -307,5 +309,42 @@ test("createRateLimiter token bucket and virtual time mechanics", async (t) => {
     // After invalid settles, settling with valid number should still work (first valid settle)
     lease.settle(500);
     lease.release();
+  });
+
+  await t.test("concurrency is hard-capped at 2 even if higher concurrency is requested", async () => {
+    const clock = new ManualClock(1_000_000);
+    const sleeper = {
+      async sleep(ms: number) {
+        clock.advance(ms);
+      },
+    };
+
+    const limiter = createRateLimiter({
+      rpm: 1000,
+      tpm: 1_000_000,
+      concurrency: 10, // Request 10 concurrency -> must be clamped to 2
+      clock,
+      sleeper,
+    });
+
+    const l1 = await limiter.acquire(10);
+    const l2 = await limiter.acquire(10);
+
+    let l3Acquired = false;
+    const l3Promise = limiter.acquire(10).then((lease) => {
+      l3Acquired = true;
+      return lease;
+    });
+
+    // Tick microtasks
+    await Promise.resolve();
+    assert.equal(l3Acquired, false, "Third acquire must wait on concurrency slot 2");
+
+    l1.release();
+    const l3 = await l3Promise;
+    assert.equal(l3Acquired, true, "Third acquire proceeds once slot 1 released");
+
+    l2.release();
+    l3.release();
   });
 });
