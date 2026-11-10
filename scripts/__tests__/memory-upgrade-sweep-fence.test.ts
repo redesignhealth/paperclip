@@ -1119,6 +1119,10 @@ test("classifyCpClaimFailure: bounds cause chains and matches expected error tax
   // SQLSTATE 42501 insufficient_privilege -> unclassified
   assert.equal(classifyCpClaimFailure({ code: "42501" }), "unclassified");
 
+  // Connect-time socket codes ECONNREFUSED and CONNECTION_CONNECT_TIMEOUT -> cp_terminated (R4-F2)
+  assert.equal(classifyCpClaimFailure({ code: "ECONNREFUSED" }), "cp_terminated");
+  assert.equal(classifyCpClaimFailure({ code: "CONNECTION_CONNECT_TIMEOUT" }), "cp_terminated");
+
   // Self-referential cause cycle terminates and returns unclassified
   const cycle: any = { code: "UNRECOGNIZED_1" };
   cycle.cause = { code: "UNRECOGNIZED_2", cause: cycle };

@@ -75,6 +75,8 @@ test("memory upgrade error sanitization and CLI hardening", async (t) => {
   await t.test("sanitizeCliErrorMessage preserves bounded codes and fixed messages for census and sweep", () => {
     const requiredCodes = [
       "NOT_PGVECTOR",
+      "UNSUPPORTED_VECTOR_TYPE",
+      "unsupported_vector_type",
       "SUPERUSER_REJECTED",
       "BYPASSRLS_REJECTED",
       "EXCESSIVE_PRIVILEGE_REJECTED",
