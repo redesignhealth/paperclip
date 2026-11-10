@@ -372,7 +372,7 @@ test("sweep orchestrator integration", async (t) => {
       status: "ready",
     });
 
-    const clock = new ManualClock(1_000_000);
+    const clock = new ManualClock(Date.now());
 
     // Seed memories
     for (let i = 0; i < 15; i++) {
@@ -497,13 +497,14 @@ test("sweep orchestrator integration", async (t) => {
       status: "running",
     }).returning();
 
-    const clock = new ManualClock(2_000_000);
+    const startMs = Date.now();
+    const clock = new ManualClock(startMs);
 
     const customSleeper = {
       async sleep(ms: number) {
         clock.advance(ms);
         // After 10s of pausing, complete the active run so sweep can resume
-        if (clock.nowMs() >= 2_010_000) {
+        if (clock.nowMs() >= startMs + 10_000) {
           await cpDb.delete(heartbeatRuns).where(eq(heartbeatRuns.id, activeRun.id));
         }
       },
@@ -535,7 +536,7 @@ test("sweep orchestrator integration", async (t) => {
   });
 
   await t.test("repeated edits count superseded transitions and reclassifications in cumulative counters while ledger is authoritative current partition", async () => {
-    const clock = new ManualClock(3_000_000);
+    const clock = new ManualClock(Date.now());
     const [compEdit] = await cpDb.insert(companies).values({ name: "Comp Edit", issuePrefix: "CE" }).returning();
     const dbNameEdit = `tenant_db_${compEdit.id.slice(0, 8)}`;
     const roleEdit = `${tenantInfo.usr}_edit`;
@@ -646,7 +647,7 @@ test("sweep orchestrator integration", async (t) => {
   });
 
   await t.test("live table with text ID column: classifies valid UUIDs and rejects non-UUID IDs upfront", async () => {
-    const clock = new ManualClock(4_000_000);
+    const clock = new ManualClock(Date.now());
     const [compText] = await cpDb.insert(companies).values({ name: "Comp Text ID", issuePrefix: "CT" }).returning();
     const dbNameText = `tenant_db_${compText.id.slice(0, 8)}`;
     const roleText = `${tenantInfo.usr}_text`;

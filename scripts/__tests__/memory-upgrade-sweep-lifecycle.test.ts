@@ -73,7 +73,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
   });
 
   await t.test("Item 1: noise-to-pending source reclassifies, deletes stale ledger row, and unchanged re-run causes 0 increments", async () => {
-    const clock = new ManualClock(1_000_000);
+    const clock = new ManualClock(Date.now());
     const [comp] = await cpDb.insert(companies).values({ name: "NoiseToPending Co", issuePrefix: "NP" }).returning();
     const dbName = `tn_db_${comp.id.slice(0, 8)}`;
     const role = `role_${comp.id.slice(0, 8)}`;
@@ -183,7 +183,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
   });
 
   await t.test("Item 18: agent reassignment with identical content is detected and reclassified", async () => {
-    const clock = new ManualClock(2_000_000);
+    const clock = new ManualClock(Date.now());
     const [comp] = await cpDb.insert(companies).values({ name: "Reassign Co", issuePrefix: "RA" }).returning();
     const dbName = `tn_db_${comp.id.slice(0, 8)}`;
     const role = `role_${comp.id.slice(0, 8)}`;
@@ -277,7 +277,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
   });
 
   await t.test("Item 4: uppercase text-UUID collection across multiple pages and tombstones", async () => {
-    const clock = new ManualClock(3_000_000);
+    const clock = new ManualClock(Date.now());
     const [comp] = await cpDb.insert(companies).values({ name: "Upper UUID Co", issuePrefix: "UU" }).returning();
     const dbName = `tn_db_${comp.id.slice(0, 8)}`;
     const role = `role_${comp.id.slice(0, 8)}`;
@@ -375,7 +375,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
   });
 
   await t.test("Item 20: lease release on success and failure paths", async () => {
-    const clock = new ManualClock(4_000_000);
+    const clock = new ManualClock(Date.now());
     const [comp] = await cpDb.insert(companies).values({ name: "Lease Release Co", issuePrefix: "LR" }).returning();
     const dbName = `tn_db_${comp.id.slice(0, 8)}`;
     const role = `role_${comp.id.slice(0, 8)}`;
@@ -468,7 +468,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
   });
 
   await t.test("Item 20: injected cleanup error code='marker_secret_cleanup' absent output, primary failure retained", async () => {
-    const clock = new ManualClock(4_500_000);
+    const clock = new ManualClock(Date.now());
     const [comp] = await cpDb.insert(companies).values({ name: "Cleanup Error Co", issuePrefix: "CE" }).returning();
     const dbName = `tn_db_${comp.id.slice(0, 8)}`;
     const role = `role_${comp.id.slice(0, 8)}`;
@@ -584,7 +584,7 @@ test("sweep lifecycle, resilience, and edge cases", async (t) => {
   });
 
   await t.test("Item 20: CONVERTER_CONTRACT_MISMATCH and needs_recovery refusal", async () => {
-    const clock = new ManualClock(5_000_000);
+    const clock = new ManualClock(Date.now());
     const [comp] = await cpDb.insert(companies).values({ name: "Contract Refusal Co", issuePrefix: "CR" }).returning();
     const dbName = `tn_db_${comp.id.slice(0, 8)}`;
     const role = `role_${comp.id.slice(0, 8)}`;

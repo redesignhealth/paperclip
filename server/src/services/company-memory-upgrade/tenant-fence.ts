@@ -247,11 +247,7 @@ export async function claimTenantFenceGuarded(
         );
       }
       const dbNowTime = row.dbNow instanceof Date ? row.dbNow.getTime() : new Date(row.dbNow).getTime();
-      // In production, clock_timestamp() on CP DB is the authoritative clock.
-      // When tests pass an artificial/simulated clock (e.g. ManualClock starting near epoch 0),
-      // we defer to params.now so simulated time advancement behaves as intended.
-      const isSimulatedClock = Math.abs(now.getTime() - dbNowTime) > 86_400_000;
-      if (!isSimulatedClock && row.leaseExpiresAt.getTime() <= dbNowTime) {
+      if (row.leaseExpiresAt.getTime() <= dbNowTime) {
         throw new CompanyMemoryUpgradeError(
           "Cannot claim tenant fence: control-plane lease already expired according to database clock",
           "LEASE_FENCED_OUT",

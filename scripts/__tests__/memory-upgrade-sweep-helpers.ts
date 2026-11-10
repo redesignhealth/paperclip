@@ -49,7 +49,7 @@ export {
 export class ManualClock {
   private currentTimeMs: number;
 
-  constructor(initialTimeMs: number = 1_700_000_000_000) {
+  constructor(initialTimeMs: number = Date.now()) {
     this.currentTimeMs = initialTimeMs;
   }
 

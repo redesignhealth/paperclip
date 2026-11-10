@@ -690,3 +690,64 @@ test("stageSourceRecords: fail-closed validation on vectorType and embedding dim
     },
   );
 });
+
+test("tenant fence: lease expired by CP DB clock is refused even when params.now claims it is still valid (F5)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const cpFixture = await startEmbeddedPostgresTestDatabase("fence-f5-dbclock-");
+  const cpDb = createDb(cpFixture.connectionString);
+  const tenantFixture = await startEmbeddedPostgresTestDatabase("fence-f5-tenant-");
+  const tenantSql = openTenantClient(tenantFixture.connectionString);
+
+  t.after(async () => {
+    await tenantSql.end();
+    await cpDb.$client?.end();
+    await tenantFixture.cleanup();
+    await cpFixture.cleanup();
+  });
+
+  await ensureUpgradeTables(tenantSql, "text");
+
+  const [company] = await cpDb.insert(companies).values({
+    name: "DB Clock Authority Co",
+    issuePrefix: "DC",
+  }).returning();
+
+  const upgrade = await openUpgrade(cpDb, {
+    companyId: company.id,
+    converterId: "paperclip.memory-upgrade.atomic-converter",
+    converterVersion: 1,
+    collectionName: "mem0_memories",
+    embeddingModel: "text-embedding-3-small",
+    embeddingDimensions: 1536,
+  });
+
+  const claim = await claimUpgradeLease(cpDb, { upgradeId: upgrade.id, leaseOwner: "worker-skew" });
+  assert.ok(claim.acquired && claim.leaseToken);
+
+  // Set leaseExpiresAt in the past relative to the real database clock
+  await cpDb
+    .update(companyMemoryUpgrades)
+    .set({ leaseExpiresAt: new Date(Date.now() - 5_000) })
+    .where(eq(companyMemoryUpgrades.id, upgrade.id));
+
+  // Caller's local clock is skewed far in the past (e.g. 1 hour ago), so local check thinks lease is still valid
+  const skewedWorkerNow = new Date(Date.now() - 3_600_000);
+
+  await assert.rejects(
+    () =>
+      claimTenantFenceGuarded(cpDb, tenantSql, {
+        upgradeId: upgrade.id,
+        cpLeaseToken: claim.leaseToken!,
+        leaseOwner: "worker-skew",
+        now: skewedWorkerNow,
+      }),
+    (err: any) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "LEASE_FENCED_OUT");
+      assert.match(err.message, /database clock/);
+      return true;
+    },
+  );
+});
