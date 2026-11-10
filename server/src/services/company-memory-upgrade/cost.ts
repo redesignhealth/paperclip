@@ -185,7 +185,7 @@ export const UTF8_MAX_BYTES_PER_CHAR = 4;
 export interface PreflightCostInput {
   /** The exact serialized initial chat request body (JSON.stringify of the real request payload). */
   initialRequestBodyBytes: number;
-  /** The exact serialized repair-retry chat request body (JSON.stringify of the real repair payload). */
+  /** The projected worst-case serialized repair-retry chat request body byte count (base payload + analytical echo allowance). */
   repairRequestBodyBytes: number;
   rates: CostRatesNanodollars;
 }
@@ -201,9 +201,9 @@ export interface PreflightCostEstimate {
  * Computes the worst-case nanodollar cost ceiling for converting ONE source row, covering:
  *   - up to PREFLIGHT_MAX_CHAT_CALLS (2) chat completions calls (initial + one repair retry),
  *     each capped at PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL (600) output tokens, with input
- *     tokens projected conservatively from the ACTUAL serialized request body byte length
- *     (including full system prompt, schema, wrapper tags, and -- for the repair call -- the
- *     echoed prior turn and repair instruction overhead);
+ *     tokens projected conservatively from the ACTUAL serialized initial request body byte length
+ *     plus the projected worst-case repair body (base payload with schema/prompt/wrapper overhead
+ *     plus an analytical allowance for the echoed prior turn);
  *   - up to PREFLIGHT_MAX_EMBEDDING_CALLS (3) embedding calls, each projected conservatively
  *     from the maximum possible converted record size (PREFLIGHT_MAX_RECORD_DATA_CHARS Unicode
  *     characters at UTF8_MAX_BYTES_PER_CHAR bytes/char), NOT a fixed-token ASCII heuristic.
@@ -217,7 +217,7 @@ export interface PreflightCostEstimate {
 export function estimateWorstCaseSourceCostNanodollars(input: PreflightCostInput): PreflightCostEstimate {
   const { rates } = input;
 
-  // Chat: input tokens bounded by actual serialized request body bytes (conservative upper bound).
+  // Chat: input tokens bounded by serialized request body bytes (actual initial + projected repair upper bound).
   const projectedChatInputTokens = input.initialRequestBodyBytes + input.repairRequestBodyBytes;
   const projectedChatOutputTokens = PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL * PREFLIGHT_MAX_CHAT_CALLS;
 
