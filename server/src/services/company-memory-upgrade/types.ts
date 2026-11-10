@@ -124,6 +124,18 @@ export const SWEEP_ERROR_CODE_MAP: Record<string, UpgradeErrorCode> = {
   // Conversion / embedding / staging / publish / drain / rollback
   CONVERSION_FAILED: "conversion_failed",
   conversion_failed: "conversion_failed",
+  LLM_UNAVAILABLE: "conversion_failed",
+  llm_unavailable: "conversion_failed",
+  COMPANY_OPENAI_KEY_REJECTED: "conversion_failed",
+  company_openai_key_rejected: "conversion_failed",
+  COMPANY_OPENAI_QUOTA_EXHAUSTED: "conversion_failed",
+  company_openai_quota_exhausted: "conversion_failed",
+  LLM_REQUEST_REJECTED: "conversion_failed",
+  llm_request_rejected: "conversion_failed",
+  COMPANY_OPENAI_KEY_MISSING: "conversion_failed",
+  company_openai_key_missing: "conversion_failed",
+  COMPANY_OPENAI_KEY_PROVIDER_UNSUPPORTED: "conversion_failed",
+  company_openai_key_provider_unsupported: "conversion_failed",
   EMBEDDING_FAILED: "embedding_failed",
   embedding_failed: "embedding_failed",
   STAGING_WRITE_FAILED: "staging_write_failed",
@@ -151,6 +163,14 @@ export function mapSweepErrorCode(code: string | undefined | null): UpgradeError
   }
   return "unexpected_failure";
 }
+
+export const TERMINAL_LLM_ERROR_CODES = Object.freeze(
+  new Set<string>([
+    "COMPANY_OPENAI_KEY_REJECTED",
+    "COMPANY_OPENAI_QUOTA_EXHAUSTED",
+    "LLM_REQUEST_REJECTED",
+  ]),
+);
 
 export class CompanyMemoryUpgradeError extends Error {
   readonly code: string;
