@@ -9,6 +9,8 @@
  * - Transport failures (429/5xx/network/timeout) are retried with Retry-After-aware
  *   exponential backoff + jitter. If exhausted, resolves to outcome 'llm_unavailable'.
  * - Failed-attempt token refunds: deliberately NOT implemented (over-debiting is safe).
+ * - INVARIANT: At most PREFLIGHT_MAX_CHAT_CALLS (2) billed chat calls per source, reported
+ *   tokens >= tokens actually billed and <= preflight projection, no billed response ever retried.
  * - Schema violations trigger exactly ONE repair retry naming the violated rule class
  *   and appending the prior assistant turn. If sensitive content is detected in the raw
  *   model response, no repair turn is issued; it maps immediately to drop_sensitive
@@ -28,7 +30,7 @@ import {
 } from "./converter-contract.js";
 import { type MonotonicClock, type Sleeper } from "./clock.js";
 import { type RedactionRegistry } from "./openai-key.js";
-import { estimateChatTokens, parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
+import { estimateChatTokens, isInsufficientQuotaError, parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
 import { CompanyMemoryUpgradeError, TERMINAL_LLM_ERROR_CODES } from "./types.js";
 
 /**
@@ -116,23 +118,6 @@ export function buildRepairConversionMessages(
   ];
 }
 
-function isInsufficientQuotaError(rawBody: string): boolean {
-  try {
-    const parsed = JSON.parse(rawBody);
-    const err = parsed?.error;
-    if (err && typeof err === "object") {
-      if (err.code === "insufficient_quota" || err.type === "insufficient_quota") {
-        return true;
-      }
-    }
-  } catch {
-    if (rawBody.includes("insufficient_quota")) {
-      return true;
-    }
-  }
-  return false;
-}
-
 /** Mirrors the literal max_completion_tokens cap applied to every chat conversion call. */
 export const PREFLIGHT_MAX_COMPLETION_TOKENS = CANONICAL_CONVERSION_PARAMS.max_completion_tokens;
 
@@ -198,17 +183,18 @@ export function createOpenAiConversionClient(
 
   type AttemptResult =
     | { kind: "ok"; data: { content: string; inputTokens: number; outputTokens: number } }
+    | { kind: "billed_unusable"; data: { inputTokens: number; outputTokens: number } }
     | { kind: "retry"; delayMs: number };
+
+  type ExecuteChatResponse =
+    | { kind: "ok"; content: string; inputTokens: number; outputTokens: number }
+    | { kind: "unusable"; inputTokens: number; outputTokens: number };
 
   async function executeChatRequest(
     messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
     estimatedTokens: number,
     signal?: AbortSignal,
-  ): Promise<{
-    content: string;
-    inputTokens: number;
-    outputTokens: number;
-  }> {
+  ): Promise<ExecuteChatResponse> {
     let attempt = 0;
     let baseDelayMs = 500;
 
@@ -220,7 +206,6 @@ export function createOpenAiConversionClient(
       try {
         const body = buildConversionRequestBody(model, messages);
         let res: Response;
-        let data: any;
         try {
           res = await fetchImpl(endpoint, {
             method: "POST",
@@ -231,15 +216,7 @@ export function createOpenAiConversionClient(
             body,
             signal,
           });
-
-          if (signal?.aborted) {
-            throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
-          }
-
-          if (res.ok) {
-            data = await res.json();
-          }
-        } catch (fetchErr: any) {
+        } catch (fetchErr: unknown) {
           if (fetchErr instanceof CompanyMemoryUpgradeError) {
             throw fetchErr;
           }
@@ -247,12 +224,14 @@ export function createOpenAiConversionClient(
             throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
           }
           if (currentAttempt >= maxAttempts) {
-            const rawMsg = fetchErr?.message ? String(fetchErr.message) : "network error";
-            const scrubbed = redaction ? redaction.scrub(rawMsg) : rawMsg;
-            throw new CompanyMemoryUpgradeError(
-              `OpenAI request failed after ${maxAttempts} attempts: ${scrubbed}`,
-              "LLM_UNAVAILABLE",
-            );
+            const rawMsg =
+              fetchErr && typeof fetchErr === "object" && "message" in fetchErr && (fetchErr as any).message
+                ? String((fetchErr as any).message)
+                : "network error";
+            const msg = redaction
+              ? `OpenAI request failed after ${maxAttempts} attempts: ${redaction.scrub(rawMsg)}`
+              : `OpenAI request failed after ${maxAttempts} attempts.`;
+            throw new CompanyMemoryUpgradeError(msg, "LLM_UNAVAILABLE");
           }
           const jitter = Math.floor(random() * 50);
           const delay = currentBaseDelayMs + jitter;
@@ -317,39 +296,66 @@ export function createOpenAiConversionClient(
           throw new CompanyMemoryUpgradeError(msg, "LLM_REQUEST_REJECTED");
         }
 
-        // res.ok
-        const content = data.choices?.[0]?.message?.content;
-        if (typeof content !== "string") {
-          if (currentAttempt >= maxAttempts) {
-            throw new CompanyMemoryUpgradeError(
-              `OpenAI chat completions failed: missing string content after ${maxAttempts} attempts`,
-              "LLM_UNAVAILABLE",
-            );
+        // res.ok: separate try/catch around res.json()
+        let data: unknown;
+        try {
+          data = await res.json();
+        } catch (jsonErr: unknown) {
+          if (signal?.aborted) {
+            throw new CompanyMemoryUpgradeError("Conversion aborted.", "ABORTED_BY_OPERATOR");
           }
-          const jitter = Math.floor(random() * 50);
-          const delay = currentBaseDelayMs + jitter;
-          return { kind: "retry", delayMs: delay };
+          const inputTokens = Buffer.byteLength(body, "utf8");
+          const outputTokens = PREFLIGHT_MAX_COMPLETION_TOKENS;
+          lease.settle(inputTokens + outputTokens);
+          return {
+            kind: "billed_unusable",
+            data: { inputTokens, outputTokens },
+          };
         }
 
-        const rawPromptTokens = data.usage?.prompt_tokens;
+        // Usage extraction ABOVE content-type check, settle once
+        const rawUsage =
+          data && typeof data === "object" && "usage" in data && data.usage && typeof data.usage === "object"
+            ? (data.usage as Record<string, unknown>)
+            : undefined;
+
+        const rawPromptTokens = rawUsage?.prompt_tokens;
         const inputTokens =
           typeof rawPromptTokens === "number" && Number.isFinite(rawPromptTokens) && rawPromptTokens >= 0
             ? rawPromptTokens
             : Buffer.byteLength(body, "utf8");
 
-        const rawCompletionTokens = data.usage?.completion_tokens;
+        const rawCompletionTokens = rawUsage?.completion_tokens;
         const outputTokens =
           typeof rawCompletionTokens === "number" && Number.isFinite(rawCompletionTokens) && rawCompletionTokens >= 0
             ? rawCompletionTokens
             : PREFLIGHT_MAX_COMPLETION_TOKENS;
 
-        const rawTotalTokens = data.usage?.total_tokens;
+        const rawTotalTokens = rawUsage?.total_tokens;
         const totalTokens =
           typeof rawTotalTokens === "number" && Number.isFinite(rawTotalTokens) && rawTotalTokens >= 0
             ? rawTotalTokens
             : inputTokens + outputTokens;
 
         lease.settle(totalTokens);
+
+        const rawChoices =
+          data && typeof data === "object" && "choices" in data && Array.isArray((data as any).choices)
+            ? (data as any).choices
+            : undefined;
+        const firstChoice = rawChoices?.[0];
+        const rawMessage =
+          firstChoice && typeof firstChoice === "object" && "message" in firstChoice && firstChoice.message && typeof firstChoice.message === "object"
+            ? (firstChoice.message as Record<string, unknown>)
+            : undefined;
+        const content = rawMessage?.content;
+
+        if (typeof content !== "string") {
+          return {
+            kind: "billed_unusable",
+            data: { inputTokens, outputTokens },
+          };
+        }
 
         return {
           kind: "ok",
@@ -368,7 +374,10 @@ export function createOpenAiConversionClient(
       attempt++;
       const result = await performSingleAttempt(attempt, baseDelayMs);
       if (result.kind === "ok") {
-        return result.data;
+        return { kind: "ok", ...result.data };
+      }
+      if (result.kind === "billed_unusable") {
+        return { kind: "unusable", ...result.data };
       }
       baseDelayMs *= 2;
       await sleeper.sleep(result.delayMs);
@@ -398,6 +407,14 @@ export function createOpenAiConversionClient(
         const resp = await executeChatRequest(messages, estimatedTokens, options?.signal);
         totalInputTokens += resp.inputTokens;
         totalOutputTokens += resp.outputTokens;
+        if (resp.kind === "unusable") {
+          return {
+            status: "quarantined",
+            rejectCode: "llm_unavailable",
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+          };
+        }
         responseContent = resp.content;
       } catch (err: any) {
         if (
@@ -461,6 +478,14 @@ export function createOpenAiConversionClient(
         const repairResp = await executeChatRequest(repairMessages, estimatedTokens + 100, options?.signal);
         totalInputTokens += repairResp.inputTokens;
         totalOutputTokens += repairResp.outputTokens;
+        if (repairResp.kind === "unusable") {
+          return {
+            status: "quarantined",
+            rejectCode: "llm_unavailable",
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+          };
+        }
         responseContent = repairResp.content;
       } catch (err: any) {
         if (

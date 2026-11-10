@@ -15,7 +15,7 @@
 
 import { type MonotonicClock, type Sleeper } from "./clock.js";
 import { type RedactionRegistry } from "./openai-key.js";
-import { parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
+import { isInsufficientQuotaError, parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
 import { CompanyMemoryUpgradeError } from "./types.js";
 
 export interface EmbeddingResult {
@@ -93,23 +93,6 @@ export function assertEmbeddingShape(data: unknown, redaction?: RedactionRegistr
   return vector as number[];
 }
 
-function isInsufficientQuotaError(rawBody: string): boolean {
-  try {
-    const parsed = JSON.parse(rawBody);
-    const err = parsed?.error;
-    if (err && typeof err === "object") {
-      if (err.code === "insufficient_quota" || err.type === "insufficient_quota") {
-        return true;
-      }
-    }
-  } catch {
-    if (rawBody.includes("insufficient_quota")) {
-      return true;
-    }
-  }
-  return false;
-}
-
 export function createOpenAiEmbeddingClient(
   options: CreateOpenAiEmbeddingClientOptions,
 ): EmbeddingClient {
@@ -153,7 +136,6 @@ export function createOpenAiEmbeddingClient(
           });
 
           let res: Response;
-          let data: any;
           try {
             res = await fetchImpl(endpoint, {
               method: "POST",
@@ -164,15 +146,7 @@ export function createOpenAiEmbeddingClient(
               body,
               signal: embedOptions?.signal,
             });
-
-            if (embedOptions?.signal?.aborted) {
-              throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
-            }
-
-            if (res.ok) {
-              data = await res.json();
-            }
-          } catch (fetchErr: any) {
+          } catch (fetchErr: unknown) {
             if (fetchErr instanceof CompanyMemoryUpgradeError) {
               throw fetchErr;
             }
@@ -180,12 +154,14 @@ export function createOpenAiEmbeddingClient(
               throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
             }
             if (currentAttempt >= maxAttempts) {
-              const rawMsg = fetchErr?.message ? String(fetchErr.message) : "network error";
-              const scrubbed = redaction ? redaction.scrub(rawMsg) : rawMsg;
-              throw new CompanyMemoryUpgradeError(
-                `OpenAI embedding request failed after ${maxAttempts} attempts: ${scrubbed}`,
-                "EMBEDDING_FAILED",
-              );
+              const rawMsg =
+                fetchErr && typeof fetchErr === "object" && "message" in fetchErr && (fetchErr as any).message
+                  ? String((fetchErr as any).message)
+                  : "network error";
+              const msg = redaction
+                ? `OpenAI embedding request failed after ${maxAttempts} attempts: ${redaction.scrub(rawMsg)}`
+                : `OpenAI embedding request failed after ${maxAttempts} attempts.`;
+              throw new CompanyMemoryUpgradeError(msg, "EMBEDDING_FAILED");
             }
             const jitter = Math.floor(random() * 50);
             const delay = currentBaseDelayMs + jitter;
@@ -245,9 +221,29 @@ export function createOpenAiEmbeddingClient(
             throw new CompanyMemoryUpgradeError(msg, "EMBEDDING_FAILED");
           }
 
+          // res.ok: separate try/catch for res.json()
+          let data: unknown;
+          try {
+            data = await res.json();
+          } catch (jsonErr: unknown) {
+            if (embedOptions?.signal?.aborted) {
+              throw new CompanyMemoryUpgradeError("Embedding aborted.", "ABORTED_BY_OPERATOR");
+            }
+            // Exactly one billed embedding call goes unaccounted and that it is inside the existing
+            // 3-call preflight ceiling and aborts the run, so it cannot breach the cap.
+            throw new CompanyMemoryUpgradeError(
+              "OpenAI embeddings response body failed to parse as JSON.",
+              "EMBEDDING_FAILED",
+            );
+          }
+
           const embedding = assertEmbeddingShape(data, redaction);
 
-          const rawTokens = data.usage?.prompt_tokens;
+          const rawUsage =
+            data && typeof data === "object" && "usage" in data && data.usage && typeof data.usage === "object"
+              ? (data.usage as Record<string, unknown>)
+              : undefined;
+          const rawTokens = rawUsage?.prompt_tokens;
           const tokens =
             typeof rawTokens === "number" && Number.isFinite(rawTokens) && rawTokens >= 0
               ? rawTokens

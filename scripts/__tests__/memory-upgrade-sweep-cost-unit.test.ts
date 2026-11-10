@@ -4,7 +4,7 @@
  * These are pure, dependency-free tests (no embedded postgres, no network). The single
  * end-to-end multi-page accounting test that exercises runSweep() against an embedded
  * postgres fixture stays in memory-upgrade-sweep-orchestrator.test.ts alongside the rest of the
- * sweep orchestrator integration tests.
+ * sweep orchestrator integration tests (real sweep call sites land in PR C).
  */
 
 import assert from "node:assert/strict";
@@ -295,5 +295,41 @@ test("createCostTracker: addActualCostNanodollars and assertBudgetAllows reject 
   assert.throws(
     () => tracker.assertBudgetAllows(-1n),
     (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "INVALID_ARGUMENT",
+  );
+});
+
+test("regression guard: worst-path conversion (call 1 schema invalid + call 2 billed unusable fallback) satisfies preflight token bounds", () => {
+  const model = "gpt-5.4-mini";
+  const sourceText = "A complex user instruction containing multiple facts that require conversion.";
+  const { initialRequestBodyBytes, repairRequestBodyBytes } = projectWorstCaseConversionRequestBytes(
+    sourceText,
+    model,
+  );
+  const worstCaseInputCap = initialRequestBodyBytes + repairRequestBodyBytes;
+
+  // Initial attempt: call 1 input tokens are bounded by serialized initial body bytes
+  const initialMessages = buildInitialConversionMessages(sourceText);
+  const initialBody = buildConversionRequestBody(model, initialMessages);
+  const call1InputTokens = Buffer.byteLength(initialBody, "utf8");
+  const call1OutputTokens = 600;
+
+  // Repair attempt: repair messages built with prior response echo and reject code
+  const placeholderPriorResponse = "x".repeat(600 * 4);
+  const longestRejectCode = CONVERSION_REJECT_CODES.reduce((a, b) => (a.length >= b.length ? a : b));
+  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, longestRejectCode);
+  const repairBody = buildConversionRequestBody(model, repairMessages);
+  const call2InputTokens = Buffer.byteLength(repairBody, "utf8");
+  const call2OutputTokens = 600;
+
+  const totalInputTokens = call1InputTokens + call2InputTokens;
+  const totalOutputTokens = call1OutputTokens + call2OutputTokens;
+
+  assert.ok(
+    totalInputTokens <= worstCaseInputCap,
+    `totalInputTokens (${totalInputTokens}) must not exceed preflight projection (${worstCaseInputCap})`,
+  );
+  assert.ok(
+    totalOutputTokens <= 1200,
+    `totalOutputTokens (${totalOutputTokens}) must not exceed 2 * 600 = 1200`,
   );
 });

@@ -182,7 +182,8 @@ function getHeaderValue(
  * Any unmatched residue, negative value, or invalid format returns null.
  */
 export function parseDurationMs(str: string): number | null {
-  const trimmed = typeof str === "string" ? str.trim() : "";
+  // str is typed as string; redundant typeof str === "string" check removed
+  const trimmed = str.trim();
   if (!trimmed || trimmed.startsWith("-")) return null;
 
   // Bare unit-less number: seconds
@@ -284,6 +285,26 @@ export function parseRetryAfterMs(
 
   if (maxMs === null) return null;
   return Math.min(maxMs, MAX_RETRY_AFTER_MS);
+}
+
+/**
+ * Detects OpenAI insufficient_quota errors either from structured JSON error objects
+ * (err.code or err.type === "insufficient_quota") or via raw substring match fallback.
+ * Checks substring whenever structured check does not match, not only when JSON.parse throws.
+ */
+export function isInsufficientQuotaError(rawBody: string): boolean {
+  try {
+    const parsed = JSON.parse(rawBody);
+    const err = parsed?.error;
+    if (err && typeof err === "object") {
+      if (err.code === "insufficient_quota" || err.type === "insufficient_quota") {
+        return true;
+      }
+    }
+  } catch {
+    // Non-JSON or malformed body falls through to substring check
+  }
+  return rawBody.includes("insufficient_quota");
 }
 
 /**

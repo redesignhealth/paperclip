@@ -519,7 +519,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(res.outputTokens, 600, "outputTokens must fall back to 600");
   });
 
-  await t.test("choices: [] is retried and exhausted into quarantined/llm_unavailable (not not_json)", async () => {
+  await t.test("choices: [] is treated as billed_unusable without retrying (exact usage passthrough variant)", async () => {
     let sleepCalls = 0;
     const sleeper = {
       sleep: async (ms: number) => {
@@ -529,8 +529,43 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     };
 
     const { fetch: recordingFetch, requests } = createRecordingFetch([
-      { status: 200, body: { choices: [] } },
-      { status: 200, body: { choices: [] } },
+      {
+        status: 200,
+        body: {
+          choices: [],
+          usage: { prompt_tokens: 120, completion_tokens: 45 },
+        },
+      },
+    ]);
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: recordingFetch,
+      limiter,
+      sleeper,
+      clock,
+      maxAttempts: 3,
+    });
+
+    const res = await client.convert("Fact text.");
+    assert.equal(res.status, "quarantined");
+    assert.equal(res.rejectCode, "llm_unavailable");
+    assert.equal(requests.length, 1, "Must not retry billed empty choices");
+    assert.equal(sleepCalls, 0, "Must not sleep or backoff on billed unusable response");
+    assert.equal(res.inputTokens, 120, "Must pass through exact prompt_tokens from usage");
+    assert.equal(res.outputTokens, 45, "Must pass through exact completion_tokens from usage");
+  });
+
+  await t.test("choices: [] is treated as billed_unusable without retrying ((bodyBytes, 600) fallback variant)", async () => {
+    let sleepCalls = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        sleepCalls++;
+        clock.advance(ms);
+      },
+    };
+
+    const { fetch: recordingFetch, requests } = createRecordingFetch([
       { status: 200, body: { choices: [] } },
     ]);
 
@@ -546,8 +581,11 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     const res = await client.convert("Fact text.");
     assert.equal(res.status, "quarantined");
     assert.equal(res.rejectCode, "llm_unavailable");
-    assert.equal(requests.length, 3, "Must retry empty choices up to maxAttempts");
-    assert.equal(sleepCalls, 2);
+    assert.equal(requests.length, 1, "Must not retry billed empty choices");
+    assert.equal(sleepCalls, 0, "Must not sleep or backoff on billed unusable response");
+    const expectedInputBytes = Buffer.byteLength(requests[0].body, "utf8");
+    assert.equal(res.inputTokens, expectedInputBytes, "Must fall back to request body bytes");
+    assert.equal(res.outputTokens, 600, "Must fall back to 600 output tokens");
   });
 
   await t.test("injected fetch error message embeds API key is scrubbed by redaction", async () => {
@@ -672,44 +710,27 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(requests.length, 1, "fetchImpl must be called exactly once; must not issue repair turn on sensitive raw output");
   });
 
-  await t.test("first 200 body json() rejects, second succeeds -> success with 2 calls", async () => {
+  await t.test("unreadable 200 body is quarantined without retrying", async () => {
+    let sleepCalls = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        sleepCalls++;
+        clock.advance(ms);
+      },
+    };
+
     let callCount = 0;
-    const customFetch: typeof fetch = async () => {
+    const requests: Array<{ url: string; init?: RequestInit; body: string }> = [];
+    const customFetch: typeof fetch = async (url, init) => {
       callCount++;
-      if (callCount === 1) {
-        return {
-          ok: true,
-          status: 200,
-          headers: new Headers(),
-          json: async () => {
-            throw new Error("Premature EOF during body read with key sk-secret-1234567890");
-          },
-        } as any;
-      }
+      requests.push({ url: String(url), init, body: String(init?.body ?? "") });
       return {
         ok: true,
         status: 200,
         headers: new Headers(),
-        json: async () => ({
-          choices: [
-            {
-              message: {
-                content: JSON.stringify({
-                  decision: "convert",
-                  records: [
-                    {
-                      data: "Valid atomic record after body retry.",
-                      type: "fact",
-                      subject: "body retry",
-                      confidence: 0.9,
-                    },
-                  ],
-                }),
-              },
-            },
-          ],
-          usage: { prompt_tokens: 100, completion_tokens: 50 },
-        }),
+        json: async () => {
+          throw new Error("Premature EOF during body read with key sk-secret-1234567890");
+        },
       } as any;
     };
 
@@ -717,14 +738,114 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
       apiKey: "sk-mock-key-12345678901234567890",
       fetchImpl: customFetch,
       limiter,
-      sleeper: clock,
+      sleeper,
       clock,
       maxAttempts: 3,
     });
 
     const res = await client.convert("Input text");
-    assert.equal(res.status, "convert");
-    assert.equal(callCount, 2, "Must retry failed body json() and succeed on second call");
+    assert.equal(res.status, "quarantined");
+    assert.equal(res.rejectCode, "llm_unavailable");
+    assert.equal(callCount, 1, "Must never retry a billed 200 response with unreadable body");
+    assert.equal(sleepCalls, 0, "Must not sleep or backoff on billed unusable response");
+    assert.equal(res.inputTokens, Buffer.byteLength(requests[0].body, "utf8"));
+    assert.equal(res.outputTokens, 600);
+  });
+
+  await t.test("repair-turn case: call 1 schema-invalid triggers repair, call 2 json() rejects -> quarantined/llm_unavailable", async () => {
+    let sleepCalls = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        sleepCalls++;
+        clock.advance(ms);
+      },
+    };
+
+    let callCount = 0;
+    const requests: Array<{ url: string; init?: RequestInit; body: string }> = [];
+    const schemaInvalidOutput = {
+      decision: "convert",
+      records: [
+        {
+          data: "Fact 1 and Fact 2",
+          type: "fact",
+          subject: "subject",
+        },
+      ],
+    };
+
+    const customFetch: typeof fetch = async (url, init) => {
+      callCount++;
+      requests.push({ url: String(url), init, body: String(init?.body ?? "") });
+      if (callCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            choices: [{ message: { content: JSON.stringify(schemaInvalidOutput) } }],
+            usage: { prompt_tokens: 150, completion_tokens: 40 },
+          }),
+        } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => {
+          throw new Error("Premature EOF on repair attempt body");
+        },
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: customFetch,
+      limiter,
+      sleeper,
+      clock,
+      maxAttempts: 3,
+    });
+
+    const res = await client.convert("Input text requiring repair");
+    assert.equal(res.status, "quarantined");
+    assert.equal(res.rejectCode, "llm_unavailable");
+    assert.equal(callCount, 2, "Must execute call 1 (initial) and call 2 (repair)");
+    assert.equal(sleepCalls, 0, "No backoff sleep on billed unusable response");
+    const expectedCall2BodyBytes = Buffer.byteLength(requests[1].body, "utf8");
+    assert.equal(res.inputTokens, 150 + expectedCall2BodyBytes);
+    assert.equal(res.outputTokens, 40 + 600);
+  });
+
+  await t.test("abort-during-body-read rejects ABORTED_BY_OPERATOR not quarantine", async () => {
+    const controller = new AbortController();
+    const abortingFetch: typeof fetch = async () => {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => {
+          controller.abort();
+          throw new Error("aborted during stream read");
+        },
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: abortingFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    await assert.rejects(
+      () => client.convert("Text", { signal: controller.signal }),
+      (err: any) => {
+        assert.equal(err.code, "ABORTED_BY_OPERATOR");
+        return true;
+      },
+    );
   });
 
   await t.test("failed attempt token refunds: retried request debits twice without refund", async () => {
@@ -962,29 +1083,25 @@ test("Embedding client assertions and shape validation", async (t) => {
     assert.equal(settled, false, "Lease must NOT be settled when response shape validation fails");
   });
 
-  await t.test("first 200 body json() rejects, second succeeds -> success with 2 calls", async () => {
+  await t.test("embedding client throws EMBEDDING_FAILED on unreadable 200 body without retrying", async () => {
     let callCount = 0;
+    let sleepCalls = 0;
+    const sleeper = {
+      sleep: async (ms: number) => {
+        sleepCalls++;
+        clock.advance(ms);
+      },
+    };
+
     const customFetch: typeof fetch = async () => {
       callCount++;
-      if (callCount === 1) {
-        return {
-          ok: true,
-          status: 200,
-          headers: new Headers(),
-          json: async () => {
-            throw new Error("Premature EOF during body read with key sk-secret-1234567890");
-          },
-        } as any;
-      }
       return {
         ok: true,
         status: 200,
         headers: new Headers(),
-        json: async () => ({
-          model: "text-embedding-3-small",
-          data: [{ embedding: new Array(1536).fill(0.01) }],
-          usage: { prompt_tokens: 12 },
-        }),
+        json: async () => {
+          throw new Error("Premature EOF during body read with key sk-secret-1234567890");
+        },
       } as any;
     };
 
@@ -992,14 +1109,22 @@ test("Embedding client assertions and shape validation", async (t) => {
       apiKey: "sk-mock-key-12345678901234567890",
       fetchImpl: customFetch,
       limiter,
-      sleeper: clock,
+      sleeper,
       clock,
       maxAttempts: 3,
     });
 
-    const res = await embClient.embed("Text to embed");
-    assert.equal(res.tokens, 12);
-    assert.equal(callCount, 2, "Must retry failed body json() and succeed on second attempt");
+    await assert.rejects(
+      () => embClient.embed("Text to embed"),
+      (err: any) => {
+        assert.equal(err.code, "EMBEDDING_FAILED");
+        assert.equal(callCount, 1, "Must fail immediately without retrying billed 200");
+        assert.equal(sleepCalls, 0, "Sleeper must never be called");
+        assert.ok(!err.message.includes("sk-secret-1234567890"), "Must not leak secret in error message");
+        assert.ok(!err.message.includes("Premature EOF"), "Must not leak response-derived text");
+        return true;
+      },
+    );
   });
 
   await t.test("retries on 5xx (500/502/503) and 408/409", async () => {
@@ -1043,8 +1168,10 @@ test("Embedding client assertions and shape validation", async (t) => {
 
   await t.test("retries on network error", async () => {
     let callCount = 0;
+    let sleepCalls = 0;
     const sleeper = {
       sleep: async (ms: number) => {
+        sleepCalls++;
         clock.advance(ms);
       },
     };
@@ -1077,6 +1204,65 @@ test("Embedding client assertions and shape validation", async (t) => {
     const res = await embClient.embed("Text to embed");
     assert.equal(res.tokens, 8);
     assert.equal(callCount, 2);
+    assert.equal(sleepCalls, 1);
+  });
+
+  await t.test("M3: transport error exhaustion without redaction yields static error message with no injected text", async () => {
+    const secretKey = "sk-proj-transportleaksecret9999";
+    const failingFetch: typeof fetch = async () => {
+      throw new Error(`Connection timeout carrying ${secretKey}`);
+    };
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: failingFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+      maxAttempts: 2,
+    });
+
+    await assert.rejects(
+      () => embClient.embed("Text to embed"),
+      (err: any) => {
+        assert.equal(err.code, "EMBEDDING_FAILED");
+        assert.equal(err.message, "OpenAI embedding request failed after 2 attempts.");
+        assert.ok(!err.message.includes(secretKey), "Must not leak secret text");
+        assert.ok(!err.message.includes("Connection timeout"), "Must not interpolate raw error without redaction");
+        return true;
+      },
+    );
+  });
+
+  await t.test("M3: transport error exhaustion with redaction interpolates scrubbed error message", async () => {
+    const secretKey = "sk-proj-transportleaksecret8888";
+    const redaction = new RedactionRegistry();
+    redaction.add(secretKey);
+
+    const failingFetch: typeof fetch = async () => {
+      throw new Error(`Connection timeout carrying ${secretKey}`);
+    };
+
+    const embClient = createOpenAiEmbeddingClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: failingFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+      redaction,
+      maxAttempts: 2,
+    });
+
+    await assert.rejects(
+      () => embClient.embed("Text to embed"),
+      (err: any) => {
+        assert.equal(err.code, "EMBEDDING_FAILED");
+        assert.ok(err.message.includes("[REDACTED_API_KEY]"), "Must scrub secret using redaction registry");
+        assert.ok(!err.message.includes(secretKey), "Must not leak raw secret");
+        assert.ok(err.message.startsWith("OpenAI embedding request failed after 2 attempts: Connection timeout carrying"));
+        return true;
+      },
+    );
   });
 
   await t.test("attempt exhaustion throws EMBEDDING_FAILED", async () => {
