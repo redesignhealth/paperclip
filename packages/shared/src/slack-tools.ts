@@ -83,7 +83,7 @@ export const SLACK_TOOLS = [
       user: user
         .optional()
         .describe(
-          "Slack user ID (for example U012AB3CD) of the workspace member to DM. Omit to DM the current task's linked requester. Do not guess an ID; use one from a mention or the request (slack_user takes an ID, it cannot search by name).",
+          "Slack user ID (for example U012AB3CD) of the workspace member to DM. Omit to DM the current task's linked requester. Do not guess an ID; find it with slack_find_user, or use one from a mention or the request.",
         ),
     },
   ),
@@ -126,6 +126,17 @@ export const SLACK_TOOLS = [
     "read",
     "Look up a Slack user's display identity. This does not grant authority.",
     { user },
+  ),
+  tool(
+    "find_user",
+    "users.list",
+    ["users:read"],
+    "read",
+    "Find people in this workspace by name or email fragment (every word must match, for example \"patrick mc\"). Returns every match with its Slack user ID; guests and bots are flagged and cannot be DMed. Email search works only when the Slack app can see emails. If more than one person matches, ask which one is meant instead of choosing. Use the returned ID with slack_open_dm.",
+    {
+      query: z.string().trim().min(2).max(100),
+      limit: z.number().int().min(1).max(25).optional(),
+    },
   ),
   tool(
     "emoji",
