@@ -7,8 +7,10 @@ import test from "node:test";
 import {
   buildConversionRequestBody,
   buildInitialConversionMessages,
+  buildRepairConversionMessages,
   createOpenAiConversionClient,
   PREFLIGHT_MAX_COMPLETION_TOKENS,
+  projectWorstCaseRepairRequestBodyBytes,
 } from "../../server/src/services/company-memory-upgrade/llm-converter.js";
 import { CANONICAL_CONVERSION_PARAMS } from "../../server/src/services/company-memory-upgrade/converter-contract.js";
 import {
@@ -820,12 +822,30 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
   await t.test("quote-heavy/control/multibyte schema-invalid call 1: oversize repair request is intercepted and never sent; first-call usage counted", async () => {
     let callCount = 0;
     const requests: Array<{ url: string; init?: RequestInit; body: string }> = [];
+    const subClock = new ManualClock();
+    const subLimiter = setupTestLimiter(subClock);
 
-    // Call 1 returns schema-invalid JSON packed with quotes, control chars, and multibyte chars
-    // that would exceed the preflight projected repair body size if echoed back into repair messages.
+    const sourceText = "Input text with oversize repair echo potential";
+    const model = "gpt-5.4-mini";
+
+    // Call 1 returns schema-invalid JSON packed with control characters that escape to \u00XX (6 bytes each),
+    // genuinely exceeding the escape-aware preflight projection (600 * 24 bytes).
     const oversizeSchemaInvalidContent = JSON.stringify({
-      invalid: "\"".repeat(1500) + "\n\t".repeat(500) + "日本語漢字🎉".repeat(300),
+      invalid: "\u0000".repeat(4000),
     });
+
+    const wouldBeRepairMessages = buildRepairConversionMessages(
+      buildInitialConversionMessages(sourceText),
+      oversizeSchemaInvalidContent,
+      "decision_invalid",
+    );
+    const wouldBeRepairBody = buildConversionRequestBody(model, wouldBeRepairMessages);
+    const wouldBeBytes = Buffer.byteLength(wouldBeRepairBody, "utf8");
+    const projectedBytes = projectWorstCaseRepairRequestBodyBytes(sourceText, model);
+    assert.ok(
+      wouldBeBytes > projectedBytes,
+      `Would-be repair body (${wouldBeBytes} bytes) must strictly exceed projected bound (${projectedBytes} bytes)`,
+    );
 
     const customFetch: typeof fetch = async (url, init) => {
       callCount++;
@@ -843,19 +863,131 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
 
     const client = createOpenAiConversionClient({
       apiKey: "sk-mock-key-12345678901234567890",
+      model,
       fetchImpl: customFetch,
-      limiter,
-      sleeper: clock,
-      clock,
+      limiter: subLimiter,
+      sleeper: subClock,
+      clock: subClock,
       maxAttempts: 3,
     });
 
-    const res = await client.convert("Input text with oversize repair echo potential");
+    const res = await client.convert(sourceText);
     assert.equal(res.status, "quarantined");
     assert.equal(res.rejectCode, "decision_invalid");
     assert.equal(callCount, 1, "Must NEVER issue call 2 (oversize repair request intercepted before fetch)");
+    assert.equal(requests.length, 1, "Only initial request was dispatched");
+    assert.ok(
+      requests[0].body.includes("Input text with oversize repair echo potential"),
+      "Initial request body contains input text",
+    );
     assert.equal(res.inputTokens, 125, "Reports ONLY first-call input tokens");
     assert.equal(res.outputTokens, 600, "Reports ONLY first-call output tokens");
+  });
+
+  await t.test("realistic quote-heavy JSON-ish ~600-token reply that previously tripped guard is within bound and executes repair call (2 fetches)", async () => {
+    let callCount = 0;
+    const requests: Array<{ url: string; init?: RequestInit; body: string }> = [];
+    const subClock = new ManualClock();
+    const subLimiter = setupTestLimiter(subClock);
+
+    const sourceText = "A user interaction with multiple memories to extract";
+    const model = "gpt-5.4-mini";
+
+    // Realistic quote-heavy JSON-ish reply (~2800 bytes, ~600 tokens worth).
+    // Under the old 4 bytes/token bound (2400 bytes echo allowance), this would exceed the bound and be skipped.
+    // Under the escape-aware 24 bytes/token bound (14400 bytes echo allowance), it is within bound.
+    const quoteHeavyInvalidContent = JSON.stringify({
+      malformed: true,
+      context: "User said: \"Please remember 'key-quote-1' and 'key-quote-2'\".",
+      details: Array.from({ length: 30 }, (_, i) => `item_${i}: "quoted value with \\"escaped\\" text and / slashes"`).join(", "),
+      nested: { a: "quote \"test\"", b: "another \"quote\" here", c: "end of \"stream\"" },
+    });
+
+    const initialMessages = buildInitialConversionMessages(sourceText);
+    const wouldBeRepairMessages = buildRepairConversionMessages(
+      initialMessages,
+      quoteHeavyInvalidContent,
+      "decision_invalid",
+    );
+    const repairBody = buildConversionRequestBody(model, wouldBeRepairMessages);
+    const repairBytes = Buffer.byteLength(repairBody, "utf8");
+
+    const emptyEchoBody = buildConversionRequestBody(
+      model,
+      buildRepairConversionMessages(initialMessages, "", "records_not_empty_on_drop"),
+    );
+    const oldProjectedBound = Buffer.byteLength(emptyEchoBody, "utf8") + 600 * 4;
+    const newProjectedBound = projectWorstCaseRepairRequestBodyBytes(sourceText, model);
+
+    assert.ok(
+      repairBytes > oldProjectedBound,
+      `Actual repair body (${repairBytes} bytes) must exceed old 4-byte/token bound (${oldProjectedBound} bytes)`,
+    );
+    assert.ok(
+      repairBytes <= newProjectedBound,
+      `Actual repair body (${repairBytes} bytes) must be within new bound (${newProjectedBound} bytes)`,
+    );
+
+    const customFetch: typeof fetch = async (url, init) => {
+      callCount++;
+      requests.push({ url: String(url), init, body: String(init?.body ?? "") });
+      if (callCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            choices: [{ message: { content: quoteHeavyInvalidContent } }],
+            usage: { prompt_tokens: 125, completion_tokens: 600 },
+          }),
+        } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  decision: "convert",
+                  records: [
+                    {
+                      data: "Extracted memory after successful repair",
+                      type: "fact",
+                      subject: "user",
+                      confidence: 0.9,
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 200, completion_tokens: 50 },
+        }),
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      model,
+      fetchImpl: customFetch,
+      limiter: subLimiter,
+      sleeper: subClock,
+      clock: subClock,
+      maxAttempts: 3,
+    });
+
+    const res = await client.convert(sourceText);
+    assert.equal(callCount, 2, "Repair call must be issued (2 fetches)");
+    assert.equal(requests.length, 2, "Exactly 2 requests dispatched");
+    assert.equal(res.status, "convert");
+    if (res.status === "convert") {
+      assert.equal(res.records.length, 1);
+    }
+    assert.equal(res.inputTokens, 125 + 200);
+    assert.equal(res.outputTokens, 600 + 50);
   });
 
   await t.test("abort-during-body-read rejects ABORTED_BY_OPERATOR not quarantine", async () => {

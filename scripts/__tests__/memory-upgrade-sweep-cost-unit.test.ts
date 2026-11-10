@@ -15,6 +15,10 @@ import {
   buildInitialConversionMessages,
   buildRepairConversionMessages,
   createOpenAiConversionClient,
+  isRepairRequestBodyOversize,
+  PREFLIGHT_MAX_COMPLETION_TOKENS,
+  PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN,
+  projectWorstCaseRepairRequestBodyBytes,
 } from "../../server/src/services/company-memory-upgrade/llm-converter.js";
 import { createRateLimiter } from "../../server/src/services/company-memory-upgrade/rate-limiter.js";
 import { ManualClock } from "./memory-upgrade-sweep-helpers.js";
@@ -219,21 +223,25 @@ test("projectWorstCaseConversionRequestBytes sizes the repair body using the LON
   const { repairRequestBodyBytes } = projectWorstCaseConversionRequestBytes("", "gpt-5.4-mini");
 
   // Reconstruct the expected worst-case repair body using the real longest reject code and
-  // confirm a byte-for-byte match -- proving the projection derives the placeholder from
+  // confirm an exact match -- proving the projection derives the base from
   // CONVERSION_REJECT_CODES at module load rather than a shorter hardcoded literal.
   const initialMessages = buildInitialConversionMessages("");
-  const worstCaseEchoBytes = PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL * UTF8_MAX_BYTES_PER_CHAR;
-  const placeholder = "x".repeat(worstCaseEchoBytes);
-  const expectedRepairMessages = buildRepairConversionMessages(initialMessages, placeholder, longestRejectCode);
-  const expectedBody = buildConversionRequestBody("gpt-5.4-mini", expectedRepairMessages);
-  assert.equal(repairRequestBodyBytes, utf8ByteLength(expectedBody));
+  const expectedEmptyEchoMessages = buildRepairConversionMessages(initialMessages, "", longestRejectCode);
+  const expectedEmptyBody = buildConversionRequestBody("gpt-5.4-mini", expectedEmptyEchoMessages);
+  const expectedRepairRequestBodyBytes =
+    utf8ByteLength(expectedEmptyBody) +
+    PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
+  assert.equal(repairRequestBodyBytes, expectedRepairRequestBodyBytes);
 
   // Confirm the real projection is strictly larger than what the old hardcoded 15-char
   // "data_not_atomic" placeholder would have produced (an undercount of the worst case).
-  const shorterRepairMessages = buildRepairConversionMessages(initialMessages, placeholder, "data_not_atomic");
-  const shorterBody = buildConversionRequestBody("gpt-5.4-mini", shorterRepairMessages);
+  const shorterEmptyEchoMessages = buildRepairConversionMessages(initialMessages, "", "data_not_atomic");
+  const shorterEmptyBody = buildConversionRequestBody("gpt-5.4-mini", shorterEmptyEchoMessages);
+  const shorterRepairRequestBodyBytes =
+    utf8ByteLength(shorterEmptyBody) +
+    PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
   assert.ok(
-    repairRequestBodyBytes > utf8ByteLength(shorterBody),
+    repairRequestBodyBytes > shorterRepairRequestBodyBytes,
     "projection using the longest reject code must exceed the old hardcoded data_not_atomic placeholder",
   );
 });
@@ -308,7 +316,6 @@ test("regression guard: quote-heavy/control/multibyte schema-invalid call 1 ensu
     sourceText,
     model,
   );
-  const worstCaseInputCap = initialRequestBodyBytes + repairRequestBodyBytes;
 
   const clock = new ManualClock();
   const limiter = createRateLimiter({
@@ -320,12 +327,14 @@ test("regression guard: quote-heavy/control/multibyte schema-invalid call 1 ensu
   });
 
   let callCount = 0;
+  const requests: Array<{ body: string }> = [];
   const oversizeSchemaInvalidContent = JSON.stringify({
-    invalid: "\"".repeat(1500) + "\n\t".repeat(500) + "日本語漢字🎉".repeat(300),
+    invalid: "\u0000".repeat(4000),
   });
 
-  const customFetch: typeof fetch = async () => {
+  const customFetch: typeof fetch = async (_url, init) => {
     callCount++;
+    requests.push({ body: String(init?.body ?? "") });
     return {
       ok: true,
       status: 200,
@@ -349,18 +358,194 @@ test("regression guard: quote-heavy/control/multibyte schema-invalid call 1 ensu
   const res = await client.convert(sourceText);
 
   assert.equal(callCount, 1, "Oversize repair request must never be sent");
+  assert.equal(requests.length, 1, "Only first call request was dispatched");
   assert.equal(res.status, "quarantined");
   assert.equal(res.rejectCode, "decision_invalid");
   assert.equal(res.inputTokens, 140, "Only first-call input tokens counted");
-  assert.equal(res.outputTokens, 600, "Only first-call output tokens counted");
+  assert.equal(res.outputTokens, 600, "Only first-call output tokens counted (tightened to exact 600)");
+
+  // Finding 4: compare actual serialized initial request bytes against projection
+  const actualInitialBytes = Buffer.byteLength(requests[0].body, "utf8");
   assert.ok(
-    res.inputTokens <= worstCaseInputCap,
-    `reported inputTokens (${res.inputTokens}) must not exceed preflight projection (${worstCaseInputCap})`,
+    actualInitialBytes <= initialRequestBodyBytes,
+    `actual initial request bytes (${actualInitialBytes}) must not exceed projection (${initialRequestBodyBytes})`,
   );
+
+  // Finding 3: assert would-be repair body strictly exceeds projection
+  const wouldBeRepairMessages = buildRepairConversionMessages(
+    buildInitialConversionMessages(sourceText),
+    oversizeSchemaInvalidContent,
+    "decision_invalid",
+  );
+  const wouldBeRepairBody = buildConversionRequestBody(model, wouldBeRepairMessages);
+  const wouldBeRepairBytes = Buffer.byteLength(wouldBeRepairBody, "utf8");
   assert.ok(
-    res.outputTokens <= 1200,
-    `reported outputTokens (${res.outputTokens}) must not exceed 2 * 600 = 1200`,
+    wouldBeRepairBytes > repairRequestBodyBytes,
+    `would-be repair request body bytes (${wouldBeRepairBytes}) must strictly exceed projection (${repairRequestBodyBytes})`,
   );
+});
+
+test("projectWorstCaseRepairRequestBodyBytes handles null, undefined, empty, and multibyte sourceText", () => {
+  const model = "gpt-5.4-mini";
+  const emptyBytes = projectWorstCaseRepairRequestBodyBytes("", model);
+  const nullBytes = projectWorstCaseRepairRequestBodyBytes(null, model);
+  const undefinedBytes = projectWorstCaseRepairRequestBodyBytes(undefined, model);
+  assert.equal(nullBytes, emptyBytes, "null sourceText defaults to empty string");
+  assert.equal(undefinedBytes, emptyBytes, "undefined sourceText defaults to empty string");
+  assert.ok(Number.isFinite(emptyBytes) && emptyBytes > 0);
+
+  const multibyteText = "こんにちは世界 🌍 Mem0 conversion with emoji and kanji";
+  const multibyteBytes = projectWorstCaseRepairRequestBodyBytes(multibyteText, model);
+  assert.ok(multibyteBytes > emptyBytes, "multibyte sourceText increases repair body byte projection");
+  assert.ok(Number.isFinite(multibyteBytes));
+});
+
+test("isRepairRequestBodyOversize pure predicate boundary behavior", () => {
+  const projected = 15_000;
+  assert.equal(isRepairRequestBodyOversize(projected - 1, projected), false, "below bound is not oversize");
+  assert.equal(isRepairRequestBodyOversize(projected, projected), false, "exact projected bound is not oversize (repair permitted)");
+  assert.equal(isRepairRequestBodyOversize(projected + 1, projected), true, "projected + 1 is oversize (repair skipped)");
+});
+
+test("boundary test via injected echo: exact projected bound issues repair (2 calls), projected + 1 skips repair (1 call)", async () => {
+  const model = "gpt-5.4-mini";
+  const sourceText = "boundary test text";
+  const projectedBytes = projectWorstCaseRepairRequestBodyBytes(sourceText, model);
+
+  const initialMessages = buildInitialConversionMessages(sourceText);
+  const baseRepairBodyNotJson = buildConversionRequestBody(
+    model,
+    buildRepairConversionMessages(initialMessages, "", "not_json"),
+  );
+  const baseNotJsonBytes = Buffer.byteLength(baseRepairBodyNotJson, "utf8");
+  const exactDiff = projectedBytes - baseNotJsonBytes;
+  assert.ok(exactDiff > 0);
+
+  const exactEchoContent = "x".repeat(exactDiff);
+  const exactRepairBody = buildConversionRequestBody(
+    model,
+    buildRepairConversionMessages(initialMessages, exactEchoContent, "not_json"),
+  );
+  assert.equal(
+    Buffer.byteLength(exactRepairBody, "utf8"),
+    projectedBytes,
+    "exactEchoContent must produce a repair body exactly equal to projectedBytes",
+  );
+
+  // 1) Test at exact bound: repair call is issued (2 fetches)
+  {
+    let callCount = 0;
+    const clock = new ManualClock();
+    const limiter = createRateLimiter({
+      rpm: 10_000,
+      tpm: 1_000_000,
+      concurrency: 2,
+      clock,
+      sleeper: clock,
+    });
+    const customFetch: typeof fetch = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            choices: [{ message: { content: exactEchoContent } }],
+            usage: { prompt_tokens: 100, completion_tokens: 50 },
+          }),
+        } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  decision: "convert",
+                  records: [
+                    {
+                      data: "Extracted valid fact after successful repair",
+                      type: "fact",
+                      subject: "user",
+                      confidence: 0.9,
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 150, completion_tokens: 20 },
+        }),
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-boundary",
+      model,
+      fetchImpl: customFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    const res = await client.convert(sourceText);
+    assert.equal(callCount, 2, "At exact projected bound, repair call MUST be issued (2 calls)");
+    assert.equal(res.status, "convert");
+  }
+
+  // 2) Test at projected + 1: repair call is skipped (1 fetch, quarantined)
+  {
+    const plusOneEchoContent = "x".repeat(exactDiff + 1);
+    const plusOneRepairBody = buildConversionRequestBody(
+      model,
+      buildRepairConversionMessages(initialMessages, plusOneEchoContent, "not_json"),
+    );
+    assert.equal(
+      Buffer.byteLength(plusOneRepairBody, "utf8"),
+      projectedBytes + 1,
+      "plusOneEchoContent must produce a repair body exactly equal to projectedBytes + 1",
+    );
+
+    let callCount = 0;
+    const clock = new ManualClock();
+    const limiter = createRateLimiter({
+      rpm: 10_000,
+      tpm: 1_000_000,
+      concurrency: 2,
+      clock,
+      sleeper: clock,
+    });
+    const customFetch: typeof fetch = async () => {
+      callCount++;
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [{ message: { content: plusOneEchoContent } }],
+          usage: { prompt_tokens: 100, completion_tokens: 50 },
+        }),
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-boundary",
+      model,
+      fetchImpl: customFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+    });
+
+    const res = await client.convert(sourceText);
+    assert.equal(callCount, 1, "At projected + 1, repair call MUST be skipped (1 call)");
+    assert.equal(res.status, "quarantined");
+    assert.equal(res.rejectCode, "not_json");
+  }
 });
 
 test("regression guard: actual within-bound repair with unreadable call 2 reports both calls within preflight projection", async () => {

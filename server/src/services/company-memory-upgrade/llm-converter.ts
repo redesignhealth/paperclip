@@ -150,13 +150,29 @@ const LONGEST_REJECT_CODE = CONVERSION_REJECT_CODES.reduce(
 /**
  * Worst-case assumed bytes-per-output-token when projecting the size of the model's own
  * prior (rejected) response as it gets echoed back into the repair-retry request.
+ *
+ * Conservative ceiling: assumes an average of up to 4 characters per token, with each
+ * character expanding to up to 6 bytes under JSON string escaping (e.g. \u00XX control codes),
+ * yielding 4 * 6 = 24 bytes/token. This ensures the preflight projection strictly bounds
+ * realistic and adversarial escaped echoes within PREFLIGHT_MAX_COMPLETION_TOKENS.
  */
-export const PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN = 4;
+export const PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN = 24;
+
+/**
+ * Evaluates whether an actual serialized repair request body exceeds the projected byte bound.
+ * Returns true if the repair request is oversize and must be aborted/quarantined.
+ */
+export function isRepairRequestBodyOversize(
+  actualBytes: number,
+  projectedBytes: number,
+): boolean {
+  return actualBytes > projectedBytes;
+}
 
 /**
  * Projects the worst-case serialized repair request body byte length for a given source
- * text and model. Uses the canonical placeholder prior response ("x".repeat(600 * 4)) and
- * the longest possible conversion reject code.
+ * text and model. Serializes a base repair body with an empty echo and adds the worst-case
+ * echo bytes analytically (PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN).
  *
  * This is the single source of truth for both preflight cost estimation (cost.ts) and
  * the runtime guard before issuing a repair call (llm-converter.ts).
@@ -166,11 +182,16 @@ export function projectWorstCaseRepairRequestBodyBytes(
   model: string,
 ): number {
   const initialMessages = buildInitialConversionMessages(sourceText ?? "");
-  const worstCaseEchoBytes = PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
-  const placeholderPriorResponse = "x".repeat(worstCaseEchoBytes);
-  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, LONGEST_REJECT_CODE);
-  const repairBody = buildConversionRequestBody(model, repairMessages);
-  return Buffer.byteLength(repairBody, "utf8");
+  const emptyEchoRepairMessages = buildRepairConversionMessages(
+    initialMessages,
+    "",
+    LONGEST_REJECT_CODE,
+  );
+  const emptyEchoRepairBody = buildConversionRequestBody(model, emptyEchoRepairMessages);
+  const baseBytes = Buffer.byteLength(emptyEchoRepairBody, "utf8");
+  const worstCaseEchoBytes =
+    PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
+  return baseBytes + worstCaseEchoBytes;
 }
 
 export interface CreateOpenAiConversionClientOptions {
@@ -513,7 +534,7 @@ export function createOpenAiConversionClient(
       // Fail-closed bound: if the actual serialized repair request exceeds the preflight
       // byte projection used by cost estimation (e.g. quote-heavy/control/multibyte echo),
       // quarantine immediately with first-call usage and do not issue a paid repair call.
-      if (repairRequestBodyBytes > maxRepairRequestBodyBytes) {
+      if (isRepairRequestBodyOversize(repairRequestBodyBytes, maxRepairRequestBodyBytes)) {
         return {
           status: "quarantined",
           rejectCode: validation.rejectCode,
