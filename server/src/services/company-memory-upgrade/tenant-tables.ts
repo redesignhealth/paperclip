@@ -122,6 +122,10 @@ export async function ensureUpgradeTables(
     CREATE INDEX IF NOT EXISTS "pmu_staging_src_idx"
     ON "paperclip_memory_upgrade_staging" ("upgrade_id", "source_id");
 
+    CREATE INDEX IF NOT EXISTS "pmu_staging_unpublished_idx"
+    ON "paperclip_memory_upgrade_staging" ("upgrade_id", "source_id", "output_id")
+    WHERE "published_at" IS NULL;
+
     CREATE TABLE IF NOT EXISTS "paperclip_memory_upgrade_ledger" (
       "upgrade_id" uuid NOT NULL,
       "source_id" uuid NOT NULL,
