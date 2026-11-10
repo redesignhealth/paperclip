@@ -17,6 +17,7 @@ import {
   validateAndResolveTableIdentifier,
   validateOutputPath,
 } from "../server/src/services/company-memory-upgrade/census.js";
+import { MAX_USD_CAP } from "../server/src/services/company-memory-upgrade/cost.js";
 import {
   formatSweepTextReport,
   runSweep,
@@ -58,6 +59,13 @@ export const VALUE_FLAGS = new Set([
   "--active-run-poll-ms",
   "--max-pause-seconds",
   "--operator-label",
+  "--model",
+  "--openai-key-file",
+  "--max-cost-usd",
+  "--chat-rpm",
+  "--chat-tpm",
+  "--embedding-rpm",
+  "--embedding-tpm",
 ]);
 
 export const ALLOWED_CENSUS_FLAGS = new Set([
@@ -91,6 +99,16 @@ export const ALLOWED_SWEEP_FLAGS = new Set([
   "--output",
   "--out",
   "--format",
+  "--model",
+  "--openai-key-file",
+  "--max-cost-usd",
+  "--chat-rpm",
+  "--chat-tpm",
+  "--embedding-rpm",
+  "--embedding-tpm",
+  "--chat-input-usd-per-mtok",
+  "--chat-output-usd-per-mtok",
+  "--embedding-usd-per-mtok",
 ]);
 
 /**
@@ -520,6 +538,24 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   CONVERSION_FAILED: "Memory conversion failed.",
   conversion_failed: "Memory conversion failed.",
 
+  COMPANY_OPENAI_KEY_MISSING: "Target company does not have an active company-scoped openai_api_key secret configured in control plane.",
+  company_openai_key_missing: "Target company does not have an active company-scoped openai_api_key secret configured in control plane.",
+
+  COMPANY_OPENAI_KEY_PROVIDER_UNSUPPORTED: "Company openai_api_key secret uses an unsupported secret provider. Use --openai-key-file to supply an external key file.",
+  company_openai_key_provider_unsupported: "Company openai_api_key secret uses an unsupported secret provider. Use --openai-key-file to supply an external key file.",
+
+  COMPANY_OPENAI_KEY_REJECTED: "The company OpenAI key was rejected by the provider (401/403). Rotate the secret or pass --openai-key-file.",
+  company_openai_key_rejected: "The company OpenAI key was rejected by the provider (401/403). Rotate the secret or pass --openai-key-file.",
+
+  COMPANY_OPENAI_QUOTA_EXHAUSTED: "The company OpenAI account has insufficient quota (429 insufficient_quota). Add billing or rotate the key before retrying.",
+  company_openai_quota_exhausted: "The company OpenAI account has insufficient quota (429 insufficient_quota). Add billing or rotate the key before retrying.",
+
+  LLM_REQUEST_REJECTED: "The LLM provider rejected the conversion request with a non-retryable error (4xx other than 408/409/429). Inspect the request shape or model configuration.",
+  llm_request_rejected: "The LLM provider rejected the conversion request with a non-retryable error (4xx other than 408/409/429). Inspect the request shape or model configuration.",
+
+  LLM_UNAVAILABLE: "LLM conversion service is unavailable.",
+  llm_unavailable: "LLM conversion service is unavailable.",
+
   EMBEDDING_FAILED: "Embedding generation failed.",
   embedding_failed: "Embedding generation failed.",
 
@@ -554,10 +590,12 @@ const SAFE_OUTPUT_PATH_REJECTED_MESSAGES = new Set([
 ]);
 
 const SAFE_INVALID_ARGUMENT_REGEXES = [
-  /^Flag '--[a-z0-9-]+' requires a (usable|positive integer|non-negative integer) value\.$/,
+  /^Flag '--[a-z0-9-]+' requires a (usable|positive integer|non-negative integer|positive number) value\.$/,
   /^Boolean flag '--[a-z0-9-]+' does not take a value\.$/,
   /^Unknown option '--?[a-zA-Z0-9_-]+'\. Only [a-zA-Z0-9_ -]+ options are accepted\.$/,
   /^Invalid --[a-z0-9-]+\. Must be a non-negative number\.$/,
+  /^Flag '--[a-z0-9-]+' exceeds the operational cap of \$[0-9,]+\.$/,
+  /^Invalid --[a-z0-9-]+\. Exceeds the operational cap of \$[0-9,]+\.$/,
 ];
 
 const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
@@ -571,6 +609,13 @@ const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
   "Refusing to run census without --company <uuid> when control plane URL is not provided.",
   "Unable to infer company ID for memory database. Please supply --company <uuid>.",
   "Ambiguous company mapping: multiple company_memory_databases records found. Please supply --company <uuid>.",
+  "Invalid --model. Only 'gpt-5.4-mini' is supported.",
+  "Refusing to read key file inside repository. API keys must not reside in the repository tree.",
+  "Key file does not exist at specified path.",
+  "Refusing to read key file: symbolic links are not permitted.",
+  "Key file permissions too open. Must be mode 0600 or 0400 (no group or other access permissions).",
+  "Invalid key file content: key must be 20-512 printable non-whitespace ASCII characters.",
+  "Flag '--max-cost-usd' requires a positive number value.",
 ]);
 
 export function sanitizeCliErrorMessage(error: unknown): string {
@@ -653,9 +698,9 @@ export async function runSweepCli(
       console.log(`
 Usage: pnpm memory:upgrade sweep --database-url <tenant-dsn> --control-plane-url <cp-dsn> --company <uuid> --confirm <uuid> [options]
 
-Classifies legacy Mem0 memory rows into the tenant upgrade ledger (TECH-8191).
+Classifies legacy Mem0 memory rows and stages converted records into the upgrade staging table (TECH-8191).
 Accesses the live collection table strictly read-only (SELECT ONLY).
-Zero memories converted or published in this phase (conversion lands in PR3b).
+Zero memories published to the live collection table.
 
 Required:
   --database-url <dsn>           Tenant PostgreSQL DSN (or COMPANY_MEMORY_DATABASE_URL env var)
@@ -665,8 +710,18 @@ Required:
 
 Options:
   --table <name>                 Target Mem0 collection table name (default: "mem0_memories")
-  --page-size <int>              Keyset page size for scanning sources (default: 1000)
+  --model <name>                 Converter LLM model (default: "gpt-5.4-mini")
+  --openai-key-file <path>       External 0600 key file path (bypasses company_secrets resolution)
   --max-rows <int>               Maximum number of live source rows to scan
+  --max-cost-usd <num>           Maximum running cost in USD before aborting sweep
+  --page-size <int>              Keyset page size for scanning sources (default: 1000)
+  --chat-rpm <int>               Chat completions rate limit cap (RPM, default: 500)
+  --chat-tpm <int>               Chat completions token limit cap (TPM, default: 200,000)
+  --embedding-rpm <int>          Embeddings rate limit cap (RPM, default: 3,000)
+  --embedding-tpm <int>          Embeddings token limit cap (TPM, default: 1,000,000)
+  --chat-input-usd-per-mtok <n>  Override chat input price in USD per 1M tokens
+  --chat-output-usd-per-mtok <n> Override chat output price in USD per 1M tokens
+  --embedding-usd-per-mtok <num> Override embedding price in USD per 1M tokens
   --pause-when-active-runs <n>   Active run threshold to pause sweep (default: 1, 0 to disable)
   --active-run-poll-ms <int>     Active run polling interval in milliseconds (default: 15000)
   --max-pause-seconds <int>      Maximum total pause time allowed before failing (default: 0 = unbounded)
@@ -777,6 +832,67 @@ Options:
       }
     }
 
+    const rawModel = parseFlagValue("--model", argv);
+    let model: string | undefined = undefined;
+    if (rawModel !== null) {
+      if (rawModel !== "gpt-5.4-mini") {
+        throw new CompanyMemoryUpgradeError(
+          "Invalid --model. Only 'gpt-5.4-mini' is supported.",
+          "INVALID_ARGUMENT",
+        );
+      }
+      model = rawModel;
+    }
+
+    const openaiKeyFile = parseFlagValue("--openai-key-file", argv);
+
+    const rawMaxCost = parseFlagValue("--max-cost-usd", argv);
+    let maxCostUsd: number | undefined = undefined;
+    if (rawMaxCost !== null) {
+      const num = parseFloat(rawMaxCost);
+      if (!Number.isFinite(num) || Number.isNaN(num) || num <= 0 || !isNumericString(rawMaxCost)) {
+        throw new CompanyMemoryUpgradeError(
+          "Flag '--max-cost-usd' requires a positive number value.",
+          "INVALID_ARGUMENT",
+        );
+      }
+      if (num > MAX_USD_CAP) {
+        throw new CompanyMemoryUpgradeError(
+          `Flag '--max-cost-usd' exceeds the operational cap of $${MAX_USD_CAP.toLocaleString()}.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      maxCostUsd = num;
+    }
+
+    const chatRpm = parsePositiveInt("--chat-rpm", undefined);
+    const chatTpm = parsePositiveInt("--chat-tpm", undefined);
+    const embeddingRpm = parsePositiveInt("--embedding-rpm", undefined);
+    const embeddingTpm = parsePositiveInt("--embedding-tpm", undefined);
+
+    function parseSweepPrice(flagName: string): number | undefined {
+      const raw = parseFlagValue(flagName, argv);
+      if (raw === null) return undefined;
+      const num = parseFloat(raw);
+      if (!Number.isFinite(num) || Number.isNaN(num) || num < 0 || !isNumericString(raw)) {
+        throw new CompanyMemoryUpgradeError(
+          `Invalid ${flagName}. Must be a non-negative number.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      if (num > MAX_USD_CAP) {
+        throw new CompanyMemoryUpgradeError(
+          `Invalid ${flagName}. Exceeds the operational cap of $${MAX_USD_CAP.toLocaleString()}.`,
+          "INVALID_ARGUMENT",
+        );
+      }
+      return num;
+    }
+
+    const chatInputUsdPerMillion = parseSweepPrice("--chat-input-usd-per-mtok");
+    const chatOutputUsdPerMillion = parseSweepPrice("--chat-output-usd-per-mtok");
+    const embeddingUsdPerMillion = parseSweepPrice("--embedding-usd-per-mtok");
+
     const outputPath =
       parseFlagValue("--output", argv) ??
       parseFlagValue("--out", argv) ??
@@ -811,6 +927,16 @@ Options:
         allowProd,
         outputPath,
         format,
+        model,
+        openaiKeyFile,
+        maxCostUsd,
+        chatRpm,
+        chatTpm,
+        embeddingRpm,
+        embeddingTpm,
+        chatInputUsdPerMillion,
+        chatOutputUsdPerMillion,
+        embeddingUsdPerMillion,
       },
       deps,
     );
