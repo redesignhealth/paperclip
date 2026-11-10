@@ -17,7 +17,10 @@ import {
   type RolePrivilegeRow,
   validateAndResolveTableIdentifier,
 } from "./census.js";
-import { MODEL_CLASSIFIED_SENSITIVE_REASON_CODE } from "./llm-converter.js";
+import {
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
+  MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
+} from "./llm-converter.js";
 import {
   acquireSourceAdvisoryLock,
   type TenantFence,
@@ -69,6 +72,10 @@ export type UnroutableReasonCode = (typeof VALID_UNROUTABLE_REASONS)[number];
 export const VALID_NOISE_REASONS = [
   "empty",
   "exact_placeholder_or_greeting",
+  // Model-decided drop_noise outcomes (no deterministic preflight match) carry this exact
+  // bounded literal, mirroring the MODEL_CLASSIFIED_SENSITIVE_REASON_CODE precedent for
+  // dropped_sensitive below (TECH-8191 Argus round 1 finding: model_classified_noise).
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
 ] as const;
 
 export type NoiseReasonCode = (typeof VALID_NOISE_REASONS)[number];

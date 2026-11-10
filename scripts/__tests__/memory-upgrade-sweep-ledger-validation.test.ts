@@ -20,6 +20,10 @@ import {
   validateOutcomeReason,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
 import {
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
+  MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
+} from "../../server/src/services/company-memory-upgrade/llm-converter.js";
+import {
   isValidVectorType,
   quoteVectorType,
 } from "../../server/src/services/company-memory-upgrade/tenant-tables.js";
@@ -188,6 +192,15 @@ test("sweep-tenant ledger reason-code validation and tombstone edge cases", asyn
     const hash = computeSourceContentSha256("Model classified test text");
 
     assert.equal(validateOutcomeReason("dropped_sensitive", "model_classified"), "model_classified");
+
+    // Guard against drift: validateOutcomeReason must accept the exact producer constant
+    // llm-converter.ts emits for model-decided drop_sensitive outcomes (TECH-8191 Argus
+    // round 1 finding -- already fixed here, this assertion pins it).
+    assert.equal(MODEL_CLASSIFIED_SENSITIVE_REASON_CODE, "model_classified");
+    assert.equal(
+      validateOutcomeReason("dropped_sensitive", MODEL_CLASSIFIED_SENSITIVE_REASON_CODE),
+      MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
+    );
 
     await commitSourceOutcome(sql, {
       upgradeId,
@@ -480,6 +493,15 @@ test("sweep-tenant ledger reason-code validation and tombstone edge cases", asyn
     for (const r of VALID_NOISE_REASONS) {
       assert.equal(validateOutcomeReason("dropped_noise", r), r);
     }
+    // Guard against drift: VALID_NOISE_REASONS must include the exact producer constant
+    // llm-converter.ts emits for model-decided drop_noise outcomes (TECH-8191 Argus round 1
+    // finding: model_classified_noise), mirroring the dropped_sensitive precedent below.
+    assert.equal(MODEL_CLASSIFIED_NOISE_REASON_CODE, "model_classified_noise");
+    assert.ok((VALID_NOISE_REASONS as readonly string[]).includes(MODEL_CLASSIFIED_NOISE_REASON_CODE));
+    assert.equal(
+      validateOutcomeReason("dropped_noise", MODEL_CLASSIFIED_NOISE_REASON_CODE),
+      MODEL_CLASSIFIED_NOISE_REASON_CODE,
+    );
     // Literal-positive: unroutable
     for (const r of VALID_UNROUTABLE_REASONS) {
       assert.equal(validateOutcomeReason("unroutable", r), r);
