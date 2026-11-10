@@ -21,18 +21,14 @@
 import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import {
-  agents,
-  companies,
-  companyMemoryDatabases,
   companyMemoryUpgrades,
   createDb,
   type Db,
 } from "@paperclipai/db";
-import { INVOKABLE_AGENT_STATUSES } from "@paperclipai/shared";
 import { eq, sql } from "drizzle-orm";
 import postgres from "postgres";
-import { adapterSupportsRuntimeMemory, deriveCompanyMemoryDatabaseNames, isSupportedCompanyMemoryEmbedding } from "../company-memory-constants.js";
 import { countActiveCompanyRuns, createActiveRunGate } from "./active-runs.js";
+import { classifyAgentRouting, type CpAgentRow } from "./agent-routing.js";
 import { assertCompanyAcceptsMemoryWork, findActiveUpgrade } from "./admission.js";
 import { CONVERSION_BUDGET_CONSTANTS } from "./budget.js";
 import {
@@ -43,11 +39,7 @@ import {
   usdToNanodollars,
 } from "./cost.js";
 import {
-  assertNoElevatedRolePrivileges,
-  assertNonSuperuserAndRestrictedRole,
   isValidUuid,
-  ROLE_PRIVILEGE_PREFLIGHT_SQL_TEXT,
-  type RolePrivilegeRow,
   type UnroutableReason,
   validateAndResolveTableIdentifier,
   validateDatabaseUrl,
@@ -66,6 +58,7 @@ import {
 import { createOpenAiEmbeddingClient, type EmbeddingClient } from "./embedding-client.js";
 import { createOpenAiConversionClient, type ConversionClient, type ConversionClientResult } from "./llm-converter.js";
 import { RedactionRegistry, resolveCompanyOpenAiKey } from "./openai-key.js";
+import { runTenantPreflight } from "./preflight.js";
 import { createRateLimiter } from "./rate-limiter.js";
 import { detectSensitiveFamilies, type SensitiveFamilyName } from "./sensitive-patterns.js";
 import { computeSourceContentSha256 } from "./source-hash.js";
@@ -77,11 +70,8 @@ import {
   updateUpgradeCounters,
 } from "./state-machine.js";
 import {
-  assertSupportedStagingVectorType,
-  assertTenantRolePreflight,
   commitSourceOutcome,
   ensureUpgradeTables,
-  introspectCollection,
   iterateSourcePages,
   loadLedgerForSources,
   type NoiseReasonCode,
@@ -181,56 +171,6 @@ export interface SweepReport {
     totalPausedMs: number;
   };
   caveats: string[];
-}
-
-interface CpAgentRow {
-  id: string;
-  name: string;
-  adapterType: string;
-  status: string;
-  pausedAt: Date | string | null;
-}
-
-function classifyAgentRouting(
-  rawAgentId: string | null | undefined,
-  cpAgentMap: Map<string, CpAgentRow>,
-): { isRoutable: boolean; matchedAgentId: string | null; unroutableReason?: UnroutableReason } {
-  if (!rawAgentId || rawAgentId.trim() === "" || rawAgentId.trim() === "(none)") {
-    return { isRoutable: false, matchedAgentId: null, unroutableReason: "missing_agent_id" };
-  }
-
-  const trimmed = rawAgentId.trim().toLowerCase();
-  if (!isValidUuid(trimmed)) {
-    return { isRoutable: false, matchedAgentId: null, unroutableReason: "malformed_agent_id" };
-  }
-
-  const cpAgent = cpAgentMap.get(trimmed);
-  if (!cpAgent) {
-    return { isRoutable: false, matchedAgentId: null, unroutableReason: "unknown_agent" };
-  }
-
-  const matchedAgentId = cpAgent.id;
-
-  if (!adapterSupportsRuntimeMemory(cpAgent.adapterType)) {
-    return { isRoutable: false, matchedAgentId, unroutableReason: "non_memory_adapter" };
-  }
-
-  if (cpAgent.status === "terminated") {
-    return { isRoutable: false, matchedAgentId, unroutableReason: "terminated" };
-  }
-
-  if (cpAgent.status === "pending_approval") {
-    return { isRoutable: false, matchedAgentId, unroutableReason: "pending_approval" };
-  }
-
-  const isInvokable = INVOKABLE_AGENT_STATUSES.has(cpAgent.status);
-  const isPausedStatus = cpAgent.status === "paused";
-
-  if (!isInvokable && !isPausedStatus) {
-    return { isRoutable: false, matchedAgentId, unroutableReason: "unknown_status" };
-  }
-
-  return { isRoutable: true, matchedAgentId };
 }
 
 export function formatSweepTextReport(report: SweepReport): string {
@@ -423,147 +363,17 @@ export async function runSweep(
   const leaseOwner = `memupg_sweep_${process.pid}_${rand8}`;
 
   try {
-    // 1. Role preflights on both connections
-    await assertTenantRolePreflight(tenantSql, "tenant");
-
-    await cpDb.transaction(async (tx) => {
-      await assertNonSuperuserAndRestrictedRole(tx, "control-plane");
-    });
-
-    // 2. Fetch tenant current_database() and current_user
-    const dbInfoRows = await tenantSql`
-      SELECT current_database()::text AS current_database, current_user::text AS current_user;
-    `;
-    const currentDatabase = deps._internalDatabaseIdentityOverride?.database !== undefined
-      ? (deps._internalDatabaseIdentityOverride.database ?? "").trim()
-      : (dbInfoRows[0]?.current_database ?? "").trim();
-    const currentUser = deps._internalDatabaseIdentityOverride?.user !== undefined
-      ? (deps._internalDatabaseIdentityOverride.user ?? "").trim()
-      : (dbInfoRows[0]?.current_user ?? "").trim();
-
-    if (!currentDatabase || !currentUser) {
-      throw new CompanyMemoryUpgradeError(
-        "Unable to determine current database and user identity from tenant connection.",
-        "DATABASE_IDENTITY_UNAVAILABLE",
+    // 1-5. Run tenant and control-plane preflight checks (zero CP side effects)
+    const { shape, stagingVectorType, resolvedCompanyName, cpAgentMap } =
+      await runTenantPreflight(
+        cpDb,
+        tenantSql,
+        { companyId, tableName },
+        {
+          _internalSkipVectorIdentityCheck: deps._internalSkipVectorIdentityCheck,
+          _internalDatabaseIdentityOverride: deps._internalDatabaseIdentityOverride,
+        },
       );
-    }
-
-    // 3. Control plane binding verification
-    let resolvedCompanyName: string | null = null;
-    await cpDb.transaction(async (tx) => {
-      const compRows = await tx
-        .select({ id: companies.id, name: companies.name })
-        .from(companies)
-        .where(eq(companies.id, companyId));
-
-      if (!compRows[0]) {
-        throw new CompanyMemoryUpgradeError(
-          "Target company record does not exist in control plane database.",
-          "COMPANY_NOT_FOUND",
-        );
-      }
-      resolvedCompanyName = compRows[0].name;
-
-      const memDbRows = await tx
-        .select({
-          databaseName: companyMemoryDatabases.databaseName,
-          databaseRole: companyMemoryDatabases.databaseRole,
-          host: companyMemoryDatabases.host,
-          port: companyMemoryDatabases.port,
-          status: companyMemoryDatabases.status,
-          embeddingModel: companyMemoryDatabases.embeddingModel,
-          embeddingDimensions: companyMemoryDatabases.embeddingDimensions,
-        })
-        .from(companyMemoryDatabases)
-        .where(eq(companyMemoryDatabases.companyId, companyId))
-        .limit(1);
-
-      if (!memDbRows[0]) {
-        throw new CompanyMemoryUpgradeError(
-          "No company_memory_databases record found for target company.",
-          "COMPANY_BINDING_MISMATCH",
-        );
-      }
-
-      const memRow = memDbRows[0];
-      if (memRow.status !== "ready") {
-        throw new CompanyMemoryUpgradeError(
-          "Company memory database binding status is not ready (refusing pending, failed, deprovisioning, archived).",
-          "COMPANY_BINDING_MISMATCH",
-        );
-      }
-
-      // Preflight BEFORE lease work spends money:
-      // company_memory_databases embedding model/dims must satisfy isSupportedCompanyMemoryEmbedding;
-      // agree with converter (text-embedding-3-small, 1536).
-      if (
-        !isSupportedCompanyMemoryEmbedding({
-          model: memRow.embeddingModel,
-          dimensions: memRow.embeddingDimensions,
-        })
-      ) {
-        throw new CompanyMemoryUpgradeError(
-          `Company memory database embedding (${memRow.embeddingModel}, ${memRow.embeddingDimensions}) is not supported.`,
-          "EMBEDDING_FAILED",
-        );
-      }
-      if (memRow.embeddingModel !== "text-embedding-3-small" || memRow.embeddingDimensions !== 1536) {
-        throw new CompanyMemoryUpgradeError(
-          `Company memory database embedding (${memRow.embeddingModel}, ${memRow.embeddingDimensions}) does not match converter target (text-embedding-3-small, 1536).`,
-          "EMBEDDING_FAILED",
-        );
-      }
-
-      if (memRow.databaseName !== currentDatabase || memRow.databaseRole !== currentUser) {
-        throw new CompanyMemoryUpgradeError(
-          "Company memory database binding mismatch between control plane and connected tenant.",
-          "COMPANY_BINDING_MISMATCH",
-        );
-      }
-
-      const pcmemPattern = /^pcmem_[0-9a-f]{32}$/;
-      if (pcmemPattern.test(currentDatabase)) {
-        const derived = deriveCompanyMemoryDatabaseNames(companyId);
-        if (currentDatabase !== derived.databaseName || currentUser !== derived.databaseRole) {
-          throw new CompanyMemoryUpgradeError(
-            "Company memory database binding mismatch with derived credentials.",
-            "COMPANY_BINDING_MISMATCH",
-          );
-        }
-      }
-    });
-
-    // 4. Introspect live collection shape
-    const shape = await introspectCollection(tenantSql, tableName, {
-      skipVectorIdentityCheck: deps._internalSkipVectorIdentityCheck,
-    });
-
-    const stagingVectorType = deps._internalSkipVectorIdentityCheck
-      ? "text"
-      : shape.embeddingType;
-
-    // Preflight BEFORE any control-plane side effect: a staging column we cannot write to must
-    // not open or resume an upgrade row. A non-terminal upgrade row blocks company deletion in
-    // this slice (see the runbook WARNING), so failing after openUpgrade/claimUpgradeLease is
-    // strictly worse than failing here. ensureUpgradeTables re-asserts this as defence in depth.
-    assertSupportedStagingVectorType(stagingVectorType);
-
-    // 5. Pre-load company agents for routing
-    const agentRows = await cpDb
-      .select({
-        id: agents.id,
-        name: agents.name,
-        adapterType: agents.adapterType,
-        status: agents.status,
-        pausedAt: agents.pausedAt,
-      })
-      .from(agents)
-      .where(eq(agents.companyId, companyId));
-
-    const cpAgentMap = new Map<string, CpAgentRow>();
-    for (const a of agentRows) {
-      cpAgentMap.set(a.id.trim().toLowerCase(), a);
-    }
 
     // 6. Acquire upgrade record in control-plane transaction
     let upgrade = await cpDb.transaction(async (tx) => {

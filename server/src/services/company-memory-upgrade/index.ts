@@ -10,5 +10,7 @@ export * from "./clock.js";
 export * from "./active-runs.js";
 export * from "./converter-version.js";
 export * from "./source-hash.js";
+export * from "./agent-routing.js";
+export * from "./preflight.js";
 export * from "./sweep-tenant.js";
 export * from "./sweep.js";
