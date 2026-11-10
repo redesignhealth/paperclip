@@ -372,7 +372,7 @@ test("sweep orchestrator integration", async (t) => {
       status: "ready",
     });
 
-    const clock = new ManualClock(1_000_000);
+    const clock = new ManualClock(Date.now());
 
     // Seed memories
     for (let i = 0; i < 15; i++) {
@@ -497,13 +497,14 @@ test("sweep orchestrator integration", async (t) => {
       status: "running",
     }).returning();
 
-    const clock = new ManualClock(2_000_000);
+    const startMs = Date.now();
+    const clock = new ManualClock(startMs);
 
     const customSleeper = {
       async sleep(ms: number) {
         clock.advance(ms);
         // After 10s of pausing, complete the active run so sweep can resume
-        if (clock.nowMs() >= 2_010_000) {
+        if (clock.nowMs() >= startMs + 10_000) {
           await cpDb.delete(heartbeatRuns).where(eq(heartbeatRuns.id, activeRun.id));
         }
       },
@@ -535,7 +536,7 @@ test("sweep orchestrator integration", async (t) => {
   });
 
   await t.test("repeated edits count superseded transitions and reclassifications in cumulative counters while ledger is authoritative current partition", async () => {
-    const clock = new ManualClock(3_000_000);
+    const clock = new ManualClock(Date.now());
     const [compEdit] = await cpDb.insert(companies).values({ name: "Comp Edit", issuePrefix: "CE" }).returning();
     const dbNameEdit = `tenant_db_${compEdit.id.slice(0, 8)}`;
     const roleEdit = `${tenantInfo.usr}_edit`;
@@ -646,7 +647,7 @@ test("sweep orchestrator integration", async (t) => {
   });
 
   await t.test("live table with text ID column: classifies valid UUIDs and rejects non-UUID IDs upfront", async () => {
-    const clock = new ManualClock(4_000_000);
+    const clock = new ManualClock(Date.now());
     const [compText] = await cpDb.insert(companies).values({ name: "Comp Text ID", issuePrefix: "CT" }).returning();
     const dbNameText = `tenant_db_${compText.id.slice(0, 8)}`;
     const roleText = `${tenantInfo.usr}_text`;
@@ -741,5 +742,83 @@ test("sweep orchestrator integration", async (t) => {
       },
       (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "UNSUPPORTED_SOURCE_ID",
     );
+  });
+
+  await t.test("tenant fence claim failure (42501 permission denied) aborts and records tenant_fence_claim_failed in last_error (F1/F8)", async () => {
+    const [compFence] = await cpDb.insert(companies).values({ name: "Fence Claim Perm Denied Co", issuePrefix: "FCP" }).returning();
+    const dbNameFence = `tenant_db_${compFence.id.slice(0, 8)}`;
+    const roleFence = `${tenantInfo.usr}_fence`;
+    await cpDb.insert(companyMemoryDatabases).values({
+      companyId: compFence.id,
+      databaseName: dbNameFence,
+      databaseRole: roleFence,
+      host: "localhost",
+      port: 5432,
+      status: "ready",
+    });
+
+    const proxiedTenantSql = new Proxy(tenantWorkerSql, {
+      get(target, prop, receiver) {
+        if (prop === "begin") {
+          return async (cb: any) => {
+            return target.begin(async (realTx: any) => {
+              // 42501 is injected on the fence-claim upsert only. `ensureUpgradeTables` also runs
+              // through `tenantSql.begin`, so a looser match would break table initialisation instead
+              // and the test would assert the wrong failure.
+              const proxiedTx = new Proxy(realTx, {
+                apply(tTx, thisArg, argArray) {
+                  const strings = argArray[0];
+                  const queryText = Array.isArray(strings) ? strings.join(" ") : String(strings ?? "");
+                  if (/INSERT\s+INTO\s+paperclip_memory_upgrade_fence/i.test(queryText)) {
+                    throw Object.assign(
+                      new Error("permission denied for table paperclip_memory_upgrade_fence"),
+                      { code: "42501" },
+                    );
+                  }
+                  return Reflect.apply(tTx, thisArg, argArray);
+                },
+              });
+              return cb(proxiedTx);
+            });
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    await assert.rejects(
+      async () => {
+        await runSweep(
+          {
+            databaseUrl: tenantWorkerUrl.toString(),
+            controlPlaneUrl: cpWorkerUrl.toString(),
+            companyId: compFence.id,
+            pageSize: 5,
+            pauseWhenActiveRuns: 0,
+          },
+          {
+            controlPlaneDb: cpWorkerDb,
+            tenantSql: proxiedTenantSql,
+            _internalSkipVectorIdentityCheck: true,
+            _internalDatabaseIdentityOverride: { database: dbNameFence, user: roleFence },
+          },
+        );
+      },
+      (err: any) => {
+        assert.ok(err instanceof CompanyMemoryUpgradeError);
+        assert.equal(err.code, "TENANT_FENCE_CLAIM_FAILED");
+        return true;
+      },
+    );
+
+    const [upgradeRecord] = await cpDb
+      .select({
+        lastError: companyMemoryUpgrades.lastError,
+        leaseToken: companyMemoryUpgrades.leaseToken,
+      })
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.companyId, compFence.id));
+    assert.equal(upgradeRecord?.lastError, "tenant_fence_claim_failed");
+    assert.equal(upgradeRecord?.leaseToken, null);
   });
 });

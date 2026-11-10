@@ -406,10 +406,18 @@ Options:
 
 export interface RunSweepCliDependencies extends SweepDependencies {}
 
+const TENANT_FENCE_CLAIM_FAILED_MESSAGE =
+  "Upgrade fence claim failed (control-plane database unreachable or admission transaction terminated, or tenant database unreachable, refused or stalled). No memories were staged and no ledger rows were written; the tenant fence epoch may have been bumped, which is safe — the next successful claim supersedes it. Retry after checking control-plane database connectivity, tenant database connectivity, and the tenant role's privileges on paperclip_memory_upgrade_fence.";
+
+const UNSUPPORTED_VECTOR_TYPE_MESSAGE =
+  "Tenant staging column type is not supported: the upgrade requires an unqualified vector(1536) (pgvector visible in the connection's search_path) or text. A schema-qualified type such as extensions.vector(1536) means pgvector is installed outside the tenant role's search_path. No upgrade work was started. Fix the tenant role's search_path (or relocate the extension) and retry.";
+
 const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   // Census & Preflight codes
   NOT_PGVECTOR: "Target database is missing required vector extension or column is not a valid pgvector column.",
   not_pgvector: "Target database is missing required vector extension or column is not a valid pgvector column.",
+  UNSUPPORTED_VECTOR_TYPE: UNSUPPORTED_VECTOR_TYPE_MESSAGE,
+  unsupported_vector_type: UNSUPPORTED_VECTOR_TYPE_MESSAGE,
 
   SUPERUSER_REJECTED: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
   superuser_rejected: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
@@ -452,6 +460,9 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
 
   LEASE_FENCED_OUT: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
   lease_fenced_out: "Failed to acquire or maintain lease for upgrade. Another worker may hold the lease.",
+
+  TENANT_FENCE_CLAIM_FAILED: TENANT_FENCE_CLAIM_FAILED_MESSAGE,
+  tenant_fence_claim_failed: TENANT_FENCE_CLAIM_FAILED_MESSAGE,
 
   LEASE_EXPIRED: "Upgrade lease has expired.",
   lease_expired: "Upgrade lease has expired.",

@@ -58,6 +58,7 @@ import {
   updateUpgradeCounters,
 } from "./state-machine.js";
 import {
+  assertSupportedStagingVectorType,
   assertTenantRolePreflight,
   commitSourceOutcome,
   ensureUpgradeTables,
@@ -69,6 +70,7 @@ import {
   reconcileTombstones,
   type TenantSourceRow,
 } from "./sweep-tenant.js";
+import { claimTenantFenceGuarded, type TenantFence } from "./tenant-fence.js";
 import {
   type Clock,
   CompanyMemoryUpgradeError,
@@ -415,6 +417,12 @@ export async function runSweep(
       ? "text"
       : shape.embeddingType;
 
+    // Preflight BEFORE any control-plane side effect: a staging column we cannot write to must
+    // not open or resume an upgrade row. A non-terminal upgrade row blocks company deletion in
+    // this slice (see the runbook WARNING), so failing after openUpgrade/claimUpgradeLease is
+    // strictly worse than failing here. ensureUpgradeTables re-asserts this as defence in depth.
+    assertSupportedStagingVectorType(stagingVectorType);
+
     // 5. Pre-load company agents for routing
     const agentRows = await cpDb
       .select({
@@ -506,6 +514,14 @@ export async function runSweep(
     heartbeatHandle.assertActive();
     await ensureUpgradeTables(tenantSql, stagingVectorType);
 
+    heartbeatHandle.assertActive();
+    const tenantFence: TenantFence = await claimTenantFenceGuarded(cpDb, tenantSql, {
+      upgradeId,
+      cpLeaseToken: leaseToken,
+      leaseOwner,
+      now: clock.now(),
+    });
+
     // 10. Active run gate
     activeRunGate = createActiveRunGate({
       db: cpDb,
@@ -579,7 +595,7 @@ export async function runSweep(
         maxSourceId: maxPageId,
         liveSourceIds: pageSourceIds,
         assertLeaseActive: () => heartbeatHandle?.assertActive(),
-      });
+      }, tenantFence);
       pageDeltas.sourceDeletedCount += tombstoneResult.tombstonesCount;
 
       // Load existing ledger rows for live sources in this page
@@ -609,7 +625,7 @@ export async function runSweep(
 
           // Content or agent assignment changed: reconcile to superseded
           heartbeatHandle.assertActive();
-          await reconcileChangedContent(tenantSql, upgradeId, canonicalSourceId);
+          await reconcileChangedContent(tenantSql, upgradeId, canonicalSourceId, tenantFence);
           pageDeltas.supersededCount++;
           // Then source re-enters classification in this same sweep
         }
@@ -624,7 +640,7 @@ export async function runSweep(
             agentId: routing.matchedAgentId,
             outcome: "unroutable",
             reasonCode: routing.unroutableReason!,
-          });
+          }, tenantFence);
           pageDeltas.unroutableCount++;
           continue;
         }
@@ -640,7 +656,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "dropped_noise",
             reasonCode: noise.reason!,
-          });
+          }, tenantFence);
           pageDeltas.droppedNoiseCount++;
           continue;
         }
@@ -661,7 +677,7 @@ export async function runSweep(
             agentId: matchedAgentId,
             outcome: "dropped_sensitive",
             reasonCode: families,
-          });
+          }, tenantFence);
           pageDeltas.droppedSensitiveCount++;
           continue;
         }
@@ -720,7 +736,7 @@ export async function runSweep(
       liveTableName: tableName,
       isUuidId: shape.isUuidId,
       assertLeaseActive: () => heartbeatHandle?.assertActive(),
-    });
+    }, tenantFence);
     if (finalTombstones.tombstonesCount > 0) {
       heartbeatHandle.assertActive();
       counts.sourceDeletedCount += finalTombstones.tombstonesCount;

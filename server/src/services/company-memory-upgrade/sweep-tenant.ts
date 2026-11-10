@@ -17,14 +17,28 @@ import {
   type RolePrivilegeRow,
   validateAndResolveTableIdentifier,
 } from "./census.js";
-import { ensureUpgradeTables } from "./tenant-tables.js";
+import {
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
+  MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
+} from "./llm-converter.js";
+import {
+  acquireSourceAdvisoryLock,
+  type TenantFence,
+  validateTenantFence,
+} from "./tenant-fence.js";
+import {
+  assertSupportedStagingVectorType,
+  ensureUpgradeTables,
+} from "./tenant-tables.js";
+
+export type { TenantFence } from "./tenant-fence.js";
 import {
   CompanyMemoryUpgradeError,
   UPGRADE_LEDGER_OUTCOMES,
   type UpgradeLedgerOutcome,
 } from "./types.js";
 
-export { ensureUpgradeTables, UPGRADE_LEDGER_OUTCOMES };
+export { assertSupportedStagingVectorType, ensureUpgradeTables, UPGRADE_LEDGER_OUTCOMES };
 
 export interface TenantSourceRow {
   id: string;
@@ -32,6 +46,7 @@ export interface TenantSourceRow {
   userId: string | null;
   data: string | null;
   createdAt: string | null;
+  rawPayload?: Record<string, unknown> | null;
 }
 
 export interface TenantCollectionShape {
@@ -59,6 +74,10 @@ export type UnroutableReasonCode = (typeof VALID_UNROUTABLE_REASONS)[number];
 export const VALID_NOISE_REASONS = [
   "empty",
   "exact_placeholder_or_greeting",
+  // Model-decided drop_noise outcomes (no deterministic preflight match) carry this exact
+  // bounded literal, mirroring the MODEL_CLASSIFIED_SENSITIVE_REASON_CODE precedent for
+  // dropped_sensitive below (TECH-8191 Argus round 1 finding: model_classified_noise).
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
 ] as const;
 
 export type NoiseReasonCode = (typeof VALID_NOISE_REASONS)[number];
@@ -112,6 +131,15 @@ export function validateOutcomeReason(
         "INVALID_ARGUMENT",
       );
     }
+
+    // Exact bounded literal for model-classified sensitivity (no regex family matched on the
+    // model's own output text, but the model itself decided drop_sensitive). This is a single
+    // fixed value and is NEVER combined with family tokens in a CSV -- it is validated as an
+    // exact match here, separately from the sorted family CSV validation below.
+    if (reasonCode === MODEL_CLASSIFIED_SENSITIVE_REASON_CODE) {
+      return reasonCode;
+    }
+
     const tokens = reasonCode.split(",");
     for (const token of tokens) {
       if (!KNOWN_SENSITIVE_FAMILY_NAMES.includes(token as KnownSensitiveFamilyName)) {
@@ -377,6 +405,7 @@ export async function introspectCollection(
   const cleanedVectorType = options?.skipVectorIdentityCheck
     ? vectorCol.formatted_type.trim().replace(/^"|"$/g, "")
     : vectorCol.formatted_type.trim();
+  // Introspection describes schema-qualified vector types; assertSupportedStagingVectorType enforces unqualified vector(1536) / text before staging.
   const vectorMatch = cleanedVectorType.match(
     /^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?vector\((\d+)\)$/i,
   );
@@ -464,7 +493,8 @@ export async function* iterateSourcePages(
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
-          t.payload->>'created_at' AS created_at
+          t.payload->>'created_at' AS created_at,
+          t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text) COLLATE \"C\""} ASC
         LIMIT ${currentLimit};
@@ -478,7 +508,8 @@ export async function* iterateSourcePages(
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
-          t.payload->>'created_at' AS created_at
+          t.payload->>'created_at' AS created_at,
+          t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         WHERE t.id > $1::uuid
         ORDER BY t.id ASC
@@ -495,7 +526,8 @@ export async function* iterateSourcePages(
           t.payload->>'agent_id' AS agent_id,
           t.payload->>'user_id' AS user_id,
           t.payload->>'data' AS data,
-          t.payload->>'created_at' AS created_at
+          t.payload->>'created_at' AS created_at,
+          t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         WHERE lower(t.id::text) COLLATE "C" > $1::text COLLATE "C"
         ORDER BY lower(t.id::text) COLLATE "C" ASC
@@ -509,13 +541,29 @@ export async function* iterateSourcePages(
       break;
     }
 
-    const page: TenantSourceRow[] = rows.map((r) => ({
-      id: String(r.id).toLowerCase(),
-      agentId: r.agent_id ?? null,
-      userId: r.user_id ?? null,
-      data: r.data ?? null,
-      createdAt: r.created_at ?? null,
-    }));
+    const page: TenantSourceRow[] = rows.map((r) => {
+      let rawPayload: Record<string, unknown> | null = null;
+      if (r.raw_payload) {
+        if (typeof r.raw_payload === "object") {
+          rawPayload = r.raw_payload;
+        } else if (typeof r.raw_payload === "string") {
+          try {
+            // Note: postgres.js parses json/jsonb columns natively; this fallback is defensive and consumed downstream by conversion.
+            rawPayload = JSON.parse(r.raw_payload);
+          } catch {
+            rawPayload = null;
+          }
+        }
+      }
+      return {
+        id: String(r.id).toLowerCase(),
+        agentId: r.agent_id ?? null,
+        userId: r.user_id ?? null,
+        data: r.data ?? null,
+        createdAt: r.created_at ?? null,
+        rawPayload,
+      };
+    });
 
     lastId = page[page.length - 1].id;
     totalYielded += page.length;
@@ -586,7 +634,14 @@ export async function reconcileTombstones(
   sql: postgres.Sql,
   upgradeId: string,
   options: ReconcileTombstonesOptions,
+  fence: TenantFence,
 ): Promise<ReconcileTombstonesResult> {
+  if (!fence || fence.upgradeId !== upgradeId) {
+    throw new CompanyMemoryUpgradeError(
+      "reconcileTombstones requires a valid tenant fence for this upgrade.",
+      "INVALID_ARGUMENT",
+    );
+  }
   options.assertLeaseActive?.();
 
   let tombstoneIds: string[] = [];
@@ -680,6 +735,11 @@ export async function reconcileTombstones(
     const batch = tombstoneIds.slice(i, i + batchSize);
 
     await sql.begin(async (tx: any) => {
+      // Fence row SHARE lock (L2), held to commit. Tombstone batches deliberately validate
+      // the fence ONCE per batch transaction rather than taking up to `batchSize` (up to 500)
+      // individual per-source advisory locks (L1) -- see module doc in tenant-fence.ts.
+      await validateTenantFence(tx, fence);
+
       // 1. Find unpublished staging output_ids
       const stagingRows = await tx`
         SELECT output_id
@@ -711,17 +771,27 @@ export async function reconcileTombstones(
       `;
       deletedStagingCount += deletedStaging.length;
 
-      // 4. Update ledger outcome to source_deleted
+      // 4. Update ledger outcome to source_deleted, recomputing output_ids from staging
+      // AFTER the unpublished-row deletes above so the ledger never references a staging
+      // row that no longer exists. By construction, anything still staged for these
+      // sources at this point has published_at IS NOT NULL (still-live published outputs),
+      // which must be retained and kept referenced going forward.
       const updatedRows = await tx`
-        UPDATE paperclip_memory_upgrade_ledger
+        UPDATE paperclip_memory_upgrade_ledger AS l
         SET
           outcome = 'source_deleted',
           reason_code = NULL,
+          output_ids = COALESCE((
+            SELECT array_agg(s.output_id ORDER BY s.output_id)
+            FROM paperclip_memory_upgrade_staging s
+            WHERE s.upgrade_id = l.upgrade_id
+              AND s.source_id = l.source_id
+          ), '{}'),
           updated_at = now()
-        WHERE upgrade_id = ${upgradeId}::uuid
-          AND source_id = ANY(${batch}::uuid[])
-          AND outcome <> 'source_deleted'
-        RETURNING source_id;
+        WHERE l.upgrade_id = ${upgradeId}::uuid
+          AND l.source_id = ANY(${batch}::uuid[])
+          AND l.outcome <> 'source_deleted'
+        RETURNING l.source_id;
       `;
       actualTombstonesCount += updatedRows.length;
     });
@@ -744,18 +814,32 @@ export async function reconcileChangedContent(
   sql: postgres.Sql,
   upgradeId: string,
   sourceId: string,
-): Promise<{ deletedStagingCount: number; deletedDedupeCount: number }> {
+  fence: TenantFence,
+): Promise<{ deletedStagingCount: number; deletedDedupeCount: number; retainedOutputIds: string[] }> {
   if (!isValidUuid(sourceId)) {
     throw new CompanyMemoryUpgradeError(
       "sourceId must be a valid UUID string.",
       "UNSUPPORTED_SOURCE_ID",
     );
   }
+  if (!fence || fence.upgradeId !== upgradeId) {
+    throw new CompanyMemoryUpgradeError(
+      "reconcileChangedContent requires a valid tenant fence for this upgrade.",
+      "INVALID_ARGUMENT",
+    );
+  }
 
   let deletedStagingCount = 0;
   let deletedDedupeCount = 0;
+  let retainedOutputIds: string[] = [];
 
   await sql.begin(async (tx: any) => {
+    // L1: per-source advisory lock BEFORE the fence row lock, serializing two workers that
+    // might otherwise race this source's dedupe/staging/ledger bookkeeping concurrently.
+    await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
+    // L2: fence row SHARE lock, held to commit.
+    await validateTenantFence(tx, fence);
+
     // 1. Find unpublished staging output_ids
     const stagingRows = await tx`
       SELECT output_id
@@ -787,15 +871,42 @@ export async function reconcileChangedContent(
     `;
     deletedStagingCount = deletedStaging.length;
 
-    // 4. Delete stale ledger row so changed source can reclassify cleanly
-    await tx`
-      DELETE FROM paperclip_memory_upgrade_ledger
+    // 4. Recompute remaining (still-published) staging output_ids for this source, AFTER
+    // the unpublished-row deletes above.
+    const remainingRows = await tx`
+      SELECT output_id
+      FROM paperclip_memory_upgrade_staging
       WHERE upgrade_id = ${upgradeId}::uuid
-        AND source_id = ${sourceId}::uuid;
+        AND source_id = ${sourceId}::uuid
+      ORDER BY output_id ASC;
     `;
+    retainedOutputIds = remainingRows.map((r: any) => String(r.output_id));
+
+    if (retainedOutputIds.length === 0) {
+      // No published rows remain referencing this source: safe to delete the stale ledger
+      // row entirely so the changed source can reclassify cleanly from scratch.
+      await tx`
+        DELETE FROM paperclip_memory_upgrade_ledger
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND source_id = ${sourceId}::uuid;
+      `;
+    } else {
+      // Published rows remain live and must stay referenced by SOME ledger row: mark the
+      // row 'superseded' (rather than deleting it) and retain exactly the ids still staged.
+      await tx`
+        UPDATE paperclip_memory_upgrade_ledger
+        SET
+          outcome = 'superseded',
+          reason_code = NULL,
+          output_ids = ${retainedOutputIds}::uuid[],
+          updated_at = now()
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND source_id = ${sourceId}::uuid;
+      `;
+    }
   });
 
-  return { deletedStagingCount, deletedDedupeCount };
+  return { deletedStagingCount, deletedDedupeCount, retainedOutputIds };
 }
 
 /**
@@ -805,6 +916,7 @@ export async function reconcileChangedContent(
 export async function commitSourceOutcome(
   sql: postgres.Sql,
   params: CommitSourceOutcomeParams,
+  fence: TenantFence,
 ): Promise<void> {
   const {
     upgradeId,
@@ -833,10 +945,20 @@ export async function commitSourceOutcome(
       "INVALID_ARGUMENT",
     );
   }
+  if (!fence || fence.upgradeId !== upgradeId) {
+    throw new CompanyMemoryUpgradeError(
+      "commitSourceOutcome requires a valid tenant fence for this upgrade.",
+      "INVALID_ARGUMENT",
+    );
+  }
 
   const validatedReason = validateOutcomeReason(outcome, reasonCode);
 
   await sql.begin(async (tx: any) => {
+    // L1 before L2: per-source advisory lock, then fence row validation.
+    await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
+    await validateTenantFence(tx, fence);
+
     await tx`
       INSERT INTO paperclip_memory_upgrade_ledger (
         upgrade_id,
@@ -867,4 +989,304 @@ export async function commitSourceOutcome(
         updated_at = now();
     `;
   });
+}
+
+export interface StageSourceRecordItem {
+  outputId: string;
+  dataSha256: string;
+  payload: Record<string, unknown>;
+  embedding: number[];
+}
+
+export interface StageSourceRecordsParams {
+  upgradeId: string;
+  sourceId: string;
+  sourceContentSha256: string;
+  agentId: string;
+  records: StageSourceRecordItem[];
+  vectorType?: string;
+}
+
+export interface StageSourceRecordsResult {
+  outcome: "published" | "deduplicated";
+  outputIds: string[];
+  stagedCount: number;
+  deduplicatedCount: number;
+}
+
+/**
+ * Stages converted records for a single source row in one atomic tenant transaction.
+ *
+ * Operational rules:
+ * - Deletes unpublished staging rows for the source and their matching dedupe slots.
+ *   Published staging rows (published_at IS NOT NULL) are NEVER deleted.
+ * - Claims dedupe slots via INSERT ... ON CONFLICT (upgrade_id, agent_id, data_sha256) DO NOTHING.
+ * - Stages won records with published_at NULL (unambiguously not live).
+ * - Upserts ledger with outcome 'published' (if >= 1 won) or 'deduplicated' (if all duplicate).
+ *   NOTE: The ledger CHECK vocabulary has no 'staged'; published_at IS NULL is the
+ *   authoritative marker for not-live staging rows.
+ */
+export async function stageSourceRecords(
+  sql: postgres.Sql,
+  params: StageSourceRecordsParams,
+  fence: TenantFence,
+): Promise<StageSourceRecordsResult> {
+  const { upgradeId, sourceId, sourceContentSha256, agentId, records } = params;
+
+  if (!isValidUuid(sourceId)) {
+    throw new CompanyMemoryUpgradeError(
+      "sourceId must be a valid UUID string.",
+      "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(
+      "upgradeId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (!isValidUuid(agentId)) {
+    throw new CompanyMemoryUpgradeError(
+      "agentId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (!fence || fence.upgradeId !== upgradeId) {
+    throw new CompanyMemoryUpgradeError(
+      "stageSourceRecords requires a valid tenant fence for this upgrade.",
+      "INVALID_ARGUMENT",
+    );
+  }
+
+  const normalizedVectorType = params.vectorType?.trim().toLowerCase();
+  const isTextVector = normalizedVectorType === "text";
+
+  if (!isTextVector) {
+    // TECH-8191 follow-up: the staging INSERT hardcodes an unqualified ::vector(1536) cast;
+    // schema-qualified or non-1536 pgvector is unsupported until the cast is parameterised.
+    assertSupportedStagingVectorType(params.vectorType ?? "vector(1536)");
+    for (const record of records) {
+      if (!Array.isArray(record.embedding) || record.embedding.length !== 1536) {
+        throw new CompanyMemoryUpgradeError(
+          "Embedding dimensions mismatch: records must contain exactly 1536 dimensions",
+          "INVALID_ARGUMENT",
+        );
+      }
+    }
+  }
+
+  let resultOutcome: "published" | "deduplicated" = "published";
+  const wonOutputIds: string[] = [];
+
+  await sql.begin(async (tx: any) => {
+    // L1 before L2: per-source advisory lock, then fence row validation. Serializes two
+    // workers racing this source's dedupe slots and ledger bookkeeping.
+    await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
+    await validateTenantFence(tx, fence);
+
+    // 1. Find unpublished staging output_ids for this source
+    const existingStaging = await tx`
+      SELECT output_id
+      FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgradeId}::uuid
+        AND source_id = ${sourceId}::uuid
+        AND published_at IS NULL;
+    `;
+    const oldOutputIds = existingStaging.map((r: any) => r.output_id);
+
+    // 2. Delete matching dedupe rows and unpublished staging rows
+    if (oldOutputIds.length > 0) {
+      await tx`
+        DELETE FROM paperclip_memory_upgrade_dedupe
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND output_id = ANY(${oldOutputIds}::uuid[]);
+      `;
+      await tx`
+        DELETE FROM paperclip_memory_upgrade_staging
+        WHERE upgrade_id = ${upgradeId}::uuid
+          AND source_id = ${sourceId}::uuid
+          AND published_at IS NULL;
+      `;
+    }
+
+    // 3. Claim dedupe slots for each record
+    const wonRecords: StageSourceRecordItem[] = [];
+    for (const rec of records) {
+      if (!isValidUuid(rec.outputId)) {
+        throw new CompanyMemoryUpgradeError(
+          "outputId must be a valid UUID string.",
+          "INVALID_ARGUMENT",
+        );
+      }
+
+      const claimRows = await tx`
+        INSERT INTO paperclip_memory_upgrade_dedupe (
+          upgrade_id,
+          agent_id,
+          data_sha256,
+          output_id,
+          created_at
+        ) VALUES (
+          ${upgradeId}::uuid,
+          ${agentId}::uuid,
+          ${rec.dataSha256},
+          ${rec.outputId}::uuid,
+          now()
+        )
+        ON CONFLICT (upgrade_id, agent_id, data_sha256) DO NOTHING
+        RETURNING output_id;
+      `;
+
+      if (claimRows.length > 0) {
+        wonRecords.push(rec);
+        wonOutputIds.push(rec.outputId);
+      }
+    }
+
+    // 4. Stage won records (published_at IS NULL)
+    for (const won of wonRecords) {
+      const vectorLiteral = JSON.stringify(won.embedding);
+      if (isTextVector) {
+        await tx`
+          INSERT INTO paperclip_memory_upgrade_staging (
+            upgrade_id,
+            source_id,
+            output_id,
+            agent_id,
+            payload,
+            embedding,
+            content_sha256,
+            published_at,
+            created_at
+          ) VALUES (
+            ${upgradeId}::uuid,
+            ${sourceId}::uuid,
+            ${won.outputId}::uuid,
+            ${agentId}::uuid,
+            ${JSON.stringify(won.payload)}::jsonb,
+            ${vectorLiteral}::text,
+            ${won.dataSha256},
+            NULL,
+            now()
+          );
+        `;
+      } else {
+        await tx`
+          INSERT INTO paperclip_memory_upgrade_staging (
+            upgrade_id,
+            source_id,
+            output_id,
+            agent_id,
+            payload,
+            embedding,
+            content_sha256,
+            published_at,
+            created_at
+          ) VALUES (
+            ${upgradeId}::uuid,
+            ${sourceId}::uuid,
+            ${won.outputId}::uuid,
+            ${agentId}::uuid,
+            ${JSON.stringify(won.payload)}::jsonb,
+            ${vectorLiteral}::vector(1536),
+            ${won.dataSha256},
+            NULL,
+            now()
+          );
+        `;
+      }
+    }
+
+    // 5. Recompute the FULL set of output_ids referenced by this source's ledger row from
+    // staging, AFTER all staging mutations above. This must include not just the records
+    // just won in step 4, but also any PRE-EXISTING published rows for this source that
+    // were untouched by this call (the delete in step 2 only ever removes unpublished
+    // rows) -- otherwise a still-live published row would silently become unreferenced by
+    // any ledger row, violating the "every staging output is referenced in the source
+    // ledger" invariant.
+    const allStagingRows = await tx`
+      SELECT output_id
+      FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgradeId}::uuid
+        AND source_id = ${sourceId}::uuid
+      ORDER BY output_id ASC;
+    `;
+    const recomputedOutputIds = allStagingRows.map((r: any) => String(r.output_id));
+
+    // 6. Upsert ledger outcome
+    // NOTE: The CHECK vocabulary has no 'staged'; published_at IS NULL in staging
+    // is the authoritative not-live marker.
+    if (wonRecords.length > 0) {
+      resultOutcome = "published";
+      await tx`
+        INSERT INTO paperclip_memory_upgrade_ledger (
+          upgrade_id,
+          source_id,
+          source_content_sha256,
+          agent_id,
+          outcome,
+          reason_code,
+          output_ids,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${upgradeId}::uuid,
+          ${sourceId}::uuid,
+          ${sourceContentSha256},
+          ${agentId}::uuid,
+          'published',
+          NULL,
+          ${recomputedOutputIds}::uuid[],
+          now(),
+          now()
+        )
+        ON CONFLICT (upgrade_id, source_id) DO UPDATE SET
+          source_content_sha256 = EXCLUDED.source_content_sha256,
+          agent_id = EXCLUDED.agent_id,
+          outcome = EXCLUDED.outcome,
+          reason_code = EXCLUDED.reason_code,
+          output_ids = EXCLUDED.output_ids,
+          updated_at = now();
+      `;
+    } else {
+      resultOutcome = "deduplicated";
+      await tx`
+        INSERT INTO paperclip_memory_upgrade_ledger (
+          upgrade_id,
+          source_id,
+          source_content_sha256,
+          agent_id,
+          outcome,
+          reason_code,
+          output_ids,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${upgradeId}::uuid,
+          ${sourceId}::uuid,
+          ${sourceContentSha256},
+          ${agentId}::uuid,
+          'deduplicated',
+          NULL,
+          ${recomputedOutputIds}::uuid[],
+          now(),
+          now()
+        )
+        ON CONFLICT (upgrade_id, source_id) DO UPDATE SET
+          source_content_sha256 = EXCLUDED.source_content_sha256,
+          agent_id = EXCLUDED.agent_id,
+          outcome = EXCLUDED.outcome,
+          reason_code = EXCLUDED.reason_code,
+          output_ids = EXCLUDED.output_ids,
+          updated_at = now();
+      `;
+    }
+  });
+
+  return {
+    outcome: resultOutcome,
+    outputIds: wonOutputIds,
+    stagedCount: wonOutputIds.length,
+    deduplicatedCount: records.length - wonOutputIds.length,
+  };
 }

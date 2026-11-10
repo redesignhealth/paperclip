@@ -6,6 +6,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
 import {
+  assertSupportedStagingVectorType,
   ensureUpgradeTables,
   isValidVectorType,
   UPGRADE_LEDGER_OUTCOMES,
@@ -28,6 +29,7 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_staging CASCADE`;
     await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_ledger CASCADE`;
     await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_dedupe CASCADE`;
+    await sql`DROP TABLE IF EXISTS paperclip_memory_upgrade_fence CASCADE`;
   });
 
   afterAll(async () => {
@@ -87,6 +89,37 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     );
   });
 
+  it("assertSupportedStagingVectorType and ensureUpgradeTables enforce unqualified vector(1536) or text (R2-F7)", async () => {
+    expect(() => assertSupportedStagingVectorType("text")).not.toThrow();
+    expect(() => assertSupportedStagingVectorType("TEXT")).not.toThrow();
+    expect(() => assertSupportedStagingVectorType("vector(1536)")).not.toThrow();
+
+    expect(() => assertSupportedStagingVectorType("public.vector(1536)")).toThrowError(
+      expect.objectContaining({
+        code: "UNSUPPORTED_VECTOR_TYPE",
+      }),
+    );
+    expect(() => assertSupportedStagingVectorType("vector(512)")).toThrowError(
+      expect.objectContaining({
+        code: "UNSUPPORTED_VECTOR_TYPE",
+      }),
+    );
+
+    // ensureUpgradeTables preflights at startup before any conversion
+    await expect(ensureUpgradeTables(sql, "public.vector(1536)")).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "UNSUPPORTED_VECTOR_TYPE",
+      }),
+    );
+    await expect(ensureUpgradeTables(sql, "vector(512)")).rejects.toThrowError(
+      expect.objectContaining({
+        name: "CompanyMemoryUpgradeError",
+        code: "UNSUPPORTED_VECTOR_TYPE",
+      }),
+    );
+  });
+
   it("idempotently creates staging, ledger, and dedupe tables with expected columns and indexes", async () => {
     // First run creates tables
     await ensureUpgradeTables(sql, "text");
@@ -128,6 +161,50 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     expect(indexNames).toContain("pmu_staging_src_idx");
     expect(indexNames).toContain("pmu_ledger_outcome_idx");
     expect(indexNames).toContain("pmu_dedupe_uq");
+  });
+
+  it("idempotently creates paperclip_memory_upgrade_fence with expected columns, PK, and defaults", async () => {
+    await ensureUpgradeTables(sql, "text");
+    await expect(ensureUpgradeTables(sql, "text")).resolves.toBeUndefined();
+
+    const columns = await sql`
+      SELECT column_name, data_type, is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'paperclip_memory_upgrade_fence'
+      ORDER BY ordinal_position;
+    `;
+    const colNames = columns.map((c) => c.column_name);
+    expect(colNames).toEqual(["upgrade_id", "fence_epoch", "lease_token", "lease_owner", "claimed_at"]);
+
+    const pkRows = await sql`
+      SELECT a.attname
+      FROM pg_index i
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+      WHERE i.indrelid = 'paperclip_memory_upgrade_fence'::regclass AND i.indisprimary;
+    `;
+    expect(pkRows.map((r) => r.attname)).toEqual(["upgrade_id"]);
+
+    // Claim-like upsert: unconditional increment on conflict
+    const upgradeId = randomUUID();
+    await sql`
+      INSERT INTO paperclip_memory_upgrade_fence (upgrade_id, fence_epoch, lease_token, lease_owner)
+      VALUES (${upgradeId}::uuid, 1, 'token-a', 'owner-a')
+    `;
+    const [row1] = await sql`SELECT fence_epoch::text AS fence_epoch FROM paperclip_memory_upgrade_fence WHERE upgrade_id = ${upgradeId}::uuid`;
+    expect(row1.fence_epoch).toBe("1");
+
+    await sql`
+      INSERT INTO paperclip_memory_upgrade_fence (upgrade_id, fence_epoch, lease_token, lease_owner)
+      VALUES (${upgradeId}::uuid, 1, 'token-b', 'owner-b')
+      ON CONFLICT (upgrade_id) DO UPDATE SET
+        fence_epoch = paperclip_memory_upgrade_fence.fence_epoch + 1,
+        lease_token = EXCLUDED.lease_token,
+        lease_owner = EXCLUDED.lease_owner,
+        claimed_at = now()
+    `;
+    const [row2] = await sql`SELECT fence_epoch::text AS fence_epoch, lease_token FROM paperclip_memory_upgrade_fence WHERE upgrade_id = ${upgradeId}::uuid`;
+    expect(row2.fence_epoch).toBe("2");
+    expect(row2.lease_token).toBe("token-b");
   });
 
   it("enforces unique constraint on (upgrade_id, agent_id, data_sha256) in paperclip_memory_upgrade_dedupe", async () => {
@@ -333,5 +410,30 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
         )
       `,
     ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("pre-provisioned tables + DML-only non-owner role: ensureUpgradeTables fails 42501 before any fence claim (R3-F4)", async () => {
+    await ensureUpgradeTables(sql, "text"); // owner (superuser) provisions
+
+    await sql.unsafe(`CREATE ROLE pmu_dml_only WITH LOGIN PASSWORD 'pass123' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;`);
+    await sql.unsafe(`GRANT USAGE ON SCHEMA public TO pmu_dml_only;`); // USAGE only, no CREATE
+    await sql.unsafe(`GRANT SELECT, INSERT, UPDATE ON paperclip_memory_upgrade_fence TO pmu_dml_only;`);
+    await sql.unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON paperclip_memory_upgrade_ledger, paperclip_memory_upgrade_staging, paperclip_memory_upgrade_dedupe TO pmu_dml_only;`);
+
+    const url = new URL(tempDb!.connectionString);
+    url.username = "pmu_dml_only";
+    url.password = "pass123";
+    const dmlSql = postgres(url.toString(), { max: 1, onnotice: () => {} });
+    try {
+      // (a) the DML the runbook promises is sufficient really does work
+      await dmlSql`INSERT INTO paperclip_memory_upgrade_fence (upgrade_id, fence_epoch, lease_token, lease_owner)
+                   VALUES (${randomUUID()}::uuid, 1, 'tok', 'owner')`;
+      // (b) but ensureUpgradeTables still issues DDL and is refused
+      await expect(ensureUpgradeTables(dmlSql, "text")).rejects.toMatchObject({ code: "42501" });
+    } finally {
+      await dmlSql.end();
+      await sql.unsafe(`DROP OWNED BY pmu_dml_only;`); // drops the grants
+      await sql.unsafe(`DROP ROLE IF EXISTS pmu_dml_only;`);
+    }
   });
 });
