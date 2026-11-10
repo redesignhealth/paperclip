@@ -132,7 +132,7 @@ export const SLACK_TOOLS = [
     "users.list",
     ["users:read"],
     "read",
-    "Find people in this workspace by name or email fragment (every word must match, for example \"patrick mc\"). Returns every match with its Slack user ID; guests and bots are flagged. If more than one person matches, ask which one is meant instead of choosing. Use the returned ID with slack_open_dm.",
+    "Find people in this workspace by name or email fragment (every word must match, for example \"patrick mc\"). Returns every match with its Slack user ID; guests and bots are flagged and cannot be DMed. Email search works only when the Slack app can see emails. If more than one person matches, ask which one is meant instead of choosing. Use the returned ID with slack_open_dm.",
     {
       query: z.string().trim().min(2).max(100),
       limit: z.number().int().min(1).max(25).optional(),

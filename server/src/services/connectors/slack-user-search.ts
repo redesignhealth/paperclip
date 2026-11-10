@@ -8,14 +8,14 @@ export const SLACK_USER_SEARCH_CACHE_MS = 5 * 60_000;
 const MAX_PAGES = 25;
 const PAGE_SIZE = 200;
 const cache = new Map<string, { at: number; members: SlackObject[] }>();
+const inflight = new Map<string, Promise<SlackObject[]>>();
 
 export function clearSlackUserSearchCache() {
   cache.clear();
+  inflight.clear();
 }
 
-async function members(api: Api, cacheKey: string, now: number): Promise<SlackObject[]> {
-  const cached = cache.get(cacheKey);
-  if (cached && now - cached.at < SLACK_USER_SEARCH_CACHE_MS) return cached.members;
+async function walkMembers(api: Api, cacheKey: string, now: number): Promise<SlackObject[]> {
   const all: SlackObject[] = [];
   const seen = new Set<string>();
   let cursor = "";
@@ -35,6 +35,31 @@ async function members(api: Api, cacheKey: string, now: number): Promise<SlackOb
   throw unprocessable("This Slack workspace is too large to search by name. Ask for the person's Slack user ID instead.");
 }
 
+async function members(api: Api, cacheKey: string, now: number): Promise<SlackObject[]> {
+  // Drop expired lists so connections that are never searched again do not stay in memory.
+  for (const [key, entry] of cache) if (now - entry.at >= SLACK_USER_SEARCH_CACHE_MS) cache.delete(key);
+  const cached = cache.get(cacheKey);
+  if (cached) return cached.members;
+  // Concurrent searches on one connection share a single walk of users.list.
+  const running = inflight.get(cacheKey);
+  if (running) return running;
+  const walk = walkMembers(api, cacheKey, now).finally(() => inflight.delete(cacheKey));
+  inflight.set(cacheKey, walk);
+  return walk;
+}
+
+export type SlackUserMatch = {
+  id: string;
+  name: unknown;
+  displayName: string | undefined;
+  realName: string | undefined;
+  email: string | undefined;
+  guest: boolean;
+  bot: boolean;
+};
+
+const text = (value: unknown) => (typeof value === "string" && value !== "" ? value : undefined);
+
 /**
  * Find people in the bot's workspace by a name or email fragment. Every word of the query must appear in the
  * person's name, display name or email (case-insensitive), so "patrick mc" finds "Patrick McDonagh". All matches are
@@ -48,7 +73,7 @@ export async function findSlackUsers(
   now = Date.now(),
 ) {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const matches: Array<Record<string, unknown>> = [];
+  const matches: SlackUserMatch[] = [];
   let total = 0;
   for (const member of await members(api, cacheKey, now)) {
     if (member.deleted === true || typeof member.id !== "string") continue;
@@ -63,11 +88,11 @@ export async function findSlackUsers(
     matches.push({
       id: member.id,
       name: member.name,
-      displayName: profile.display_name || undefined,
-      realName: member.real_name,
-      email: profile.email,
+      displayName: text(profile.display_name),
+      realName: text(member.real_name) ?? text(profile.real_name),
+      email: text(profile.email),
       guest: member.is_restricted === true || member.is_ultra_restricted === true,
-      bot: member.is_bot === true,
+      bot: member.is_bot === true || member.id === "USLACKBOT",
     });
   }
   return { matches, total, truncated: total > matches.length };

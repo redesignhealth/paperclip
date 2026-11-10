@@ -82,6 +82,35 @@ describe("slack_find_user", () => {
     expect(api).toHaveBeenCalledTimes(3);
   });
 
+  it("falls back to the profile name for realName and treats Slackbot as a bot", async () => {
+    const api = apiWith([[
+      member("U7", { name: "kim", real_name: "", profile: { real_name: "Kim Park" } }),
+      member("USLACKBOT", { name: "slackbot", real_name: "Slackbot" }),
+    ]]);
+    const kim = (await findSlackUsers(api, "e1", "kim park")).matches[0]!;
+    expect(kim.realName).toBe("Kim Park");
+    expect((await findSlackUsers(api, "e1", "slackbot")).matches[0]).toMatchObject({ bot: true });
+  });
+
+  it("shares one walk of users.list between concurrent searches", async () => {
+    const api = apiWith([people]);
+    await Promise.all([findSlackUsers(api, "e1", "sam"), findSlackUsers(api, "e1", "pat")]);
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops expired lists and refuses a workspace larger than the page ceiling", async () => {
+    const api = apiWith([people]);
+    await findSlackUsers(api, "old", "sam", 10, 0);
+    await findSlackUsers(api, "other", "sam", 10, SLACK_USER_SEARCH_CACHE_MS + 1);
+    await findSlackUsers(api, "old", "sam", 10, SLACK_USER_SEARCH_CACHE_MS + 2);
+    expect(api).toHaveBeenCalledTimes(3);
+    const endless = vi.fn(async (_m: string, args?: Record<string, unknown>) => ({
+      members: [],
+      response_metadata: { next_cursor: `c${Number(String(args?.cursor ?? "c0").slice(1)) + 1}` },
+    }));
+    await expect(findSlackUsers(endless, "big", "sam")).rejects.toThrow("too large");
+  });
+
   it("is a read tool that takes a short query, an optional limit, and nothing else", () => {
     const tool = SLACK_TOOLS.find((entry) => entry.name === "slack_find_user")!;
     expect(tool.risk).toBe("read");
