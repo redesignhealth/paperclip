@@ -7,6 +7,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../environment-runtime.js";
 import { environmentService } from "../environments.js";
 import { createHeartbeatRecovery, type HeartbeatRecoveryDependencies } from "./recovery.js";
+import { heartbeatService } from "../heartbeat.js";
+import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import type { HotRestartIntent } from "../hot-restart.js";
 import type { NativeRestartRecoveryClaim, NativeRestartRecoveryDisposition } from "../native-runtime/index.js";
 import { NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE } from "../native-runtime/native-runner-ownership.js";
@@ -655,5 +657,20 @@ describePostgres("heartbeat recovery module ownership", () => {
     settle();
     await Promise.all([...deps.activeRunExecutionPromises]);
     await vi.waitFor(() => expect(deps.activeRunExecutionPromises.size).toBe(0));
+  });
+
+  it("forwards pluginWorkerManager from heartbeat service options into restart recovery", async () => {
+    const pluginWorkerManager = {
+      call: vi.fn(),
+      getWorker: vi.fn(),
+    } as unknown as PluginWorkerManager;
+    const heartbeat = heartbeatService(db, { pluginWorkerManager });
+    native.finalizations.mockClear();
+    await heartbeat.recoverNativeRunsAfterRestart();
+    expect(native.finalizations).toHaveBeenCalledWith(
+      db,
+      undefined,
+      expect.objectContaining({ pluginWorkerManager }),
+    );
   });
 });
