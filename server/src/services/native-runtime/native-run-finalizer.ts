@@ -601,6 +601,9 @@ export async function recordNativeFinalizationFailure(input: {
     message,
     nextAction:
       input.failureScope === "workspace"
+        && (message === "native_plugin_workspace_branch_mismatch" || message === "native_plugin_workspace_owner_mismatch")
+        ? "Repair the plugin workspace branch or owner, then resume finalization without another provider turn."
+        : input.failureScope === "workspace"
         ? input.permanent
           ? "Restore the exact sandbox containing the unexported workspace changes, or resolve the task manually from durable evidence."
           : "Retry workspace export and merge from the retained sandbox; do not submit another provider turn."
