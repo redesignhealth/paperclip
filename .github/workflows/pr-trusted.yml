@@ -445,10 +445,15 @@ jobs:
       - name: Verify Mem0 memory content sampler test coverage
         run: pnpm run test:sample-mem0-memory-content
 
+      # The trusted workflow also tests older hotfix releases. Those releases
+      # do not contain the memory-upgrade CLI or its test scripts. If the CLI
+      # exists, missing/broken test scripts still fail normally.
       - name: Verify Mem0 memory upgrade census test coverage
+        if: hashFiles('scripts/memory-upgrade.ts') != ''
         run: pnpm run test:memory-upgrade-census
 
       - name: Verify Mem0 memory upgrade sweep test coverage
+        if: hashFiles('scripts/memory-upgrade.ts') != ''
         run: pnpm run test:memory-upgrade-sweep
 
       - name: Upload CI profile timings
