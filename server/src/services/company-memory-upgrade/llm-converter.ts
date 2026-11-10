@@ -22,6 +22,7 @@
 import {
   CANONICAL_CONVERSION_PARAMS,
   CONVERSION_JSON_SCHEMA,
+  CONVERSION_REJECT_CODES,
   CONVERSION_SYSTEM_PROMPT,
   type ConversionRecord,
   SUPPORTED_CONVERTER_MODELS,
@@ -141,6 +142,37 @@ export function buildConversionRequestBody(
   });
 }
 
+const LONGEST_REJECT_CODE = CONVERSION_REJECT_CODES.reduce(
+  (longest, code) => (code.length > longest.length ? code : longest),
+  "",
+);
+
+/**
+ * Worst-case assumed bytes-per-output-token when projecting the size of the model's own
+ * prior (rejected) response as it gets echoed back into the repair-retry request.
+ */
+export const PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN = 4;
+
+/**
+ * Projects the worst-case serialized repair request body byte length for a given source
+ * text and model. Uses the canonical placeholder prior response ("x".repeat(600 * 4)) and
+ * the longest possible conversion reject code.
+ *
+ * This is the single source of truth for both preflight cost estimation (cost.ts) and
+ * the runtime guard before issuing a repair call (llm-converter.ts).
+ */
+export function projectWorstCaseRepairRequestBodyBytes(
+  sourceText: string | null | undefined,
+  model: string,
+): number {
+  const initialMessages = buildInitialConversionMessages(sourceText ?? "");
+  const worstCaseEchoBytes = PREFLIGHT_MAX_COMPLETION_TOKENS * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
+  const placeholderPriorResponse = "x".repeat(worstCaseEchoBytes);
+  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, LONGEST_REJECT_CODE);
+  const repairBody = buildConversionRequestBody(model, repairMessages);
+  return Buffer.byteLength(repairBody, "utf8");
+}
+
 export interface CreateOpenAiConversionClientOptions {
   apiKey: string;
   model?: SupportedConverterModel | string;
@@ -194,6 +226,7 @@ export function createOpenAiConversionClient(
     messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
     estimatedTokens: number,
     signal?: AbortSignal,
+    prebuiltBody?: string,
   ): Promise<ExecuteChatResponse> {
     let attempt = 0;
     let baseDelayMs = 500;
@@ -204,7 +237,7 @@ export function createOpenAiConversionClient(
     ): Promise<AttemptResult> {
       const lease = await limiter.acquire(estimatedTokens);
       try {
-        const body = buildConversionRequestBody(model, messages);
+        const body = prebuiltBody ?? buildConversionRequestBody(model, messages);
         let res: Response;
         try {
           res = await fetchImpl(endpoint, {
@@ -473,9 +506,24 @@ export function createOpenAiConversionClient(
       // 3. Schema or rule violation -> Exactly ONE repair retry naming the violated rule class
       const repairRuleClass = validation.rejectCode;
       const repairMessages = buildRepairConversionMessages(messages, responseContent, repairRuleClass);
+      const repairBody = buildConversionRequestBody(model, repairMessages);
+      const repairRequestBodyBytes = Buffer.byteLength(repairBody, "utf8");
+      const maxRepairRequestBodyBytes = projectWorstCaseRepairRequestBodyBytes(text, model);
+
+      // Fail-closed bound: if the actual serialized repair request exceeds the preflight
+      // byte projection used by cost estimation (e.g. quote-heavy/control/multibyte echo),
+      // quarantine immediately with first-call usage and do not issue a paid repair call.
+      if (repairRequestBodyBytes > maxRepairRequestBodyBytes) {
+        return {
+          status: "quarantined",
+          rejectCode: validation.rejectCode,
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+        };
+      }
 
       try {
-        const repairResp = await executeChatRequest(repairMessages, estimatedTokens + 100, options?.signal);
+        const repairResp = await executeChatRequest(repairMessages, estimatedTokens + 100, options?.signal, repairBody);
         totalInputTokens += repairResp.inputTokens;
         totalOutputTokens += repairResp.outputTokens;
         if (repairResp.kind === "unusable") {

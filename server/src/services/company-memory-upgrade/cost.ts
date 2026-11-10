@@ -17,13 +17,11 @@
  */
 
 import {
-  CONVERSION_REJECT_CODES,
-} from "./converter-contract.js";
-import {
   buildConversionRequestBody,
   buildInitialConversionMessages,
-  buildRepairConversionMessages,
   PREFLIGHT_MAX_COMPLETION_TOKENS,
+  PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN,
+  projectWorstCaseRepairRequestBodyBytes,
 } from "./llm-converter.js";
 import { CompanyMemoryUpgradeError } from "./types.js";
 
@@ -41,11 +39,6 @@ export const MAX_USD_CAP = 1_000_000;
 
 /** Max 32-bit-safe-ish cap for raw token counts supplied to cost functions. */
 const MAX_TOKEN_COUNT = 1_000_000_000_000; // 1e12 tokens; generous, prevents overflow abuse
-
-const LONGEST_REJECT_CODE = CONVERSION_REJECT_CODES.reduce(
-  (longest, code) => (code.length > longest.length ? code : longest),
-  "",
-);
 
 function assertFiniteNumber(value: unknown, fieldName: string): asserts value is number {
   if (typeof value !== "number" || !Number.isFinite(value) || Number.isNaN(value)) {
@@ -250,11 +243,9 @@ export function estimateWorstCaseSourceCostNanodollars(input: PreflightCostInput
 
 /**
  * Worst-case assumed bytes-per-output-token when projecting the size of the model's own
- * prior (rejected) response as it gets echoed back into the repair-retry request. There is
- * no way to know the real byte size before the call happens; UTF8_MAX_BYTES_PER_CHAR (4) is
- * used as a deliberately generous ceiling, consistent with the embedding projection above.
+ * prior (rejected) response as it gets echoed back into the repair-retry request.
  */
-export const PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN = UTF8_MAX_BYTES_PER_CHAR;
+export { PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN };
 
 /**
  * Builds the ACTUAL serialized initial request body, and a worst-case serialized repair
@@ -270,11 +261,7 @@ export function projectWorstCaseConversionRequestBytes(
   const initialBody = buildConversionRequestBody(model, initialMessages);
   const initialRequestBodyBytes = utf8ByteLength(initialBody);
 
-  const worstCaseEchoBytes = PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL * PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN;
-  const placeholderPriorResponse = "x".repeat(worstCaseEchoBytes);
-  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, LONGEST_REJECT_CODE);
-  const repairBody = buildConversionRequestBody(model, repairMessages);
-  const repairRequestBodyBytes = utf8ByteLength(repairBody);
+  const repairRequestBodyBytes = projectWorstCaseRepairRequestBodyBytes(sourceText, model);
 
   return { initialRequestBodyBytes, repairRequestBodyBytes };
 }

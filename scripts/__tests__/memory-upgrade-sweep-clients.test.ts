@@ -817,6 +817,47 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(res.outputTokens, 40 + 600);
   });
 
+  await t.test("quote-heavy/control/multibyte schema-invalid call 1: oversize repair request is intercepted and never sent; first-call usage counted", async () => {
+    let callCount = 0;
+    const requests: Array<{ url: string; init?: RequestInit; body: string }> = [];
+
+    // Call 1 returns schema-invalid JSON packed with quotes, control chars, and multibyte chars
+    // that would exceed the preflight projected repair body size if echoed back into repair messages.
+    const oversizeSchemaInvalidContent = JSON.stringify({
+      invalid: "\"".repeat(1500) + "\n\t".repeat(500) + "日本語漢字🎉".repeat(300),
+    });
+
+    const customFetch: typeof fetch = async (url, init) => {
+      callCount++;
+      requests.push({ url: String(url), init, body: String(init?.body ?? "") });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [{ message: { content: oversizeSchemaInvalidContent } }],
+          usage: { prompt_tokens: 125, completion_tokens: 600 },
+        }),
+      } as any;
+    };
+
+    const client = createOpenAiConversionClient({
+      apiKey: "sk-mock-key-12345678901234567890",
+      fetchImpl: customFetch,
+      limiter,
+      sleeper: clock,
+      clock,
+      maxAttempts: 3,
+    });
+
+    const res = await client.convert("Input text with oversize repair echo potential");
+    assert.equal(res.status, "quarantined");
+    assert.equal(res.rejectCode, "decision_invalid");
+    assert.equal(callCount, 1, "Must NEVER issue call 2 (oversize repair request intercepted before fetch)");
+    assert.equal(res.inputTokens, 125, "Reports ONLY first-call input tokens");
+    assert.equal(res.outputTokens, 600, "Reports ONLY first-call output tokens");
+  });
+
   await t.test("abort-during-body-read rejects ABORTED_BY_OPERATOR not quarantine", async () => {
     const controller = new AbortController();
     const abortingFetch: typeof fetch = async () => {

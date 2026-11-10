@@ -14,7 +14,10 @@ import {
   buildConversionRequestBody,
   buildInitialConversionMessages,
   buildRepairConversionMessages,
+  createOpenAiConversionClient,
 } from "../../server/src/services/company-memory-upgrade/llm-converter.js";
+import { createRateLimiter } from "../../server/src/services/company-memory-upgrade/rate-limiter.js";
+import { ManualClock } from "./memory-upgrade-sweep-helpers.js";
 import {
   buildCostRatesNanodollars,
   ceilTokenCostNanodollars,
@@ -298,7 +301,7 @@ test("createCostTracker: addActualCostNanodollars and assertBudgetAllows reject 
   );
 });
 
-test("regression guard: worst-path conversion (call 1 schema invalid + call 2 billed unusable fallback) satisfies preflight token bounds", () => {
+test("regression guard: quote-heavy/control/multibyte schema-invalid call 1 ensures oversize repair is never sent and first usage counted within preflight projection", async () => {
   const model = "gpt-5.4-mini";
   const sourceText = "A complex user instruction containing multiple facts that require conversion.";
   const { initialRequestBodyBytes, repairRequestBodyBytes } = projectWorstCaseConversionRequestBytes(
@@ -307,29 +310,133 @@ test("regression guard: worst-path conversion (call 1 schema invalid + call 2 bi
   );
   const worstCaseInputCap = initialRequestBodyBytes + repairRequestBodyBytes;
 
-  // Initial attempt: call 1 input tokens are bounded by serialized initial body bytes
-  const initialMessages = buildInitialConversionMessages(sourceText);
-  const initialBody = buildConversionRequestBody(model, initialMessages);
-  const call1InputTokens = Buffer.byteLength(initialBody, "utf8");
-  const call1OutputTokens = 600;
+  const clock = new ManualClock();
+  const limiter = createRateLimiter({
+    rpm: 10_000,
+    tpm: 1_000_000,
+    concurrency: 2,
+    clock,
+    sleeper: clock,
+  });
 
-  // Repair attempt: repair messages built with prior response echo and reject code
-  const placeholderPriorResponse = "x".repeat(600 * 4);
-  const longestRejectCode = CONVERSION_REJECT_CODES.reduce((a, b) => (a.length >= b.length ? a : b));
-  const repairMessages = buildRepairConversionMessages(initialMessages, placeholderPriorResponse, longestRejectCode);
-  const repairBody = buildConversionRequestBody(model, repairMessages);
-  const call2InputTokens = Buffer.byteLength(repairBody, "utf8");
-  const call2OutputTokens = 600;
+  let callCount = 0;
+  const oversizeSchemaInvalidContent = JSON.stringify({
+    invalid: "\"".repeat(1500) + "\n\t".repeat(500) + "日本語漢字🎉".repeat(300),
+  });
 
-  const totalInputTokens = call1InputTokens + call2InputTokens;
-  const totalOutputTokens = call1OutputTokens + call2OutputTokens;
+  const customFetch: typeof fetch = async () => {
+    callCount++;
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        choices: [{ message: { content: oversizeSchemaInvalidContent } }],
+        usage: { prompt_tokens: 140, completion_tokens: 600 },
+      }),
+    } as any;
+  };
 
+  const client = createOpenAiConversionClient({
+    apiKey: "sk-test-key-cost-unit-guard",
+    model,
+    fetchImpl: customFetch,
+    limiter,
+    sleeper: clock,
+    clock,
+  });
+
+  const res = await client.convert(sourceText);
+
+  assert.equal(callCount, 1, "Oversize repair request must never be sent");
+  assert.equal(res.status, "quarantined");
+  assert.equal(res.rejectCode, "decision_invalid");
+  assert.equal(res.inputTokens, 140, "Only first-call input tokens counted");
+  assert.equal(res.outputTokens, 600, "Only first-call output tokens counted");
   assert.ok(
-    totalInputTokens <= worstCaseInputCap,
-    `totalInputTokens (${totalInputTokens}) must not exceed preflight projection (${worstCaseInputCap})`,
+    res.inputTokens <= worstCaseInputCap,
+    `reported inputTokens (${res.inputTokens}) must not exceed preflight projection (${worstCaseInputCap})`,
   );
   assert.ok(
-    totalOutputTokens <= 1200,
-    `totalOutputTokens (${totalOutputTokens}) must not exceed 2 * 600 = 1200`,
+    res.outputTokens <= 1200,
+    `reported outputTokens (${res.outputTokens}) must not exceed 2 * 600 = 1200`,
+  );
+});
+
+test("regression guard: actual within-bound repair with unreadable call 2 reports both calls within preflight projection", async () => {
+  const model = "gpt-5.4-mini";
+  const sourceText = "A complex user instruction containing multiple facts that require conversion.";
+  const { initialRequestBodyBytes, repairRequestBodyBytes } = projectWorstCaseConversionRequestBytes(
+    sourceText,
+    model,
+  );
+  const worstCaseInputCap = initialRequestBodyBytes + repairRequestBodyBytes;
+
+  const clock = new ManualClock();
+  const limiter = createRateLimiter({
+    rpm: 10_000,
+    tpm: 1_000_000,
+    concurrency: 2,
+    clock,
+    sleeper: clock,
+  });
+
+  let callCount = 0;
+  const requests: Array<{ body: string }> = [];
+
+  const withinBoundSchemaInvalid = JSON.stringify({ invalid: "short text" });
+
+  const customFetch: typeof fetch = async (_url, init) => {
+    callCount++;
+    requests.push({ body: String(init?.body ?? "") });
+    if (callCount === 1) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          choices: [{ message: { content: withinBoundSchemaInvalid } }],
+          usage: { prompt_tokens: 110, completion_tokens: 35 },
+        }),
+      } as any;
+    }
+    // Call 2: HTTP 200 with unreadable body (billed_unusable)
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => {
+        throw new Error("Premature EOF on unreadable body");
+      },
+    } as any;
+  };
+
+  const client = createOpenAiConversionClient({
+    apiKey: "sk-test-key-cost-unit-guard",
+    model,
+    fetchImpl: customFetch,
+    limiter,
+    sleeper: clock,
+    clock,
+    maxAttempts: 3,
+  });
+
+  const res = await client.convert(sourceText);
+
+  assert.equal(callCount, 2, "Both initial and repair calls must be made when within bound");
+  assert.equal(res.status, "quarantined");
+  assert.equal(res.rejectCode, "llm_unavailable");
+
+  const call2BodyBytes = Buffer.byteLength(requests[1].body, "utf8");
+  assert.equal(res.inputTokens, 110 + call2BodyBytes);
+  assert.equal(res.outputTokens, 35 + 600);
+
+  assert.ok(
+    res.inputTokens <= worstCaseInputCap,
+    `totalInputTokens (${res.inputTokens}) must not exceed preflight projection (${worstCaseInputCap})`,
+  );
+  assert.ok(
+    res.outputTokens <= 1200,
+    `totalOutputTokens (${res.outputTokens}) must not exceed 2 * 600 = 1200`,
   );
 });
