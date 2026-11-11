@@ -243,9 +243,12 @@ export function partitionCandidates(
 }
 
 export function formatPublishTextReport(report: PublishReport): string {
+  const isComplete = report.counts.pendingRows === 0 && report.counts.pendingSources === 0;
   const header = report.isDryRun
     ? "DRY RUN — no rows were published. No lease or fence was taken; these numbers are a point-in-time estimate."
-    : "Publish complete.";
+    : isComplete
+      ? "Publish complete."
+      : "Publish batch complete; pending work remains.";
   return [
     `=== Memory Upgrade Publish Report ===`,
     header,
@@ -337,19 +340,6 @@ export async function runPublish(
       },
     );
 
-    const stagingType = await introspectStagingEmbeddingType(tenantSql);
-    if (!stagingType && isDryRun) {
-      return {
-        isDryRun: true,
-        companyId,
-        upgradeId: "none",
-        state: "sweeping",
-        counts: { publishedCount: 0, supersededCount: 0, sourceDeletedCount: 0, pendingRows: 0, alreadyPublishedRows: 0, pendingSources: 0 },
-        durationMs: Date.now() - startTime,
-        activeRunGate: { pauseCount: 0, totalPausedMs: 0 },
-      };
-    }
-
     await assertLiveCollectionInsertable(tenantSql, tableName, preflight.shape);
     const vectorCast = resolveLiveVectorCast(preflight.shape, preflight.stagingVectorType);
 
@@ -383,8 +373,22 @@ export async function runPublish(
     }
     activeUpgradeId = upgrade.id;
 
+    const stagingType = await introspectStagingEmbeddingType(tenantSql);
+
     // Phase B: Dry run
     if (isDryRun) {
+      if (!stagingType) {
+        return {
+          isDryRun: true,
+          companyId,
+          upgradeId: activeUpgradeId,
+          state: upgrade.state,
+          counts: { publishedCount: 0, supersededCount: 0, sourceDeletedCount: 0, pendingRows: 0, alreadyPublishedRows: 0, pendingSources: 0 },
+          durationMs: Date.now() - startTime,
+          activeRunGate: { pauseCount: 0, totalPausedMs: 0 },
+        };
+      }
+
       const [{ pending_rows, already_published_rows, pending_sources }] = (await tenantSql.unsafe(
         `SELECT
            count(*) FILTER (WHERE published_at IS NULL)::int AS pending_rows,
@@ -597,10 +601,12 @@ export async function runPublish(
             stagingCountRows.map((r) => [String(r.source_id).toLowerCase(), r.count]),
           );
 
+          let budgetExhausted = false;
           const boundedSources: string[] = [];
           for (const p of publishable) {
             const count = countsBySource.get(p.id.toLowerCase()) ?? 0;
             if (maxRows !== undefined && rowBudgetUsed + count > maxRows) {
+              budgetExhausted = true;
               break;
             }
             boundedSources.push(p.id);
@@ -625,11 +631,25 @@ export async function runPublish(
             totalPublished += res.publishedCount;
             await flushPending();
           }
+
+          if (budgetExhausted) {
+            break;
+          }
         }
       }
 
       lastSourceId = page.maxSourceId;
     }
+
+    const [{ pending_rows, already_published_rows, pending_sources }] = (await tenantSql.unsafe(
+      `SELECT
+         count(*) FILTER (WHERE published_at IS NULL)::int AS pending_rows,
+         count(*) FILTER (WHERE published_at IS NOT NULL)::int AS already_published_rows,
+         count(DISTINCT source_id) FILTER (WHERE published_at IS NULL)::int AS pending_sources
+       FROM paperclip_memory_upgrade_staging
+       WHERE upgrade_id = $1::uuid;`,
+      [activeUpgradeId],
+    )) as Array<{ pending_rows: number; already_published_rows: number; pending_sources: number }>;
 
     const gateStats = activeRunGate.stats();
 
@@ -642,9 +662,9 @@ export async function runPublish(
         publishedCount: totalPublished,
         supersededCount: totalSuperseded,
         sourceDeletedCount: totalSourceDeleted,
-        pendingRows: 0,
-        alreadyPublishedRows: totalPublished,
-        pendingSources: 0,
+        pendingRows: pending_rows ?? 0,
+        alreadyPublishedRows: already_published_rows ?? 0,
+        pendingSources: pending_sources ?? 0,
       },
       durationMs: Date.now() - startTime,
       activeRunGate: {
