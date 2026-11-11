@@ -389,7 +389,8 @@ export async function setupLiveFixtures(input: {
     },
   });
 
-  if (execution.task.flow === "warm_three_turn"
+  if (execution.task.flow === "repository_verification"
+    || execution.task.flow === "warm_three_turn"
     || (execution.suite.id === "extended-harnesses" && execution.task.id === "file-edit-validate")) {
     registry.register<ProjectRecord>({
       id: "project",
