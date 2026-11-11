@@ -4,7 +4,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveLiveVectorCast } from "../../server/src/services/company-memory-upgrade/publish-tenant.js";
+import {
+  publishSourceBatch,
+  resolveLiveVectorCast,
+  type PublishSourceBatchParams,
+} from "../../server/src/services/company-memory-upgrade/publish-tenant.js";
 import {
   mapSweepErrorCode,
   SWEEP_ERROR_CODE_MAP,
@@ -76,4 +80,15 @@ test("publish error codes are mapped in SWEEP_ERROR_CODE_MAP in both case forms"
   }
 
   assert.ok(UPGRADE_ERROR_CODES.includes("publish_precondition_failed"));
+});
+
+test("PublishSourceBatchParams contract: outputIds and payloadType are not in interface", () => {
+  type HasKey<T, K extends string> = K extends keyof T ? true : false;
+  type _NoOutputIds = HasKey<PublishSourceBatchParams, "outputIds">;
+  type _NoPayloadType = HasKey<PublishSourceBatchParams, "payloadType">;
+
+  const noOutputIds: _NoOutputIds = false;
+  const noPayloadType: _NoPayloadType = false;
+  assert.equal(noOutputIds, false);
+  assert.equal(noPayloadType, false);
 });

@@ -34,11 +34,9 @@ export interface LiveSourceRow {
 export interface PublishSourceBatchParams {
   upgradeId: string;
   sourceIds: string[];
-  outputIds?: string[];
   tableName: string;
   shape: TenantCollectionShape;
   vectorCast: string | null;
-  payloadType?: "jsonb" | "json";
 }
 
 export interface PublishSourceBatchResult {
