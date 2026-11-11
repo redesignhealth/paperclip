@@ -266,6 +266,10 @@ export function formatPublishTextReport(report: PublishReport): string {
   ].join("\n");
 }
 
+export function formatPublishReport(report: PublishReport, format: "text" | "json" = "text"): string {
+  return format === "json" ? JSON.stringify(report, null, 2) : formatPublishTextReport(report);
+}
+
 export async function runPublish(
   options: PublishOptions,
   deps: PublishDependencies = {},

@@ -24,7 +24,6 @@ import {
   type SweepDependencies,
 } from "../server/src/services/company-memory-upgrade/sweep.js";
 import { CompanyMemoryUpgradeError } from "../server/src/services/company-memory-upgrade/types.js";
-
 export const STUB_SUBCOMMANDS = new Set([
   "flip",
   "drain",
@@ -38,7 +37,16 @@ export const BOOLEAN_FLAGS = new Set([
   "--prod",
   "--help",
   "-h",
+  "--dry-run",
 ]);
+
+import {
+  ALLOWED_PUBLISH_FLAGS,
+  runPublishCli,
+  type RunPublishCliDependencies,
+} from "./memory-upgrade-publish.js";
+
+export { ALLOWED_PUBLISH_FLAGS, runPublishCli, type RunPublishCliDependencies };
 
 export const VALUE_FLAGS = new Set([
   "--database-url",
@@ -55,6 +63,7 @@ export const VALUE_FLAGS = new Set([
   "--embedding-usd-per-mtok",
   "--page-size",
   "--max-rows",
+  "--batch-sources",
   "--pause-when-active-runs",
   "--active-run-poll-ms",
   "--max-pause-seconds",
@@ -610,6 +619,8 @@ const SAFE_STATE_MISMATCH_MESSAGES = new Set([
   "Upgrade is in needs_recovery. Recovery/status/rollback are unavailable in this slice.",
   "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
   "Cannot run sweep: active upgrade is not in sweeping state.",
+  "No active memory upgrade for this company; run 'pnpm memory:upgrade sweep' first.",
+  "Cannot run publish: active upgrade is not in sweeping state.",
 ]);
 
 const SAFE_OUTPUT_PATH_REJECTED_MESSAGES = new Set([
@@ -995,7 +1006,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (!subcommand) {
     console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-    console.error("Available subcommands: census, sweep");
+    console.error("Available subcommands: census, sweep, publish");
     return 1;
   }
 
@@ -1005,6 +1016,10 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (subcommand === "sweep") {
     return await runSweepCli(args.slice(1));
+  }
+
+  if (subcommand === "publish") {
+    return await runPublishCli(args.slice(1));
   }
 
   if (STUB_SUBCOMMANDS.has(subcommand)) {
@@ -1018,7 +1033,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census, sweep");
+  console.error("Available subcommands: census, sweep, publish");
   return 1;
 }
 

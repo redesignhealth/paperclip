@@ -15,6 +15,8 @@ import {
   UPGRADE_ERROR_CODES,
 } from "../../server/src/services/company-memory-upgrade/types.js";
 import type { TenantCollectionShape } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import "./memory-upgrade-publish-cli-validation.test.js";
+import "./memory-upgrade-publish-cli-exec.test.js";
 
 test("resolveLiveVectorCast returns null when types match, cast when different", () => {
   const baseShape: TenantCollectionShape = {
