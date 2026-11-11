@@ -16547,9 +16547,11 @@ export function toolAccessService(
     connection = resolvedClient.connection;
     const client = resolvedClient.client;
     const resolvedOAuth = oauthConfig(connection);
+    // Manual OAuth clients are confidential by default; only explicit public
+    // clients store `clientTokenEndpointAuthMethod: "none"` (TECH-7973, TECH-8347).
     const isManualConfidential =
       resolvedClient.source === "manual" &&
-      isConfidentialOAuthMethod(resolvedOAuth.clientTokenEndpointAuthMethod);
+      resolvedOAuth.clientTokenEndpointAuthMethod !== "none";
     if (
       (galleryMethod?.oauthClientSecretRequired || isManualConfidential) &&
       !client.clientSecret

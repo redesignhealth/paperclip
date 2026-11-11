@@ -5490,6 +5490,43 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       });
     });
 
+    it("TECH-8347 regression: normally saved manual confidential client (omitted auth method, no secret) fails at start before consent", async () => {
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual App Saved Config", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: app!.id,
+        uid: randomUUID(),
+        name: "Manual Confidential Saved Config No Secret",
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-confidential-client",
+            clientRegistrationSource: "manual",
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      await expect(
+        service.startOAuth(company.id, connection!.id, { redirectUri: REDIRECT_URI, actor }),
+      ).rejects.toMatchObject({
+        status: 422,
+        message: "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+      });
+    });
+
     it("TECH-8347 unchanged cases: CIMD, public DCR (none), env-preconfigured, and manual public (TECH-7973)", async () => {
       stubPublicUrl();
       const company = await createCompany(db);
