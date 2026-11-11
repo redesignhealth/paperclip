@@ -2614,3 +2614,9 @@ pnpm test:e2e:runner -- --id case-handoffs.runner-codex-subscription.local.same-
 
 The suite is excluded from `--all`. Its presence is not live qualification;
 inspect the packaged attempt evidence and normal Product E2E report.
+
+## Source-server startup
+
+Source-server startup prepares the existing shared/plugin SDK build dependencies
+before importing native tool authority. Installed-package checks never execute
+checkout build helpers.
