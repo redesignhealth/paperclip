@@ -393,6 +393,41 @@ Operational Prerequisites:
 > Even if tenant DDL fails during initialization (e.g., if the tenant role lacks CREATE privilege when executing `ensureUpgradeTables`), an active upgrade row will have already been created on the control plane, leaving the company in a non-terminal upgrade state that permanently blocks deletion until subsequent lifecycle tooling lands. CREATE privilege preflight checks are tracked in TECH-8222; operators must ensure proper tenant database privileges before running sweep in non-production environments.
 > NEVER perform manual SQL bypasses (e.g. deleting or mutating `company_memory_upgrades` rows) or attempt ad-hoc auto-clearing to work around deletion blocks. Manual tampering invalidates upgrade invariants and risks catastrophic memory corruption.
 
+#### Publish (TECH-8191)
+
+Paperclip provides a tenant-isolated, fenced publish command to copy staged converted memories into the live Mem0 collection table (`mem0_memories`) under `user_id = agent.id`:
+
+```bash
+# Preview (dry run): validates preflights and reports counts without mutation
+pnpm memory:upgrade publish --database-url <tenant-dsn> --control-plane-url <cp-dsn> --company <uuid> --dry-run
+
+# Confirmed run: inserts live rows and marks published_at under tenant fence
+pnpm memory:upgrade publish --database-url <tenant-dsn> --control-plane-url <cp-dsn> --confirm <uuid> [options]
+```
+
+Full CLI options, verification SQL, and remediation are in [doc/COMPANY-MEMORY-PUBLISH-CLI.md](./COMPANY-MEMORY-PUBLISH-CLI.md).
+
+Operational Prerequisites:
+- **Tenant role permissions**: Must hold schema `CREATE` and own upgrade tables (`ensureUpgradeTables`).
+- **Live table unique constraint**: The live table must have a unique index / PK on `id` (`LIVE_TABLE_ID_NOT_UNIQUE`).
+- **Live table insertability**: No non-null columns without defaults beyond `id`, payload, vector (`LIVE_TABLE_NOT_INSERTABLE`).
+- **Active upgrade state**: Must be in `sweeping` state with matching converter contract (`CONVERTER_CONTRACT_MISMATCH`).
+
+What Publish Does and Does Not Do:
+- **Does not prune**: Legacy company-scoped rows remain untouched in the live collection.
+- **Does not flip runtime flags**: Neither `agent-scoped-mem0` nor `scope_migration_completed_at` is altered.
+- **Quarantined sources**: Retained in staging and ledger; never pruned and never published.
+- **Dropped / unroutable sources**: Unpublished staging and dedupe rows are cleared under tenant fence.
+- **Row budget enforcement**: `--max-rows` bounds work at source granularity; a source's rows are never split across runs. If a source would exceed the remaining budget AFTER some rows were already consumed/published in the run, publish halts without advancing the cursor so the next run resumes there. If instead the very FIRST eligible source already exceeds `--max-rows` on its own (nothing consumed/published yet), publish refuses with `[INVALID_ARGUMENT]` rather than silently completing with zero rows published and stalling identically on every repeat run; increase `--max-rows` to at least that source's row count and re-run.
+- **Atomic live batching**: Each batch commits live rows (`ON CONFLICT (id) DO NOTHING`) and sets `published_at = now()` in a single tenant transaction under fence.
+- **Failure remediation**: Safe remediation for `LIVE_TABLE_ID_NOT_UNIQUE` (restore PK), `LIVE_TABLE_NOT_INSERTABLE` (add column defaults), `PUBLISH_LEDGER_INCONSISTENT` (re-run sweep), and `PUBLISH_CONFLICT_UNEXPECTED` (investigate ID collision).
+
+Updated Invariants (PR4 Publish):
+- **Invariant 1 (Staging & Publish Guarantee)**: Sweep stages with `published_at = NULL`. Publish inserts staged records with `outcome = 'published'` into live collection under `user_id = agent.id` and marks `published_at = now()` in a single tenant transaction under fence.
+- **Invariant 4 (Authoritative Ledger vs. Cumulative Counters)**: `published_count` stays 0 during sweep, and increments honestly as batches commit during publish. Surviving published rows (`published_at IS NOT NULL`) are never deleted by tombstones or superseding.
+- **Invariant 7 (Live Table Access)**: In sweep, access is strictly SELECT. In publish, access includes `INSERT INTO ... ON CONFLICT (id) DO NOTHING`. Zero UPDATE, DELETE, or DDL index modifications are issued against live collection.
+- **Invariant 9 (Tenant Write Fencing)**: Live publish inserts and `published_at` marking commit in a single tenant transaction under fence. Publish batches take per-source L1 advisory locks in ascending canonical key order before validating fence (L1 before L2, batch size 100).
+
 Operational Invariants:
 1. **Staging-Only Guarantee (PR3b)**:
    - Routable, non-noise, non-sensitive rows are converted into 1 to 3 atomic memory sentences via `gpt-5.4-mini` and re-embedded via `text-embedding-3-small` (1536 dims).

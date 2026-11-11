@@ -109,6 +109,18 @@ test("sweep CLI validation and flags", async (t) => {
   });
 
   await t.test("validateNoUnknownFlags rejects unexpected options for sweep", () => {
+    assert.equal(ALLOWED_SWEEP_FLAGS.has("--dry-run"), false, "ALLOWED_SWEEP_FLAGS must not contain --dry-run");
+
+    assert.throws(
+      () => validateNoUnknownFlags(["--dry-run"], ALLOWED_SWEEP_FLAGS, "sweep"),
+      (err: any) => {
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(err.message.includes("Unknown option '--dry-run'"));
+        assert.ok(err.message.includes("Only sweep options are accepted"));
+        return true;
+      },
+    );
+
     assert.throws(
       () => validateNoUnknownFlags(["--long-threshold=500"], ALLOWED_SWEEP_FLAGS, "sweep"),
       (err: any) => {
@@ -127,6 +139,34 @@ test("sweep CLI validation and flags", async (t) => {
         return true;
       },
     );
+  });
+
+  await t.test("sweep CLI rejects --dry-run before opening any connection or mutation", async () => {
+    let stderr = "";
+    const origError = console.error;
+    console.error = (msg: string) => { stderr += `${msg}\n`; };
+    const validUuid = randomUUID();
+    let clientOpened = false;
+
+    try {
+      const exit = await runSweepCli([
+        "--database-url", "postgres://u:p@localhost:5432/tenant",
+        "--control-plane-url", "postgres://u:p@localhost:5432/cp",
+        "--company", validUuid,
+        "--confirm", validUuid,
+        "--dry-run",
+      ], {
+        openTenantClient: (() => { clientOpened = true; throw new Error("must not be called"); }) as any,
+        openControlPlaneClient: (() => { clientOpened = true; throw new Error("must not be called"); }) as any,
+      } as any);
+
+      assert.equal(exit, 1);
+      assert.ok(stderr.includes("Unknown option '--dry-run'"));
+      assert.ok(stderr.includes("Only sweep options are accepted"));
+      assert.equal(clientOpened, false, "Must reject before opening any client connection");
+    } finally {
+      console.error = origError;
+    }
   });
 
   await t.test("--confirm missing, mismatched, or invalid UUID rejects without echoing arg values", async () => {
