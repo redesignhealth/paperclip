@@ -235,6 +235,65 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     assert.equal(u6Problem.status, "integrated");
     assert.equal(u6Problem.problem, "integration_sha is in neither trunk nor master");
 
+    // Lifecycle completion: once human merges PR to master, verify passes and promote succeeds
+    fx.git("checkout", "-q", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge PR 101 to master", PR_HEAD_U6);
+    const postMergeVerify = await verify(pool, fx.dir, directRefs);
+    assert.equal(postMergeVerify.ok, true, "verify passes once integration_sha is merged into master");
+    const promoteU6 = await promote(pool, fx.dir, { runId: "run-E", promotePr: 101, ...directRefs });
+    assert.deepEqual(promoteU6.promoted, [U6]);
+    const r6After = await rowOf(U6);
+    assert.equal(r6After.status, "promoted");
+    assert.equal(r6After.promote_pr, 101);
+    assert.equal(r6After.master_sha, promoteU6.masterSha);
+
+    // ---- scoped regression: promote safely selects rows matching review_pr, avoiding misattribution across separate PRs
+    fx.git("checkout", "-q", "-b", "upstream-u8", fx.U2);
+    fs.writeFileSync(path.join(fx.dir, "u8.txt"), "u8\n");
+    fx.git("add", "-A");
+    fx.git("commit", "-q", "-m", "U8");
+    const U8 = fx.git("rev-parse", "HEAD");
+
+    fx.git("checkout", "-q", "-b", "upstream-u9", fx.U2);
+    fs.writeFileSync(path.join(fx.dir, "u9.txt"), "u9\n");
+    fx.git("add", "-A");
+    fx.git("commit", "-q", "-m", "U9");
+    const U9 = fx.git("rev-parse", "HEAD");
+
+    await admin.query(`INSERT INTO upstream_sync_log (upstream_sha, title, category, status, path) VALUES ($1, 'U8', 'feature', 'assessed', 'clean'), ($2, 'U9', 'feature', 'assessed', 'clean')`, [U8, U9]);
+
+    // PR 201 merges U8 into master
+    fx.git("checkout", "-q", "-b", "sync-u8", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge U8 to PR branch", U8);
+    const PR_HEAD_U8 = fx.git("rev-parse", "HEAD");
+    fx.git("checkout", "-q", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge PR 201 to master", PR_HEAD_U8);
+    await record(pool, { shas: [U8], status: "integrated", runId: "run-F", fields: { integration_sha: PR_HEAD_U8, review_pr: 201, path: "clean" } });
+
+    // PR 202 merges U9 into master
+    fx.git("checkout", "-q", "-b", "sync-u9", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge U9 to PR branch", U9);
+    const PR_HEAD_U9 = fx.git("rev-parse", "HEAD");
+    fx.git("checkout", "-q", "master");
+    fx.git("merge", "-q", "--no-ff", "-m", "merge PR 202 to master", PR_HEAD_U9);
+    await record(pool, { shas: [U9], status: "integrated", runId: "run-G", fields: { integration_sha: PR_HEAD_U9, review_pr: 202, path: "clean" } });
+
+    // Both U8 and U9 are now integrated ancestors of master, but belong to PR 201 and 202 respectively.
+    // Promoting PR 201 must ONLY promote U8, leaving U9 integrated!
+    const promote201 = await promote(pool, fx.dir, { runId: "run-F", promotePr: 201, ...directRefs });
+    assert.deepEqual(promote201.promoted, [U8], "only U8 is promoted by promotePr 201");
+    assert.deepEqual(promote201.stillIntegrated, [U9], "U9 remains integrated");
+    assert.equal((await rowOf(U8)).status, "promoted");
+    assert.equal((await rowOf(U8)).promote_pr, 201);
+    assert.equal((await rowOf(U9)).status, "integrated");
+
+    // Promoting PR 202 now promotes U9 with promotePr 202
+    const promote202 = await promote(pool, fx.dir, { runId: "run-G", promotePr: 202, ...directRefs });
+    assert.deepEqual(promote202.promoted, [U9], "U9 is promoted by promotePr 202");
+    assert.deepEqual(promote202.stillIntegrated, [], "no integrated rows remain");
+    assert.equal((await rowOf(U9)).status, "promoted");
+    assert.equal((await rowOf(U9)).promote_pr, 202);
+
     // ---- negative promoted ancestry case: squash/rebase promotion lacks git ancestry -------
     fx.git("checkout", "-q", "-b", "upstream-u7", fx.U2);
     fs.writeFileSync(path.join(fx.dir, "u7.txt"), "u7\n");
@@ -268,7 +327,7 @@ test("handle: claim -> assess -> merge -> record -> promote -> verify", { skip }
     fx.git("branch", "old-master", oldMaster);
     const badOldMaster = await verify(pool, fx.dir, { trunkRef: directRefs.trunkRef, masterRef: "refs/heads/old-master" });
     assert.equal(badOldMaster.ok, false);
-    assert.deepEqual([...new Set(badOldMaster.problems.map((p) => p.sha))].sort(), [fx.U1, fx.U2, fx.U3, U5, U6, U7].sort());
+    assert.deepEqual([...new Set(badOldMaster.problems.map((p) => p.sha))].sort(), [fx.U1, fx.U2, fx.U3, U5, U6, U7, U8, U9].sort());
     assert.ok(badOldMaster.problems.some((p) => p.sha === U5 && p.status === "promoted"));
   } finally {
     await pool?.end();

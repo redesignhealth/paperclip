@@ -356,19 +356,49 @@ export async function record(db, { shas, status, runId, fields = {}, argusRound 
 // ---- promote ---------------------------------------------------------------------------
 
 // Detect a human-merged promotion and record it. The worker never merges to master; this
-// marks every `integrated` row whose merge commit is now an ancestor of `masterRef` as
+// marks `integrated` rows whose merge commit is now an ancestor of `masterRef` as
 // `promoted`, all in one transaction. `masterSha` defaults to the master tip observed.
-export async function promote(db, repo, { runId, promotePr, masterRef, masterSha = null }) {
+//
+// Safe row selection: rows matching the recorded `review_pr` equal to `promotePr` are
+// selected so separately merged PR rows are not misattributed to a single promotePr.
+// If explicit `shas` are passed, only those shas are candidates. For backward compatibility
+// with legacy promotions (where `trunkRef !== masterRef` and a single PR promoted rows with
+// earlier or null review_pr), all integrated ancestors are eligible if no rows match promotePr.
+export async function promote(db, repo, { runId, promotePr, masterRef, masterSha = null, shas = null, trunkRef = null, integrationRef = null }) {
   runId = requireRun(runId);
   if (!Number.isSafeInteger(promotePr) || promotePr < 1) throw new Error("promotePr (the merged PR number) is required");
   const master = await requireSha(repo, masterSha ?? masterRef, "master");
+  const ref = trunkRef ?? integrationRef;
   const { rows } = await db.query(
-    `SELECT upstream_sha, integration_sha FROM upstream_sync_log WHERE status = 'integrated' ORDER BY id`,
+    `SELECT upstream_sha, integration_sha, review_pr FROM upstream_sync_log WHERE status = 'integrated' ORDER BY id`,
   );
+  let candidates;
+  if (shas?.length) {
+    const wanted = new Set(shas);
+    candidates = rows.filter((r) => wanted.has(r.upstream_sha));
+  } else {
+    const hasMatchingReviewPr = rows.some((r) => r.review_pr === promotePr);
+    if (hasMatchingReviewPr) {
+      candidates = rows.filter((r) => r.review_pr === promotePr);
+    } else {
+      const isLegacyBranchModel = ref && masterRef && ref !== masterRef;
+      if (isLegacyBranchModel) {
+        candidates = rows;
+      } else {
+        candidates = rows.filter((r) => r.review_pr === null);
+      }
+    }
+  }
+
+  const candidateSet = new Set(candidates.map((r) => r.upstream_sha));
   const merged = [];
   const pending = [];
   const cache = new Map();
   for (const r of rows) {
+    if (!candidateSet.has(r.upstream_sha)) {
+      pending.push(r.upstream_sha);
+      continue;
+    }
     if (!cache.has(r.integration_sha)) cache.set(r.integration_sha, await isAncestor(repo, r.integration_sha, master));
     (cache.get(r.integration_sha) ? merged : pending).push(r.upstream_sha);
   }

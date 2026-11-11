@@ -34,7 +34,7 @@ worker commands (JSON on stdout; common flags: --run-id, --repo, --trunk-ref (or
   delta --base B --upstream U --merge M [--expect SHA256]   resolution delta of merge commit M
   record --shas A,B --status S [--path --integration-sha --delta-sha256 --review-pr --promote-pr --master-sha
          --skip-reason --argus-verdict] [--argus-round JSON] [--argus-round-cap N (default 10)]
-  promote --promote-pr N  mark integrated rows now in master as promoted (after a human merged the PR)
+  promote --promote-pr N [--shas A,B]  mark integrated rows now in master as promoted (after a human merged the PR)
   repoint --sha U --new-sha N --expect-old OLD --reason TEXT
                           audited re-point of an integrated row's integration_sha (N must descend from OLD, contain U, be on trunk)
   verify                  check integrated/promoted rows against git ancestry (exit 1 on mismatch)`;
@@ -148,7 +148,16 @@ async function workerCommand(db, argv) {
       argusRoundCap: num("argus-round-cap") ?? w.argusRoundCap,
     }));
   }
-  if (cmd === "promote") return out(await handle.promote(db, repo, { runId, promotePr: num("promote-pr"), masterRef: refs.masterRef, masterSha: v["master-sha"] ?? null }));
+  if (cmd === "promote") {
+    return out(await handle.promote(db, repo, {
+      runId,
+      promotePr: num("promote-pr"),
+      masterRef: refs.masterRef,
+      masterSha: v["master-sha"] ?? null,
+      shas: v.shas ? v.shas.split(",").map((s) => s.trim()).filter(Boolean) : null,
+      trunkRef: refs.trunkRef,
+    }));
+  }
   if (cmd === "repoint") {
     return out(await handle.repoint(db, repo, { sha: v.sha, newSha: v["new-sha"], expectOld: v["expect-old"], reason: v.reason, runId, ...refs }));
   }
