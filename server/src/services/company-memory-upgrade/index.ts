@@ -14,3 +14,4 @@ export * from "./agent-routing.js";
 export * from "./preflight.js";
 export * from "./sweep-tenant.js";
 export * from "./sweep.js";
+export * from "./publish-tenant.js";

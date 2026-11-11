@@ -525,6 +525,27 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   STAGING_WRITE_FAILED: "Failed to write to staging ledger.",
   staging_write_failed: "Failed to write to staging ledger.",
 
+  PUBLISH_PRECONDITION_FAILED:
+    "Publish refused before writing anything: tenant upgrade state is inconsistent. No memories were published.",
+  publish_precondition_failed:
+    "Publish refused before writing anything: tenant upgrade state is inconsistent. No memories were published.",
+  LIVE_TABLE_ID_NOT_UNIQUE:
+    'The live Mem0 collection has no unique index or primary key on its "id" column. Publish requires one for idempotent inserts, and Paperclip will never create an index on the live collection. Restore the Mem0 primary key and retry.',
+  live_table_id_not_unique:
+    'The live Mem0 collection has no unique index or primary key on its "id" column. Publish requires one for idempotent inserts, and Paperclip will never create an index on the live collection. Restore the Mem0 primary key and retry.',
+  LIVE_TABLE_NOT_INSERTABLE:
+    "The live Mem0 collection has columns that are NOT NULL without a default, beyond the id, payload and vector columns Paperclip writes. Publish refuses rather than fail partway through a batch.",
+  live_table_not_insertable:
+    "The live Mem0 collection has columns that are NOT NULL without a default, beyond the id, payload and vector columns Paperclip writes. Publish refuses rather than fail partway through a batch.",
+  PUBLISH_LEDGER_INCONSISTENT:
+    "Staging rows were found whose upgrade ledger row is missing, has a non-publishable outcome, or disagrees on the owning agent. Publish refused and wrote nothing. Re-run 'pnpm memory:upgrade sweep' to reconcile the ledger, then retry.",
+  publish_ledger_inconsistent:
+    "Staging rows were found whose upgrade ledger row is missing, has a non-publishable outcome, or disagrees on the owning agent. Publish refused and wrote nothing. Re-run 'pnpm memory:upgrade sweep' to reconcile the ledger, then retry.",
+  PUBLISH_CONFLICT_UNEXPECTED:
+    "A live-collection insert was skipped by a constraint conflict on a row that this upgrade did not create. Publish refused and rolled back the batch; no pre-existing memory was modified.",
+  publish_conflict_unexpected:
+    "A live-collection insert was skipped by a constraint conflict on a row that this upgrade did not create. Publish refused and rolled back the batch; no pre-existing memory was modified.",
+
   PUBLISH_FAILED: "Failed to publish upgraded memories.",
   publish_failed: "Failed to publish upgraded memories.",
 

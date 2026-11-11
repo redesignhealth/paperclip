@@ -15,6 +15,10 @@ import {
   stageSourceRecords,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
 import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
+import {
+  publishSourceBatch,
+  resolveLiveVectorCast,
+} from "../../server/src/services/company-memory-upgrade/publish-tenant.js";
 
 test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGVECTOR_TESTS !== "true" }, async (t) => {
   const dockerDsn = process.env.PAPERCLIP_TEST_DOCKER_PGVECTOR_URL;
@@ -109,5 +113,29 @@ test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGV
 
     assert.equal(dimsRows.length, 1);
     assert.equal(dimsRows[0].dims, 1536);
+  });
+
+  // Test 26: publishSourceBatch with resolveLiveVectorCast returning null
+  await t.test("Test 26: publishSourceBatch with resolveLiveVectorCast null round-trips real pgvector floats", async () => {
+    const fence = await claimTenantFenceForTestSetup(sql, upgradeId);
+    const shape = await introspectCollection(sql, liveTable, { skipVectorIdentityCheck: false });
+    const vectorCast = resolveLiveVectorCast(shape, "vector(1536)");
+    assert.equal(vectorCast, null);
+
+    const pubRes = await publishSourceBatch(
+      sql,
+      { upgradeId, sourceIds: [sourceId], tableName: liveTable, shape, vectorCast },
+      fence,
+    );
+    assert.equal(pubRes.insertedCount, 1);
+    assert.equal(pubRes.publishedCount, 1);
+
+    const liveVecRows = (await sql.unsafe(`
+      SELECT vector_dims(vector) as dims, vector::text as vec_text
+      FROM "${liveTable}" WHERE id = $1::uuid;
+    `, [outputId])) as Array<{ dims: number; vec_text: string }>;
+
+    assert.equal(liveVecRows.length, 1);
+    assert.equal(liveVecRows[0].dims, 1536);
   });
 });
