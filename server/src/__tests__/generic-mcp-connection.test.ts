@@ -48,6 +48,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
@@ -74,7 +75,7 @@ import { createHttpLogger, logger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { startOAuthRefreshFixture } from "../../../scripts/mcp-fixtures/servers/oauth-refresh-fixture.mjs";
 
-const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL?.trim();
+const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalTestDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -413,6 +414,13 @@ function createRouteApp(
   app.use(errorHandler);
   return app;
 }
+
+describe("generic remote MCP test database guard", () => {
+  it("rejects an invalid external test database URL before any connection or migration", () => {
+    expect(() => resolveExternalTestDatabaseUrl("PAPERCLIP_TEST_DATABASE_URL", "postgresql://localhost:5432/paperclip_production"))
+      .toThrow(/PAPERCLIP_TEST_DATABASE_URL must name a dedicated PostgreSQL database ending in _test/);
+  });
+});
 
 describeEmbeddedPostgres("generic remote MCP connections", () => {
   let db!: ReturnType<typeof createDb>;

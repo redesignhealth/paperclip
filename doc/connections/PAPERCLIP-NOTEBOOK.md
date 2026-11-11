@@ -44,14 +44,15 @@ be deployed together; this source addition does not establish that deployment.
 
 Run it only in an approved agent shell that already has `PAPERCLIP_API_URL`,
 `PAPERCLIP_API_KEY`, and `PAPERCLIP_RUN_ID`. These are the existing Paperclip run
-credentials, not Notebook credentials. It creates no login or API key. Download
-and inspect the trusted script before running it:
+credentials, not Notebook credentials. It creates no login or API key. The shell
+environment must provide an independently verified, pinned publisher artifact
+as a prerequisite; do not use unverified automatic downloads or arbitrary `curl | node`
+execution patterns.
+
+Once a verified publisher artifact is present, invoke it against the build output:
 
 ```sh
-curl --fail --silent --show-error --proto '=https' \
-  https://notebook.paperclip.app/client/publish.mjs \
-  -o /tmp/paperclip-notebook-publish.mjs
-node /tmp/paperclip-notebook-publish.mjs ./dist \
+node /path/to/verified/publish.mjs ./dist \
   --connection CONNECTION_ID --title "Weekly report" \
   --idempotency-key weekly-report-build
 ```
