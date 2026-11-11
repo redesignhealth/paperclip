@@ -721,6 +721,12 @@ as `agentmail_send` rather than extending core tools with provider-specific
 branches. Existing MCP connectors continue to use their normal MCP tool catalog;
 they do not need a duplicate native wrapper just to supply a skill.
 
+For a gated catalog connector, declare `experimentalFeatureKey` in its
+`AppDefinition`. Shared availability checks resolve the saved application key
+and evaluate that feature before setup, discovery, and execution. Keep the
+feature's settings visibility separate from this enforcement. Do not add
+provider-name checks to the gateway or setup screens.
+
 **Resolve eligibility from current assignments and access.** An AgentMail account
 credential alone does not give an agent email capabilities. An active inbox
 assigned to that agent does, provided both the inbox connection and saved
