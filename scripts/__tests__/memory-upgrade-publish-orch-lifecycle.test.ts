@@ -37,6 +37,19 @@ test("publish orchestrator: lifecycle state and admission checks", async (t) => 
         err.message.includes("No active memory upgrade for this company"),
     );
 
+    // Dry run against company with no active upgrade also throws STATE_MISMATCH (preflight check ordering)
+    await assert.rejects(
+      () =>
+        runPublish(
+          { companyId: env.company.id },
+          { cpDb: env.cpWorkerDb, tenantSql: env.tenantWorkerSql, _internalSkipVectorIdentityCheck: true },
+        ),
+      (err: any) =>
+        err instanceof CompanyMemoryUpgradeError &&
+        err.code === "STATE_MISMATCH" &&
+        err.message.includes("No active memory upgrade for this company"),
+    );
+
     // Verify publish never created an upgrade record
     const upgrades = await env.cpDb.select().from(companyMemoryUpgrades);
     assert.equal(upgrades.length, 0);
@@ -57,6 +70,19 @@ test("publish orchestrator: lifecycle state and admission checks", async (t) => 
         embeddingDimensions: 1536,
       })
       .returning();
+
+    // Dry run against non-sweeping state also throws STATE_MISMATCH
+    await assert.rejects(
+      () =>
+        runPublish(
+          { companyId: env.company.id },
+          { cpDb: env.cpWorkerDb, tenantSql: env.tenantWorkerSql, _internalSkipVectorIdentityCheck: true },
+        ),
+      (err: any) =>
+        err instanceof CompanyMemoryUpgradeError &&
+        err.code === "STATE_MISMATCH" &&
+        err.message.includes("active upgrade is not in sweeping state"),
+    );
 
     await assert.rejects(
       () =>
