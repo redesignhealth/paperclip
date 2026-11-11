@@ -606,6 +606,21 @@ export async function runPublish(
           for (const p of publishable) {
             const count = countsBySource.get(p.id.toLowerCase()) ?? 0;
             if (maxRows !== undefined && rowBudgetUsed + count > maxRows) {
+              // No source has been admitted into this (or any prior) page's budget yet:
+              // the very first eligible source is already larger than --max-rows. Bounding
+              // would publish zero rows while leaving the source unpublished, so a repeat
+              // run would hit the exact same wall and stall forever. Since sources are
+              // published atomically (never split across rows), refuse instead of silently
+              // no-op'ing.
+              if (rowBudgetUsed === 0 && totalPublished === 0) {
+                throw new CompanyMemoryUpgradeError(
+                  "Source exceeds --max-rows and cannot be split; increase --max-rows to at least the source's row count.",
+                  "INVALID_ARGUMENT",
+                );
+              }
+              // Otherwise this run already made progress (published rows in this or an
+              // earlier page): stop normally so the committed progress is reported, and a
+              // follow-up run resumes at this source.
               budgetExhausted = true;
               break;
             }

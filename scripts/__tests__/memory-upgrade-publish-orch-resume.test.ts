@@ -17,6 +17,7 @@ import {
   formatPublishTextReport,
   runPublish,
 } from "../../server/src/services/company-memory-upgrade/publish.js";
+import { CompanyMemoryUpgradeError } from "../../server/src/services/company-memory-upgrade/state-machine.js";
 import {
   seedLedgerRow,
   seedStagedMemory,
@@ -188,4 +189,89 @@ test("publish orchestrator: multi-page budget exhaustion, truthful reporting, an
   const text2 = formatPublishTextReport(rep2);
   assert.match(text2, /Publish complete\./);
   assert.doesNotMatch(text2, /pending work remains/);
+});
+
+test("publish orchestrator: first oversized source refuses instead of stalling silently", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const env = await setupPublishTestEnvironment("orch-first-oversized");
+  t.after(async () => {
+    await env.cleanup();
+  });
+
+  const [upgrade] = await env.cpDb
+    .insert(companyMemoryUpgrades)
+    .values({
+      companyId: env.company.id,
+      state: "sweeping",
+      converterId: "paperclip.memory-upgrade.atomic-converter",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+      publishedCount: 0,
+    })
+    .returning();
+
+  // Single source with 3 staging rows; maxRows is smaller than the source's row count.
+  // The source is the first (and only) eligible candidate, and no rows have been
+  // consumed/published yet in this run, so bounding would publish nothing and a
+  // repeat run would hit the exact same wall: refuse instead of silently stalling.
+  const sId = randomUUID();
+  const text = `Memory content for ${sId}`;
+  const sha = computeSourceContentSha256(text);
+  await insertTenantMemoryRow(env.tenantSql, { id: sId, agentId: env.agent.id, data: text });
+
+  const outputIds: string[] = [];
+  for (let j = 0; j < 3; j++) {
+    const mem = await seedStagedMemory(env.tenantSql, {
+      upgradeId: upgrade.id,
+      sourceId: sId,
+      agentId: env.agent.id,
+    });
+    outputIds.push(mem.outputId);
+  }
+  await seedLedgerRow(env.tenantSql, {
+    upgradeId: upgrade.id,
+    sourceId: sId,
+    agentId: env.agent.id,
+    outcome: "published",
+    outputIds,
+    sourceContentSha256: sha,
+  });
+
+  await assert.rejects(
+    () =>
+      runPublish(
+        { companyId: env.company.id, confirm: env.company.id, maxRows: 2 },
+        { cpDb: env.cpWorkerDb, tenantSql: env.tenantWorkerSql, _internalSkipVectorIdentityCheck: true },
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof CompanyMemoryUpgradeError);
+      assert.equal(err.code, "INVALID_ARGUMENT");
+      assert.equal(
+        err.message,
+        "Source exceeds --max-rows and cannot be split; increase --max-rows to at least the source's row count.",
+      );
+      return true;
+    },
+  );
+
+  // Nothing was published; the source's staging rows remain untouched for a resumed run.
+  const [{ count: publishedRows }] = (await env.tenantSql.unsafe(
+    `SELECT count(*)::int as count FROM paperclip_memory_upgrade_staging WHERE published_at IS NOT NULL;`,
+  )) as Array<{ count: number }>;
+  assert.equal(publishedRows, 0);
+
+  const [upg] = await env.cpDb.select().from(companyMemoryUpgrades).where(eq(companyMemoryUpgrades.id, upgrade.id));
+  assert.equal(upg.publishedCount, 0);
+
+  // A follow-up run with a sufficient --max-rows succeeds and publishes the source whole.
+  const rep = await runPublish(
+    { companyId: env.company.id, confirm: env.company.id, maxRows: 10 },
+    { cpDb: env.cpWorkerDb, tenantSql: env.tenantWorkerSql, _internalSkipVectorIdentityCheck: true },
+  );
+  assert.equal(rep.counts.publishedCount, 3);
+  assert.equal(rep.counts.pendingRows, 0);
 });
