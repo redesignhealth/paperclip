@@ -44,7 +44,7 @@ import {
   validateTenantFence,
   type TenantFence,
 } from "./tenant-fence.js";
-import { UPGRADE_WORK_STATES, isUpgradeWorkState } from "./phases.js";
+import { isUpgradeWorkState } from "./phases.js";
 import { isValidUuid } from "./census.js";
 import { ensureUpgradeTables, introspectStagingEmbeddingType } from "./tenant-tables.js";
 import {
@@ -452,7 +452,7 @@ export async function runPublish(
       cpLeaseToken: leaseToken,
       leaseOwner,
       now: clock.now?.() ?? new Date(),
-      allowedStates: UPGRADE_WORK_STATES,
+      allowedStates: new Set([upgrade.state]),
     });
 
     const activeRunGate = createActiveRunGate({

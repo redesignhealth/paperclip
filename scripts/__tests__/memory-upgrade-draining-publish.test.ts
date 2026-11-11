@@ -111,3 +111,94 @@ test("publish accepts draining state and publishes pending rows (embedded postgr
     );
   }
 });
+
+test("publish: state change between findActiveUpgrade read and fence claim fences worker out (TECH-8191)", async (t) => {
+  const support = await getEmbeddedPostgresTestSupport();
+  handleEmbeddedPostgresUnsupported(support, t);
+
+  const env = await setupPublishTestEnvironment("drain-pub-race");
+  t.after(async () => {
+    await env.cleanup();
+  });
+
+  const [upgrade] = await env.cpDb
+    .insert(companyMemoryUpgrades)
+    .values({
+      companyId: env.company.id,
+      state: "sweeping",
+      converterId: "paperclip.memory-upgrade.atomic-converter",
+      converterVersion: 1,
+      collectionName: "mem0_memories",
+      embeddingModel: "text-embedding-3-small",
+      embeddingDimensions: 1536,
+    })
+    .returning();
+
+  const sourceId = randomUUID();
+  const outputId = randomUUID();
+  const text = "Memory staged during sweeping";
+  const sha = computeSourceContentSha256(text);
+
+  await insertTenantMemoryRow(env.tenantSql, { id: sourceId, agentId: env.agent.id, data: text });
+
+  await seedStagedMemory(env.tenantSql, {
+    upgradeId: upgrade.id,
+    sourceId,
+    outputId,
+    agentId: env.agent.id,
+    contentSha256: sha,
+    payload: { data: text, user_id: env.agent.id, agent_id: env.agent.id },
+  });
+
+  await seedLedgerRow(env.tenantSql, {
+    upgradeId: upgrade.id,
+    sourceId,
+    agentId: env.agent.id,
+    outcome: "published",
+    outputIds: [outputId],
+    sourceContentSha256: sha,
+  });
+
+  // Intercept ensureUpgradeTables (which runs after findActiveUpgrade/read & lease claim, right before claimTenantFenceGuarded)
+  // to simulate a concurrent worker transitioning the upgrade sweeping -> flipping -> draining
+  const origBegin = env.tenantWorkerSql.begin.bind(env.tenantWorkerSql);
+  let stateTransitioned = false;
+  env.tenantWorkerSql.begin = (async (...args: any[]) => {
+    const res = await (origBegin as any)(...args);
+    if (!stateTransitioned) {
+      stateTransitioned = true;
+      // Concurrent transition occurs while Worker A read 'sweeping'
+      await env.cpDb
+        .update(companyMemoryUpgrades)
+        .set({ state: "draining" })
+        .where(eq(companyMemoryUpgrades.id, upgrade.id));
+    }
+    return res;
+  }) as any;
+
+  const workerDeps = {
+    cpDb: env.cpWorkerDb,
+    tenantSql: env.tenantWorkerSql,
+    _internalSkipVectorIdentityCheck: true,
+  };
+
+  await assert.rejects(
+    () => runPublish({ companyId: env.company.id, confirm: env.company.id }, workerDeps),
+    (err: any) => {
+      assert.equal(err instanceof CompanyMemoryUpgradeError, true);
+      assert.equal(err.code, "LEASE_FENCED_OUT");
+      return true;
+    },
+  );
+
+  assert.equal(stateTransitioned, true);
+
+  // Assert no live writes: outputId not in live collection
+  const liveRows = await env.tenantSql`SELECT id::text FROM mem0_memories WHERE id = ${outputId}::uuid`;
+  assert.equal(liveRows.length, 0);
+
+  // Staged memory was not marked published
+  const stagedRows = await env.tenantSql`SELECT published_at FROM paperclip_memory_upgrade_staging WHERE output_id = ${outputId}::uuid`;
+  assert.equal(stagedRows.length, 1);
+  assert.equal(stagedRows[0].published_at, null);
+});

@@ -86,12 +86,24 @@ test("tenant fence allowed states: default sweeping-only vs UPGRADE_WORK_STATES"
     (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "LEASE_FENCED_OUT",
   );
 
-  // Explicit UPGRADE_WORK_STATES accepts 'draining' and bumps epoch
+  // Observed 'sweeping' singleton refuses 'draining' with LEASE_FENCED_OUT
+  await assert.rejects(
+    () =>
+      claimTenantFenceGuarded(cpDb, tenantSql, {
+        upgradeId: upgrade.id,
+        cpLeaseToken: leaseToken,
+        leaseOwner: "test-worker",
+        allowedStates: new Set(["sweeping"]),
+      }),
+    (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "LEASE_FENCED_OUT",
+  );
+
+  // Observed 'draining' singleton accepts 'draining' and bumps epoch
   const f3 = await claimTenantFenceGuarded(cpDb, tenantSql, {
     upgradeId: upgrade.id,
     cpLeaseToken: leaseToken,
     leaseOwner: "test-worker",
-    allowedStates: UPGRADE_WORK_STATES,
+    allowedStates: new Set(["draining"]),
   });
   assert.equal(f3.fenceEpoch, "3");
 

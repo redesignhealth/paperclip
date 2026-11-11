@@ -69,7 +69,7 @@ import {
   startLeaseHeartbeat,
   updateUpgradeCounters,
 } from "./state-machine.js";
-import { UPGRADE_WORK_STATES, isUpgradeWorkState } from "./phases.js";
+import { isUpgradeWorkState } from "./phases.js";
 import {
   commitSourceOutcome,
   ensureUpgradeTables,
@@ -423,6 +423,13 @@ export async function runSweep(
       );
     }
 
+    if (!isUpgradeWorkState(upgrade.state)) {
+      throw new CompanyMemoryUpgradeError(
+        "Cannot run sweep: active upgrade is not in sweeping state.",
+        "STATE_MISMATCH",
+      );
+    }
+
     upgradeId = upgrade.id;
 
     // 7. Claim upgrade lease
@@ -464,7 +471,7 @@ export async function runSweep(
       cpLeaseToken: leaseToken,
       leaseOwner,
       now: clock.now(),
-      allowedStates: UPGRADE_WORK_STATES,
+      allowedStates: new Set([upgrade.state]),
     });
 
     // 10. Rate limiters and conversion clients
