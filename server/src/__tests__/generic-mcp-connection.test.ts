@@ -5583,16 +5583,19 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
       // 3. Env-preconfigured
       vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "env-preconfigured-id");
-      installMcpOAuthFixture({ auth: "oauth" });
-      const [app3] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Preconf App", type: "mcp_http", status: "active", metadata: {} }).returning();
-      const [preconf] = await db.insert(toolConnections).values({
-        companyId: company.id, applicationId: app3!.id, uid: randomUUID(), name: "Preconfigured Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
-        config: { url: MCP_URL }, transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
-      }).returning();
-      const preconfStart = await service.startOAuth(company.id, preconf!.id, { redirectUri: REDIRECT_URI, actor });
-      expect(preconfStart.registrationSource).toBe("preconfigured");
-      expect(new URL(preconfStart.authorizationUrl).searchParams.get("client_id")).toBe("env-preconfigured-id");
-      vi.unstubAllEnvs();
+      try {
+        installMcpOAuthFixture({ auth: "oauth" });
+        const [app3] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Preconf App", type: "mcp_http", status: "active", metadata: {} }).returning();
+        const [preconf] = await db.insert(toolConnections).values({
+          companyId: company.id, applicationId: app3!.id, uid: randomUUID(), name: "Preconfigured Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+          config: { url: MCP_URL }, transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+        }).returning();
+        const preconfStart = await service.startOAuth(company.id, preconf!.id, { redirectUri: REDIRECT_URI, actor });
+        expect(preconfStart.registrationSource).toBe("preconfigured");
+        expect(new URL(preconfStart.authorizationUrl).searchParams.get("client_id")).toBe("env-preconfigured-id");
+      } finally {
+        vi.unstubAllEnvs();
+      }
 
       // 4. Manual public client (TECH-7973)
       installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
@@ -5614,6 +5617,111 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const manualPublicStart = await service.startOAuth(company.id, manualPublic!.id, { redirectUri: REDIRECT_URI, actor });
       expect(manualPublicStart.registrationSource).toBe("manual");
       expect(new URL(manualPublicStart.authorizationUrl).searchParams.get("client_id")).toBe("manual-public-client");
+    });
+
+    it("TECH-8347: omitted stored auth method with AS advertising none only succeeds", async () => {
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual App None Only", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: app!.id,
+        uid: randomUUID(),
+        name: "Manual App None Only Conn",
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-client-none-only",
+            clientRegistrationSource: "manual",
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      const start = await service.startOAuth(company.id, connection!.id, { redirectUri: REDIRECT_URI, actor });
+      expect(start.registrationSource).toBe("manual");
+      expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("manual-client-none-only");
+    });
+
+    it("TECH-8347: omitted stored auth method with dual-method AS (none + client_secret_post) succeeds for legacy public", async () => {
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual App Dual Method", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: app!.id,
+        uid: randomUUID(),
+        name: "Manual App Dual Method Conn",
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-client-dual",
+            clientRegistrationSource: "manual",
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      const start = await service.startOAuth(company.id, connection!.id, { redirectUri: REDIRECT_URI, actor });
+      expect(start.registrationSource).toBe("manual");
+      expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("manual-client-dual");
+    });
+
+    it("TECH-8347: omitted stored auth method with AS absent methods rejects 422 oauth_client_secret_missing", async () => {
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: [] });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual App Absent Methods", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: app!.id,
+        uid: randomUUID(),
+        name: "Manual App Absent Methods Conn",
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-client-absent-methods",
+            clientRegistrationSource: "manual",
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      await expect(
+        service.startOAuth(company.id, connection!.id, { redirectUri: REDIRECT_URI, actor }),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: { code: "oauth_client_secret_missing" },
+      });
     });
 
     it("TECH-8347: deleted secret during refresh throws 404 instead of silent downgrade", async () => {

@@ -16561,10 +16561,29 @@ export function toolAccessService(
     const resolvedOAuth = oauthConfig(connection);
     // Manual OAuth clients are confidential by default unless explicitly public
     // (`clientTokenEndpointAuthMethod: "none"`, TECH-7973) or the authorization
-    // server advertises no confidential token endpoint auth methods (TECH-8347).
+    // server advertises token endpoint auth methods that include "none".
+    //
+    // Rationale:
+    // When clientTokenEndpointAuthMethod is omitted on a manual client (the standard
+    // saved shape):
+    // 1. If the authorization server advertises no token endpoint auth methods (or omits
+    //    discovery), RFC 6749 defaults client authentication to confidential, so we
+    //    require a client secret.
+    // 2. If the authorization server advertises confidential methods without "none",
+    //    it only supports confidential clients and requires a client secret.
+    // 3. If the authorization server advertises "none" (either "none" alone or dual-method
+    //    "none" + "client_secret_post"), we must allow omitted stored method to continue
+    //    as public so legacy public manual clients without secrets are not broken.
+    //    Trade-off: a genuinely confidential manual client that omitted its auth method on
+    //    a dual-method server will not be rejected here at start and may fail later at the
+    //    token endpoint, but this avoids regressing working legacy public connections.
+    // Explicit stored confidential methods (client_secret_post / client_secret_basic)
+    // always reject missing secrets regardless of server advertisement.
+    const advertisedMethods = endpoints.tokenEndpointAuthMethodsSupported ?? [];
     const serverSupportsConfidential =
-      !endpoints.tokenEndpointAuthMethodsSupported?.length ||
-      endpoints.tokenEndpointAuthMethodsSupported.some(isConfidentialOAuthMethod);
+      advertisedMethods.length === 0 ||
+      (advertisedMethods.some(isConfidentialOAuthMethod) &&
+        !advertisedMethods.includes("none"));
     const isManualConfidential =
       resolvedClient.source === "manual" &&
       resolvedOAuth.clientTokenEndpointAuthMethod !== "none" &&
