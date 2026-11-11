@@ -84,6 +84,7 @@ import {
   notInArray,
   or,
   sql,
+  count,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -521,6 +522,15 @@ function oauthProviderErrorMessage(
  */
 export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH =
   "/api/tools/oauth/client-metadata";
+
+export const OAUTH_CALLBACK_UPSTREAM_FAILURE_CODES = new Set([
+  "oauth_token_exchange_failed",
+  "oauth_reauthorization_required",
+  "oauth_dynamic_client_registration_failed",
+  "oauth_client_secret_missing",
+  "oauth_access_token_missing",
+  "oauth_metadata_failed",
+]);
 
 /**
  * Tailscale's public suffix (MagicDNS short names and tailnet devices). Those
@@ -3201,6 +3211,13 @@ function sanitizeHttpFailure(error: unknown): {
 } {
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (code === "oauth_sign_in_required") {
+      return {
+        status: "missing_secret",
+        message: error.message || "This app has no connected account. Click Connect to sign in again.",
+        code: "oauth_sign_in_required",
+      };
+    }
     if (code === "cognee_access_unverified" || code === "memory_api_key_rejected") {
       return { status: "error", message: error.message, code };
     }
@@ -8472,6 +8489,97 @@ export function toolAccessService(
     }
   }
 
+  async function personalInstancesMissingOwnerCredential(
+    rows: ToolConnection[] | (typeof toolConnections.$inferSelect)[],
+  ): Promise<Set<string>> {
+    const targets = rows.filter((row) => isPersonalDefaultMcpInstance(row));
+    if (!targets.length) return new Set<string>();
+
+    const missing = new Set<string>();
+    const targetsWithOwner = targets.filter((t) => Boolean(t.createdByUserId));
+
+    // Ownerless/legacy personal instances:
+    // A personal default-MCP instance is strictly single-user and must be bound to
+    // an owner (createdByUserId). If an instance is ownerless or legacy without
+    // createdByUserId, it has no owner who could hold an active personal credential.
+    // In accordance with TECH-8349 ("never show a personal connection active without
+    // a credential"), treating ownerless instances as missing credentials (needing attention)
+    // is safe, fail-closed, and consistent with ownerHasPersonalCredential returning false.
+    for (const target of targets) {
+      if (!target.createdByUserId) {
+        missing.add(target.id);
+      }
+    }
+
+    if (!targetsWithOwner.length) return missing;
+
+    const companyIds = Array.from(new Set(targetsWithOwner.map((t) => t.companyId)));
+    const connectionIds = targetsWithOwner.map((t) => t.id);
+
+    const grants = await db
+      .select({
+        connectionId: connectionGrants.connectionId,
+        subjectUserId: connectionGrants.subjectUserId,
+        credentialSecretRefs: connectionGrants.credentialSecretRefs,
+      })
+      .from(connectionGrants)
+      .where(
+        and(
+          inArray(connectionGrants.companyId, companyIds),
+          inArray(connectionGrants.connectionId, connectionIds),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.status, "active"),
+        ),
+      );
+
+    for (const target of targetsWithOwner) {
+      const hasOwnerGrantWithToken = grants.some(
+        (grant) =>
+          grant.connectionId === target.id &&
+          grant.subjectUserId === target.createdByUserId &&
+          Array.isArray(grant.credentialSecretRefs) &&
+          grant.credentialSecretRefs.some((r) => r?.configPath === "oauth.access_token"),
+      );
+      if (!hasOwnerGrantWithToken) {
+        missing.add(target.id);
+      }
+    }
+    return missing;
+  }
+
+  async function ownerHasPersonalCredential(
+    row: ToolConnection | typeof toolConnections.$inferSelect,
+  ): Promise<boolean> {
+    if (!row.createdByUserId) return false;
+    const missing = await personalInstancesMissingOwnerCredential([row]);
+    return !missing.has(row.id);
+  }
+
+  /**
+   * Annotates in-memory response connections when a personal default-MCP instance
+   * is missing its owner's active credential.
+   *
+   * Containment gate: Returns early when `viewerUserId` is undefined (such as internal
+   * system callers like connection-intents.ts:257) to ensure only viewer-facing responses
+   * reflect personal credential health.
+   */
+  async function annotatePersonalInstanceCredentialHealth(
+    connections: ToolConnection[],
+    viewerUserId?: string,
+  ): Promise<void> {
+    if (!viewerUserId) return;
+    const missing = await personalInstancesMissingOwnerCredential(connections);
+    if (!missing.size) return;
+    for (const connection of connections) {
+      if (missing.has(connection.id)) {
+        connection.healthStatus = "missing_secret";
+        connection.healthMessage =
+          "This app has no connected account. Click Connect to sign in again.";
+        connection.requiresReauthorization = true;
+      }
+    }
+  }
+
   async function annotateGitHubAuthorization(
     connections: ToolConnection[],
     viewerUserId?: string,
@@ -8554,6 +8662,11 @@ export function toolAccessService(
     await assertConnectorConnectionSetupEnabled(connection);
     const unavailableServices: string[] = [];
     try {
+      if (isPersonalDefaultMcpInstance(connection) && !(await ownerHasPersonalCredential(connection))) {
+        throw new HttpError(409, "This app has no connected account. Click Connect to sign in again.", {
+          code: "oauth_sign_in_required",
+        });
+      }
       assertSupportedConnection(connection);
       const config = asRecord(connection.config);
       const oauth = asRecord(config.oauth);
@@ -9119,10 +9232,11 @@ export function toolAccessService(
         pendingProfilesByConnection.set(tool.connectionId, profileCounts);
       }
     }
+    const missingOwnerCredentialSet = await personalInstancesMissingOwnerCredential(connections);
     const apps = connections.flatMap((connection) => {
-      const healthNeedsAttention = isAttentionHealthStatus(
-        connection.healthStatus,
-      );
+      const isMissingOwnerCred = missingOwnerCredentialSet.has(connection.id);
+      const healthNeedsAttention =
+        isAttentionHealthStatus(connection.healthStatus) || isMissingOwnerCred;
       const quarantinedCatalogEntryCount =
         quarantinedCountByConnection.get(connection.id) ?? 0;
       const pendingActionRequestCount =
@@ -9150,10 +9264,17 @@ export function toolAccessService(
           ? ["profile_new_tools" as const]
           : []),
       ];
+      const connectionDto = toConnection(connection);
+      if (isMissingOwnerCred) {
+        connectionDto.healthStatus = "missing_secret";
+        connectionDto.healthMessage =
+          "This app has no connected account. Click Connect to sign in again.";
+        connectionDto.requiresReauthorization = true;
+      }
       return reasons.length > 0
         ? [
             {
-              connection: toConnection(connection),
+              connection: connectionDto,
               healthNeedsAttention,
               quarantinedCatalogEntryCount,
               pendingActionRequestCount,
@@ -15343,6 +15464,9 @@ export function toolAccessService(
     await assertConnectorConnectionSetupEnabled(connection);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
+    if (isPersonalDefaultMcpInstance(connection) && !(await ownerHasPersonalCredential(connection))) {
+      throw conflict("Sign in to this app before saving permissions. Click Connect to finish signing in, then set your actions.", { code: "oauth_sign_in_required" });
+    }
     if (connection.config.mcpPreserveAccess === true && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
       const [profile] = await db.select().from(toolProfiles).where(and(
         eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${connection.id}`),
@@ -15481,6 +15605,7 @@ export function toolAccessService(
           policies: [],
           updatedConnection: connection,
           skippedExistingProfile: true,
+          createdProfile: false,
         };
       }
 
@@ -15762,7 +15887,13 @@ export function toolAccessService(
         .set({ status: "active", updatedAt: new Date() })
         .where(eq(toolApplications.id, connection.applicationId));
 
-      return { profileId, profileBindings, policies, updatedConnection };
+      return {
+        profileId,
+        profileBindings,
+        policies,
+        updatedConnection,
+        createdProfile: !existingProfile,
+      };
     });
     emitConnectionUpdated(
       transactionResult.updatedConnection,
@@ -15793,6 +15924,7 @@ export function toolAccessService(
         profileEntries: details.entries,
         profileBindings: details.bindings,
         policies: [],
+        createdProfile: false,
       };
     }
 
@@ -15818,6 +15950,7 @@ export function toolAccessService(
       profileEntries: details.entries,
       profileBindings: transactionResult.profileBindings,
       policies: transactionResult.policies,
+      createdProfile: Boolean(transactionResult.createdProfile),
     };
   }
 
@@ -17909,6 +18042,53 @@ export function toolAccessService(
     };
   }
 
+  async function markCallbackFailureHealth(
+    stateRow: typeof toolOauthStates.$inferSelect,
+    error: unknown,
+  ): Promise<void> {
+    try {
+      const code = (error as { details?: { code?: string } })?.details?.code;
+      if (!code || !OAUTH_CALLBACK_UPSTREAM_FAILURE_CODES.has(code)) return;
+      const [connection] = await db
+        .select()
+        .from(toolConnections)
+        .where(
+          and(
+            eq(toolConnections.id, stateRow.connectionId),
+            eq(toolConnections.companyId, stateRow.companyId),
+          ),
+        )
+        .limit(1);
+      if (!connection || connection.status === "archived") return;
+      const now = new Date();
+      const healthCols = connectionHealthColumns(
+        connection,
+        "error",
+        "Sign-in failed. Reconnect this app to continue.",
+      );
+      await db
+        .update(toolConnections)
+        .set({
+          ...healthCols,
+          lastError: code,
+          healthCheckedAt: now,
+          lastHealthAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(toolConnections.id, connection.id),
+            eq(toolConnections.companyId, stateRow.companyId),
+          ),
+        );
+    } catch (err) {
+      logger.warn(
+        { err, connectionId: stateRow.connectionId, companyId: stateRow.companyId },
+        "[tool-access] failed to record callback failure health",
+      );
+    }
+  }
+
   async function completeOAuthCallback(input: {
     state: string;
     code?: string | null;
@@ -17930,7 +18110,8 @@ export function toolAccessService(
     // path here. Consuming the state up front is what makes a denial terminal —
     // a refused request must not stay completable by a later code (PAP-17109).
     const stateRow = await consumeOAuthState(input.state, input.actor);
-    if (input.error) {
+    try {
+      if (input.error) {
       await rejectPendingOAuthInteraction(stateRow, input.actor);
       const providerError = normalizeOAuthProviderError(input.error);
       throw new HttpError(
@@ -18307,20 +18488,6 @@ export function toolAccessService(
       // who had just consented landed on a false "Nothing to test" state.
       // Activate and discover with the just-issued token before returning.
       const isPersonalInstance = isPersonalDefaultMcpInstance(connection);
-      let profileExisted = false;
-      if (isPersonalInstance) {
-        const [existingProfile] = await db
-          .select({ id: toolProfiles.id })
-          .from(toolProfiles)
-          .where(
-            and(
-              eq(toolProfiles.companyId, connection.companyId),
-              eq(toolProfiles.profileKey, `app:${connection.id}`),
-            ),
-          )
-          .limit(1);
-        profileExisted = Boolean(existingProfile);
-      }
       const refresh = await refreshCatalog(connection.id, input.actor, {
         // A personal default-MCP instance never gets company-wide enable-all defaults.
         enableAllByDefault: shouldFinalizeDefaults && !isPersonalInstance,
@@ -18340,9 +18507,40 @@ export function toolAccessService(
           )
         : { access: "all_agents" as const, askFirstRiskLevels: [] };
 
+      // Re-read profile existence and entry count right at the point of decision so
+      // starter-set reapply and installPersonalInstanceOnExistingAgents gating are
+      // not based on a stale snapshot taken before refreshCatalog.
+      let profileExisted = false;
+      let reuseExistingProfile = false;
+      if (isPersonalInstance) {
+        const [existingProfile] = await db
+          .select({ id: toolProfiles.id })
+          .from(toolProfiles)
+          .where(
+            and(
+              eq(toolProfiles.companyId, connection.companyId),
+              eq(toolProfiles.profileKey, `app:${connection.id}`),
+            ),
+          )
+          .limit(1);
+        profileExisted = Boolean(existingProfile);
+        if (existingProfile) {
+          const [entryCountRow] = await db
+            .select({ count: count() })
+            .from(toolProfileEntries)
+            .where(
+              and(
+                eq(toolProfileEntries.companyId, connection.companyId),
+                eq(toolProfileEntries.profileId, existingProfile.id),
+              ),
+            );
+          reuseExistingProfile = Number(entryCountRow?.count ?? 0) > 0;
+        }
+      }
+
       // H2: For an existing personal profile, skip RH ceiling re-activation and skip
       // finishOAuthCatalogWithRecommendedDefaults to preserve all user-reviewed profile choices.
-      if (isPersonalInstance && profileExisted) {
+      if (isPersonalInstance && reuseExistingProfile) {
         return {
           connectionId: refresh.connection.id,
           application: toApplication(application),
@@ -18379,7 +18577,7 @@ export function toolAccessService(
               ? {
                   trusted: {
                     personalSubjectUserId: stateRow.subjectUserId,
-                    expectNewProfile: true,
+                    expectNewProfile: !profileExisted,
                     activateOnNewProfileIds,
                   },
                 }
@@ -18403,7 +18601,12 @@ export function toolAccessService(
           const row = rowById.get(entry.id);
           if (row) currentCatalog.push(toCatalogEntryForConnection(row, connection));
         }
-        if (isPersonalInstance && !profileExisted && stateRow.subjectUserId && installsOnExistingAgentsOnConnect(connection)) {
+        if (
+          isPersonalInstance &&
+          finished.createdProfile &&
+          stateRow.subjectUserId &&
+          installsOnExistingAgentsOnConnect(connection)
+        ) {
           await installPersonalInstanceOnExistingAgents(connection, stateRow.subjectUserId);
         }
       }
@@ -18660,7 +18863,11 @@ export function toolAccessService(
       suggestedDefaults,
       auth: null,
     };
+  } catch (error) {
+    await markCallbackFailureHealth(stateRow, error);
+    throw error;
   }
+}
 
   /**
    * Finish the one decision that cannot safely be guessed for a browser OAuth
@@ -20575,6 +20782,7 @@ export function toolAccessService(
       await annotateAiGrantHealth(connections);
       await annotateGitHubAuthorization(connections, viewerUserId);
       await annotateSavedOAuthClientSecret(connections, viewerUserId);
+      await annotatePersonalInstanceCredentialHealth(connections, viewerUserId);
       return connections;
     },
 
@@ -20702,6 +20910,7 @@ export function toolAccessService(
       await annotateAiGrantHealth([connection]);
       await annotateGitHubAuthorization([connection], viewerUserId);
       await annotateSavedOAuthClientSecret([connection], viewerUserId);
+      await annotatePersonalInstanceCredentialHealth([connection], viewerUserId);
       return connection;
     },
 

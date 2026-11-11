@@ -166,7 +166,7 @@ import {
 } from "./tool-access-policy.js";
 import { toolDiscoveryScheduler, ToolDiscoveryBusyError } from "./tool-discovery-scheduler.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
-import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns, defaultToolTimeoutMs } from "./default-mcp-spec.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns, defaultToolTimeoutMs, isPersonalDefaultMcpInstance } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -4966,6 +4966,61 @@ export function createToolGatewayService(
     }
     const grantHeaders = await resolveUserGrantAuthHeader(session, connection, responsibleUserId);
     if (grantHeaders) return grantHeaders;
+    const isOwnerActing = Boolean(
+      connection.createdByUserId &&
+      responsibleUserId === connection.createdByUserId,
+    );
+    if (
+      isPersonalDefaultMcpInstance(connection) &&
+      isOwnerActing &&
+      connection.healthStatus !== "missing_secret"
+    ) {
+      try {
+        const ownerUserId = connection.createdByUserId!;
+        let ownerHasCredential = false;
+        const [ownerGrant] = await withCredentialReadScope(connection.companyId, (tx) =>
+          tx
+            .select()
+            .from(connectionGrants)
+            .where(
+              and(
+                eq(connectionGrants.companyId, connection.companyId),
+                eq(connectionGrants.connectionId, connection.id),
+                eq(connectionGrants.kind, "user"),
+                eq(connectionGrants.subjectUserId, ownerUserId),
+                eq(connectionGrants.status, "active"),
+              ),
+            )
+            .limit(1),
+        );
+        ownerHasCredential = Boolean(
+          ownerGrant &&
+          Array.isArray(ownerGrant.credentialSecretRefs) &&
+          ownerGrant.credentialSecretRefs.some((r) => r.configPath === "oauth.access_token"),
+        );
+        if (!ownerHasCredential) {
+          await markRemoteConnectionHealth(
+            connection,
+            "missing_secret",
+            "This app has no connected account. Click Connect to sign in again.",
+          );
+          await bestEffortAudit({
+            session,
+            companyId: connection.companyId,
+            agentId: session.agentId,
+            runId: session.runId,
+            issueId: session.issueId,
+            action: "tool_gateway.personal_credential_resolution_error",
+            details: { connectionId: connection.id, reason: "owner_credential_missing" },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, connectionId: connection.id, companyId: connection.companyId },
+          "[tool-gateway] failed to record missing owner credential health",
+        );
+      }
+    }
     if (startUserAuthorizationHook) {
       // resolveResponsibleUserId (called above to produce responsibleUserId)
       // already returns null -- which throws responsible_user_unknown before
@@ -6991,6 +7046,8 @@ export function createToolGatewayService(
     // unhealthy. The invocation still records/returns its error; catalog refresh
     // handles service availability, and grant checks remain authoritative.
     // A rejected personal credential is one person's problem; it must not mark the shared connection as errored for everyone.
+    // This does not conflict with resolvePersonalOrConnectionCredentialHeaders marking missing_secret for
+    // isPersonalDefaultMcpInstance: a personal instance has exactly one owner, and we mark only when the owner has no grant.
     const markCallHealth = (status: Parameters<typeof markRemoteConnectionHealth>[1], message: string) =>
       (workspaceTarget || personalOnly) && status !== "ok" ? Promise.resolve() : markRemoteConnectionHealth(connection, status, message);
     if (connection.config.sourceTemplateKey === "google-workspace"

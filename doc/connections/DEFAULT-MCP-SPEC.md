@@ -43,9 +43,9 @@ filters and Apps Script. An owner can enable those in Permissions. The Google se
 that change data (for example `manage_drive_access`, `modify_sheet_values`, `run_script_function`) as read-only. See
 [TOOL-ENABLEMENT-RUNBOOK.md](./TOOL-ENABLEMENT-RUNBOOK.md). The instance is also installed,
 through the owner-only per-agent install path, on the live agents that owner created (not terminated, not awaiting
-approval). Agents other people created and agents created later start with it off, and a reconnect changes
-neither the tool choices nor the installs. The result is recorded in a
-`personal_instance.install_on_existing_agents` audit event.
+approval). Agents other people created and agents created later start with it off; a reconnect preserves existing tool
+choices and installs; if the profile has no tool entries at all, the first-consent starter set is applied again; installs
+are never re-derived on reconnect. The result is recorded in a `personal_instance.install_on_existing_agents` audit event.
 
 RH MCP uses the same protected seed and personal-connect lifecycle, but its new personal instance
 auto-approves only the read tools listed below (see the current ceiling list for the exact count);

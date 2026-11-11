@@ -1272,6 +1272,7 @@ export interface FinishToolAppResult {
   profileEntries: ToolProfileEntry[];
   profileBindings: ToolProfileBinding[];
   policies: ToolPolicy[];
+  createdProfile?: boolean;
 }
 
 export interface McpJsonImportDraft {

@@ -63,6 +63,7 @@ import {
   DEFAULT_MCP_SPEC_ENABLED_ENV,
   agentMayUseConnectionTool,
   agentReadCeilingForConnection,
+  RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS,
 } from "../services/default-mcp-spec.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import * as instanceSettingsModule from "../services/instance-settings.js";
@@ -3436,6 +3437,114 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     }
   });
 
+  it("TECH-8349 #10: A failed token exchange sets health error, message and lastError (HTML and JSON callback)", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+      tokenFailure: {
+        status: 401,
+        body: {
+          error: "invalid_client",
+        },
+      },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture failed token",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+
+    // 1. HTML callback
+    const start1 = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state1 = new URL(start1.authorizationUrl).searchParams.get("state")!;
+    const code1 = fixture.issueAuthorizationCode(start1.authorizationUrl);
+
+    const htmlRes = await request(app)
+      .get("/api/tools/oauth/callback")
+      .set("Accept", "text/html")
+      .query({ state: state1, code: code1 });
+    expect(htmlRes.status).toBe(303);
+
+    const [row1] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(row1!.healthStatus).toBe("error");
+    expect(row1!.healthMessage).toBe("Sign-in failed. Reconnect this app to continue.");
+    expect(row1!.lastError).toBe("oauth_token_exchange_failed");
+
+    // 2. JSON callback
+    const start2 = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state2 = new URL(start2.authorizationUrl).searchParams.get("state")!;
+    const code2 = fixture.issueAuthorizationCode(start2.authorizationUrl);
+
+    const jsonRes = await request(app)
+      .get("/api/tools/oauth/callback")
+      .set("Accept", "application/json")
+      .query({ state: state2, code: code2 });
+    expect(jsonRes.status).toBe(502);
+    expect(jsonRes.body.details).toMatchObject({ code: "oauth_token_exchange_failed" });
+
+    const [row2] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(row2!.healthStatus).toBe("error");
+    expect(row2!.healthMessage).toBe("Sign-in failed. Reconnect this app to continue.");
+    expect(row2!.lastError).toBe("oauth_token_exchange_failed");
+  });
+
+  it("TECH-8349 #11: access_denied does NOT set health error", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture access denied",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+    // Set initial health to unchecked
+    await db.update(toolConnections).set({ healthStatus: "unchecked", healthMessage: null, lastError: null }).where(eq(toolConnections.id, connected.connectionId));
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor,
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+    const res = await request(app)
+      .get("/api/tools/oauth/callback")
+      .set("Accept", "text/html")
+      .query({ state, error: "access_denied" });
+    expect(res.status).toBe(303);
+
+    const [row] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(row!.healthStatus).not.toBe("error");
+    expect(row!.healthStatus).toBe("unchecked");
+  });
+
   it("does not log the upstream diagnostic for a provider denial", async () => {
     vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
     installMcpOAuthFixture({ auth: "oauth" });
@@ -5109,6 +5218,135 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(await grantsOf(instanceId)).toEqual([
         expect.objectContaining({ kind: "user", subjectUserId: alice }),
       ]);
+    });
+
+    it("TECH-8349 #12: empty-profile reconnect reapplies starter set, preserves bindings, and skips agent installs", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: GOOGLE_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id, name: "Target agent", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, createdByUserId: alice,
+      }).returning();
+
+      // 1. Initial connect
+      const firstStart = await startSeedConnect(company.id, seed.id, alice);
+      expect(firstStart.status).toBe(200);
+      const instanceId = firstStart.body.connectionId as string;
+      expect((await completeSeedConnect(company.id, alice, firstStart.body.authorizationUrl, fixture)).status).toBe(200);
+
+      // Snapshot agent installs and audit events
+      const installsBefore = await installsOf(instanceId);
+      expect(installsBefore.length).toBeGreaterThan(0);
+      const auditsBefore = (await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.action, "personal_instance.install_on_existing_agents"))).length;
+      expect(auditsBefore).toBeGreaterThan(0);
+
+      // 2. Delete the profile entries for app:<id>
+      const [profile] = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`)));
+      expect(profile).toBeTruthy();
+      await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id));
+      expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id))).toHaveLength(0);
+
+      // Snapshot bindings
+      const bindingsBefore = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile!.id));
+      expect(bindingsBefore.length).toBeGreaterThan(0);
+
+      // 3. Remove connection (archive)
+      stubPublicUrl();
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+      await request(aliceApp).patch(`/api/tool-connections/${instanceId}`).send({ status: "archived" }).expect(200);
+
+      // 4. Connect again and complete callback
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(200);
+      expect(restart.body.connectionId).toBe(instanceId);
+      const callback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      // 5. The profile then holds exactly the starter set
+      const entriesAfter = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id));
+      const catalog = await catalogOf(instanceId);
+      const catalogById = new Map(catalog.map((e) => [e.id, e.toolName]));
+      const activeToolNames = entriesAfter.map((e) => catalogById.get(e.catalogEntryId)).sort();
+      const expectedStarterTools = GOOGLE_TOOLS.filter((t) => (RH_GOOGLE_MCP_INITIAL_ACTIVE_TOOLS as readonly string[]).includes(t.name)).map((t) => t.name).sort();
+      expect(activeToolNames).toEqual(expectedStarterTools);
+
+      // 6. Prior bindings survive
+      const bindingsAfter = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile!.id));
+      expect(bindingsAfter.map((b) => [b.targetType, b.targetId, b.profileId])).toEqual(
+        bindingsBefore.map((b) => [b.targetType, b.targetId, b.profileId]),
+      );
+
+      // 7. No install_on_existing_agents audit and no new install rows
+      const auditsAfter = (await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.action, "personal_instance.install_on_existing_agents"))).length;
+      expect(auditsAfter).toBe(auditsBefore);
+      const installsAfter = await installsOf(instanceId);
+      expect(installsAfter).toEqual(installsBefore);
+    });
+
+    it("TECH-8349 #13: A populated-profile reconnect keeps its choices; the starter set is not reapplied", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_ALL_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await rhSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      // 1. Initial connect
+      const firstStart = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = firstStart.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, firstStart.body.authorizationUrl, fixture);
+
+      // 2. Custom profile entries: keep only ONE tool in profile entries
+      const [profile] = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, company.id), eq(toolProfiles.profileKey, `app:${instanceId}`)));
+      const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id));
+      for (const entry of entries.slice(1)) {
+        await db.delete(toolProfileEntries).where(eq(toolProfileEntries.id, entry.id));
+      }
+      const singleEntryBefore = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id));
+      expect(singleEntryBefore).toHaveLength(1);
+
+      // 3. Reconnect
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      const callback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      // 4. Still only has the single entry (starter set was not reapplied)
+      const entriesAfter = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile!.id));
+      expect(entriesAfter.map((e) => e.catalogEntryId)).toEqual(singleEntryBefore.map((e) => e.catalogEntryId));
+    });
+
+    it("TECH-8349 #14: Health clears after a successful reconnect", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth", tools: RH_ALL_TOOLS });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await rhSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      // 1. Initial connect
+      const firstStart = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = firstStart.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, firstStart.body.authorizationUrl, fixture);
+
+      // 2. Set degraded/error healthStatus and lastError
+      await db
+        .update(toolConnections)
+        .set({
+          healthStatus: "missing_secret",
+          healthMessage: "This app has no connected account. Click Connect to sign in again.",
+          lastError: "secret_missing",
+        })
+        .where(eq(toolConnections.id, instanceId));
+
+      // 3. Reconnect successfully
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      const callback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      // 4. Health clears
+      const [connAfter] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      expect(connAfter!.healthStatus).toBe("ok");
+      expect(connAfter!.lastError).toBeNull();
     });
 
     it("S6: a profile created between the pre-network snapshot and the finish transaction is left untouched (same id, explicit deny, no writes)", async () => {
