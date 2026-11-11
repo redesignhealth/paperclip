@@ -15,7 +15,7 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environmentLeases, environments, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants, plugins } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
@@ -33,7 +33,7 @@ import { execute as executeGemini, testEnvironment as testGeminiEnvironment } fr
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { resolveExecutionRunAdapterConfig } from "../services/heartbeat.js";
-import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
+import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import express from "express";
 import request from "supertest";
@@ -165,6 +165,125 @@ describe("managed AI connections", () => {
       expect((await db.select().from(agents).where(eq(agents.id, id)))[0].adapterConfig).toMatchObject(config);
       expect(response.body.runtimeConfig.aiConnection).toEqual(aiConnection);
     } finally { probe.mockRestore(); }
+  });
+
+  // Route-level matrix for the managed-binding probe deferral in
+  // validateManagedAgentBinding: an agent that is not yet saved — or an
+  // unprepared setup draft whose plugin has not created the agent-owned
+  // computer — skips the Copilot verification probe in a plugin environment
+  // (the lifecycle verifies the saved agent later), while every disqualifying
+  // condition — a saved agent, an explicit test, a non-plugin environment —
+  // still probes.
+  describe("Copilot probe deferral in plugin environments", () => {
+    const copilotConfig = { provider: "acpx", acpxAgent: "copilot", model: "gpt-5.6-luna" } as const;
+    const copilotAiConnection = { provider: "github", method: "api_key", mode: "responsible_user" } as const;
+    const verifiedCopilot = { status: "verified", version: "1.0.88", profileDigest: "fixture-profile", promptSent: false, models: [{ id: copilotConfig.model, label: "GPT" }] } as const;
+
+    // Seeds the connection owner's Copilot connection plus a ready plugin that
+    // leases agent computers, a plugin-driver environment pinned to it, and a
+    // fake running worker the environment runtime can acquire and release a
+    // probe lease through. The Copilot probe itself is mocked per test, so the
+    // worker never executes a Runner task.
+    async function copilotPluginFixture(label: string) {
+      const owner = `copilot-plugin-${label}`;
+      const pluginId = randomUUID();
+      const pluginKey = `copilot.computers.${pluginId}`;
+      const token = `github_pat_fixture_plugin_${label}`;
+      const manifest: PaperclipPluginManifestV1 = {
+        id: pluginKey, apiVersion: 1, version: "0.1.0", displayName: "Copilot computers fixture",
+        description: "Provides the agent computers a Copilot verification probe leases", author: "Tests",
+        categories: ["workspace"], capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "computers", displayName: "Agent computers", configSchema: { type: "object" }, supportsTasks: true }],
+        entrypoints: { worker: "worker.js" },
+      };
+      await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+      const account = await service.save(companyId, owner, { provider: "github", method: "api_key", ownership: "personal", name: `Plugin Copilot ${label}`, apiKey: token, agentIds: [], allAgents: false }, token);
+      await service.setDefault(companyId, owner, account.grantId);
+      await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: pluginKey, version: "0.1.0", manifestJson: manifest, status: "ready" });
+      const [pluginEnvironment] = await db.insert(environments).values({ name: `Copilot computers ${label}`, driver: "plugin", status: "active", config: { pluginKey, driverKey: "computers", driverConfig: {} } }).returning();
+      const workerCall = vi.fn(async (calledPluginId: string, method: string) => {
+        if (calledPluginId !== pluginId) throw new Error(`Unexpected plugin worker call: ${calledPluginId}`);
+        if (method === "environmentAcquireLease") return { providerLeaseId: `plugin-probe-lease-${label}`, metadata: { remoteCwd: "/workspace" } };
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin environment method: ${method}`);
+      });
+      const pluginWorkerManager = {
+        isRunning: (id: string) => id === pluginId,
+        getWorker: (id: string) => id === pluginId ? { supportedMethods: ["environmentAcquireLease", "environmentReleaseLease", "environmentTask"] } : undefined,
+        call: workerCall,
+      } as unknown as PluginWorkerManager;
+      return { owner, pluginId, token, account, pluginEnvironment, workerCall, pluginWorkerManager };
+    }
+
+    async function copilotApp(owner: string, pluginWorkerManager: PluginWorkerManager) {
+      const { errorHandler } = await import("../middleware/index.js");
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: owner, companyIds: [companyId], isInstanceAdmin: true }; next(); });
+      app.use("/api", agentRoutes(db, { pluginWorkerManager }));
+      app.use(errorHandler);
+      return app;
+    }
+
+    async function withoutBoardApprovalGate<T>(run: () => Promise<T>): Promise<T> {
+      const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, companyId));
+      try { return await run(); } finally {
+        await db.update(companies).set({ requireBoardApprovalForNewAgents: company.requireBoardApprovalForNewAgents }).where(eq(companies.id, companyId));
+      }
+    }
+
+    it("defers the Copilot probe when onboarding completes a plugin-environment setup draft", async () => {
+      const f = await copilotPluginFixture("setup-hire");
+      const setupAgentId = randomUUID();
+      // A saved setup draft: the row exists (paused, held for setup), but its
+      // plugin has not created the agent-owned computer yet.
+      await db.insert(agents).values({ id: setupAgentId, companyId, name: "Plugin Copilot setup", createdByUserId: f.owner,
+        adapterType: "paperclip_runner", adapterConfig: { ...copilotConfig },
+        status: "paused", lifecycleState: "paused", pauseReason: "setup", lifecycleHolds: ["setup"],
+        defaultEnvironmentId: f.pluginEnvironment.id });
+      const probe = vi.spyOn(copilotProbe, "probeCopilotExecutionTarget").mockResolvedValue(verifiedCopilot);
+      const app = await copilotApp(f.owner, f.pluginWorkerManager);
+      try {
+        const response = await withoutBoardApprovalGate(() => request(app).post(`/api/companies/${companyId}/agent-hires`).send({
+          setupAgentId, name: "Plugin Copilot setup", role: "general", adapterType: "paperclip_runner",
+          adapterConfig: { ...copilotConfig }, runtimeConfig: { aiConnection: copilotAiConnection },
+          defaultEnvironmentId: f.pluginEnvironment.id,
+        }));
+        expect(response.status, JSON.stringify(response.body)).toBe(201);
+        expect(response.body.agent).toMatchObject({ id: setupAgentId, lifecycleState: "preparing" });
+        const [saved] = await db.select().from(agents).where(eq(agents.id, setupAgentId));
+        expect(saved.runtimeConfig.aiConnection).toEqual(copilotAiConnection);
+        expect(saved.defaultEnvironmentId).toBe(f.pluginEnvironment.id);
+        // The draft row exists but has no computer yet, so completing its
+        // hire must not probe or lease either; the lifecycle verifies the
+        // saved agent after the plugin creates its agent-owned computer.
+        expect(probe).not.toHaveBeenCalled();
+        expect(f.workerCall).not.toHaveBeenCalled();
+        expect(await db.select({ id: environmentLeases.id }).from(environmentLeases).where(eq(environmentLeases.environmentId, f.pluginEnvironment.id))).toEqual([]);
+      } finally { probe.mockRestore(); }
+    });
+
+    it("defers the Copilot probe when a plugin-environment setup draft saves its Copilot binding", async () => {
+      const f = await copilotPluginFixture("setup-edit");
+      const setupAgentId = randomUUID();
+      await db.insert(agents).values({ id: setupAgentId, companyId, name: "Plugin Copilot setup edit", createdByUserId: f.owner,
+        adapterType: "paperclip_runner", adapterConfig: { ...copilotConfig },
+        status: "paused", lifecycleState: "paused", pauseReason: "setup", lifecycleHolds: ["setup"],
+        defaultEnvironmentId: f.pluginEnvironment.id });
+      const probe = vi.spyOn(copilotProbe, "probeCopilotExecutionTarget").mockResolvedValue(verifiedCopilot);
+      const app = await copilotApp(f.owner, f.pluginWorkerManager);
+      try {
+        const response = await request(app).patch(`/api/agents/${setupAgentId}`).send({ runtimeConfig: { aiConnection: copilotAiConnection } });
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        expect(response.body).toMatchObject({ pauseReason: "setup", runtimeConfig: { aiConnection: copilotAiConnection } });
+        // Saving the draft's binding is not an explicit test, and the draft
+        // has no computer yet: the probe is deferred to the lifecycle.
+        expect(probe).not.toHaveBeenCalled();
+        expect(f.workerCall).not.toHaveBeenCalled();
+        expect(await db.select({ id: environmentLeases.id }).from(environmentLeases).where(eq(environmentLeases.environmentId, f.pluginEnvironment.id))).toEqual([]);
+      } finally { probe.mockRestore(); }
+    });
   });
   it("passes the live sandbox worker manager to Copilot connection verification", async () => {
     const pluginWorkerManager = {} as PluginWorkerManager;
@@ -2178,7 +2297,9 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
         expect(tryDeliver).toHaveBeenCalledTimes(2);
         expect(tryDeliver).toHaveBeenCalledWith(interactionId);
       }
-      expect(acquire).toHaveBeenCalledWith(expect.objectContaining({ companyId, environment: expect.objectContaining({ id: environment.id }) }));
+      // Adoption is an explicit test of a real saved agent, so the probe lease
+      // keeps the adopted agent's identity — never an anonymous lease.
+      expect(acquire).toHaveBeenCalledWith(expect.objectContaining({ companyId, agentId: id, environment: expect.objectContaining({ id: environment.id }) }));
       expect(probe).toHaveBeenCalledWith(expect.objectContaining({ executionTarget: target, config: expect.objectContaining({ provider: "codex", model: "gpt-5.6-sol", managedAiConnection: expect.any(Object) }) }));
       expect(providerRequest).toHaveBeenCalledWith("https://api.openai.com/v1/models", expect.objectContaining({
         headers: { Authorization: "Bearer fixture-adoption-key" },
