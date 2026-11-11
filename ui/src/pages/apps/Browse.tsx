@@ -32,6 +32,7 @@ import {
 import type { Agent, ComposioAppSnapshot, ToolApplication, ToolConnection } from "@paperclipai/shared";
 import {
   getAppDefinitionForUrl,
+  getAppDefinitionForApplicationKey,
   isMemoryConnectorId,
   getAppStoreDefinition,
   isToolConnectionAttentionHealth,
@@ -48,6 +49,7 @@ import { isDefaultMcpSeed, isPersonalDefaultMcpInstance } from "@/lib/tool-insta
 import { useNavigate } from "@/lib/router";
 import { useChatConnectorsEnabled, chatProviderVisible } from "@/hooks/useChatConnectorsEnabled";
 import { useMemoryConnectorsEnabled } from "@/hooks/useMemoryConnectorsEnabled";
+import { useConnectorAvailability } from "@/hooks/useConnectorAvailability";
 import { appCopyFor } from "@/lib/app-gallery-copy";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
@@ -434,6 +436,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
   const { userId: viewingUserId, settled: identitySettled } = useAccountIdentity();
   const { enabled: chatConnectorsEnabled, githubEnabled } = useChatConnectorsEnabled();
   const { enabled: memoryConnectorsEnabled } = useMemoryConnectorsEnabled();
+  const connectorAvailability = useConnectorAvailability();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
@@ -598,6 +601,7 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
     (galleryQuery.data?.apps ?? []) as AppGalleryDisplayEntry[]
   ).filter((entry) => {
     if (!memoryConnectorsEnabled && isMemoryConnectorId(appDefinitionSlug(entry))) return false;
+    if (!connectorAvailability.enabled(entry)) return false;
     const definition = getAppStoreDefinition(appDefinitionSlug(entry));
     return (
       chatProviderVisible(appDefinitionSlug(entry), chatConnectorsEnabled, githubEnabled) ||
@@ -1048,6 +1052,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
               onRequestRemove={target => void requestConnectionRemoval(target)}
               preselectedAgentId={preselectedChatAgentId}
               chatConnectorsEnabled={chatConnectorsEnabled}
+              setupEnabled={connectorAvailability.enabled(row.entry ?? getConnectableAppDefinition(row.slug))
+                && row.applications.every(application => connectorAvailability.enabled(getAppDefinitionForApplicationKey(application.applicationKey)))}
               githubReviewBotsEnabled={githubEnabled}
               onConnectAggregator={connectAggregator}
               onManageAggregator={(app, connectionId) => setAggregatorToManage({ app, connectionId })}
@@ -1151,6 +1157,7 @@ export function ConnectorCard({
   onRequestRemove,
   preselectedAgentId,
   chatConnectorsEnabled,
+  setupEnabled = true,
   githubReviewBotsEnabled = false,
   onConnectAggregator,
   onManageAggregator,
@@ -1176,6 +1183,7 @@ export function ConnectorCard({
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
   chatConnectorsEnabled: boolean;
+  setupEnabled?: boolean;
   githubReviewBotsEnabled?: boolean;
   onConnectAggregator?: (app: AggregatorAppCatalogEntry) => void;
   onManageAggregator?: (app: AggregatorAppCatalogEntry, connectionId?: string) => void;
@@ -1268,7 +1276,7 @@ export function ConnectorCard({
         >
           Connect Copilot
         </Button>}
-        <Button
+        {setupEnabled && <Button
           type="button"
           size="sm"
           variant="outline"
@@ -1302,7 +1310,7 @@ export function ConnectorCard({
           aria-label={`${action.label} ${row.name}`}
         >
           {action.label}
-        </Button>
+        </Button>}
       </div>
 
       <Collapsible open={expanded} onOpenChange={open => setExpandedOverride({ open, defaultExpanded })}>
@@ -1330,6 +1338,7 @@ export function ConnectorCard({
                     details={renderAccountDetails?.(connection)}
                     key={connection.id}
                     row={row}
+                    setupEnabled={setupEnabled}
                     connection={connection}
                     owner={owner}
                     agent={agent}
@@ -1481,6 +1490,7 @@ function ConnectionAccountRow({
   discovery,
   onConfigureArcade,
   onConfigureExecutor,
+  setupEnabled = true,
 }: {
   details?: ReactNode;
   row: ConnectorRowModel;
@@ -1496,6 +1506,7 @@ function ConnectionAccountRow({
   discovery?: AggregatorAppsResponse;
   onConfigureArcade?: () => void;
   onConfigureExecutor?: () => void;
+  setupEnabled?: boolean;
 }) {
   const { pushToast } = useToast();
   const isConnectingRef = useRef(false);
@@ -1531,7 +1542,7 @@ function ConnectionAccountRow({
       subtitle={agentSubtitle} nameTitle={agent ? `${accountName}${agent.title?.trim() ? ` (${agent.title.trim()})` : ""}` : undefined}
       details={<>{details}{discovery?.discovery.message || discovery?.sync.status === "error" ? <p className="text-xs text-muted-foreground" role="status">{discovery.discovery.message ?? discovery.sync.error}</p> : null}</>}
       openLabel={`Open ${accountName} permissions`} onOpen={() => onNavigate(`/apps/${connection.id}/permissions`)}>
-        {state.kind === "attention" || state.kind === "draft" ? (
+        {setupEnabled && (state.kind === "attention" || state.kind === "draft") ? (
           <Button
             type="button"
             size="sm"
