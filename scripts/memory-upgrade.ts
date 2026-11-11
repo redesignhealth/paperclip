@@ -39,18 +39,36 @@ export const BOOLEAN_FLAGS = new Set([
   "-h",
 ]);
 
+// Census must not share the mutable shared set to avoid cross-command flag leakage
+export const BOOLEAN_CENSUS_FLAGS = new Set(BOOLEAN_FLAGS);
+export const BOOLEAN_SWEEP_FLAGS = new Set(["--prod", "--help", "-h"]);
+
 import {
   ALLOWED_PUBLISH_FLAGS,
   BOOLEAN_PUBLISH_FLAGS,
   runPublishCli,
   type RunPublishCliDependencies,
 } from "./memory-upgrade-publish.js";
+import { ALLOWED_FLIP_FLAGS, BOOLEAN_FLIP_FLAGS } from "./memory-upgrade-flip-flags.js";
+import { ALLOWED_DRAIN_FLAGS, BOOLEAN_DRAIN_FLAGS } from "./memory-upgrade-drain-flags.js";
+import { ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS } from "./memory-upgrade-verify-flags.js";
+import { ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS } from "./memory-upgrade-rollback-flags.js";
+import { ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS } from "./memory-upgrade-status-flags.js";
+import { ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS } from "./memory-upgrade-recover-flags.js";
+import {
+  LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES,
+  LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES,
+  LIFECYCLE_SAFE_STATE_MISMATCH_MESSAGES,
+} from "./memory-upgrade-lifecycle-errors.js";
 
 export {
-  ALLOWED_PUBLISH_FLAGS,
-  BOOLEAN_PUBLISH_FLAGS,
-  runPublishCli,
-  type RunPublishCliDependencies,
+  ALLOWED_PUBLISH_FLAGS, BOOLEAN_PUBLISH_FLAGS, runPublishCli, type RunPublishCliDependencies,
+  ALLOWED_FLIP_FLAGS, BOOLEAN_FLIP_FLAGS,
+  ALLOWED_DRAIN_FLAGS, BOOLEAN_DRAIN_FLAGS,
+  ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS,
+  ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS,
+  ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS,
+  ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS,
 };
 
 export const VALUE_FLAGS = new Set([
@@ -80,6 +98,11 @@ export const VALUE_FLAGS = new Set([
   "--chat-tpm",
   "--embedding-rpm",
   "--embedding-tpm",
+  "--mode",
+  "--probe-limit",
+  "--max-drain-hours",
+  "--probe-interval-minutes",
+  "--blocking-run-limit",
 ]);
 
 export const ALLOWED_CENSUS_FLAGS = new Set([
@@ -446,6 +469,7 @@ const UNSUPPORTED_VECTOR_TYPE_MESSAGE =
   "Tenant staging column type is not supported: the upgrade requires an unqualified vector(1536) (pgvector visible in the connection's search_path) or text. A schema-qualified type such as extensions.vector(1536) means pgvector is installed outside the tenant role's search_path. No upgrade work was started. Fix the tenant role's search_path (or relocate the extension) and retry.";
 
 const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
+  ...LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES,
   // Census & Preflight codes
   NOT_PGVECTOR: "Target database is missing required vector extension or column is not a valid pgvector column.",
   not_pgvector: "Target database is missing required vector extension or column is not a valid pgvector column.",
@@ -627,6 +651,7 @@ const SAFE_STATE_MISMATCH_MESSAGES = new Set([
   "Cannot run sweep: active upgrade is not in sweeping state.",
   "No active memory upgrade for this company; run 'pnpm memory:upgrade sweep' first.",
   "Cannot run publish: active upgrade is not in sweeping state.",
+  ...LIFECYCLE_SAFE_STATE_MISMATCH_MESSAGES,
 ]);
 
 const SAFE_OUTPUT_PATH_REJECTED_MESSAGES = new Set([
@@ -663,6 +688,7 @@ const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
   "Invalid key file content: key must be 20-512 printable non-whitespace ASCII characters.",
   "Flag '--max-cost-usd' requires a positive number value.",
   "Source exceeds --max-rows and cannot be split; increase --max-rows to at least the source's row count.",
+  ...LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES,
 ]);
 
 export function sanitizeCliErrorMessage(error: unknown): string {
