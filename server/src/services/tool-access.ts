@@ -9880,7 +9880,7 @@ export function toolAccessService(
           inArray(connectionGrants.connectionId, personal.map((connection) => connection.id)),
           eq(connectionGrants.kind, "user"),
           eq(connectionGrants.subjectUserId, viewerUserId),
-          eq(connectionGrants.status, "active"),
+          ne(connectionGrants.status, "revoked"),
         ))
       : [];
     const savedPersonal = new Set(grants.filter((grant) => grant.refs.some((ref) => ref.configPath === "oauth.client_secret")).map((grant) => grant.connectionId));
@@ -9940,7 +9940,7 @@ export function toolAccessService(
             eq(connectionGrants.connectionId, connection.id),
             eq(connectionGrants.kind, "user"),
             eq(connectionGrants.subjectUserId, actor.actorId),
-            eq(connectionGrants.status, "active"),
+            ne(connectionGrants.status, "revoked"),
           ),
         )
         .limit(1);
@@ -16547,11 +16547,17 @@ export function toolAccessService(
     connection = resolvedClient.connection;
     const client = resolvedClient.client;
     const resolvedOAuth = oauthConfig(connection);
-    // Manual OAuth clients are confidential by default; only explicit public
-    // clients store `clientTokenEndpointAuthMethod: "none"` (TECH-7973, TECH-8347).
+    // Manual OAuth clients are confidential by default unless explicitly public
+    // (`clientTokenEndpointAuthMethod: "none"`, TECH-7973) or the authorization
+    // server advertises no confidential token endpoint auth methods (TECH-8347).
+    const serverSupportsConfidential =
+      !endpoints.tokenEndpointAuthMethodsSupported?.length ||
+      endpoints.tokenEndpointAuthMethodsSupported.some(isConfidentialOAuthMethod);
     const isManualConfidential =
       resolvedClient.source === "manual" &&
-      resolvedOAuth.clientTokenEndpointAuthMethod !== "none";
+      resolvedOAuth.clientTokenEndpointAuthMethod !== "none" &&
+      (isConfidentialOAuthMethod(resolvedOAuth.clientTokenEndpointAuthMethod) ||
+        serverSupportsConfidential);
     if (
       (galleryMethod?.oauthClientSecretRequired || isManualConfidential) &&
       !client.clientSecret
