@@ -418,7 +418,7 @@ What Publish Does and Does Not Do:
 - **Does not flip runtime flags**: Neither `agent-scoped-mem0` nor `scope_migration_completed_at` is altered.
 - **Quarantined sources**: Retained in staging and ledger; never pruned and never published.
 - **Dropped / unroutable sources**: Unpublished staging and dedupe rows are cleared under tenant fence.
-- **Row budget enforcement**: `--max-rows` bounds work at source granularity. If a source exceeds the budget, publish halts without advancing cursor so next run resumes there.
+- **Row budget enforcement**: `--max-rows` bounds work at source granularity; a source's rows are never split across runs. If a source would exceed the remaining budget AFTER some rows were already consumed/published in the run, publish halts without advancing the cursor so the next run resumes there. If instead the very FIRST eligible source already exceeds `--max-rows` on its own (nothing consumed/published yet), publish refuses with `[INVALID_ARGUMENT]` rather than silently completing with zero rows published and stalling identically on every repeat run; increase `--max-rows` to at least that source's row count and re-run.
 - **Atomic live batching**: Each batch commits live rows (`ON CONFLICT (id) DO NOTHING`) and sets `published_at = now()` in a single tenant transaction under fence.
 - **Failure remediation**: Safe remediation for `LIVE_TABLE_ID_NOT_UNIQUE` (restore PK), `LIVE_TABLE_NOT_INSERTABLE` (add column defaults), `PUBLISH_LEDGER_INCONSISTENT` (re-run sweep), and `PUBLISH_CONFLICT_UNEXPECTED` (investigate ID collision).
 

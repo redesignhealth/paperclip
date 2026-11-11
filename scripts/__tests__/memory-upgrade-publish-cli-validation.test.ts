@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { runPublishCli } from "../memory-upgrade-publish.js";
+import { sanitizeCliErrorMessage } from "../memory-upgrade.js";
+import { CompanyMemoryUpgradeError } from "../../server/src/services/company-memory-upgrade/types.js";
 
 test("publish CLI validation and flags", async (t) => {
   const localDsn = "postgres://user:pass@127.0.0.1:5432/test_tenant";
@@ -96,5 +98,23 @@ test("publish CLI validation and flags", async (t) => {
     } finally {
       c.restore();
     }
+  });
+
+  await t.test("source-atomic --max-rows refusal is allowlisted verbatim, with no ID/DSN echo for a differing message", () => {
+    const fixedMsg =
+      "Source exceeds --max-rows and cannot be split; increase --max-rows to at least the source's row count.";
+    const errFixed = new CompanyMemoryUpgradeError(fixedMsg, "INVALID_ARGUMENT");
+    assert.equal(sanitizeCliErrorMessage(errFixed), `[INVALID_ARGUMENT] ${fixedMsg}`);
+
+    // Any other INVALID_ARGUMENT message (e.g. one that embedded an id/DSN) is
+    // never echoed verbatim; the sanitizer falls back to a generic message.
+    const secretUuid = randomUUID();
+    const errUnsafe = new CompanyMemoryUpgradeError(
+      `Source ${secretUuid} exceeds --max-rows.`,
+      "INVALID_ARGUMENT",
+    );
+    const sanitized = sanitizeCliErrorMessage(errUnsafe);
+    assert.equal(sanitized, "[INVALID_ARGUMENT] Invalid command argument.");
+    assert.ok(!sanitized.includes(secretUuid));
   });
 });

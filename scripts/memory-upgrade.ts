@@ -656,6 +656,7 @@ const SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = new Set([
   "Key file permissions too open. Must be mode 0600 or 0400 (no group or other access permissions).",
   "Invalid key file content: key must be 20-512 printable non-whitespace ASCII characters.",
   "Flag '--max-cost-usd' requires a positive number value.",
+  "Source exceeds --max-rows and cannot be split; increase --max-rows to at least the source's row count.",
 ]);
 
 export function sanitizeCliErrorMessage(error: unknown): string {

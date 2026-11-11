@@ -22,7 +22,7 @@ pnpm memory:upgrade publish \
 | `--company <uuid>` | Optional | Target company UUID (must match `--confirm` if both passed). |
 | `--dry-run` | Flag | Preview mode. Zero live or staging mutations. |
 | `--batch-sources <int>` | Optional | Sources committed per transaction (default: `100`). |
-| `--max-rows <int>` | Optional | Max staging rows to publish; source bounded. |
+| `--max-rows <int>` | Optional | Max staging rows to publish; source bounded (a source's rows are never split). If the first eligible source alone exceeds this budget, publish refuses with `[INVALID_ARGUMENT]` rather than silently publishing nothing (see Error Codes below). |
 | `--page-size <int>` | Optional | Keyset page size for staging scan (default: `1000`). |
 | `--table <name>` | Optional | Live Mem0 collection table name (default: `"mem0_memories"`). |
 | `--pause-when-active-runs <n>` | Optional | Active heartbeat run pause threshold (default: `1`). |
@@ -110,3 +110,4 @@ WHERE s.upgrade_id = '<upgrade-uuid>'::uuid
 | `PUBLISH_CONFLICT_UNEXPECTED` | Constraint conflict on row not created by upgrade. | Investigate ID collision in live table. Batch rolls back safely. |
 | `PUBLISH_PRECONDITION_FAILED` | Inconsistent tenant upgrade state. | Verify upgrade state and tenant tables; re-run sweep if needed. |
 | `STATE_MISMATCH` | No active sweeping upgrade. | Run `pnpm memory:upgrade sweep` first to initiate upgrade. |
+| `INVALID_ARGUMENT` | `Source exceeds --max-rows and cannot be split; increase --max-rows to at least the source's row count.` — the first eligible source (no rows consumed/published yet in this run) has more staging rows than `--max-rows` allows. | Re-run with a larger `--max-rows` (at least the source's row count), or omit `--max-rows` entirely. This only occurs with zero progress; if the budget runs out on a later source after some rows were already published, publish instead stops normally and reports the committed progress for a resumed run. |
