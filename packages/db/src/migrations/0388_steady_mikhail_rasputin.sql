@@ -1,0 +1,1 @@
+ALTER TABLE "company_memory_upgrades" ADD COLUMN "drain_probe_streak_started_at" timestamp with time zone;
