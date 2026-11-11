@@ -16,11 +16,12 @@ describe("connector availability", () => {
     expect(isConnectorFeatureEnabled(gated, { enableCases: true })).toBe(true);
   });
 
-  it("validates the feature key schema", () => {
+  it("validates the feature key and declares Notebook's hidden rollout in its manifest", () => {
     expect(appDefinitionSchema.parse(gated).experimentalFeatureKey).toBe("enableCases");
     expect(appDefinitionSchema.safeParse({ ...gated, experimentalFeatureKey: "typoFeature" }).success).toBe(false);
-    const synthetic = { ...ordinary, slug: "synthetic-gated", name: "Synthetic Gated", experimentalFeatureKey: "enablePaperclipNotebook" as const };
-    expect(isConnectorFeatureEnabled(synthetic, {})).toBe(false);
-    expect(isConnectorFeatureEnabled(synthetic, { enablePaperclipNotebook: true })).toBe(true);
+    const notebook = getConnectableAppDefinition("paperclip-notebook")!;
+    expect(notebook.experimentalFeatureKey).toBe("enablePaperclipNotebook");
+    expect(isConnectorFeatureEnabled(notebook, {})).toBe(false);
+    expect(isConnectorFeatureEnabled(notebook, { enablePaperclipNotebook: true })).toBe(true);
   });
 });
