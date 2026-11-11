@@ -15,6 +15,10 @@ import {
   stageSourceRecords,
 } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
 import { claimTenantFenceForTestSetup } from "../../server/src/services/company-memory-upgrade/tenant-fence.testing.js";
+import {
+  publishSourceBatch,
+  resolveLiveVectorCast,
+} from "../../server/src/services/company-memory-upgrade/publish-tenant.js";
 
 test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGVECTOR_TESTS !== "true" }, async (t) => {
   const dockerDsn = process.env.PAPERCLIP_TEST_DOCKER_PGVECTOR_URL;
@@ -32,6 +36,8 @@ test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGV
   const upgradeId = randomUUID();
   const agentId = randomUUID();
   const sourceId = randomUUID();
+  const outputId = randomUUID();
+  const fakeEmbedding = Array.from({ length: 1536 }, (_, i) => (i % 100) / 100);
 
   // Test 24: CREATE EXTENSION IF NOT EXISTS vector, create live table with vector(1536), ensureUpgradeTables with vector(1536)
   await t.test("Test 24: ensureUpgradeTables creates real pgvector(1536) staging column", async () => {
@@ -72,8 +78,6 @@ test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGV
   // Test 25: stageSourceRecords with a real 1536-float embedding and NO vectorType: "text"
   await t.test("Test 25: stageSourceRecords parameterised cast inserts real vector and vector_dims returns 1536", async () => {
     const fence = await claimTenantFenceForTestSetup(sql, upgradeId);
-    const fakeEmbedding = Array.from({ length: 1536 }, (_, i) => (i % 100) / 100);
-    const outputId = randomUUID();
 
     const stageRes = await stageSourceRecords(
       sql,
@@ -109,5 +113,53 @@ test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGV
 
     assert.equal(dimsRows.length, 1);
     assert.equal(dimsRows[0].dims, 1536);
+  });
+
+  // Test 26: publishSourceBatch with resolveLiveVectorCast returning null
+  await t.test("Test 26: publishSourceBatch with resolveLiveVectorCast null round-trips real pgvector floats", async () => {
+    const fence = await claimTenantFenceForTestSetup(sql, upgradeId);
+    const shape = await introspectCollection(sql, liveTable, { skipVectorIdentityCheck: false });
+    const vectorCast = resolveLiveVectorCast(shape, "vector(1536)");
+    assert.equal(vectorCast, null);
+
+    const pubRes = await publishSourceBatch(
+      sql,
+      { upgradeId, sourceIds: [sourceId], tableName: liveTable, shape, vectorCast },
+      fence,
+    );
+    assert.equal(pubRes.insertedCount, 1);
+    assert.equal(pubRes.publishedCount, 1);
+
+    // Inspect fixture staged embedding
+    const stagingVecRows = (await sql`
+      SELECT
+        vector_dims(embedding) AS dims,
+        (embedding)::text AS vec_text
+      FROM paperclip_memory_upgrade_staging
+      WHERE upgrade_id = ${upgradeId}::uuid AND output_id = ${outputId}::uuid;
+    `) as Array<{ dims: number; vec_text: string }>;
+
+    assert.equal(stagingVecRows.length, 1);
+    assert.equal(stagingVecRows[0].dims, 1536);
+
+    // Inspect live table row
+    const liveVecRows = (await sql.unsafe(`
+      SELECT vector_dims(vector) as dims, vector::text as vec_text
+      FROM "${liveTable}" WHERE id = $1::uuid;
+    `, [outputId])) as Array<{ dims: number; vec_text: string }>;
+
+    assert.equal(liveVecRows.length, 1);
+    assert.equal(liveVecRows[0].dims, 1536);
+
+    // Verify live table vector exactly matches staged embedding and roundtrips input floats
+    assert.equal(liveVecRows[0].vec_text, stagingVecRows[0].vec_text);
+    const liveFloats = JSON.parse(liveVecRows[0].vec_text) as number[];
+    assert.equal(liveFloats.length, fakeEmbedding.length);
+    for (let i = 0; i < fakeEmbedding.length; i++) {
+      assert.ok(
+        Math.abs(liveFloats[i] - fakeEmbedding[i]) < 1e-5,
+        `vector element ${i} mismatch: got ${liveFloats[i]}, expected ${fakeEmbedding[i]}`,
+      );
+    }
   });
 });
