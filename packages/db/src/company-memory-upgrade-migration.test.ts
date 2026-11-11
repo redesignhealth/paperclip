@@ -67,6 +67,7 @@ describePostgres("company memory upgrade migration", () => {
       "embedding_tokens",
       "estimated_cost_nanodollars",
       "marked_at",
+      "drain_probe_streak_started_at",
       "drain_confirmed_at",
       "verified_at",
       "pruned_at",
@@ -89,6 +90,7 @@ describePostgres("company memory upgrade migration", () => {
     expect(columnMap.get("state")?.column_default).toContain("'sweeping'");
     expect(columnMap.get("sweep_count")?.column_default).toContain("0");
     expect(columnMap.get("llm_input_tokens")?.column_default).toContain("0");
+    expect(columnMap.get("drain_probe_streak_started_at")?.is_nullable).toBe("YES");
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   it("enforces state check constraint, rejecting invalid states", async () => {

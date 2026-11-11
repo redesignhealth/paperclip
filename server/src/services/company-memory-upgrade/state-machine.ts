@@ -887,6 +887,9 @@ export async function updateUpgradeCounters(
   if (params.markedAt !== undefined) {
     setFields.markedAt = params.markedAt;
   }
+  if (params.drainProbeStreakStartedAt !== undefined) {
+    setFields.drainProbeStreakStartedAt = params.drainProbeStreakStartedAt;
+  }
   if (params.drainConfirmedAt !== undefined) {
     setFields.drainConfirmedAt = params.drainConfirmedAt;
   }

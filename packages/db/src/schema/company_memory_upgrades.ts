@@ -59,6 +59,12 @@ export const companyMemoryUpgrades = pgTable(
 
     // Timestamps (nullable)
     markedAt: timestamp("marked_at", { withTimezone: true }),
+    /**
+     * Control-plane bookkeeping for the drain streak: records when the current
+     * consecutive-empty-probe streak began; null when no streak is running.
+     * Only meaningful while the upgrade is draining.
+     */
+    drainProbeStreakStartedAt: timestamp("drain_probe_streak_started_at", { withTimezone: true }),
     drainConfirmedAt: timestamp("drain_confirmed_at", { withTimezone: true }),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
     /** Timestamp recorded when pruning completes (recorded on transition to 'completed'). Null while in 'pruning' or if aborted/crashed. */

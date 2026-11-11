@@ -2703,6 +2703,13 @@
       "when": 1794053588872,
       "tag": "0387_upstream_sync_integration_repoint",
       "breakpoints": true
+    },
+    {
+      "idx": 388,
+      "version": "7",
+      "when": 1794422726364,
+      "tag": "0388_steady_mikhail_rasputin",
+      "breakpoints": true
     }
   ]
 }
