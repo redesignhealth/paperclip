@@ -14,6 +14,9 @@ import { detectSensitiveFamilies, type SensitiveFamilyName } from "./sensitive-p
 export const CONVERTER_ID = "paperclip.memory-upgrade.atomic-converter";
 export const CONVERTER_VERSION = 1;
 
+export const MODEL_CLASSIFIED_NOISE_REASON_CODE = "model_classified_noise";
+export const MODEL_CLASSIFIED_SENSITIVE_REASON_CODE = "model_classified";
+
 export const SUPPORTED_CONVERTER_MODELS = ["gpt-5.4-mini"] as const;
 export type SupportedConverterModel = (typeof SUPPORTED_CONVERTER_MODELS)[number];
 
