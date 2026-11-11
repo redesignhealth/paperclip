@@ -169,7 +169,7 @@ export async function ensureManagedRepositoriesIgnored(cwd: string, options: { p
   let excludePath: string;
   try {
     const result = await execFile("git", ["-C", cwd, "rev-parse", "--git-path", "info/exclude"], {
-      timeout: 10_000, env: { ...process.env, LC_ALL: "C" },
+      timeout: 10_000, env: { ...sanitizeRuntimeServiceBaseEnv(process.env), LC_ALL: "C" },
     });
     excludePath = path.resolve(cwd, result.stdout.trim());
   } catch (error) {
