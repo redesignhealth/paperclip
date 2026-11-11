@@ -111,6 +111,49 @@ export function assertSupportedStagingVectorType(vectorType: string): void {
   }
 }
 
+/**
+ * Resolves the staging embedding cast target from the tenant catalog and proves it matches the
+ * requested (already validated) contract. Fail-closed: never falls back to the requested type or a
+ * default when the catalog cannot be read. Returns the canonical, interpolation-safe cast target.
+ */
+export async function resolveStagingVectorType(
+  sql: SqlClient | ReturnType<typeof postgres> | { unsafe(query: string, args?: unknown[]): Promise<unknown> },
+  requestedVectorType: string,
+): Promise<string> {
+  const requested = (requestedVectorType ?? "").trim();
+  if (!isValidVectorType(requested)) {
+    throw new CompanyMemoryUpgradeError(
+      "Invalid vectorType: must be text or vector(N) with 1 <= N <= 16000",
+      "INVALID_ARGUMENT",
+    );
+  }
+  assertSupportedStagingVectorType(requested); // UNSUPPORTED_VECTOR_TYPE
+  const quotedRequested = quoteVectorType(requested);
+
+  const detected = await introspectStagingEmbeddingType(sql); // UNSAFE_CATALOG_TYPE on junk catalog names
+  if (detected === null) {
+    throw new CompanyMemoryUpgradeError(
+      "Staging table paperclip_memory_upgrade_staging has no readable embedding column; refusing to stage.",
+      "SCHEMA_INIT_FAILED",
+    );
+  }
+  if (!isValidVectorType(detected)) {
+    throw new CompanyMemoryUpgradeError(
+      `Staging embedding column type "${detected}" is neither text nor vector(N); refusing to stage.`,
+      "STAGING_VECTOR_TYPE_MISMATCH",
+    );
+  }
+  assertSupportedStagingVectorType(detected); // UNSUPPORTED_VECTOR_TYPE: stale vector(768), schema-qualified
+  const quotedDetected = quoteVectorType(detected);
+  if (quotedDetected !== quotedRequested) {
+    throw new CompanyMemoryUpgradeError(
+      `Staging embedding column is "${quotedDetected}" but this upgrade requires "${quotedRequested}"; refusing to stage.`,
+      "STAGING_VECTOR_TYPE_MISMATCH",
+    );
+  }
+  return quotedDetected;
+}
+
 export interface SqlClient {
   unsafe(query: string, args?: unknown[]): Promise<unknown>;
 }
@@ -216,4 +259,8 @@ export async function ensureUpgradeTables(
   } else {
     await sql.unsafe(ddl);
   }
+
+  // CREATE TABLE IF NOT EXISTS silently no-ops on a pre-existing staging table, so the
+  // embedding column may not be the type validated above. Verify against the catalog.
+  await resolveStagingVectorType(sql, normalizedVectorType);
 }

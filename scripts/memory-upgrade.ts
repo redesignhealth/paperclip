@@ -436,6 +436,14 @@ const SWEEP_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   not_pgvector: "Target database is missing required vector extension or column is not a valid pgvector column.",
   UNSUPPORTED_VECTOR_TYPE: UNSUPPORTED_VECTOR_TYPE_MESSAGE,
   unsupported_vector_type: UNSUPPORTED_VECTOR_TYPE_MESSAGE,
+  STAGING_VECTOR_TYPE_MISMATCH:
+    "Upgrade staging table embedding column type does not match the required vector type. Drop or migrate paperclip_memory_upgrade_staging before retrying.",
+  staging_vector_type_mismatch:
+    "Upgrade staging table embedding column type does not match the required vector type. Drop or migrate paperclip_memory_upgrade_staging before retrying.",
+  UNSAFE_CATALOG_TYPE:
+    "Database catalog reported a type name that cannot be safely used as a SQL cast target.",
+  unsafe_catalog_type:
+    "Database catalog reported a type name that cannot be safely used as a SQL cast target.",
 
   SUPERUSER_REJECTED: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",
   superuser_rejected: "Connecting role on database has superuser privileges. Dedicated non-superuser role required.",

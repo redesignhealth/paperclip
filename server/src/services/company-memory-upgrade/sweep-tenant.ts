@@ -30,7 +30,7 @@ import {
   assertSafeCatalogTypeCast,
   assertSupportedStagingVectorType,
   ensureUpgradeTables,
-  introspectStagingEmbeddingType,
+  resolveStagingVectorType,
 } from "./tenant-tables.js";
 
 export type { TenantFence } from "./tenant-fence.js";
@@ -1176,6 +1176,10 @@ export async function stageSourceRecords(
     await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
     await validateTenantFence(tx, fence);
 
+    // Fail-closed: the cast target is the staging column's ACTUAL type, proven to equal the
+    // validated contract. No fallback — a missing or drifted column refuses the run.
+    const resolvedCastType = await resolveStagingVectorType(tx, params.vectorType ?? "vector(1536)");
+
     // 1. Find unpublished staging output_ids for this source
     const existingStaging = await tx`
       SELECT output_id
@@ -1236,16 +1240,9 @@ export async function stageSourceRecords(
     }
 
     // 4. Stage won records (published_at IS NULL)
-    let resolvedCastType = "vector(1536)";
-    if (!isTextVector) {
-      const detectedStagingType = await introspectStagingEmbeddingType(tx);
-      resolvedCastType = detectedStagingType ?? params.vectorType ?? "vector(1536)";
-      assertSafeCatalogTypeCast(resolvedCastType);
-    }
-
     for (const won of wonRecords) {
       const vectorLiteral = JSON.stringify(won.embedding);
-      if (isTextVector || resolvedCastType.toLowerCase() === "text") {
+      if (resolvedCastType === "text") {
         await tx`
           INSERT INTO paperclip_memory_upgrade_staging (
             upgrade_id,
