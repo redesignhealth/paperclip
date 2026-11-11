@@ -1685,12 +1685,22 @@ const INLINE_OAUTH_TOKEN_FIELDS = [
   "clientSecret",
 ];
 
+const DCR_CLIENT_REGISTRATION_FIELDS = [
+  "clientId",
+  "clientRegistrationSource",
+  "clientTokenEndpointAuthMethod",
+  "clientRedirectUri",
+  "clientIssuer",
+  "clientResource",
+  "clientCompanyId",
+  "clientIdIssuedAt",
+  "clientSecretExpiresAt",
+] as const;
+
 /**
- * Drop inline OAuth token material from a connection config, keeping the
- * non-secret identity (client id, issuer, registration source) a later
- * reconnect reuses. Current code stores tokens as secret refs, never in the
- * config; this exists so a row written by an older build cannot keep a usable
- * token after the operator removed the app.
+ * Drop inline OAuth token material from a connection config.
+ * For connection removal, prefer `withoutRemovedOAuthRegistration` which also
+ * clears DCR client registration material (TECH-8348).
  */
 function withoutInlineOAuthTokens(
   config: Record<string, unknown>,
@@ -1707,6 +1717,49 @@ function withoutInlineOAuthTokens(
     }
   }
   return changed ? { ...config, oauth: next } : config;
+}
+
+/**
+ * Drop inline OAuth token material and, for dynamically registered (DCR)
+ * clients, clear the stored client registration so reconnecting registers a
+ * fresh client with a valid secret rather than reusing an orphaned client id
+ * whose secret was deleted during removal (TECH-8348). CIMD and manual
+ * registrations are preserved for reconnect.
+ */
+function withoutRemovedOAuthRegistration(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const oauth = config.oauth;
+  if (!oauth || typeof oauth !== "object" || Array.isArray(oauth))
+    return config;
+  const next = { ...(oauth as Record<string, unknown>) };
+  let changed = false;
+  for (const field of INLINE_OAUTH_TOKEN_FIELDS) {
+    if (field in next) {
+      delete next[field];
+      changed = true;
+    }
+  }
+  if (next.clientRegistrationSource === "dcr") {
+    for (const field of DCR_CLIENT_REGISTRATION_FIELDS) {
+      if (field in next) {
+        delete next[field];
+        changed = true;
+      }
+    }
+  }
+  return changed ? { ...config, oauth: next } : config;
+}
+
+function isSecretNotFoundError(error: unknown): boolean {
+  if (!error) return false;
+  if (error instanceof HttpError && error.status === 404) return true;
+  if (typeof error === "object") {
+    const candidate = error as { status?: unknown; statusCode?: unknown; code?: unknown };
+    if (candidate.status === 404 || candidate.statusCode === 404) return true;
+    if (candidate.code === "secret_deleted" || candidate.code === "version_missing") return true;
+  }
+  return false;
 }
 
 function actorBinding(actor: ActorInfo | undefined) {
@@ -7264,7 +7317,8 @@ export function toolAccessService(
    *
    * What stays behind is deliberate: the connection and application rows, their
    * ids, names and activity keep working so a later reconnect reuses the same
-   * identity — but with no credential, no install and no profile, so
+   * identity — but with no credential, no install and no profile (and for DCR,
+   * no client registration, since its client secret was deleted; TECH-8348), so
    * reconnecting has to ask for fresh authentication and rebuild access.
    */
   async function removeConnection(
@@ -7655,8 +7709,8 @@ export function toolAccessService(
       .set({
         credentialRefs: [],
         credentialSecretRefs: [],
-        config: withoutInlineOAuthTokens(connection.config),
-        transportConfig: withoutInlineOAuthTokens(connection.transportConfig),
+        config: withoutRemovedOAuthRegistration(connection.config),
+        transportConfig: withoutRemovedOAuthRegistration(connection.transportConfig),
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))
@@ -9899,18 +9953,23 @@ export function toolAccessService(
           (ref) => ref.configPath === "oauth.client_secret",
         );
     const clientSecret = clientSecretRef
-      ? await secrets.resolveSecretValue(
-          connection.companyId,
-          clientSecretRef.secretId,
-          clientSecretRef.versionSelector ?? "latest",
-          {
-            consumerType: "tool_connection",
-            consumerId: connection.id,
-            configPath: "oauth.client_secret",
-            actorType: actor?.actorType ?? "system",
-            actorId: actor?.actorId ?? null,
-          },
-        )
+      ? await secrets
+          .resolveSecretValue(
+            connection.companyId,
+            clientSecretRef.secretId,
+            clientSecretRef.versionSelector ?? "latest",
+            {
+              consumerType: "tool_connection",
+              consumerId: connection.id,
+              configPath: "oauth.client_secret",
+              actorType: actor?.actorType ?? "system",
+              actorId: actor?.actorId ?? null,
+            },
+          )
+          .catch((error) => {
+            if (isSecretNotFoundError(error)) return null;
+            throw error;
+          })
       : null;
     return {
       clientIdEnv: null,
@@ -11380,6 +11439,20 @@ export function toolAccessService(
     );
   }
 
+  function isConfidentialOAuthMethod(method: unknown): boolean {
+    return method === "client_secret_post" || method === "client_secret_basic";
+  }
+
+  function isConfidentialDcrClient(
+    connection: typeof toolConnections.$inferSelect,
+  ): boolean {
+    const oauth = oauthConfig(connection);
+    return (
+      oauth.clientRegistrationSource === "dcr" &&
+      isConfidentialOAuthMethod(oauth.clientTokenEndpointAuthMethod)
+    );
+  }
+
   async function ensureOAuthClient(input: {
     connection: typeof toolConnections.$inferSelect;
     endpoints: OAuthProviderEndpoints;
@@ -11427,20 +11500,24 @@ export function toolAccessService(
         metadataDocumentUrl,
       )
     ) {
-      const bound = await stampOAuthClientBinding(
+      const isConfidentialDcr = isConfidentialDcrClient(input.connection);
+      const existingClient = await oauthClientForConnection(
         input.connection,
-        input.endpoints,
-        input.redirectUri,
+        input.endpoints.provider,
+        input.actor,
       );
-      return {
-        connection: bound,
-        client: await oauthClientForConnection(
-          bound,
-          input.endpoints.provider,
-          input.actor,
-        ),
-        source: storedOAuthClientRegistrationSource(bound),
-      };
+      if (!isConfidentialDcr || existingClient.clientSecret) {
+        const bound = await stampOAuthClientBinding(
+          input.connection,
+          input.endpoints,
+          input.redirectUri,
+        );
+        return {
+          connection: bound,
+          client: existingClient,
+          source: storedOAuthClientRegistrationSource(bound),
+        };
+      }
     }
     const oauth = oauthConfig(input.connection);
     if (
@@ -11502,20 +11579,24 @@ export function toolAccessService(
           metadataDocumentUrl,
         )
       ) {
-        const bound = await stampOAuthClientBinding(
+        const isConfidentialDcr = isConfidentialDcrClient(latest);
+        const existingClient = await oauthClientForConnection(
           latest,
-          input.endpoints,
-          input.redirectUri,
+          input.endpoints.provider,
+          input.actor,
         );
-        return {
-          connection: bound,
-          client: await oauthClientForConnection(
-            bound,
-            input.endpoints.provider,
-            input.actor,
-          ),
-          source: storedOAuthClientRegistrationSource(bound),
-        };
+        if (!isConfidentialDcr || existingClient.clientSecret) {
+          const bound = await stampOAuthClientBinding(
+            latest,
+            input.endpoints,
+            input.redirectUri,
+          );
+          return {
+            connection: bound,
+            client: existingClient,
+            source: storedOAuthClientRegistrationSource(bound),
+          };
+        }
       }
       // 3. By default, Client ID Metadata Documents need no registration call,
       //    so prefer them over DCR when the authorization server advertises
@@ -16054,7 +16135,7 @@ export function toolAccessService(
             code: "personal_instance_conflict",
           });
         }
-        // If archived, revive to draft while preserving all grants/credentials/profiles
+        // If archived, revive to draft while preserving non-secret identity (DCR registration was cleared on removal; TECH-8348)
         if (existing.status === "archived") {
           const [revived] = await tx
             .update(toolConnections)
@@ -16465,8 +16546,18 @@ export function toolAccessService(
     });
     connection = resolvedClient.connection;
     const client = resolvedClient.client;
-    if (galleryMethod?.oauthClientSecretRequired && !client.clientSecret) {
-      throw unprocessable("This app requires an OAuth client secret. Add it in the app setup before signing in.");
+    const resolvedOAuth = oauthConfig(connection);
+    const isManualConfidential =
+      resolvedClient.source === "manual" &&
+      isConfidentialOAuthMethod(resolvedOAuth.clientTokenEndpointAuthMethod);
+    if (
+      (galleryMethod?.oauthClientSecretRequired || isManualConfidential) &&
+      !client.clientSecret
+    ) {
+      throw unprocessable(
+        "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+        { code: "oauth_client_secret_missing" },
+      );
     }
     if (!client.clientId)
       throw unprocessable(

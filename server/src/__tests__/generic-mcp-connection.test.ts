@@ -5200,6 +5200,384 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(row!.status).toBe("active");
       expect(row!.enabled).toBe(true);
     });
+
+    it("TECH-8347 / TECH-8348 regression: remove (DELETE) personal RH Google MCP instance with client_secret_post DCR client, then Connect and complete callback", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+      const aliceApp = createActorApp(sessionActor(company.id, alice));
+
+      // 1. Initial connect
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      expect(start.status).toBe(200);
+      const instanceId = start.body.connectionId as string;
+      const callback = await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      const [firstConn] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      expect(firstConn!.status).toBe("active");
+      const firstOauth = (firstConn!.config.oauth as Record<string, unknown>) ?? {};
+      expect(firstOauth.clientId).toBe("fixture-dcr-client");
+      expect(firstOauth.clientRegistrationSource).toBe("dcr");
+      expect(firstOauth.clientTokenEndpointAuthMethod).toBe("client_secret_post");
+
+      // Verify initial catalog and grant
+      const firstCatalog = await catalogOf(instanceId);
+      expect(firstCatalog.every((entry) => entry.status !== "removed")).toBe(true);
+      const firstGrants = await grantsOf(instanceId);
+      expect(firstGrants.find((g) => g.subjectUserId === alice)?.status).toBe("active");
+
+      // 2. Remove (DELETE /tool-connections/:id)
+      const deleteRes = await request(aliceApp).delete(`/api/tool-connections/${instanceId}`);
+      expect(deleteRes.status).toBe(200);
+
+      // Verify removal cleared DCR registration (Phase 3b)
+      const [removedConn] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      expect(removedConn!.status).toBe("archived");
+      expect(removedConn!.credentialSecretRefs).toEqual([]);
+      const removedOauth = (removedConn!.config.oauth as Record<string, unknown>) ?? {};
+      expect(removedOauth.clientId).toBeUndefined();
+      expect(removedOauth.clientRegistrationSource).toBeUndefined();
+      expect(removedOauth.clientTokenEndpointAuthMethod).toBeUndefined();
+      expect(removedOauth.clientRedirectUri).toBeUndefined();
+      expect(removedOauth.clientIssuer).toBeUndefined();
+      expect(removedOauth.clientResource).toBeUndefined();
+      expect(removedOauth.clientCompanyId).toBeUndefined();
+      expect(removedOauth.clientIdIssuedAt).toBeUndefined();
+      expect(removedOauth.clientSecretExpiresAt).toBeUndefined();
+
+      const removedCatalog = await catalogOf(instanceId);
+      expect(removedCatalog.every((entry) => entry.status === "removed")).toBe(true);
+      const removedGrants = await grantsOf(instanceId);
+      expect(removedGrants.every((g) => g.status === "revoked")).toBe(true);
+
+      // 3. Connect again and complete callback
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(200);
+      expect(restart.body.connectionId).toBe(instanceId);
+      const restartCallback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(restartCallback.status).toBe(200);
+
+      // Verify connection, grant, and catalog healed
+      const [afterConn] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      expect(afterConn!.status).toBe("active");
+      expect(afterConn!.enabled).toBe(true);
+      const afterOauth = (afterConn!.config.oauth as Record<string, unknown>) ?? {};
+      expect(afterOauth.clientId).toBe("fixture-dcr-client");
+      expect(afterOauth.clientRegistrationSource).toBe("dcr");
+
+      const afterGrants = await grantsOf(instanceId);
+      expect(afterGrants.find((g) => g.subjectUserId === alice)?.status).toBe("active");
+      const afterCatalog = await catalogOf(instanceId);
+      expect(afterCatalog.every((entry) => entry.status !== "removed")).toBe(true);
+    });
+
+    it("TECH-8347: a row already in the stuck state (active, DCR config with clientId, no client secret ref, revoked grant) heals on Connect", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+
+      // Put the row directly into the pre-3b stuck state:
+      // Active connection, DCR config with clientId, no client secret ref, revoked grant
+      await db.update(toolConnections).set({
+        credentialRefs: [],
+        credentialSecretRefs: [],
+        status: "active",
+      }).where(eq(toolConnections.id, instanceId));
+      await db.update(connectionGrants).set({
+        status: "revoked",
+        credentialSecretRefs: [],
+      }).where(eq(connectionGrants.connectionId, instanceId));
+
+      // Connect heals via fresh registration
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(200);
+      const callback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      const [healedConn] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      expect(healedConn!.status).toBe("active");
+      expect(healedConn!.credentialSecretRefs.some((r) => r.configPath === "oauth.client_secret")).toBe(true);
+      const grants = await grantsOf(instanceId);
+      expect(grants.find((g) => g.subjectUserId === alice)?.status).toBe("active");
+      const catalog = await catalogOf(instanceId);
+      expect(catalog.every((entry) => entry.status !== "removed")).toBe(true);
+    });
+
+    it("TECH-8347: self-heals when secret ref is present but secret row was deleted", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+
+      const [current] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      const oldSecretRef = current!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
+      expect(oldSecretRef).toBeDefined();
+
+      // Delete the secret row from companySecrets to simulate 404 on resolution
+      await db.delete(companySecrets).where(eq(companySecrets.id, oldSecretRef.secretId));
+
+      // Grant is revoked
+      await db.update(connectionGrants).set({
+        status: "revoked",
+      }).where(eq(connectionGrants.connectionId, instanceId));
+
+      // Connect heals via fresh registration
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(200);
+      const callback = await completeSeedConnect(company.id, alice, restart.body.authorizationUrl, fixture);
+      expect(callback.status).toBe(200);
+
+      const [healedConn] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      expect(healedConn!.status).toBe("active");
+      const newSecretRef = healedConn!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
+      expect(newSecretRef).toBeDefined();
+      expect(newSecretRef.secretId).not.toBe(oldSecretRef.secretId);
+      const grants = await grantsOf(instanceId);
+      expect(grants.find((g) => g.subjectUserId === alice)?.status).toBe("active");
+    });
+
+    it("TECH-8348: connection removal clears DCR client fields while keeping CIMD and manual fields", async () => {
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app1] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "App 1", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [app2] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "App 2", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [app3] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "App 3", type: "mcp_http", status: "active", metadata: {} }).returning();
+
+      const [dcrConn] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app1!.id, uid: randomUUID(), name: "DCR Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "dcr-client-id",
+            clientRegistrationSource: "dcr",
+            clientTokenEndpointAuthMethod: "client_secret_post",
+            clientRedirectUri: REDIRECT_URI,
+            clientIssuer: ISSUER,
+            clientResource: MCP_URL,
+            clientCompanyId: company.id,
+            clientIdIssuedAt: 1700000000,
+            clientSecretExpiresAt: 1800000000,
+            access_token: "inline-tok",
+          },
+        },
+        transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+
+      const [cimdConn] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app2!.id, uid: randomUUID(), name: "CIMD Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "https://paperclip.example/oauth/client-metadata.json",
+            clientRegistrationSource: "cimd",
+            clientTokenEndpointAuthMethod: "none",
+            clientRedirectUri: REDIRECT_URI,
+            access_token: "inline-tok",
+          },
+        },
+        transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+
+      const [manualConn] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app3!.id, uid: randomUUID(), name: "Manual Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-client-id",
+            clientRegistrationSource: "manual",
+            clientTokenEndpointAuthMethod: "client_secret_post",
+            access_token: "inline-tok",
+          },
+        },
+        transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+
+      await service.archiveConnection(dcrConn!.id, company.id, actor);
+      await service.archiveConnection(cimdConn!.id, company.id, actor);
+      await service.archiveConnection(manualConn!.id, company.id, actor);
+
+      const [afterDcr] = await db.select().from(toolConnections).where(eq(toolConnections.id, dcrConn!.id));
+      const dcrOauth = (afterDcr!.config.oauth as Record<string, unknown>) ?? {};
+      expect(dcrOauth.clientId).toBeUndefined();
+      expect(dcrOauth.clientRegistrationSource).toBeUndefined();
+      expect(dcrOauth.clientTokenEndpointAuthMethod).toBeUndefined();
+      expect(dcrOauth.clientRedirectUri).toBeUndefined();
+      expect(dcrOauth.clientIssuer).toBeUndefined();
+      expect(dcrOauth.clientResource).toBeUndefined();
+      expect(dcrOauth.clientCompanyId).toBeUndefined();
+      expect(dcrOauth.clientIdIssuedAt).toBeUndefined();
+      expect(dcrOauth.clientSecretExpiresAt).toBeUndefined();
+      expect(dcrOauth.access_token).toBeUndefined();
+
+      const [afterCimd] = await db.select().from(toolConnections).where(eq(toolConnections.id, cimdConn!.id));
+      const cimdOauth = (afterCimd!.config.oauth as Record<string, unknown>) ?? {};
+      expect(cimdOauth.clientId).toBe("https://paperclip.example/oauth/client-metadata.json");
+      expect(cimdOauth.clientRegistrationSource).toBe("cimd");
+      expect(cimdOauth.clientTokenEndpointAuthMethod).toBe("none");
+      expect(cimdOauth.clientRedirectUri).toBe(REDIRECT_URI);
+      expect(cimdOauth.access_token).toBeUndefined();
+
+      const [afterManual] = await db.select().from(toolConnections).where(eq(toolConnections.id, manualConn!.id));
+      const manualOauth = (afterManual!.config.oauth as Record<string, unknown>) ?? {};
+      expect(manualOauth.clientId).toBe("manual-client-id");
+      expect(manualOauth.clientRegistrationSource).toBe("manual");
+      expect(manualOauth.clientTokenEndpointAuthMethod).toBe("client_secret_post");
+      expect(manualOauth.access_token).toBeUndefined();
+    });
+
+    it("TECH-8347: manual confidential client with no secret fails at start before consent", async () => {
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["client_secret_post"] });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual App", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: app!.id,
+        uid: randomUUID(),
+        name: "Manual Confidential No Secret",
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-confidential-client",
+            clientRegistrationSource: "manual",
+            clientTokenEndpointAuthMethod: "client_secret_post",
+          },
+        },
+        transportConfig: { url: MCP_URL },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      await expect(
+        service.startOAuth(company.id, connection!.id, { redirectUri: REDIRECT_URI, actor }),
+      ).rejects.toMatchObject({
+        status: 422,
+        message: "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+      });
+    });
+
+    it("TECH-8347 unchanged cases: CIMD, public DCR (none), env-preconfigured, and manual public (TECH-7973)", async () => {
+      stubPublicUrl();
+      const company = await createCompany(db);
+      const service = toolAccessService(db, {
+        oauthClientMetadataLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      });
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      // 1. CIMD
+      installMcpOAuthFixture({ auth: "oauth", cimd: true });
+      const [app1] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "CIMD App", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [cimd] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app1!.id, uid: randomUUID(), name: "CIMD Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: CLIENT_METADATA_DOCUMENT_URL,
+            clientRegistrationSource: "cimd",
+            clientTokenEndpointAuthMethod: "none",
+            clientRedirectUri: REDIRECT_URI,
+            clientIssuer: ISSUER,
+            clientResource: MCP_URL,
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+      const cimdStart = await service.startOAuth(company.id, cimd!.id, { redirectUri: REDIRECT_URI, actor });
+      expect(cimdStart.registrationSource).toBe("cimd");
+      expect(new URL(cimdStart.authorizationUrl).searchParams.get("client_id")).toBe(CLIENT_METADATA_DOCUMENT_URL);
+
+      // 2. Public DCR ('none')
+      installMcpOAuthFixture({ auth: "oauth", tokenEndpointAuthMethods: ["none"] });
+      const [app2] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Public DCR App", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [publicDcr] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app2!.id, uid: randomUUID(), name: "Public DCR Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "public-dcr-client",
+            clientRegistrationSource: "dcr",
+            clientTokenEndpointAuthMethod: "none",
+            clientRedirectUri: REDIRECT_URI,
+            clientIssuer: ISSUER,
+            clientResource: MCP_URL,
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+      const publicDcrStart = await service.startOAuth(company.id, publicDcr!.id, { redirectUri: REDIRECT_URI, actor });
+      expect(publicDcrStart.registrationSource).toBe("dcr");
+      expect(new URL(publicDcrStart.authorizationUrl).searchParams.get("client_id")).toBe("public-dcr-client");
+
+      // 3. Env-preconfigured
+      vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "env-preconfigured-id");
+      installMcpOAuthFixture({ auth: "oauth" });
+      const [app3] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Preconf App", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [preconf] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app3!.id, uid: randomUUID(), name: "Preconfigured Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: { url: MCP_URL }, transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+      const preconfStart = await service.startOAuth(company.id, preconf!.id, { redirectUri: REDIRECT_URI, actor });
+      expect(preconfStart.registrationSource).toBe("preconfigured");
+      expect(new URL(preconfStart.authorizationUrl).searchParams.get("client_id")).toBe("env-preconfigured-id");
+      vi.unstubAllEnvs();
+
+      // 4. Manual public client (TECH-7973)
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none"] });
+      const [app4] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual Public App", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [manualPublic] = await db.insert(toolConnections).values({
+        companyId: company.id, applicationId: app4!.id, uid: randomUUID(), name: "Manual Public Conn", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-public-client",
+            clientRegistrationSource: "manual",
+            clientTokenEndpointAuthMethod: "none",
+            clientRedirectUri: REDIRECT_URI,
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL }, credentialRefs: [], credentialSecretRefs: [],
+      }).returning();
+      const manualPublicStart = await service.startOAuth(company.id, manualPublic!.id, { redirectUri: REDIRECT_URI, actor });
+      expect(manualPublicStart.registrationSource).toBe("manual");
+      expect(new URL(manualPublicStart.authorizationUrl).searchParams.get("client_id")).toBe("manual-public-client");
+    });
   });
 
 });
