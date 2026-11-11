@@ -44,6 +44,7 @@ import {
   validateTenantFence,
   type TenantFence,
 } from "./tenant-fence.js";
+import { UPGRADE_WORK_STATES, isUpgradeWorkState } from "./phases.js";
 import { isValidUuid } from "./census.js";
 import { ensureUpgradeTables, introspectStagingEmbeddingType } from "./tenant-tables.js";
 import {
@@ -359,7 +360,7 @@ export async function runPublish(
         "STATE_MISMATCH",
       );
     }
-    if (upgrade.state !== "sweeping") {
+    if (!isUpgradeWorkState(upgrade.state)) {
       throw new CompanyMemoryUpgradeError(
         "Cannot run publish: active upgrade is not in sweeping state.",
         "STATE_MISMATCH",
@@ -451,6 +452,7 @@ export async function runPublish(
       cpLeaseToken: leaseToken,
       leaseOwner,
       now: clock.now?.() ?? new Date(),
+      allowedStates: UPGRADE_WORK_STATES,
     });
 
     const activeRunGate = createActiveRunGate({
@@ -676,7 +678,7 @@ export async function runPublish(
       isDryRun: false,
       companyId,
       upgradeId: activeUpgradeId,
-      state: "sweeping",
+      state: upgrade.state,
       counts: {
         publishedCount: totalPublished,
         supersededCount: totalSuperseded,

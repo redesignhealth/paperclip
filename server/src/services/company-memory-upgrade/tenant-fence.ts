@@ -111,7 +111,9 @@ import { randomUUID } from "node:crypto";
 import { companyMemoryUpgrades, type Db } from "@paperclipai/db";
 import { eq, sql as dsql } from "drizzle-orm";
 import type postgres from "postgres";
-import { CompanyMemoryUpgradeError } from "./types.js";
+import { CompanyMemoryUpgradeError, type UpgradeState } from "./types.js";
+
+const DEFAULT_FENCE_ALLOWED_STATES: ReadonlySet<UpgradeState> = new Set(["sweeping"]);
 
 export interface TenantFence {
   upgradeId: string;
@@ -264,6 +266,7 @@ export interface ClaimTenantFenceGuardedParams {
   leaseOwner: string;
   boundMs?: number;
   now?: Date;
+  allowedStates?: ReadonlySet<UpgradeState>;
 }
 
 /**
@@ -313,7 +316,8 @@ export async function claimTenantFenceGuarded(
           "UPGRADE_NOT_FOUND",
         );
       }
-      if (row.state !== "sweeping") {
+      const allowedStates = params.allowedStates ?? DEFAULT_FENCE_ALLOWED_STATES;
+      if (!allowedStates.has(row.state as UpgradeState)) {
         throw new CompanyMemoryUpgradeError(
           "Cannot claim tenant fence: control-plane upgrade is no longer in sweeping state (admission already revoked)",
           "LEASE_FENCED_OUT",
