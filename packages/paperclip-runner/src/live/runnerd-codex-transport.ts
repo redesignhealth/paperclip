@@ -1,3 +1,4 @@
+import { PRP_COMPLETION_TOOL_NAME, PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA } from "../contracts/completion-result.js";
 import { RunnerLaunchPreparationStore } from "./runner-launch-preparation-store.js";
 import type { PreparedRunnerProviderLaunch, RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 import { validatePreparedRunnerLaunch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
@@ -3211,7 +3212,7 @@ function authorizedToolSet(
       operationId: String(tool.name ?? ""),
       version: 1,
       description: String(tool.description ?? ""),
-      inputSchema: record(tool.inputSchema),
+      inputSchema: tool.name === PRP_COMPLETION_TOOL_NAME ? PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA : record(tool.inputSchema),
       responseSchema: {},
     }))
     .sort((left, right) =>

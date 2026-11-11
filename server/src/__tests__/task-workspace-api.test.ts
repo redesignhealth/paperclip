@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { agents, executionWorkspaceRepositories, executionWorkspaces, issues, heartbeatRuns, projects, projectWorkspaces } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { agents, authUsers, companyMemberships, executionWorkspaceRepositories, executionWorkspaces, issues, heartbeatRuns, projects, projectWorkspaces } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
@@ -15,6 +15,28 @@ const support = await getEmbeddedPostgresTestSupport();
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
+  it("prepares a repository through native JWT authority for the local board and rechecks revoked access", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    await server.db.insert(authUsers).values({ id: "local-board", name: "Local Board", email: "local-board@example.invalid",
+      emailVerified: true, createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await server.db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "local-board", membershipRole: "owner", status: "active" });
+    const [workspace] = await server.db.insert(executionWorkspaces).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      name: "Local task files", cwd: f.workspace, mode: "isolated_workspace", strategyType: "task_directory" }).returning();
+    await server.db.update(issues).set({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: workspace.id,
+      responsibleUserId: "local-board" }).where(eq(issues.id, f.issueId));
+    await server.db.update(heartbeatRuns).set({ responsibleUserId: "local-board" }).where(eq(heartbeatRuns.id, f.runId));
+    await expect(f.authority.execute({ tool: "prepare_repository", callId: randomUUID(), arguments: {
+      repository: { kind: "url", url: "https://github.com/public/example" }, requestKey: "local-board-native" } }))
+      .resolves.toMatchObject({ kind: "requires_next_admission" });
+    await server.db.delete(companyMemberships).where(and(eq(companyMemberships.companyId, f.companyId), eq(companyMemberships.principalId, "local-board")));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, "local-board");
+    const denied = await fetch(`${server.apiUrl}/api/issues/${f.issueId}/workspace/repositories`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ repository: { kind: "url", url: "https://github.com/public/other" }, requestKey: "different-sponsor" }),
+    });
+    expect([403, 404]).toContain(denied.status);
+    expect(await server.db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.companyId, f.companyId))).toHaveLength(1);
+  });
   it("creates an explicit-workspace child through the authenticated low-trust API without repeating its saved policy", async () => {
     const f = await server.fixture({ connectionScenario: "fresh", disableWakeOnDemand: true });
     const policy = { trustPreset: "low_trust_review", authorizationPolicy: { trustPreset: "low_trust_review",

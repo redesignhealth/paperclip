@@ -319,7 +319,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     return candidatePin;
   }
   async function prepareForAdmission(input: { companyId: string; issueId: string; workspaceId: string; cwd: string; agentId: string; runId: string; responsibleUserId: string | null }) {
-    const { acquisitionRestricted } = await publicationBinding(db, input, false);
+    const { acquisitionRestricted, workspace } = await publicationBinding(db, input, false);
     const rows = await list(input.companyId, input.workspaceId);
     if (!rows.length) return [];
     await publicationBinding(db, input);
@@ -362,7 +362,11 @@ export function executionWorkspaceRepositoryService(db: Db) {
           await fs.writeFile(ignoreTemporary, "*\n", { flag: "wx", mode: 0o600 });
           await fs.rename(ignoreTemporary, ignorePath);
         } finally { await fs.rm(ignoreTemporary, { force: true }); }
-        await measureRunPhase("workspace.repository.ignore_rules", () => ensureManagedRepositoriesIgnored(root));
+        await measureRunPhase("workspace.repository.ignore_rules", () => ensureManagedRepositoriesIgnored(root, {
+          plainTaskDirectory: workspace.strategyType === "project_primary" && workspace.metadata?.source === "task_session"
+            && workspace.sourceIssueId === input.issueId && ["shared_workspace", "isolated_workspace"].includes(workspace.mode)
+            && !workspace.repoUrl && !workspace.projectId && !workspace.projectWorkspaceId,
+        }));
       }
       return stagingParent;
     });

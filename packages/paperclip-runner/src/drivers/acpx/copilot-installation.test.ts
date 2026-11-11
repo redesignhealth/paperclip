@@ -87,9 +87,20 @@ vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi
 
 describe("Copilot build-owned installation", () => {
   it("admits the current profile with environment launch preparation", () => {
-    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(54);
+    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(56);
     expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
-    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:ef3b0042e490ebb73f9d121b7e51103b4c8b98eda30941a3133d6c5a5d7e4de7");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:6af16ef34130d410c832552a4069f8202cd8973bc05ec23e4bc303c85cb48c4d");
+  });
+
+  it("merges the upstream v54/v55 guidance and continuation changes with the fork v54 sanitizer in v56", () => {
+    const fork = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v54-identity.json", import.meta.url), "utf8"));
+    const upstream = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v55-identity.json", import.meta.url), "utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v56-identity.json", import.meta.url), "utf8"));
+    expect(current.declaration.agentProfileVersion).toBe(56);
+    expect(current.commandDigest).not.toBe(fork.commandDigest);
+    expect(current.commandDigest).not.toBe(upstream.commandDigest);
+    expect(isSupportedAcpxProfileVersion("copilot", 54)).toBe(true);
+    expect(isSupportedAcpxProfileVersion("copilot", 55)).toBe(true);
   });
 
   it("preserves v53 while binding the TECH-7076 OpenCode environment sanitizer in v54", () => {

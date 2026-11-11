@@ -1,5 +1,32 @@
 # Paid runner full-stack E2E
 
+## Automatic repository continuation
+
+The explicit-only `automatic-repository` suite is an early repair check for
+native Codex and Claude on local and Daytona execution. One browser request
+must stage its managed repository, continue without a timer or another user
+message, and deliver a registered download. The oracle compares downloaded
+JSON with the actual checkout and the original task file. The source admission
+creates an unpredictable reference and registers its bytes before setup. The
+observer must download that source-attributed artifact while only the first
+admission is running, before the successor starts. A missing original, late
+observation, or different successor-created reference fails qualification. The
+successor is instructed to stop on a missing file and never recreate it. Both admissions
+must retain one workspace and commit their native results. The successor must
+have its own dispatch receipt and saved native intent. It starts after the
+predecessor finishes; dispatch must not retag the predecessor. The fixture uses
+production hire instructions and records the selected catalog model. These four
+development cells do not qualify Slack, staging configurations, migration,
+finalization restart, or the complete dependable-work milestone.
+
+Select it explicitly with `--suite automatic-repository`. Every execution has
+one attempt, two expected provider admissions, and 1,000-cent company and agent
+hard stops. Automatic infrastructure retries are disabled. Existing campaign
+reports retain failures, timings, usage, runtime costs, and source identity.
+Source-server startup prepares the existing shared/plugin SDK build dependencies
+before importing native tool authority. Installed-package checks never execute
+checkout build helpers.
+
 ## Latency observation bounds
 
 The explicit `codie-latency-diagnostic` arms its observation recorder before
