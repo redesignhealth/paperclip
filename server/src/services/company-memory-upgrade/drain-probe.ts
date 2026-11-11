@@ -19,6 +19,14 @@ import { CompanyMemoryUpgradeError } from "./types.js";
 
 export { countPublishPending, type PublishPendingResult };
 
+/**
+ * ECMAScript WhiteSpace and LineTerminator characters trimmed by String.prototype.trim().
+ * Explicitly enumerated to match JavaScript trim() semantics in PostgreSQL btrim().
+ * Excludes U+0085 (NEL) and U+200B (Zero Width Space) which JS does not trim.
+ */
+export const ECMA_TRIM_WHITESPACE =
+  "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+
 export interface DrainProbeOptions {
   upgradeId: string;
   tableName: string;
@@ -61,7 +69,12 @@ export async function runDrainProbe(
   await assertDrainProbePreflight(tenantSql, options.tableName, resolved.regclassArg);
   const pending = await countPublishPending(tenantSql, options.upgradeId);
 
-  const knownAgentIds = Array.from(options.cpAgentMap.keys()).map((k) => k.trim().toLowerCase());
+  const knownAgentIds = Array.from(
+    new Set([
+      ...Array.from(options.cpAgentMap.keys()).map((k) => k.trim().toLowerCase()),
+      ...Array.from(options.cpAgentMap.values()).map((a) => (a?.id ? a.id.trim().toLowerCase() : "")).filter(Boolean),
+    ]),
+  );
   const reconvertibleOutcomes = Array.from(RECONVERTIBLE_LEDGER_OUTCOMES);
 
   // Anti-join over live collection matching sweep decision rules exactly:
@@ -95,8 +108,8 @@ export async function runDrainProbe(
            OR l.source_content_sha256 <> encode(sha256(convert_to(coalesce(t.payload->>'data',''),'UTF8')),'hex')
            OR coalesce(l.agent_id::text,'') <> coalesce(
                 CASE
-                  WHEN btrim(lower(coalesce(t.payload->>'agent_id', ''))) = ANY($3::text[])
-                  THEN btrim(lower(t.payload->>'agent_id'))
+                  WHEN btrim(lower(coalesce(t.payload->>'agent_id', '')), $5::text) = ANY($3::text[])
+                  THEN btrim(lower(t.payload->>'agent_id'), $5::text)
                   ELSE NULL
                 END,
                 ''
@@ -111,7 +124,7 @@ export async function runDrainProbe(
          )
        LIMIT $2
      ) q;`,
-    [options.upgradeId, limit, knownAgentIds, reconvertibleOutcomes],
+    [options.upgradeId, limit, knownAgentIds, reconvertibleOutcomes, ECMA_TRIM_WHITESPACE],
   )) as Array<{
     blocking_sources: number | string | null;
     missing_scope_sources: number | string | null;
