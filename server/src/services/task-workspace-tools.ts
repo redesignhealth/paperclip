@@ -1,18 +1,27 @@
 import { prepareWorkspaceRepositorySchema, selectTaskWorkspaceSchema } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { executionWorkspaceRepositories, type Db } from "@paperclipai/db";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 
-export async function pendingTaskRepositoryContinuation(db: Pick<Db, "select">, input: {
-  companyId: string; issueId: string; runId: string; workspaceId: string | null;
+export async function pendingTaskRepository(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; workspaceId: string | null; repositoryIds?: string[];
 }) {
+  if (input.repositoryIds?.length === 0) return null;
   if (!input.workspaceId) return null;
   const [repository] = await db.select({ id: executionWorkspaceRepositories.id }).from(executionWorkspaceRepositories)
     .where(and(eq(executionWorkspaceRepositories.companyId, input.companyId),
       eq(executionWorkspaceRepositories.executionWorkspaceId, input.workspaceId),
       eq(executionWorkspaceRepositories.requestedByIssueId, input.issueId),
-      eq(executionWorkspaceRepositories.state, "pending")))
+      eq(executionWorkspaceRepositories.state, "pending"),
+      ...(input.repositoryIds ? [inArray(executionWorkspaceRepositories.id, input.repositoryIds)] : [])))
     .orderBy(asc(executionWorkspaceRepositories.createdAt), asc(executionWorkspaceRepositories.id)).limit(1);
+  return repository ?? null;
+}
+
+export async function pendingTaskRepositoryContinuation(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; runId: string; workspaceId: string | null;
+}) {
+  const repository = await pendingTaskRepository(db, input);
   return repository ? { kind: "same_agent" as const, summary: "Continue with the prepared task repository.",
     idempotencyKey: `task-repository:${input.issueId}:${repository.id}:${input.runId}` } : null;
 }
@@ -39,7 +48,7 @@ export async function callTaskWorkspaceTool(input: { name: string; arguments: Re
   if (input.name === "prepare_repository") {
     const { operationId, ...rest } = result;
     return { ...rest, ...(result.repository ? { repository: repositoryView(result.repository) } : {}), preparationId: operationId,
-      ...(result.kind === "requires_next_admission" ? { instruction: "The repository is staged for the next admission. If unfinished work needs this checkout, finish independent work and yield. Paperclip will select the saved workspace continuation; no timer or user restart is needed." } : {}),
+      ...(result.kind === "requires_next_admission" ? { instruction: "The repository is staged for the next admission. If unfinished work needs this checkout, finish independent work, then call paperclip_finish with reportedWorkDisposition=\"yielded\" and omit continuation (or use null). Paperclip will select the saved workspace continuation. Repository admission is routine setup; do not call paperclip_block or ask the user to restart. No timer is needed." } : {}),
     };
   }
   if (input.name === "get_workspace") {

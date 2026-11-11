@@ -593,6 +593,41 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect((await readIssue(issue.id)).projectId).toBe(organization.id);
   });
 
+  it("retains task-directory provenance through shared workspace preparation", async () => {
+    const { input, issue, source } = await fixture();
+    await db.update(issues).set({ projectId: null, projectWorkspaceId: null,
+      workspaceSelection: { version: 1, source: "explicit", selection: { kind: "task_directory" } },
+    }).where(eq(issues.id, issue.id));
+    input.task.issueRef = await readIssue(issue.id);
+    input.task.context = { issueId: issue.id };
+    const first = await prepareHeartbeatWorkspace(db, input);
+    expect(first.executionWorkspace.source).toBe("task_session");
+    expect(first.persistedExecutionWorkspace).toMatchObject({ mode: "shared_workspace", strategyType: "project_primary",
+      sourceIssueId: issue.id, projectId: null, projectWorkspaceId: null, repoUrl: null, metadata: { source: "task_session" } });
+    await mkdir(join(first.executionWorkspace.cwd, ".git", "info"), { recursive: true });
+    await writeFile(join(first.executionWorkspace.cwd, ".git", "info", "exclude"), "/.paperclip-repositories/\n");
+    await writeFile(join(first.executionWorkspace.cwd, "original-context.txt"), "Preserve the original task bytes\n");
+    await db.update(issues).set({ executionRunId: input.run.id }).where(eq(issues.id, issue.id));
+    const taskRepositories = executionWorkspaceService(db);
+    const receipt = await taskRepositories.requestTaskRepository({ companyId: issue.companyId, issueId: issue.id,
+      actor: { type: "board", source: "local_implicit", userId: "local-board" },
+      request: { repository: { kind: "url", url: "https://github.com/public/source" }, requestKey: "retained-task-directory" } });
+    const materialize = managedRepositoryCheckout.materializeManagedProjectWorkspace;
+    vi.spyOn(managedRepositoryCheckout, "materializeManagedProjectWorkspace").mockImplementation((cwd, options) =>
+      materialize(cwd, { ...options, localSource: source }));
+    await reuse(input, first.persistedExecutionWorkspace!);
+    await db.update(issues).set({ executionRunId: input.run.id }).where(eq(issues.id, issue.id));
+    input.task.issueRef = await readIssue(issue.id);
+    const next = await prepareHeartbeatWorkspace(db, input);
+    expect(next.executionWorkspace.source).toBe("task_session");
+    expect(next.persistedExecutionWorkspace!.metadata?.source).toBe("task_session");
+    expect(next.persistedExecutionWorkspace!.id).toBe(first.persistedExecutionWorkspace!.id);
+    expect(await readFile(join(next.executionWorkspace.cwd, "original-context.txt"), "utf8")).toBe("Preserve the original task bytes\n");
+    const [repository] = await taskRepositories.listTaskRepositories(issue.companyId, next.persistedExecutionWorkspace!.id);
+    expect(repository).toMatchObject({ id: receipt.operationId, state: "ready" });
+    expect(await readFile(join(next.executionWorkspace.cwd, repository.relativePath, "README.md"), "utf8")).toBe("source content\n");
+  });
+
   it("creates a real isolated worktree and reuses its recorded workspace", async () => {
     const { input, source, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
