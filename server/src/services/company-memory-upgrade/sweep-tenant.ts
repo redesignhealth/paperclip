@@ -20,7 +20,7 @@ import {
 import {
   MODEL_CLASSIFIED_NOISE_REASON_CODE,
   MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
-} from "./llm-converter.js";
+} from "./converter-contract.js";
 import {
   acquireSourceAdvisoryLock,
   type TenantFence,

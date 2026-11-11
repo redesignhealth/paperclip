@@ -34,23 +34,15 @@ import { type RedactionRegistry } from "./openai-key.js";
 import { estimateChatTokens, isInsufficientQuotaError, parseRetryAfterMs, type RateLimiter } from "./rate-limiter.js";
 import { CompanyMemoryUpgradeError, TERMINAL_LLM_ERROR_CODES } from "./types.js";
 
-/**
- * Exact bounded reason_code literal emitted for `dropped_noise` outcomes that were
- * classified by the model itself (decision: "drop_noise"). Shared as the producer constant
- * so validators can permit it as an exact literal.
- */
-export const MODEL_CLASSIFIED_NOISE_REASON_CODE = "model_classified_noise";
+import {
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
+  MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
+} from "./converter-contract.js";
 
-/**
- * Exact bounded reason_code literal emitted for `dropped_sensitive` outcomes that were
- * classified by the model itself (decision: "drop_sensitive" with no regex family match
- * on the model's own textual output). This is a SINGLE fixed literal -- distinct from, and
- * never combined with, the sorted comma-separated regex family CSV emitted when our own
- * `detectSensitiveFamilies` regexes match (see sensitive-patterns.ts / converter-contract.ts
- * `data_sensitive_echo`). Shared here as the producer constant so validateOutcomeReason in
- * sweep-tenant.ts can permit it as an exact literal without weakening family CSV validation.
- */
-export const MODEL_CLASSIFIED_SENSITIVE_REASON_CODE = "model_classified";
+export {
+  MODEL_CLASSIFIED_NOISE_REASON_CODE,
+  MODEL_CLASSIFIED_SENSITIVE_REASON_CODE,
+};
 
 export type ConversionClientResult =
   | {
