@@ -2740,6 +2740,26 @@
       "reviewedAt": "2026-10-15",
       "liveProof": "not-run",
       "keyPermissions": "Create an organization key with the read, write, and delete permissions for the resources you intend to manage. Daytona toolbox access is available to every valid organization key, even without selected scopes. Some user or administration endpoints require provider user authentication and will reject an API key."
+    },
+    {
+      "app": "paperclip-notebook",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "notebook:read",
+        "notebook:write",
+        "notebook:share",
+        "notebook:delete"
+      ],
+      "capability": "write",
+      "supportedActions": "Read available pages; create and update owned pages; change sharing including public discovery; manage versions; delete and restore owned pages.",
+      "evidence": [
+        "doc/connections/PAPERCLIP-NOTEBOOK.md"
+      ],
+      "reviewedAt": "2026-10-20",
+      "liveProof": "not-run",
+      "evidenceLimit": "First-party implementation contract; canonical service availability and live OAuth qualification are deployment prerequisites. Uses the existing personal OAuth flow with default connection labels; automatic remote revocation and custom keyed refresh recovery are deferred."
     }
   ]
 }

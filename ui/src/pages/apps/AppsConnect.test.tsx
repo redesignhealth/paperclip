@@ -665,6 +665,64 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(finishAppMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "source=paperclip-notebook", "source=%20paperclip-notebook%20", "appKey=paperclip-notebook", "source=paperclip-notebook&resume=existing-notebook",
+    "source=paperclip-notebook&reconnect=existing-notebook", "reconnect=existing-notebook",
+  ])("blocks Notebook setup and existing authorization shortcuts while disabled: %s", async query => {
+    mockSearch.value = query;
+    getConnectionMock.mockResolvedValue({ id: "existing-notebook", status: "active", config: { sourceTemplateKey: "paperclip-notebook" } });
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("paperclip-notebook")] });
+    await render();
+    expect(container.textContent).toContain("Paperclip Notebook is not available on this instance");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+    expect(finishAppMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["path", "inline"])("blocks the Notebook %s setup route while disabled", async route => {
+    getConnectionMock.mockResolvedValue({ id: "existing-notebook", status: "active", config: { sourceTemplateKey: "paperclip-notebook" } });
+    mockParams.appKey = route === "path" ? "paperclip-notebook" : undefined;
+    await render(undefined, false, route === "inline" ? <ConnectionSetupFlow host="dialog" serviceSlug="paperclip-notebook" configuredConnection={{ id: "existing-notebook", applicationId: "notebook-app", name: "Notebook", enabled: true, status: "active" }} /> : undefined);
+    expect(container.textContent).toContain("Paperclip Notebook is not available on this instance");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the saved application identity when its mutable provider marker has changed", async () => {
+    mockSearch.value = "source=notion&reconnect=existing-notebook";
+    getConnectionMock.mockResolvedValue({ id: "existing-notebook", applicationId: "notebook-app", status: "active", config: { sourceTemplateKey: "notion" } });
+    listConnectionsMock.mockResolvedValue({ connections: [{ id: "existing-notebook", applicationId: "notebook-app", status: "active", config: { sourceTemplateKey: "notion" } }] });
+    listApplicationsMock.mockResolvedValue({ applications: [{ id: "notebook-app", applicationKey: "app-gallery:paperclip-notebook:11111111-1111-4111-8111-111111111111", metadata: { sourceTemplateKey: "notion" } }] });
+    await render();
+    expect(container.textContent).toContain("Paperclip Notebook is not available on this instance");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+  });
+
+  it("waits for Notebook settings and fails closed when they cannot be loaded", async () => {
+    mockSearch.value = "source=paperclip-notebook";
+    let reject!: (error: Error) => void;
+    experimentalMock.mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
+    await render();
+    expect(container.textContent).toContain("Loading connection settings");
+    await act(async () => { reject(new Error("Settings unavailable")); });
+    await flushReact();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not load connector availability");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+  });
+
+  it("opens Notebook setup only with its explicit rollout opt-in", async () => {
+    mockSearch.value = "source=paperclip-notebook";
+    experimentalMock.mockResolvedValue({ enablePaperclipNotebook: true });
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("paperclip-notebook")] });
+    await render();
+    expect(container.textContent).toContain("Paperclip Notebook");
+    expect(container.textContent).not.toContain("not available on this instance");
+    expect(listGalleryMock).toHaveBeenCalledWith("company-1");
+    expect([...container.querySelectorAll("button")].some(button => /Continue to|Continue to sign in|Connect/.test(button.textContent ?? ""))).toBe(true);
+  });
+
   it.each(["mem0", "zep", "supermemory", "cognee", "honcho"])("blocks direct %s setup while memory connectors are off", async (provider) => {
     mockSearch.value = `source=${provider}`;
     await render();
