@@ -38,7 +38,13 @@ import {
   startLeaseHeartbeat,
   updateUpgradeCounters,
 } from "./state-machine.js";
-import { claimTenantFenceGuarded } from "./tenant-fence.js";
+import {
+  acquireSourceAdvisoryLock,
+  claimTenantFenceGuarded,
+  validateTenantFence,
+  type TenantFence,
+} from "./tenant-fence.js";
+import { isValidUuid } from "./census.js";
 import { ensureUpgradeTables, introspectStagingEmbeddingType } from "./tenant-tables.js";
 import {
   mapSweepErrorCode,
@@ -74,6 +80,104 @@ export interface PublishDependencies {
   sleeper?: Sleeper;
   _internalSkipVectorIdentityCheck?: boolean;
   _internalDatabaseIdentityOverride?: { database?: string | null; user?: string | null };
+  _internalCreateCpDb?: typeof createDb;
+}
+
+export interface CleanupDroppedSourceParams {
+  upgradeId: string;
+  sourceId: string;
+}
+
+/**
+ * Fenced cleanup of unpublished staging and dedupe rows for dropped or unroutable sources.
+ *
+ * Follows exact L1 -> L2 discipline:
+ * L1: acquire per-source advisory lock
+ * L2: validate tenant fence FOR SHARE
+ * Then:
+ * 1. Select output_ids of unpublished staging rows (published_at IS NULL)
+ * 2. Delete matching dedupe rows for those output_ids
+ * 3. Delete unpublished staging rows
+ * 4. Refresh ledger output_ids via correlated subquery (never EXCLUDED.output_ids)
+ */
+export async function cleanupUnpublishedDroppedStaging(
+  sql: postgres.Sql,
+  params: CleanupDroppedSourceParams,
+  fence: TenantFence,
+): Promise<{ deletedStagingCount: number; deletedDedupeCount: number }> {
+  const { upgradeId, sourceId } = params;
+
+  if (!isValidUuid(sourceId)) {
+    throw new CompanyMemoryUpgradeError(
+      "sourceId must be a valid UUID string.",
+      "UNSUPPORTED_SOURCE_ID",
+    );
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(
+      "upgradeId must be a valid UUID string.",
+      "INVALID_ARGUMENT",
+    );
+  }
+  if (!fence || fence.upgradeId !== upgradeId) {
+    throw new CompanyMemoryUpgradeError(
+      "cleanupUnpublishedDroppedStaging requires a valid tenant fence for this upgrade.",
+      "INVALID_ARGUMENT",
+    );
+  }
+
+  let deletedStagingCount = 0;
+  let deletedDedupeCount = 0;
+
+  await sql.begin(async (tx: any) => {
+    // L1: per-source advisory lock BEFORE the fence row lock
+    await acquireSourceAdvisoryLock(tx, upgradeId, sourceId);
+    // L2: fence row SHARE lock, held to commit
+    await validateTenantFence(tx, fence);
+
+    // 1. Find unpublished staging output_ids
+    const stagingRows = (await tx.unsafe(
+      `SELECT output_id
+       FROM paperclip_memory_upgrade_staging
+       WHERE upgrade_id = $1::uuid AND source_id = $2::uuid AND published_at IS NULL;`,
+      [upgradeId, sourceId],
+    )) as Array<{ output_id: string }>;
+    const outputIds = stagingRows.map((r) => r.output_id);
+
+    // 2. Delete matching dedupe rows
+    if (outputIds.length > 0) {
+      const deletedDedupe = await tx.unsafe(
+        `DELETE FROM paperclip_memory_upgrade_dedupe
+         WHERE upgrade_id = $1::uuid AND output_id = ANY($2::uuid[])
+         RETURNING output_id;`,
+        [upgradeId, outputIds],
+      );
+      deletedDedupeCount = deletedDedupe.length;
+    }
+
+    // 3. Delete unpublished staging rows
+    const deletedStaging = await tx.unsafe(
+      `DELETE FROM paperclip_memory_upgrade_staging
+       WHERE upgrade_id = $1::uuid AND source_id = $2::uuid AND published_at IS NULL
+       RETURNING output_id;`,
+      [upgradeId, sourceId],
+    );
+    deletedStagingCount = deletedStaging.length;
+
+    // 4. Refresh ledger output_ids via correlated subquery (never EXCLUDED.output_ids)
+    await tx.unsafe(
+      `UPDATE paperclip_memory_upgrade_ledger l
+       SET output_ids = COALESCE((
+         SELECT array_agg(s.output_id ORDER BY s.output_id)
+         FROM paperclip_memory_upgrade_staging s
+         WHERE s.upgrade_id = l.upgrade_id AND s.source_id = l.source_id), '{}'),
+         updated_at = now()
+       WHERE l.upgrade_id = $1::uuid AND l.source_id = $2::uuid;`,
+      [upgradeId, sourceId],
+    );
+  });
+
+  return { deletedStagingCount, deletedDedupeCount };
 }
 
 export interface PublishCounts {
@@ -182,7 +286,8 @@ export async function runPublish(
     if (!options.controlPlaneDatabaseUrl) {
       throw new CompanyMemoryUpgradeError("controlPlaneDatabaseUrl required.", "INVALID_ARGUMENT");
     }
-    cpDb = createDb(options.controlPlaneDatabaseUrl, { maxConnections: 1 });
+    const createDbFn = deps._internalCreateCpDb ?? createDb;
+    cpDb = createDbFn(options.controlPlaneDatabaseUrl, { maxConnections: 1 });
     ownCp = true;
   }
   if (!tenantSql) {
@@ -196,6 +301,29 @@ export async function runPublish(
   let heartbeatHandle: ReturnType<typeof startLeaseHeartbeat> | null = null;
   let activeUpgradeId = "";
   let leaseToken: string | null = null;
+
+  const pending = { publishedCount: 0, supersededCount: 0, sourceDeletedCount: 0 };
+  const flushPending = async (lastError?: UpgradeErrorCode): Promise<void> => {
+    if (!leaseToken || !activeUpgradeId || !cpDb) return;
+    const snap = { ...pending };
+    const hasDelta = snap.publishedCount > 0 || snap.supersededCount > 0 || snap.sourceDeletedCount > 0;
+    if (!hasDelta && lastError === undefined) return;
+    await updateUpgradeCounters(
+      cpDb,
+      activeUpgradeId,
+      leaseToken,
+      {
+        publishedCount: snap.publishedCount > 0 ? snap.publishedCount : undefined,
+        supersededCount: snap.supersededCount > 0 ? snap.supersededCount : undefined,
+        sourceDeletedCount: snap.sourceDeletedCount > 0 ? snap.sourceDeletedCount : undefined,
+        ...(lastError !== undefined ? { lastError } : {}),
+      },
+      { clock },
+    );
+    pending.publishedCount -= snap.publishedCount;
+    pending.supersededCount -= snap.supersededCount;
+    pending.sourceDeletedCount -= snap.sourceDeletedCount;
+  };
 
   try {
     // Phase A: Preflight before any mutations
@@ -328,28 +456,6 @@ export async function runPublish(
       assertLeaseActive: () => heartbeatHandle?.assertActive(),
     });
 
-    const pending = { publishedCount: 0, supersededCount: 0, sourceDeletedCount: 0 };
-    const flushPending = async (lastError?: UpgradeErrorCode): Promise<void> => {
-      const snap = { ...pending };
-      const hasDelta = snap.publishedCount > 0 || snap.supersededCount > 0 || snap.sourceDeletedCount > 0;
-      if (!hasDelta && lastError === undefined) return;
-      await updateUpgradeCounters(
-        cpDb!,
-        activeUpgradeId,
-        leaseToken!,
-        {
-          publishedCount: snap.publishedCount > 0 ? snap.publishedCount : undefined,
-          supersededCount: snap.supersededCount > 0 ? snap.supersededCount : undefined,
-          sourceDeletedCount: snap.sourceDeletedCount > 0 ? snap.sourceDeletedCount : undefined,
-          ...(lastError !== undefined ? { lastError } : {}),
-        },
-        { clock },
-      );
-      pending.publishedCount -= snap.publishedCount;
-      pending.supersededCount -= snap.supersededCount;
-      pending.sourceDeletedCount -= snap.sourceDeletedCount;
-    };
-
     let totalPublished = 0;
     let totalSuperseded = 0;
     let totalSourceDeleted = 0;
@@ -411,23 +517,11 @@ export async function runPublish(
           led.outcome === "dropped_sensitive" ||
           led.outcome === "unroutable"
         ) {
-          await tenantSql.begin(async (tx: any) => {
-            await tx.unsafe(
-              `DELETE FROM paperclip_memory_upgrade_staging
-               WHERE upgrade_id = $1::uuid AND source_id = $2::uuid AND published_at IS NULL;`,
-              [activeUpgradeId, sId],
-            );
-            await tx.unsafe(
-              `UPDATE paperclip_memory_upgrade_ledger l
-               SET output_ids = COALESCE((
-                 SELECT array_agg(s.output_id ORDER BY s.output_id)
-                 FROM paperclip_memory_upgrade_staging s
-                 WHERE s.upgrade_id = l.upgrade_id AND s.source_id = l.source_id), '{}'),
-                 updated_at = now()
-               WHERE l.upgrade_id = $1::uuid AND l.source_id = $2::uuid;`,
-              [activeUpgradeId, sId],
-            );
-          });
+          await cleanupUnpublishedDroppedStaging(
+            tenantSql,
+            { upgradeId: activeUpgradeId, sourceId: sId },
+            fence,
+          );
           continue;
         }
 
@@ -567,13 +661,7 @@ export async function runPublish(
       mapped !== "lease_expired" &&
       mapped !== "lease_lapsed"
     ) {
-      await updateUpgradeCounters(
-        cpDb!,
-        activeUpgradeId,
-        leaseToken,
-        { lastError: mapped },
-        { clock },
-      ).catch(() => {});
+      await flushPending(mapped).catch(() => {});
     }
     throw err;
   } finally {
@@ -587,6 +675,9 @@ export async function runPublish(
     }
     if (ownTenant && tenantSql) {
       await tenantSql.end().catch(() => {});
+    }
+    if (ownCp && cpDb) {
+      await cpDb.$client?.end().catch(() => {});
     }
   }
 }

@@ -192,6 +192,8 @@ export async function setupPublishTestEnvironment(prefix: string) {
     cpDb,
     tenantWorkerSql,
     cpWorkerDb,
+    tenantUrl: tenantUrl.toString(),
+    cpUrl: cpUrl.toString(),
     async cleanup() {
       await tenantWorkerSql.end().catch(() => {});
       await cpWorkerDb.$client?.end().catch(() => {});

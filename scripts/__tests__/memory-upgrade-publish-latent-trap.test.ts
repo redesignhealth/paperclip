@@ -43,19 +43,30 @@ test("publish orchestrator: latent-trap handling for quarantined, dropped, and u
     })
     .returning();
 
+  async function seedDedupe(outputId: string, dataSha = "dedupe-data-sha") {
+    await env.tenantSql.unsafe(
+      `INSERT INTO paperclip_memory_upgrade_dedupe (upgrade_id, agent_id, data_sha256, output_id, created_at)
+       VALUES ($1::uuid, $2::uuid, $3, $4::uuid, now());`,
+      [upgrade.id, env.agent.id, dataSha, outputId],
+    );
+  }
+
   // 1. Quarantined source with staged rows
   const srcQuarantine = randomUUID();
   const qStaged = await seedStagedMemory(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcQuarantine, agentId: env.agent.id });
+  await seedDedupe(qStaged.outputId, "quarantine-sha");
   await seedLedgerRow(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcQuarantine, agentId: env.agent.id, outcome: "quarantined", outputIds: [qStaged.outputId] });
 
   // 2. Dropped-noise source with staged rows
   const srcNoise = randomUUID();
   const nStaged = await seedStagedMemory(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcNoise, agentId: env.agent.id });
+  await seedDedupe(nStaged.outputId, "noise-sha");
   await seedLedgerRow(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcNoise, agentId: env.agent.id, outcome: "dropped_noise", outputIds: [nStaged.outputId] });
 
   // 3. Unroutable source with staged rows
   const srcUnroutable = randomUUID();
   const uStaged = await seedStagedMemory(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcUnroutable, agentId: env.agent.id });
+  await seedDedupe(uStaged.outputId, "unroutable-sha");
   await seedLedgerRow(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcUnroutable, agentId: env.agent.id, outcome: "unroutable", outputIds: [uStaged.outputId] });
 
   // 4. Valid published source with staged rows
@@ -63,6 +74,7 @@ test("publish orchestrator: latent-trap handling for quarantined, dropped, and u
   const textValid = "Valid publishable memory content";
   await insertTenantMemoryRow(env.tenantSql, { id: srcValid, agentId: env.agent.id, data: textValid });
   const vStaged = await seedStagedMemory(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcValid, agentId: env.agent.id });
+  await seedDedupe(vStaged.outputId, "valid-sha");
   await seedLedgerRow(env.tenantSql, { upgradeId: upgrade.id, sourceId: srcValid, agentId: env.agent.id, outcome: "published", outputIds: [vStaged.outputId], sourceContentSha256: computeSourceContentSha256(textValid) });
 
   // Run publish
@@ -81,6 +93,11 @@ test("publish orchestrator: latent-trap handling for quarantined, dropped, and u
   )) as Array<{ output_id: string; published_at: Date | null }>;
   assert.equal(qRows.length, 1);
   assert.equal(qRows[0].published_at, null); // Still unpublished
+  const qDedupe = (await env.tenantSql.unsafe(
+    "SELECT output_id FROM paperclip_memory_upgrade_dedupe WHERE output_id = $1::uuid",
+    [qStaged.outputId],
+  )) as any[];
+  assert.equal(qDedupe.length, 1, "Quarantined dedupe row must be retained");
 
   // Quarantined source MUST NOT be in live collection
   const liveQ = (await env.tenantSql.unsafe(
@@ -95,6 +112,11 @@ test("publish orchestrator: latent-trap handling for quarantined, dropped, and u
     [srcNoise],
   )) as any[];
   assert.equal(nRows.length, 0);
+  const nDedupe = (await env.tenantSql.unsafe(
+    "SELECT output_id FROM paperclip_memory_upgrade_dedupe WHERE output_id = $1::uuid",
+    [nStaged.outputId],
+  )) as any[];
+  assert.equal(nDedupe.length, 0, "Dropped noise dedupe row must be removed");
 
   // Unroutable source: unpublished staging rows were CLEARED
   const uRows = (await env.tenantSql.unsafe(
@@ -102,6 +124,11 @@ test("publish orchestrator: latent-trap handling for quarantined, dropped, and u
     [srcUnroutable],
   )) as any[];
   assert.equal(uRows.length, 0);
+  const uDedupe = (await env.tenantSql.unsafe(
+    "SELECT output_id FROM paperclip_memory_upgrade_dedupe WHERE output_id = $1::uuid",
+    [uStaged.outputId],
+  )) as any[];
+  assert.equal(uDedupe.length, 0, "Unroutable dedupe row must be removed");
 
   // Valid source was published to live collection
   const liveV = (await env.tenantSql.unsafe(
@@ -109,4 +136,9 @@ test("publish orchestrator: latent-trap handling for quarantined, dropped, and u
     [vStaged.outputId],
   )) as any[];
   assert.equal(liveV.length, 1);
+  const vDedupe = (await env.tenantSql.unsafe(
+    "SELECT output_id FROM paperclip_memory_upgrade_dedupe WHERE output_id = $1::uuid",
+    [vStaged.outputId],
+  )) as any[];
+  assert.equal(vDedupe.length, 1, "Published valid dedupe row must be retained");
 });
