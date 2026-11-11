@@ -5615,6 +5615,80 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(manualPublicStart.registrationSource).toBe("manual");
       expect(new URL(manualPublicStart.authorizationUrl).searchParams.get("client_id")).toBe("manual-public-client");
     });
+
+    it("TECH-8347: deleted secret during refresh throws 404 instead of silent downgrade", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+
+      const [current] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      const clientSecretRef = current!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
+      expect(clientSecretRef).toBeDefined();
+
+      const grants = await grantsOf(instanceId);
+      const personalGrant = grants.find((g) => g.subjectUserId === alice)!;
+      expect(personalGrant).toBeDefined();
+
+      // Delete the client secret row from companySecrets
+      await db.delete(companySecrets).where(eq(companySecrets.id, clientSecretRef.secretId));
+
+      const service = toolAccessService(db);
+      await expect(
+        service.refreshOAuthGrantCredentials({
+          companyId: company.id,
+          connectionId: instanceId,
+          grantId: personalGrant.id,
+          forceRefresh: true,
+          actor: { actorType: "user", actorId: alice },
+        }),
+      ).rejects.toMatchObject({
+        status: 404,
+      });
+    });
+
+    it("TECH-8347: unrelated resolve 422 secret_inactive during startOAuth propagates without re-registering", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+
+      const [current] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      const clientSecretRef = current!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
+      expect(clientSecretRef).toBeDefined();
+
+      // Mark the client secret as disabled so resolveSecretValue throws 422 secret_inactive
+      await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, clientSecretRef.secretId));
+
+      const registerCallsBefore = fixture.requestsTo("/register").length;
+
+      const restart = await startSeedConnect(company.id, seed.id, alice);
+      expect(restart.status).toBe(422);
+      expect(restart.body).toMatchObject({
+        code: "secret_inactive",
+      });
+
+      const registerCallsAfter = fixture.requestsTo("/register").length;
+      expect(registerCallsAfter).toBe(registerCallsBefore);
+    });
   });
 
 });

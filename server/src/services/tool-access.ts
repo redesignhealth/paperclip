@@ -57,6 +57,7 @@ import {
   isCompanyInDefaultMcpTemplateScope,
   readDefaultMcpTemplateScope,
 } from "../secrets/default-mcp-template-scope.js";
+import { isSecretProviderClientError } from "../secrets/types.js";
 import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
 import { agentInstallsRefused, loadAgentDefaultMcpState, loadPersonalOwnerCaps } from "./default-mcp-install-gate.js";
 import { parseToolProfileEntryConditions as parseEntryConditions } from "./tool-profile-entry-conditions.js";
@@ -1753,11 +1754,17 @@ function withoutRemovedOAuthRegistration(
 
 function isSecretNotFoundError(error: unknown): boolean {
   if (!error) return false;
-  if (error instanceof HttpError && error.status === 404) return true;
-  if (typeof error === "object") {
-    const candidate = error as { status?: unknown; statusCode?: unknown; code?: unknown };
-    if (candidate.status === 404 || candidate.statusCode === 404) return true;
-    if (candidate.code === "secret_deleted" || candidate.code === "version_missing") return true;
+  if (isSecretProviderClientError(error)) {
+    return error.code === "not_found";
+  }
+  if (error instanceof HttpError && error.status === 404) {
+    const detailsCode = asRecord(error.details).code;
+    if (detailsCode === "secret_deleted" || detailsCode === "version_missing") {
+      return true;
+    }
+    if (!detailsCode && error.message === "Secret not found") {
+      return true;
+    }
   }
   return false;
 }
@@ -9895,6 +9902,7 @@ export function toolAccessService(
     connection: typeof toolConnections.$inferSelect,
     provider: string,
     actor?: ActorInfo,
+    options?: { allowMissingSecret?: boolean },
   ) {
     const configured = configuredOAuthClientForConnection(connection, provider);
     if (configured.clientId) return configured;
@@ -9929,6 +9937,8 @@ export function toolAccessService(
         (ref) => ref.configPath === "oauth.client_secret",
       )
     ) {
+      // Any non-revoked personal grant (such as 'needs_reauthorization') retains
+      // its client secret reference so reconnect/reauthorization can resolve it.
       const [personalGrant] = await db
         .select({
           credentialSecretRefs: connectionGrants.credentialSecretRefs,
@@ -9967,7 +9977,7 @@ export function toolAccessService(
             },
           )
           .catch((error) => {
-            if (isSecretNotFoundError(error)) return null;
+            if (options?.allowMissingSecret && isSecretNotFoundError(error)) return null;
             throw error;
           })
       : null;
@@ -11505,6 +11515,7 @@ export function toolAccessService(
         input.connection,
         input.endpoints.provider,
         input.actor,
+        { allowMissingSecret: true },
       );
       if (!isConfidentialDcr || existingClient.clientSecret) {
         const bound = await stampOAuthClientBinding(
@@ -11584,6 +11595,7 @@ export function toolAccessService(
           latest,
           input.endpoints.provider,
           input.actor,
+          { allowMissingSecret: true },
         );
         if (!isConfidentialDcr || existingClient.clientSecret) {
           const bound = await stampOAuthClientBinding(
