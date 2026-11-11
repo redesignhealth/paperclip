@@ -12,9 +12,12 @@ import {
 } from "../server/src/services/company-memory-upgrade/publish.js";
 import { sanitizeCliErrorMessage } from "./memory-upgrade.js";
 import { parsePublishArgs } from "./memory-upgrade-publish-args.js";
-import { ALLOWED_PUBLISH_FLAGS } from "./memory-upgrade-publish-flags.js";
+import {
+  ALLOWED_PUBLISH_FLAGS,
+  BOOLEAN_PUBLISH_FLAGS,
+} from "./memory-upgrade-publish-flags.js";
 
-export { ALLOWED_PUBLISH_FLAGS };
+export { ALLOWED_PUBLISH_FLAGS, BOOLEAN_PUBLISH_FLAGS };
 
 export interface RunPublishCliDependencies extends PublishDependencies {
   env?: NodeJS.ProcessEnv;

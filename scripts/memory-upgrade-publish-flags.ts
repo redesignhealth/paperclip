@@ -2,11 +2,15 @@
  * Allowed flags for publish subcommand (TECH-8191).
  */
 
-export const ALLOWED_PUBLISH_FLAGS = new Set([
+export const BOOLEAN_PUBLISH_FLAGS = new Set([
   "--prod",
   "-h",
   "--help",
   "--dry-run",
+]);
+
+export const ALLOWED_PUBLISH_FLAGS = new Set([
+  ...BOOLEAN_PUBLISH_FLAGS,
   "--database-url",
   "--control-plane-url",
   "--company",

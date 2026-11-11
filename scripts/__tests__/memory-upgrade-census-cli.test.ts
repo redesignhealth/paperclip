@@ -309,6 +309,18 @@ describe("validation, path, and CLI flags unit tests", () => {
   });
 
   it("validates CLI flag rejection for unknown options and stub subcommands", async () => {
+    // --dry-run must be rejected by census
+    assert.equal(ALLOWED_CENSUS_FLAGS.has("--dry-run"), false, "ALLOWED_CENSUS_FLAGS must not contain --dry-run");
+    assert.throws(
+      () => validateNoUnknownFlags(["--dry-run"], ALLOWED_CENSUS_FLAGS),
+      (err: any) => {
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(err.message.includes("Unknown option '--dry-run'"));
+        assert.ok(err.message.includes("Only read-only census options are accepted"));
+        return true;
+      },
+    );
+
     // Unknown option rejected
     assert.throws(
       () => validateNoUnknownFlags(["--database-url", "url", "--write"], ALLOWED_CENSUS_FLAGS),
@@ -425,6 +437,21 @@ describe("validation, path, and CLI flags unit tests", () => {
         ]);
         assert.equal(exitHelpWithValidArgs, 0);
         assert.ok(stdoutLogged.includes("Usage: pnpm memory:upgrade census"));
+
+        // Census rejects --dry-run before opening any connection
+        stderrLogged = "";
+        stdoutLogged = "";
+        const exitDryRunCensus = await runMemoryUpgradeCli([
+          "node",
+          "memory-upgrade.ts",
+          "census",
+          "--database-url",
+          "postgres://usr:pw@localhost:5432/db",
+          "--dry-run",
+        ]);
+        assert.equal(exitDryRunCensus, 1);
+        assert.ok(stderrLogged.includes("Unknown option '--dry-run'"));
+        assert.ok(stderrLogged.includes("Only read-only census options are accepted"));
       } finally {
         console.log = origLog;
       }

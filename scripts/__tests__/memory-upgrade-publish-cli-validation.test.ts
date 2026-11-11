@@ -5,8 +5,16 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { runPublishCli } from "../memory-upgrade-publish.js";
-import { sanitizeCliErrorMessage } from "../memory-upgrade.js";
+import {
+  ALLOWED_PUBLISH_FLAGS,
+  BOOLEAN_PUBLISH_FLAGS,
+  runPublishCli,
+} from "../memory-upgrade-publish.js";
+import { parsePublishArgs } from "../memory-upgrade-publish-args.js";
+import {
+  sanitizeCliErrorMessage,
+  validateNoUnknownFlags,
+} from "../memory-upgrade.js";
 import { CompanyMemoryUpgradeError } from "../../server/src/services/company-memory-upgrade/types.js";
 
 test("publish CLI validation and flags", async (t) => {
@@ -116,5 +124,60 @@ test("publish CLI validation and flags", async (t) => {
     const sanitized = sanitizeCliErrorMessage(errUnsafe);
     assert.equal(sanitized, "[INVALID_ARGUMENT] Invalid command argument.");
     assert.ok(!sanitized.includes(secretUuid));
+  });
+
+  await t.test("--dry-run flag is strictly accepted as boolean by publish parser and rejected if assigned a value", async () => {
+    assert.equal(ALLOWED_PUBLISH_FLAGS.has("--dry-run"), true, "ALLOWED_PUBLISH_FLAGS must contain --dry-run");
+    assert.equal(BOOLEAN_PUBLISH_FLAGS.has("--dry-run"), true, "BOOLEAN_PUBLISH_FLAGS must contain --dry-run");
+
+    // validateNoUnknownFlags accepts bare --dry-run
+    assert.doesNotThrow(() => {
+      validateNoUnknownFlags(["--dry-run"], ALLOWED_PUBLISH_FLAGS, "publish", BOOLEAN_PUBLISH_FLAGS);
+    });
+
+    // validateNoUnknownFlags rejects --dry-run=<value>
+    assert.throws(
+      () => validateNoUnknownFlags(["--dry-run=true"], ALLOWED_PUBLISH_FLAGS, "publish", BOOLEAN_PUBLISH_FLAGS),
+      (err: any) => {
+        assert.equal(err.code, "INVALID_ARGUMENT");
+        assert.ok(err.message.includes("Boolean flag '--dry-run' does not take a value."));
+        return true;
+      },
+    );
+
+    // runPublishCli rejects --dry-run=value
+    const c = capture();
+    try {
+      const exitVal = await runPublishCli([
+        "--database-url", localDsn,
+        "--control-plane-url", localDsn,
+        "--company", validUuid1,
+        "--dry-run=1",
+      ], { env: {} });
+      assert.equal(exitVal, 1);
+      assert.match(c.get(), /Boolean flag '--dry-run' does not take a value\./);
+    } finally {
+      c.restore();
+    }
+
+    // parsePublishArgs parses --dry-run into confirm: undefined (dry-run preview mode)
+    const parsedWithConfirmAndDryRun = parsePublishArgs([
+      "--database-url", localDsn,
+      "--control-plane-url", localDsn,
+      "--company", validUuid1,
+      "--confirm", validUuid1,
+      "--dry-run",
+    ], {}, process.cwd());
+    assert.ok(!("exitCode" in parsedWithConfirmAndDryRun));
+    assert.equal(parsedWithConfirmAndDryRun.confirm, undefined, "--dry-run forces confirm to undefined");
+
+    const parsedWithDryRunOnly = parsePublishArgs([
+      "--database-url", localDsn,
+      "--control-plane-url", localDsn,
+      "--company", validUuid1,
+      "--dry-run",
+    ], {}, process.cwd());
+    assert.ok(!("exitCode" in parsedWithDryRunOnly));
+    assert.equal(parsedWithDryRunOnly.confirm, undefined, "omitted confirm with --dry-run succeeds in preview mode");
   });
 });

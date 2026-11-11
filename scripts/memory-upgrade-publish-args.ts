@@ -10,7 +10,10 @@ import {
   parseFlagValue,
   validateNoUnknownFlags,
 } from "./memory-upgrade.js";
-import { ALLOWED_PUBLISH_FLAGS } from "./memory-upgrade-publish-flags.js";
+import {
+  ALLOWED_PUBLISH_FLAGS,
+  BOOLEAN_PUBLISH_FLAGS,
+} from "./memory-upgrade-publish-flags.js";
 import { printPublishHelp } from "./memory-upgrade-publish-help.js";
 
 export interface ParsedPublishArgs {
@@ -40,7 +43,7 @@ export function parsePublishArgs(
     return { exitCode: 0 };
   }
 
-  validateNoUnknownFlags(argv, ALLOWED_PUBLISH_FLAGS, "publish");
+  validateNoUnknownFlags(argv, ALLOWED_PUBLISH_FLAGS, "publish", BOOLEAN_PUBLISH_FLAGS);
 
   const databaseUrl = parseFlagValue("--database-url", argv) ?? env.COMPANY_MEMORY_DATABASE_URL ?? null;
   if (!databaseUrl) {

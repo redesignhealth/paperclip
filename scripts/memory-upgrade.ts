@@ -37,16 +37,21 @@ export const BOOLEAN_FLAGS = new Set([
   "--prod",
   "--help",
   "-h",
-  "--dry-run",
 ]);
 
 import {
   ALLOWED_PUBLISH_FLAGS,
+  BOOLEAN_PUBLISH_FLAGS,
   runPublishCli,
   type RunPublishCliDependencies,
 } from "./memory-upgrade-publish.js";
 
-export { ALLOWED_PUBLISH_FLAGS, runPublishCli, type RunPublishCliDependencies };
+export {
+  ALLOWED_PUBLISH_FLAGS,
+  BOOLEAN_PUBLISH_FLAGS,
+  runPublishCli,
+  type RunPublishCliDependencies,
+};
 
 export const VALUE_FLAGS = new Set([
   "--database-url",
@@ -242,6 +247,7 @@ export function validateNoUnknownFlags(
   argv: string[],
   allowedFlags: Set<string>,
   commandLabel: string = "read-only census",
+  booleanFlags: Set<string> = BOOLEAN_FLAGS,
 ): void {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -253,7 +259,7 @@ export function validateNoUnknownFlags(
           "INVALID_ARGUMENT",
         );
       }
-      if (BOOLEAN_FLAGS.has(flagName)) {
+      if (booleanFlags.has(flagName)) {
         if (rest.length > 0) {
           throw new CompanyMemoryUpgradeError(
             `Boolean flag '${flagName}' does not take a value.`,
