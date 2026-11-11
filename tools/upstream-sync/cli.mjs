@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Upstream sync pipeline CLI (P0). No merging happens here.
-import { loadConfig } from "./lib/config.mjs";
+import { loadConfig, resolveWorkerRefs } from "./lib/config.mjs";
 import { connect, delState, getState, setState, withRunLock } from "./lib/db.mjs";
 import { detect, getMarker, insertCommits, MARKER_KEY, PAUSED_KEY } from "./lib/detect.mjs";
 import { classifyPending } from "./lib/classify.mjs";
@@ -27,7 +27,7 @@ const USAGE = `usage: node tools/upstream-sync/cli.mjs <command>
   view                    print the readable ledger view (JSON)
   report                  print the ledger as a markdown table (for the doc view)
 
-worker commands (JSON on stdout; common flags: --run-id, --repo, --trunk-ref (or --integration-ref), --master-ref):
+worker commands (JSON on stdout; common flags: --run-id, --repo, --trunk-ref (or deprecated --integration-ref), --master-ref):
   claim                   claim the oldest pending/expired row   [--lease-minutes]
   assess --sha S          claimed row -> skipped (already present) or assessed clean|conflict
   merge-plan --shas A,B,..  longest clean prefix to merge into trunk (oldest first; default: assessed rows)
@@ -36,7 +36,7 @@ worker commands (JSON on stdout; common flags: --run-id, --repo, --trunk-ref (or
          --skip-reason --argus-verdict] [--argus-round JSON] [--argus-round-cap N (default 10)]
   promote --promote-pr N  mark integrated rows now in master as promoted (after a human merged the PR)
   repoint --sha U --new-sha N --expect-old OLD --reason TEXT
-                          audited re-point of an integrated row's integration_sha (N must descend from OLD, contain U, be on integration)
+                          audited re-point of an integrated row's integration_sha (N must descend from OLD, contain U, be on trunk)
   verify                  check integrated/promoted rows against git ancestry (exit 1 on mismatch)`;
 
 const [cmd, sub, ...rest] = process.argv.slice(2);
@@ -120,8 +120,7 @@ async function workerCommand(db, argv) {
   });
   const w = cfg.worker;
   const repo = v.repo ?? w.repoDir;
-  const trunkRef = v["trunk-ref"] ?? v["integration-ref"] ?? w.trunkRef;
-  const refs = { trunkRef, integrationRef: trunkRef, masterRef: v["master-ref"] ?? w.masterRef };
+  const refs = resolveWorkerRefs(v, w);
   const runId = v["run-id"] ?? w.runId;
   const num = (name) => (v[name] === undefined ? undefined : Number(v[name]));
   const out = (x) => console.log(JSON.stringify(x, null, 2));

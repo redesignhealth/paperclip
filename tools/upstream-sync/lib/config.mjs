@@ -23,6 +23,21 @@ function parseIntEnv(env, name, fallback, { min, warn = console.warn }) {
   return n;
 }
 
+export function resolveWorkerRefs(flags = {}, workerCfg = {}, warn = console.warn) {
+  let trunkRef = flags["trunk-ref"];
+  if (flags["integration-ref"] !== undefined) {
+    warn("upstream-sync: --integration-ref is deprecated; use --trunk-ref instead");
+    if (trunkRef === undefined) trunkRef = flags["integration-ref"];
+  }
+  trunkRef = trunkRef ?? workerCfg.trunkRef ?? "refs/remotes/origin/master";
+  const masterRef = flags["master-ref"] ?? workerCfg.masterRef ?? "refs/remotes/origin/master";
+  return {
+    trunkRef,
+    integrationRef: trunkRef, // deprecated alias of trunkRef kept for one release (TECH-8283)
+    masterRef,
+  };
+}
+
 export function loadConfig(env = process.env, warn = console.warn) {
   // Durations/concurrency: 0 is nonsensical (an immediately-aborted timeout, or
   // a worker pool that never makes progress), so require >= 1.

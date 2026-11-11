@@ -83,7 +83,7 @@ test("repoint: descendant accepted, non-descendant rejected, audited, guard stil
     u.password = PASSWORD;
     u.searchParams.set("options", `-c search_path=${SCHEMA}`);
     pool = new pg.Pool({ connectionString: u.toString(), max: 1 });
-    const refs = { integrationRef: "refs/heads/integration", masterRef: "refs/heads/master" };
+    const refs = { trunkRef: "refs/heads/integration", integrationRef: "refs/heads/integration", masterRef: "refs/heads/master" };
     const base = { runId: "RED-874-test", ...refs };
 
     // ---- the guard still blocks a plain update ------------------------------------------------
@@ -102,11 +102,21 @@ test("repoint: descendant accepted, non-descendant rejected, audited, guard stil
     await assert.rejects(repoint(pool, fx.dir, { ...base, sha: fx.U1, newSha: fx.U2, expectOld: OLD, reason: "x" }), /does not descend from/);
     // A descendant that does not contain the upstream sha (M contains U1, not U2).
     await assert.rejects(repoint(pool, fx.dir, { ...base, sha: fx.U2, newSha: M, expectOld: OLD, reason: "x" }), /does not contain upstream sha/);
-    // Not on integration or master.
+    // Not on trunk or master.
     fx.git("checkout", "-q", "-b", "side", M);
     fx.git("commit", "-q", "--allow-empty", "-m", "side");
     const side = fx.git("rev-parse", "HEAD");
-    await assert.rejects(repoint(pool, fx.dir, { ...base, sha: fx.U1, newSha: side, expectOld: OLD, reason: "x" }), /neither integration nor master/);
+    await assert.rejects(repoint(pool, fx.dir, { ...base, sha: fx.U1, newSha: side, expectOld: OLD, reason: "x" }), /neither trunk nor master/);
+    // Backward-compatible alias: works when called with integrationRef instead of trunkRef
+    await assert.rejects(
+      repoint(pool, fx.dir, { runId: "RED-874-test", integrationRef: "refs/heads/integration", masterRef: "refs/heads/master", sha: fx.U1, newSha: side, expectOld: OLD, reason: "x" }),
+      /neither trunk nor master/,
+    );
+    // Direct trunk (TECH-8283): trunkRef === masterRef
+    await assert.rejects(
+      repoint(pool, fx.dir, { runId: "RED-874-test", trunkRef: "refs/heads/master", masterRef: "refs/heads/master", sha: fx.U1, newSha: side, expectOld: OLD, reason: "x" }),
+      /neither trunk nor master/,
+    );
     // Same sha, missing reason, stale expectation.
     await assert.rejects(repoint(pool, fx.dir, { ...base, sha: fx.U1, newSha: OLD, expectOld: OLD, reason: "x" }), /nothing to re-point/);
     await assert.rejects(repoint(pool, fx.dir, { ...base, sha: fx.U1, newSha: M, expectOld: OLD, reason: "  " }), /reason is required/);
@@ -162,6 +172,21 @@ test("repoint: descendant accepted, non-descendant rejected, audited, guard stil
     }
     assert.equal((await rowOf(fx.U2)).integration_sha, OLD, "rolled back with its audit row");
     assert.equal((await audits()).length, 1);
+
+    // Direct trunk repoint (TECH-8283): trunkRef === masterRef
+    const Mmaster = fx.merge("master", fx.U2);
+    const rDirect = await repoint(pool, fx.dir, {
+      runId: "RED-874-direct",
+      trunkRef: "refs/heads/master",
+      masterRef: "refs/heads/master",
+      sha: fx.U2,
+      newSha: Mmaster,
+      expectOld: OLD,
+      reason: "direct to master repoint",
+    });
+    assert.deepEqual(rDirect.repointed, { from: OLD, to: Mmaster });
+    assert.equal((await rowOf(fx.U2)).integration_sha, Mmaster);
+    assert.equal((await audits()).length, 2);
 
     // The function itself refuses what the tool would never send: a non-integrated row, a
     // conflict resolution, a malformed sha, a stale expectation.

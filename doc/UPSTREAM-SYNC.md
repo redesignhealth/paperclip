@@ -142,11 +142,11 @@ Tables:
   from another; per-run attribution is `upstream_sync.run_ref` in the events.
 
   **Re-pointing `integration_sha`** (migration 0387). A squash or a late ancestry PR can
-  change which commit on `integration` contains an upstream sha, and the write-once column
+  change which commit on `trunk` contains an upstream sha, and the write-once column
   would leave the row failing `verify`. The one sanctioned path is
   `cli.mjs repoint --sha <upstream> --new-sha <rev> --expect-old <current integration_sha> --reason "<why>"`.
   The tool checks git first: the new sha must descend from the old one, contain the upstream
-  sha, and be on `integration` (or already in master). The `upstream_sync_repoint_integration_sha()`
+  sha, and be on `trunk` (or already in master). The `upstream_sync_repoint_integration_sha()`
   function then writes an append-only `upstream_sync_integration_repoints` row (row id,
   upstream sha, old sha, new sha, actor, reason, run, time) and changes `integration_sha`
   and nothing else; the guard accepts the change only when that audit row came from the same

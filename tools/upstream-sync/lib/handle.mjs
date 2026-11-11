@@ -382,27 +382,31 @@ export async function promote(db, repo, { runId, promotePr, masterRef, masterSha
 
 // Re-point an `integrated` row's integration_sha, the one sanctioned exception to its
 // write-once guard (migration 0387). A squash or a late ancestry PR changes which commit
-// on `integration` contains the upstream sha; the row must follow, with an audit trail.
+// on `trunk` contains the upstream sha; the row must follow, with an audit trail.
 //
 // Git is checked here because the database cannot read it: the new sha must descend from
-// the old one, contain the upstream sha, and be on `integration` (or already in master).
+// the old one, contain the upstream sha, and be on `trunk` (or already in master).
 // The database then refuses anything that is not a clean `integrated` row still pointing at
 // `expectOld`, writes the audit row (row, old, new, actor, reason, time) and changes only
 // integration_sha. Returns the audit row.
-export async function repoint(db, repo, { sha, newSha, expectOld, reason, runId, integrationRef, masterRef }) {
+export async function repoint(db, repo, { sha, newSha, expectOld, reason, runId, trunkRef, integrationRef, masterRef }) {
   runId = requireRun(runId);
   if (!reason || !String(reason).trim()) throw new Error("a reason is required");
   if (!SHA_RE.test(expectOld ?? "")) throw new Error("expectOld must be the row's current integration_sha (40 hex)");
   const upstream = await requireSha(repo, sha, "upstream sha");
   const next = await requireSha(repo, newSha, "new integration sha");
-  const integration = await requireSha(repo, integrationRef, "integration ref");
+  const ref = trunkRef ?? integrationRef;
+  const trunk = await requireSha(repo, ref, "trunk ref");
   const master = masterRef ? await requireSha(repo, masterRef, "master ref") : null;
   const old = await requireSha(repo, expectOld, "current integration_sha");
   if (next === old) throw new Error("new integration sha is the current one; nothing to re-point");
   if (!(await isAncestor(repo, old, next))) throw new Error(`new integration sha ${next} does not descend from the current integration_sha ${old}`);
   if (!(await isAncestor(repo, upstream, next))) throw new Error(`new integration sha ${next} does not contain upstream sha ${upstream}`);
-  if (!(await isAncestor(repo, next, integration)) && !(master !== null && (await isAncestor(repo, next, master)))) {
-    throw new Error(`new integration sha ${next} is in neither integration nor master`);
+  const inTrunkOrMaster = trunk === master
+    ? (await isAncestor(repo, next, trunk))
+    : (await isAncestor(repo, next, trunk)) || (master !== null && (await isAncestor(repo, next, master)));
+  if (!inTrunkOrMaster) {
+    throw new Error(`new integration sha ${next} is in neither trunk nor master`);
   }
 
   return inTransaction(db, runId, async (c) => {
