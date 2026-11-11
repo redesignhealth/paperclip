@@ -472,12 +472,14 @@ export async function* iterateSourcePages(
     isUuidId?: boolean;
     startAfterId?: string | null;
     excludeUpgradeOutputs?: boolean;
+    onlyCompanyScope?: boolean;
   } = {},
 ): AsyncGenerator<TenantSourceRow[]> {
   const resolved = validateAndResolveTableIdentifier(tableName);
   const pageSize = options.pageSize && options.pageSize > 0 ? options.pageSize : 1000;
   const isUuidId = options.isUuidId ?? true;
   const excludeUpgradeOutputs = options.excludeUpgradeOutputs ?? true;
+  const onlyCompanyScope = options.onlyCompanyScope ?? false;
 
   let lastId: string | null = options.startAfterId ?? null;
   let totalYielded = 0;
@@ -492,6 +494,16 @@ export async function* iterateSourcePages(
       ? "NOT EXISTS (SELECT 1 FROM paperclip_memory_upgrade_staging s WHERE s.output_id = t.id)"
       : "NOT EXISTS (SELECT 1 FROM paperclip_memory_upgrade_staging s WHERE lower(s.output_id::text) = lower(t.id::text))"
     : null;
+
+  // Restrict to company-scoped legacy rows (TECH-8191 §5.2). Post-flip agent-scoped writes
+  // (user_id = agent.id) into the same collection are not legacy sources and must not be swept.
+  // Fails closed if payload is null, missing user_id, or has a non-company user_id.
+  const companyScopeClause = onlyCompanyScope
+    ? "t.payload->>'user_id' = 'company'"
+    : null;
+
+  const initialConditions = [excludeClause, companyScopeClause].filter(Boolean);
+  const initialWhere = initialConditions.length > 0 ? `WHERE ${initialConditions.join(" AND ")}` : "";
 
   while (true) {
     if (options.maxRows !== undefined && totalYielded >= options.maxRows) {
@@ -516,7 +528,7 @@ export async function* iterateSourcePages(
           t.payload->>'created_at' AS created_at,
           t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
-        ${excludeClause ? `WHERE ${excludeClause}` : ""}
+        ${initialWhere}
         ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text) COLLATE \"C\""} ASC
         LIMIT ${currentLimit};
       `);
@@ -534,6 +546,7 @@ export async function* iterateSourcePages(
         FROM ${resolved.regclassArg} t
         WHERE t.id > $1::uuid
           ${excludeClause ? `AND ${excludeClause}` : ""}
+          ${companyScopeClause ? `AND ${companyScopeClause}` : ""}
         ORDER BY t.id ASC
         LIMIT ${currentLimit};
       `,
@@ -553,6 +566,7 @@ export async function* iterateSourcePages(
         FROM ${resolved.regclassArg} t
         WHERE lower(t.id::text) COLLATE "C" > $1::text COLLATE "C"
           ${excludeClause ? `AND ${excludeClause}` : ""}
+          ${companyScopeClause ? `AND ${companyScopeClause}` : ""}
         ORDER BY lower(t.id::text) COLLATE "C" ASC
         LIMIT ${currentLimit};
       `,

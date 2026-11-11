@@ -69,6 +69,7 @@ import {
   startLeaseHeartbeat,
   updateUpgradeCounters,
 } from "./state-machine.js";
+import { isUpgradeWorkState } from "./phases.js";
 import {
   commitSourceOutcome,
   ensureUpgradeTables,
@@ -399,7 +400,7 @@ export async function runSweep(
         },
         { clock },
       );
-    } else if (upgrade.state === "sweeping") {
+    } else if (isUpgradeWorkState(upgrade.state)) {
       if (
         upgrade.converterId !== CONVERTER_ID ||
         upgrade.converterVersion !== CONVERTER_VERSION ||
@@ -416,6 +417,13 @@ export async function runSweep(
         "STATE_MISMATCH",
       );
     } else {
+      throw new CompanyMemoryUpgradeError(
+        "Cannot run sweep: active upgrade is not in sweeping state.",
+        "STATE_MISMATCH",
+      );
+    }
+
+    if (!isUpgradeWorkState(upgrade.state)) {
       throw new CompanyMemoryUpgradeError(
         "Cannot run sweep: active upgrade is not in sweeping state.",
         "STATE_MISMATCH",
@@ -463,6 +471,7 @@ export async function runSweep(
       cpLeaseToken: leaseToken,
       leaseOwner,
       now: clock.now(),
+      allowedStates: new Set([upgrade.state]),
     });
 
     // 10. Rate limiters and conversion clients
@@ -564,6 +573,7 @@ export async function runSweep(
       pageSize,
       maxRows,
       isUuidId: shape.isUuidId,
+      onlyCompanyScope: upgrade.state === "draining",
     });
 
     while (true) {
