@@ -471,14 +471,27 @@ export async function* iterateSourcePages(
     maxRows?: number;
     isUuidId?: boolean;
     startAfterId?: string | null;
+    excludeUpgradeOutputs?: boolean;
   } = {},
 ): AsyncGenerator<TenantSourceRow[]> {
   const resolved = validateAndResolveTableIdentifier(tableName);
   const pageSize = options.pageSize && options.pageSize > 0 ? options.pageSize : 1000;
   const isUuidId = options.isUuidId ?? true;
+  const excludeUpgradeOutputs = options.excludeUpgradeOutputs ?? true;
 
   let lastId: string | null = options.startAfterId ?? null;
   let totalYielded = 0;
+
+  // Exclude rows published by the upgrade to avoid re-ingesting them in catch-up or subsequent sweeps.
+  // Published rows have id = staging.output_id. The exclusion is cross-upgrade on purpose so rows published
+  // by any upgrade run are not treated as fresh legacy sources.
+  // Risk: a legitimate legacy row whose id happens to equal a staging output_id would be skipped.
+  // output_ids are randomUUID()-minted by the converter, so collision probability is negligible.
+  const excludeClause = excludeUpgradeOutputs
+    ? isUuidId
+      ? "NOT EXISTS (SELECT 1 FROM paperclip_memory_upgrade_staging s WHERE s.output_id = t.id)"
+      : "NOT EXISTS (SELECT 1 FROM paperclip_memory_upgrade_staging s WHERE lower(s.output_id::text) = lower(t.id::text))"
+    : null;
 
   while (true) {
     if (options.maxRows !== undefined && totalYielded >= options.maxRows) {
@@ -503,6 +516,7 @@ export async function* iterateSourcePages(
           t.payload->>'created_at' AS created_at,
           t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
+        ${excludeClause ? `WHERE ${excludeClause}` : ""}
         ORDER BY ${isUuidId ? "t.id" : "lower(t.id::text) COLLATE \"C\""} ASC
         LIMIT ${currentLimit};
       `);
@@ -519,6 +533,7 @@ export async function* iterateSourcePages(
           t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         WHERE t.id > $1::uuid
+          ${excludeClause ? `AND ${excludeClause}` : ""}
         ORDER BY t.id ASC
         LIMIT ${currentLimit};
       `,
@@ -537,6 +552,7 @@ export async function* iterateSourcePages(
           t.payload AS raw_payload
         FROM ${resolved.regclassArg} t
         WHERE lower(t.id::text) COLLATE "C" > $1::text COLLATE "C"
+          ${excludeClause ? `AND ${excludeClause}` : ""}
         ORDER BY lower(t.id::text) COLLATE "C" ASC
         LIMIT ${currentLimit};
       `,
@@ -578,6 +594,11 @@ export async function* iterateSourcePages(
     yield page;
   }
 }
+
+/**
+ * Conceptual alias for iterateSourcePages (TECH-8191 §5.1).
+ */
+export const scanTenantSources = iterateSourcePages;
 
 /**
  * Loads upgrade ledger entries for a list of source IDs.

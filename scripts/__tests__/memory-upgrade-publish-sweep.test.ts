@@ -24,6 +24,10 @@ import {
   createFakeEmbeddingClient,
 } from "./memory-upgrade-sweep-helpers.js";
 import { createDb, companies, companyMemoryDatabases, agents } from "../../packages/db/src/index.js";
+import "./memory-upgrade-sweep-scan-excludes-outputs.test.js";
+import "./memory-upgrade-sweep-scan-excludes-fake.test.js";
+import "./memory-upgrade-sweep-scan-second-sweep.test.js";
+import "./memory-upgrade-sweep-scan-text-id.test.js";
 
 test("superseded skip-check and re-conversion integration (embedded postgres + runSweep)", async (t) => {
   const support = await getEmbeddedPostgresTestSupport();

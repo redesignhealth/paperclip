@@ -159,6 +159,8 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
     `;
     const indexNames = indexes.map((i) => i.indexname);
     expect(indexNames).toContain("pmu_staging_src_idx");
+    expect(indexNames).toContain("pmu_staging_output_id_idx");
+    expect(indexNames).toContain("pmu_staging_output_id_lower_idx");
     expect(indexNames).toContain("pmu_ledger_outcome_idx");
     expect(indexNames).toContain("pmu_dedupe_uq");
   });
