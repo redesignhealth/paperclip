@@ -10,7 +10,7 @@ import { createBudget } from "../lib/budget.mjs";
 import { escapeMarkdownCell, renderOutboxText } from "../lib/alerts.mjs";
 import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
 import { escapeSlack, formatRowAlert, neutralizeMentions, renderAlert } from "../lib/alerts.mjs";
-import { loadConfig } from "../lib/config.mjs";
+import { loadConfig, resolveWorkerRefs } from "../lib/config.mjs";
 
 const MD = `# x\n- `+"`ignored/before/marker.ts`"+`\n<!-- fork-owned:start -->\n## A\n- `+"`a/b.ts`"+` note\n- `+"`dir/`"+`\n- `+"`x/**/*.json`"+`\n* `+"`y/*.ts`"+`\nprose `+"`not-a-bullet`"+`\n`;
 
@@ -335,6 +335,57 @@ test("alerts payload keeps an unescaped text for the outbox", () => {
 test("http timeout is configurable with a sane default", () => {
   assert.equal(loadConfig({}).httpTimeoutMs, 30000);
   assert.equal(loadConfig({ UPSTREAM_SYNC_HTTP_TIMEOUT_MS: "1500" }).httpTimeoutMs, 1500);
+});
+
+test("worker trunkRef defaults to master, respects UPSTREAM_SYNC_TRUNK_REF, falls back to deprecated UPSTREAM_SYNC_INTEGRATION_REF with warning", () => {
+  const def = loadConfig({});
+  assert.equal(def.worker.trunkRef, "refs/remotes/origin/master");
+  assert.equal(def.worker.integrationRef, "refs/remotes/origin/master");
+  assert.equal(def.worker.masterRef, "refs/remotes/origin/master");
+
+  const custom = loadConfig({ UPSTREAM_SYNC_TRUNK_REF: "refs/heads/custom-trunk" });
+  assert.equal(custom.worker.trunkRef, "refs/heads/custom-trunk");
+  assert.equal(custom.worker.integrationRef, "refs/heads/custom-trunk");
+
+  const warnings = [];
+  const legacy = loadConfig({ UPSTREAM_SYNC_INTEGRATION_REF: "refs/heads/legacy-integration" }, (m) => warnings.push(m));
+  assert.equal(legacy.worker.trunkRef, "refs/heads/legacy-integration");
+  assert.equal(legacy.worker.integrationRef, "refs/heads/legacy-integration");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /UPSTREAM_SYNC_INTEGRATION_REF is deprecated/);
+});
+
+test("resolveWorkerRefs: maps --trunk-ref canonically, maps --integration-ref with deprecation warning, preserves defaults", () => {
+  const w = { trunkRef: "refs/remotes/origin/master", masterRef: "refs/remotes/origin/master" };
+
+  // Default when no flags passed
+  const def = resolveWorkerRefs({}, w);
+  assert.equal(def.trunkRef, "refs/remotes/origin/master");
+  assert.equal(def.integrationRef, "refs/remotes/origin/master");
+  assert.equal(def.masterRef, "refs/remotes/origin/master");
+
+  // Canonical --trunk-ref: no warning, sets trunkRef and alias
+  const warningsTrunk = [];
+  const customTrunk = resolveWorkerRefs({ "trunk-ref": "refs/heads/feature" }, w, (m) => warningsTrunk.push(m));
+  assert.equal(customTrunk.trunkRef, "refs/heads/feature");
+  assert.equal(customTrunk.integrationRef, "refs/heads/feature");
+  assert.equal(warningsTrunk.length, 0);
+
+  // Deprecated --integration-ref: warns, maps to trunkRef and alias
+  const warningsLegacy = [];
+  const legacy = resolveWorkerRefs({ "integration-ref": "refs/heads/legacy" }, w, (m) => warningsLegacy.push(m));
+  assert.equal(legacy.trunkRef, "refs/heads/legacy");
+  assert.equal(legacy.integrationRef, "refs/heads/legacy");
+  assert.equal(warningsLegacy.length, 1);
+  assert.match(warningsLegacy[0], /--integration-ref is deprecated; use --trunk-ref instead/);
+
+  // Both provided: --trunk-ref wins, warning is still emitted for --integration-ref
+  const warningsBoth = [];
+  const both = resolveWorkerRefs({ "trunk-ref": "refs/heads/new", "integration-ref": "refs/heads/old" }, w, (m) => warningsBoth.push(m));
+  assert.equal(both.trunkRef, "refs/heads/new");
+  assert.equal(both.integrationRef, "refs/heads/new");
+  assert.equal(warningsBoth.length, 1);
+  assert.match(warningsBoth[0], /--integration-ref is deprecated/);
 });
 
 test("invalid integer env settings fall back to the default and warn", () => {

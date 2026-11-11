@@ -8,7 +8,6 @@ import plan_prs
 from fakes import SHA, SHA2, FakeGitHub, pr
 
 PULLS_PATH = f"/repos/{gate_lib.REPO}/pulls?state=open&base=master"
-INTEGRATION_PULLS_PATH = f"/repos/{gate_lib.REPO}/pulls?state=open&base=integration"
 
 
 class RecordingGitHub(FakeGitHub):
@@ -43,7 +42,6 @@ class WorkflowRunTests(unittest.TestCase):
 
         gh = FakeGitHub({
             f"/repos/{gate_lib.REPO}/pulls?state=open&base=master": [pr_internal, pr_fork, pr_other_sha],
-            INTEGRATION_PULLS_PATH: [],
         })
 
         # Event for the fork run
@@ -117,27 +115,27 @@ class WorkflowRunTests(unittest.TestCase):
             pr(12, SHA, base="develop"),
             pr(13, SHA),
         ]
-        gh = FakeGitHub({PULLS_PATH: pulls, INTEGRATION_PULLS_PATH: []})
+        gh = FakeGitHub({PULLS_PATH: pulls})
         self.assertEqual(plan_prs._from_workflow_run(gh, event()), [13])
 
     def test_resolution_uses_the_bounded_open_pr_listing_not_commit_pulls(self):
         # Fork and branch PRs are resolved via the bounded /pulls?state=open&base={base} listing
         # (head sha + head repo id); /commits/{sha}/pulls is never consulted (it can be empty
         # for fork PRs), and each listing is bounded so a huge repo fails loudly, not silently.
-        gh = RecordingGitHub({PULLS_PATH: [pr(20, SHA, head_repo=98765)], INTEGRATION_PULLS_PATH: []})
+        gh = RecordingGitHub({PULLS_PATH: [pr(20, SHA, head_repo=98765)]})
         self.assertEqual(plan_prs._from_workflow_run(gh, event(head_repo_id=98765)), [20])
         self.assertEqual(
-            sorted(gh.paginate_calls),
-            sorted([(PULLS_PATH, plan_prs.MAX_LIST_PAGES), (INTEGRATION_PULLS_PATH, plan_prs.MAX_LIST_PAGES)]),
+            gh.paginate_calls,
+            [(PULLS_PATH, plan_prs.MAX_LIST_PAGES)],
         )
         self.assertFalse(any("/commits/" in g for g in gh.gets))
 
-    def test_integration_base_prs_are_resolved_like_master(self):
-        # TECH-8201: sync/pin-bump PRs land on `integration`, not `master`; the resolver must
-        # find them there too.
-        pr_integration = pr(21, SHA, base="integration", head_repo=98765)
-        gh = FakeGitHub({PULLS_PATH: [], INTEGRATION_PULLS_PATH: [pr_integration]})
-        self.assertEqual(plan_prs._from_workflow_run(gh, event(head_repo_id=98765)), [21])
+    def test_planner_lists_only_base_master(self):
+        # TECH-8283: master is the only eligible base branch; assert planner lists only base=master
+        gh = RecordingGitHub({PULLS_PATH: [pr(20, SHA, head_repo=98765)]})
+        plan_prs._from_workflow_run(gh, event(head_repo_id=98765))
+        self.assertEqual(gh.paginate_calls, [(PULLS_PATH, plan_prs.MAX_LIST_PAGES)])
+        self.assertEqual([call[0] for call in gh.paginate_calls], [PULLS_PATH])
 
 
 class SweepTests(unittest.TestCase):
@@ -146,28 +144,26 @@ class SweepTests(unittest.TestCase):
         pr2 = pr(2, SHA2, head_repo=55555)  # fork PR
         pr_closed = pr(3, SHA, state="closed")
         pr_wrong_base = pr(4, SHA, base="main")
-        pr_integration = pr(5, SHA, base="integration")
 
         gh = FakeGitHub({
             f"/repos/{gate_lib.REPO}/pulls?state=open&base=master": [pr1, pr2, pr_closed, pr_wrong_base],
-            INTEGRATION_PULLS_PATH: [pr_integration],
         })
         res = plan_prs._sweep(gh)
-        self.assertEqual(res, [1, 2, 5])
+        self.assertEqual(res, [1, 2])
 
     def test_sweep_listing_is_bounded_by_max_list_pages(self):
-        gh = RecordingGitHub({PULLS_PATH: [pr(1, SHA)], INTEGRATION_PULLS_PATH: []})
+        gh = RecordingGitHub({PULLS_PATH: [pr(1, SHA)]})
         self.assertEqual(plan_prs._sweep(gh), [1])
         self.assertEqual(
-            sorted(gh.paginate_calls),
-            sorted([(PULLS_PATH, plan_prs.MAX_LIST_PAGES), (INTEGRATION_PULLS_PATH, plan_prs.MAX_LIST_PAGES)]),
+            gh.paginate_calls,
+            [(PULLS_PATH, plan_prs.MAX_LIST_PAGES)],
         )
 
     def test_sweep_fails_loudly_when_too_many_prs_are_open(self):
         # More than MAX_PRS candidates is a loud error, never a silent skip of the overflow
         # (the sweep is the only thing that revokes an already-green head on a new BLOCKING).
         pulls = [pr(i, SHA) for i in range(1, plan_prs.MAX_PRS + 2)]
-        gh = FakeGitHub({PULLS_PATH: pulls, INTEGRATION_PULLS_PATH: []})
+        gh = FakeGitHub({PULLS_PATH: pulls})
         with self.assertRaises(GateError) as ctx:
             plan_prs.plan("schedule", {}, gh, "", configured=True)
         self.assertEqual(ctx.exception.code, "TOO_MANY_PRS")

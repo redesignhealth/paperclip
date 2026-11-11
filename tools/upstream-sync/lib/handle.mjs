@@ -1,9 +1,13 @@
-// Deterministic worker commands (plan RED-580 sections 3-5, step 2).
+// Deterministic worker commands (plan RED-580 sections 3-5, step 2; TECH-8283).
 //
 // Everything here is mechanical: claim a row, compute its merge path, plan a clean
 // batch, compute and verify a resolution delta, record state, detect a human-merged
 // promotion, and cross-check the ledger against git ancestry. Judgment (resolving a
 // conflict, driving Argus) stays with the agent.
+//
+// Under the direct-to-master model (TECH-8283), master is the landing trunk (trunkRef).
+// A row is merged into trunkRef; the PR head merge commit is recorded as integration_sha
+// (historical column name kept), and once merged to master, promote records it as promoted.
 //
 // Git work uses plumbing only (`merge-tree --write-tree`, `merge-base --is-ancestor`,
 // `diff`) against a repository directory, so nothing is checked out or modified in the
@@ -124,15 +128,18 @@ async function loadRow(c, sha, { lock = false } = {}) {
 // a Drizzle migration/schema (plan hole 1). The ledger already holds both flags.
 export const needsWholeDiffReview = (row) => row.touches_migrations === true || (row.fork_owned_hits ?? []).length > 0;
 
-// Decide where a claimed row goes: skipped (already in integration/master), or assessed
+// Decide where a claimed row goes: skipped (already in trunk/master), or assessed
 // with path clean/conflict. Moves the row out of `claimed`.
-export async function assess(db, repo, { sha, runId, integrationRef, masterRef }) {
+export async function assess(db, repo, { sha, runId, trunkRef, integrationRef, masterRef }) {
   runId = requireRun(runId);
-  const integration = await requireSha(repo, integrationRef, "integration ref");
+  const ref = trunkRef ?? integrationRef;
+  const trunk = await requireSha(repo, ref, "trunk ref");
   const master = masterRef ? await requireSha(repo, masterRef, "master ref") : null;
   const upstream = await requireSha(repo, sha, "upstream sha");
-  const present = (await isAncestor(repo, upstream, integration)) || (master !== null && (await isAncestor(repo, upstream, master)));
-  const merge = present ? null : await mergeTree(repo, integration, upstream);
+  const present = trunk === master
+    ? (await isAncestor(repo, upstream, trunk))
+    : (await isAncestor(repo, upstream, trunk)) || (master !== null && (await isAncestor(repo, upstream, master)));
+  const merge = present ? null : await mergeTree(repo, trunk, upstream);
 
   return inTransaction(db, runId, async (c) => {
     const row = await loadRow(c, upstream, { lock: true });
@@ -156,17 +163,18 @@ export async function assess(db, repo, { sha, runId, integrationRef, masterRef }
       status: "assessed",
       path: pathKind,
       wholeDiffReview: pathKind === "clean" && needsWholeDiffReview(row),
-      integration,
+      trunk,
+      integration: trunk,
     };
   });
 }
 
 // ---- merge-plan ------------------------------------------------------------------------
 
-// Ledger rows that still stand between the integration branch and a given commit. Merging a
+// Ledger rows that still stand between the trunk branch and a given commit. Merging a
 // sha merges every earlier upstream commit with it, so a plan may only name a sha when every
-// earlier row is already in integration (or skipped) or is itself part of the plan and was
-// assessed. Anything else would reach integration without its own assessment and, for flagged
+// earlier row is already in trunk/master (or skipped) or is itself part of the plan and was
+// assessed. Anything else would reach trunk/master without its own assessment and, for flagged
 // commits, without whole-diff Argus review.
 const RESOLVED_STATUSES = ["skipped", "integrated", "promoted"];
 
@@ -206,7 +214,7 @@ export async function planCandidates(db, { shas = null } = {}) {
 }
 
 // Longest run of `shas` (oldest first, upstream first-parent order) that merges cleanly
-// into `integrationRef`, found by bisect on "merging shas[k-1] is clean": merging a sha
+// into `trunkRef`, found by bisect on "merging shas[k-1] is clean": merging a sha
 // brings in every earlier one, so the prefix is exactly what one merge of its last sha
 // covers. A flagged commit (`isFlagged`) is never batched with others: the prefix stops
 // before it, and when it is first it is planned alone. A conflicting first commit is also
@@ -215,9 +223,10 @@ export async function planCandidates(db, { shas = null } = {}) {
 // Cleanliness need not be monotone in k, so the bisect only guarantees a boundary
 // (clean at k, conflict at k+1), which is all that is needed: the returned plan is
 // verified clean, and the next commit is merged on its own next round.
-export async function mergePlan(repo, shas, { integrationRef, isFlagged = () => false, maxBatch = Infinity } = {}) {
+export async function mergePlan(repo, shas, { trunkRef, integrationRef, isFlagged = () => false, maxBatch = Infinity } = {}) {
   if (!shas.length) return { kind: "empty", shas: [] };
-  const integration = await requireSha(repo, integrationRef, "integration ref");
+  const ref = trunkRef ?? integrationRef;
+  const trunk = await requireSha(repo, ref, "trunk ref");
   for (const s of shas) if (!SHA_RE.test(s)) throw new Error(`not a full sha: ${s}`);
 
   let limit = Math.min(shas.length, maxBatch);
@@ -230,11 +239,11 @@ export async function mergePlan(repo, shas, { integrationRef, isFlagged = () => 
 
   const cleanAt = new Map();
   const isClean = async (k) => {
-    if (!cleanAt.has(k)) cleanAt.set(k, (await mergeTree(repo, integration, cand[k - 1])).clean);
+    if (!cleanAt.has(k)) cleanAt.set(k, (await mergeTree(repo, trunk, cand[k - 1])).clean);
     return cleanAt.get(k);
   };
 
-  if (!(await isClean(1))) return { kind: "conflict", shas: [cand[0]], upTo: cand[0], integration };
+  if (!(await isClean(1))) return { kind: "conflict", shas: [cand[0]], upTo: cand[0], trunk, integration: trunk };
   let lo = 1; // known clean
   let hi = cand.length + 1; // known conflict (virtual sentinel past the end)
   while (hi - lo > 1) {
@@ -242,7 +251,7 @@ export async function mergePlan(repo, shas, { integrationRef, isFlagged = () => 
     if (await isClean(mid)) lo = mid;
     else hi = mid;
   }
-  return { kind: "clean", shas: cand.slice(0, lo), upTo: cand[lo - 1], integration };
+  return { kind: "clean", shas: cand.slice(0, lo), upTo: cand[lo - 1], trunk, integration: trunk };
 }
 
 // ---- delta -----------------------------------------------------------------------------
@@ -347,19 +356,49 @@ export async function record(db, { shas, status, runId, fields = {}, argusRound 
 // ---- promote ---------------------------------------------------------------------------
 
 // Detect a human-merged promotion and record it. The worker never merges to master; this
-// marks every `integrated` row whose merge commit is now an ancestor of `masterRef` as
+// marks `integrated` rows whose merge commit is now an ancestor of `masterRef` as
 // `promoted`, all in one transaction. `masterSha` defaults to the master tip observed.
-export async function promote(db, repo, { runId, promotePr, masterRef, masterSha = null }) {
+//
+// Safe row selection: rows matching the recorded `review_pr` equal to `promotePr` are
+// selected so separately merged PR rows are not misattributed to a single promotePr.
+// If explicit `shas` are passed, only those shas are candidates. For backward compatibility
+// with legacy promotions (where `trunkRef !== masterRef` and a single PR promoted rows with
+// earlier or null review_pr), all integrated ancestors are eligible if no rows match promotePr.
+export async function promote(db, repo, { runId, promotePr, masterRef, masterSha = null, shas = null, trunkRef = null, integrationRef = null }) {
   runId = requireRun(runId);
   if (!Number.isSafeInteger(promotePr) || promotePr < 1) throw new Error("promotePr (the merged PR number) is required");
   const master = await requireSha(repo, masterSha ?? masterRef, "master");
+  const ref = trunkRef ?? integrationRef;
   const { rows } = await db.query(
-    `SELECT upstream_sha, integration_sha FROM upstream_sync_log WHERE status = 'integrated' ORDER BY id`,
+    `SELECT upstream_sha, integration_sha, review_pr FROM upstream_sync_log WHERE status = 'integrated' ORDER BY id`,
   );
+  let candidates;
+  if (shas?.length) {
+    const wanted = new Set(shas);
+    candidates = rows.filter((r) => wanted.has(r.upstream_sha));
+  } else {
+    const hasMatchingReviewPr = rows.some((r) => r.review_pr === promotePr);
+    if (hasMatchingReviewPr) {
+      candidates = rows.filter((r) => r.review_pr === promotePr);
+    } else {
+      const isLegacyBranchModel = ref && masterRef && ref !== masterRef;
+      if (isLegacyBranchModel) {
+        candidates = rows;
+      } else {
+        candidates = rows.filter((r) => r.review_pr === null);
+      }
+    }
+  }
+
+  const candidateSet = new Set(candidates.map((r) => r.upstream_sha));
   const merged = [];
   const pending = [];
   const cache = new Map();
   for (const r of rows) {
+    if (!candidateSet.has(r.upstream_sha)) {
+      pending.push(r.upstream_sha);
+      continue;
+    }
     if (!cache.has(r.integration_sha)) cache.set(r.integration_sha, await isAncestor(repo, r.integration_sha, master));
     (cache.get(r.integration_sha) ? merged : pending).push(r.upstream_sha);
   }
@@ -373,27 +412,31 @@ export async function promote(db, repo, { runId, promotePr, masterRef, masterSha
 
 // Re-point an `integrated` row's integration_sha, the one sanctioned exception to its
 // write-once guard (migration 0387). A squash or a late ancestry PR changes which commit
-// on `integration` contains the upstream sha; the row must follow, with an audit trail.
+// on `trunk` contains the upstream sha; the row must follow, with an audit trail.
 //
 // Git is checked here because the database cannot read it: the new sha must descend from
-// the old one, contain the upstream sha, and be on `integration` (or already in master).
+// the old one, contain the upstream sha, and be on `trunk` (or already in master).
 // The database then refuses anything that is not a clean `integrated` row still pointing at
 // `expectOld`, writes the audit row (row, old, new, actor, reason, time) and changes only
 // integration_sha. Returns the audit row.
-export async function repoint(db, repo, { sha, newSha, expectOld, reason, runId, integrationRef, masterRef }) {
+export async function repoint(db, repo, { sha, newSha, expectOld, reason, runId, trunkRef, integrationRef, masterRef }) {
   runId = requireRun(runId);
   if (!reason || !String(reason).trim()) throw new Error("a reason is required");
   if (!SHA_RE.test(expectOld ?? "")) throw new Error("expectOld must be the row's current integration_sha (40 hex)");
   const upstream = await requireSha(repo, sha, "upstream sha");
   const next = await requireSha(repo, newSha, "new integration sha");
-  const integration = await requireSha(repo, integrationRef, "integration ref");
+  const ref = trunkRef ?? integrationRef;
+  const trunk = await requireSha(repo, ref, "trunk ref");
   const master = masterRef ? await requireSha(repo, masterRef, "master ref") : null;
   const old = await requireSha(repo, expectOld, "current integration_sha");
   if (next === old) throw new Error("new integration sha is the current one; nothing to re-point");
   if (!(await isAncestor(repo, old, next))) throw new Error(`new integration sha ${next} does not descend from the current integration_sha ${old}`);
   if (!(await isAncestor(repo, upstream, next))) throw new Error(`new integration sha ${next} does not contain upstream sha ${upstream}`);
-  if (!(await isAncestor(repo, next, integration)) && !(master !== null && (await isAncestor(repo, next, master)))) {
-    throw new Error(`new integration sha ${next} is in neither integration nor master`);
+  const inTrunkOrMaster = trunk === master
+    ? (await isAncestor(repo, next, trunk))
+    : (await isAncestor(repo, next, trunk)) || (master !== null && (await isAncestor(repo, next, master)));
+  if (!inTrunkOrMaster) {
+    throw new Error(`new integration sha ${next} is in neither trunk nor master`);
   }
 
   return inTransaction(db, runId, async (c) => {
@@ -407,12 +450,13 @@ export async function repoint(db, repo, { sha, newSha, expectOld, reason, runId,
 // ---- verify ----------------------------------------------------------------------------
 
 // Cross-check ledger rows against git ancestry. Returns mismatches (empty = consistent):
-//   integrated: upstream_sha and integration_sha must be in `integration` (or already in
+//   integrated: upstream_sha and integration_sha must be in `trunk` (or already in
 //               master, if promoted since), and integration_sha must contain upstream_sha.
 //   promoted:   upstream_sha and integration_sha must be in `master`; a squash or rebase
 //               promotion drops them and shows up here.
-export async function verify(db, repo, { integrationRef, masterRef }) {
-  const integration = await requireSha(repo, integrationRef, "integration ref");
+export async function verify(db, repo, { trunkRef, integrationRef, masterRef }) {
+  const ref = trunkRef ?? integrationRef;
+  const trunk = await requireSha(repo, ref, "trunk ref");
   const master = await requireSha(repo, masterRef, "master ref");
   const { rows } = await db.query(
     `SELECT upstream_sha, integration_sha, master_sha, status FROM upstream_sync_log WHERE status IN ('integrated', 'promoted') ORDER BY id`,
@@ -425,8 +469,11 @@ export async function verify(db, repo, { integrationRef, masterRef }) {
     if (!(await known(r.integration_sha))) { bad("integration_sha not present in repository"); continue; }
     if (!(await isAncestor(repo, r.upstream_sha, r.integration_sha))) bad("upstream sha is not an ancestor of integration_sha");
     if (r.status === "integrated") {
-      if (!(await isAncestor(repo, r.integration_sha, integration)) && !(await isAncestor(repo, r.integration_sha, master))) {
-        bad("integration_sha is in neither integration nor master");
+      const inTrunkOrMaster = trunk === master
+        ? (await isAncestor(repo, r.integration_sha, master))
+        : (await isAncestor(repo, r.integration_sha, trunk)) || (await isAncestor(repo, r.integration_sha, master));
+      if (!inTrunkOrMaster) {
+        bad("integration_sha is in neither trunk nor master");
       }
     } else {
       if (!(await isAncestor(repo, r.upstream_sha, master))) bad("upstream sha is not in master (squash/rebase promotion?)");

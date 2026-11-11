@@ -8,6 +8,25 @@ Code: `tools/upstream-sync/` (Node >=24.11.0, matching
 `packages/shared/src/node-version.ts`; one dependency: `pg`). Fork-owned path list:
 `FORK_OWNED.md`. Requires **git >= 2.31** (`diff-tree --diff-merges=first-parent`).
 
+## Branch model (TECH-8283)
+
+`master` is the **only long-lived branch** in `redesignhealth/paperclip`. The previous permanent `integration` branch has been retired and archived at branch `archive/integration-2026-11-09` (tag `archive/integration-tip-tech-8283`).
+
+Under the direct-to-master model, upstream sync PRs land directly into `master`:
+
+- **Per-row flow:**
+  1. Branch off fresh `origin/master`.
+  2. Run `git merge <upstream_sha>` so `<upstream_sha>` is a git parent of the branch HEAD.
+  3. **Diff split rule:** If the cumulative patch exceeds ~130,000 characters (to ensure Argus can review within payload bounds), split the change into a sequence of slice PRs targeting `master`. The merge of `<upstream_sha>` must be on the **LAST non-empty slice PR**; never create an empty-diff PR.
+  4. Ensure both `ci-aggregate` and `argus-gate` are green on the **same HEAD commit**. Never push empty commits to retrigger Argus.
+  5. No admin bypass without Dan's explicit approval.
+  6. **Human merge:** A human merges the approved PR into `master` using a **merge commit** (`--no-ff`), **never squash or rebase** (squash/rebase destroys git ancestry and causes false regressions; see PR #293 and PR #302).
+  7. **Ledger tracking (post-merge):**
+     - While the PR is open and in review, the row remains in `in_review` (conflict path) or `assessed` / `claimed` (clean path) awaiting exact-head checks and human merge. Do not record as `integrated` before merge; direct trunk `verify` checks ancestry in `master` and will fail if the SHA is not yet merged.
+     - Post-merge record: `record --status integrated --integration-sha <reviewed PR HEAD> --review-pr N [conflict args]` (`integration_sha` is the reviewed PR HEAD merge commit).
+     - Promote: `promote --promote-pr N` (which detects `integration_sha` is an ancestor of `master`, advances the row to `promoted`, sets `promote_pr = N`, and records `master_sha` as the GitHub merge commit SHA on master), followed by `verify`.
+     - In this direct-to-master model, rows transition through `integrated` to `promoted` in the same post-merge tracking run; there is **no separate promotion PR**.
+
 ## What runs
 
 `node tools/upstream-sync/cli.mjs run` is the hourly job. In order:
@@ -81,12 +100,13 @@ Tables:
   A worker should tag its work with `SET upstream_sync.run_ref = '<run issue id>'` per run so
   each event ties back to a Paperclip run.
 
-- **Worker state on `upstream_sync_log` (migration `0382`, RED-583).** The detector only ever
+- **Worker state on `upstream_sync_log` (migration `0382`, RED-583; updated for TECH-8283).** The detector only ever
   writes `pending` rows. The sync worker adds, per row: a claim/lease (`claimed_by` = Paperclip
-  run id, `claimed_at`, `lease_expires_at`, `attempt`), the merge evidence (`integration_sha`,
-  `resolution_delta_sha256` — non-null exactly for a conflict resolution — `review_pr`,
-  `promote_pr`, `master_sha`) and the review trail (`argus_verdict`, `argus_rounds`, an
-  append-only jsonb array of `{round, sha, verdict, ...}`). Statuses and legal moves:
+  run id, `claimed_at`, `lease_expires_at`, `attempt`), the merge evidence (`integration_sha` —
+  under TECH-8283, the PR head merge commit landing into master — `resolution_delta_sha256` —
+  non-null exactly for a conflict resolution — `review_pr`, `promote_pr`, `master_sha`) and
+  the review trail (`argus_verdict`, `argus_rounds`, an append-only jsonb array of
+  `{round, sha, verdict, ...}`). Statuses and legal moves:
 
   ```
   pending -> claimed -> assessed -> integrated (clean path) -> promoted
@@ -94,6 +114,13 @@ Tables:
   any of claimed/assessed/in_review/integrated -> needs_human | failed
   claimed -> pending (release)       claimed -> claimed (extend, or reclaim after expiry)
   ```
+
+  In the direct-to-master model (TECH-8283), rows remain in `in_review` (or `assessed`)
+  while a PR is open awaiting exact-head checks and human merge. Once the PR merges to
+  `master` with a merge commit, the row is recorded as `integrated` with `integration_sha`
+  set to the reviewed PR head merge commit (which is now in master's ancestry). Then `promote`
+  records `promote_pr` (the merged PR number) and `master_sha` (the merge commit on master)
+  in the same post-merge run; no separate promotion branch or PR exists.
 
   Worker fields: `claimed_by` is the Paperclip run id holding the lease, `claimed_at` its start,
   `lease_expires_at` when another run may reclaim it (set exactly while `claimed`), `attempt` the
@@ -118,11 +145,11 @@ Tables:
   from another; per-run attribution is `upstream_sync.run_ref` in the events.
 
   **Re-pointing `integration_sha`** (migration 0387). A squash or a late ancestry PR can
-  change which commit on `integration` contains an upstream sha, and the write-once column
+  change which commit on `trunk` contains an upstream sha, and the write-once column
   would leave the row failing `verify`. The one sanctioned path is
   `cli.mjs repoint --sha <upstream> --new-sha <rev> --expect-old <current integration_sha> --reason "<why>"`.
   The tool checks git first: the new sha must descend from the old one, contain the upstream
-  sha, and be on `integration` (or already in master). The `upstream_sync_repoint_integration_sha()`
+  sha, and be on `trunk` (or already in master). The `upstream_sync_repoint_integration_sha()`
   function then writes an append-only `upstream_sync_integration_repoints` row (row id,
   upstream sha, old sha, new sha, actor, reason, run, time) and changes `integration_sha`
   and nothing else; the guard accepts the change only when that audit row came from the same
@@ -197,6 +224,12 @@ queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` 
 | `UPSTREAM_SYNC_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | OpenAI-compatible, `gpt-4o-mini`, falls back to `OPENAI_API_KEY` | classifier |
 | `UPSTREAM_SYNC_HTTP_TIMEOUT_MS` | `30000` | abort LLM + webhook calls; a timed-out LLM call falls back to the heuristic, a timed-out delivery is retried next flush |
 | `UPSTREAM_SYNC_RUN_BUDGET_MS` | `600000` (10 min) | cap on the whole locked run; remaining work is deferred to the next run |
+| `UPSTREAM_SYNC_TRUNK_REF` | `refs/remotes/origin/master` | worker landing trunk ref (direct-to-master); replaces deprecated `UPSTREAM_SYNC_INTEGRATION_REF` |
+| `UPSTREAM_SYNC_INTEGRATION_REF` | none | deprecated alias for `UPSTREAM_SYNC_TRUNK_REF` (kept for compatibility) |
+| `UPSTREAM_SYNC_MASTER_REF` | `refs/remotes/origin/master` | worker production master ref |
+| `UPSTREAM_SYNC_REPO_DIR` | `process.cwd()` | repository directory for worker git operations |
+| `UPSTREAM_SYNC_ARGUS_ROUND_CAP` | `10` | non-approving rounds before moving row to `needs_human` |
+| `UPSTREAM_SYNC_LEASE_MINUTES` | `15` | worker claim lease duration |
 | `UPSTREAM_SYNC_ALERT_*`, `UPSTREAM_SYNC_SLACK_WEBHOOK_URL` | see Alerts | |
 
 ## Routine setup (one-off runbook)

@@ -23,6 +23,21 @@ function parseIntEnv(env, name, fallback, { min, warn = console.warn }) {
   return n;
 }
 
+export function resolveWorkerRefs(flags = {}, workerCfg = {}, warn = console.warn) {
+  let trunkRef = flags["trunk-ref"];
+  if (flags["integration-ref"] !== undefined) {
+    warn("upstream-sync: --integration-ref is deprecated; use --trunk-ref instead");
+    if (trunkRef === undefined) trunkRef = flags["integration-ref"];
+  }
+  trunkRef = trunkRef ?? workerCfg.trunkRef ?? "refs/remotes/origin/master";
+  const masterRef = flags["master-ref"] ?? workerCfg.masterRef ?? "refs/remotes/origin/master";
+  return {
+    trunkRef,
+    integrationRef: trunkRef, // deprecated alias of trunkRef kept for one release (TECH-8283)
+    masterRef,
+  };
+}
+
 export function loadConfig(env = process.env, warn = console.warn) {
   // Durations/concurrency: 0 is nonsensical (an immediately-aborted timeout, or
   // a worker pool that never makes progress), so require >= 1.
@@ -67,14 +82,23 @@ export function loadConfig(env = process.env, warn = console.warn) {
     },
     // Worker (handle.mjs). The Argus round cap is a setting, not a constant: a row moves
     // to needs_human only after this many non-approving rounds (default 10).
-    worker: {
-      repoDir: env.UPSTREAM_SYNC_REPO_DIR || process.cwd(),
-      integrationRef: env.UPSTREAM_SYNC_INTEGRATION_REF || "refs/remotes/origin/integration",
-      masterRef: env.UPSTREAM_SYNC_MASTER_REF || "refs/remotes/origin/master",
-      argusRoundCap: int("UPSTREAM_SYNC_ARGUS_ROUND_CAP", 10),
-      leaseMinutes: int("UPSTREAM_SYNC_LEASE_MINUTES", 15),
-      runId: env.PAPERCLIP_RUN_ID || "",
-    },
+    worker: (() => {
+      let trunkRef = env.UPSTREAM_SYNC_TRUNK_REF;
+      if ((trunkRef === undefined || trunkRef === "") && env.UPSTREAM_SYNC_INTEGRATION_REF !== undefined && env.UPSTREAM_SYNC_INTEGRATION_REF !== "") {
+        warn("upstream-sync: UPSTREAM_SYNC_INTEGRATION_REF is deprecated; use UPSTREAM_SYNC_TRUNK_REF instead");
+        trunkRef = env.UPSTREAM_SYNC_INTEGRATION_REF;
+      }
+      trunkRef = (trunkRef !== undefined && trunkRef !== "") ? trunkRef : "refs/remotes/origin/master";
+      return {
+        repoDir: env.UPSTREAM_SYNC_REPO_DIR || process.cwd(),
+        trunkRef,
+        integrationRef: trunkRef, // deprecated alias of trunkRef kept for one release (TECH-8283)
+        masterRef: env.UPSTREAM_SYNC_MASTER_REF || "refs/remotes/origin/master",
+        argusRoundCap: int("UPSTREAM_SYNC_ARGUS_ROUND_CAP", 10),
+        leaseMinutes: int("UPSTREAM_SYNC_LEASE_MINUTES", 15),
+        runId: env.PAPERCLIP_RUN_ID || "",
+      };
+    })(),
     ops: {
       queueDepthMax: count("UPSTREAM_SYNC_QUEUE_DEPTH_MAX", 40),
       oldestPendingHoursMax: count("UPSTREAM_SYNC_OLDEST_PENDING_HOURS_MAX", 48),

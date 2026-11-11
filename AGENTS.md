@@ -256,6 +256,10 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
+## 12. Upstream Sync Branch Policy (TECH-8283)
+
+`master` is the only long-lived branch in `redesignhealth/paperclip`; the permanent `integration` branch is retired (archived at `archive/integration-2026-11-09`). All upstream sync PRs branch off `origin/master` and merge `<upstream_sha>` so that upstream is a git parent of the PR head. If a patch exceeds ~130,000 characters, it is split into slice PRs targeting `master` with the upstream merge on the last non-empty slice PR (never an empty-diff PR). Both `ci-aggregate` and `argus-gate` must be green on the same head commit before merging; never push empty commits to retrigger Argus, and never use admin bypass without Dan's explicit approval. Human maintainers must merge with a merge commit (`--no-ff`), never squash or rebase (which breaks git ancestry; see #293 and #302). While open, rows remain in `in_review` or `assessed` awaiting exact-head checks and human merge. Once merged into `master`, post-merge ledger tracking records `integrated` (`integration_sha` = reviewed PR head merge commit) and then advances to `promoted` (`promote_pr` = merged PR number, `master_sha` = GitHub merge commit SHA) in the same post-merge cycle with no separate promotion PR. Full details and operational runbooks are documented in [`doc/UPSTREAM-SYNC.md`](doc/UPSTREAM-SYNC.md).
+
 ## Design system
 
 `DESIGN.md` at the repo root is the source of truth for UI design decisions. The token-only rule applies to all `ui/` changes: every color, spacing, radius, type, shadow, and motion value in `ui/src/components/**` and `ui/src/pages/**` comes from the token layer in `ui/src/index.css` — no hex, raw px, arbitrary Tailwind bracket values, or raw `font-size`/`fontSize` declarations in components, outside the documented allowlist in `ui/src/index.css`. Run `pnpm check:token-gates` (`scripts/check-token-gates.mjs`) before committing UI changes — it fails on any violation not covered by that allowlist.

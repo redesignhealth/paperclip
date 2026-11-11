@@ -114,7 +114,7 @@ test("cli merge-plan: plans assessed rows, names the blocker, and exits cleanly 
     await seed(fx.U3, "pending");
     const u = new URL(url);
     u.searchParams.set("options", `-c search_path=${SCHEMA}`);
-    const run = () => promisify(execFile)(process.execPath, [CLI, "merge-plan", "--repo", fx.dir, "--integration-ref", "refs/heads/integration"], {
+    const run = () => promisify(execFile)(process.execPath, [CLI, "merge-plan", "--repo", fx.dir, "--trunk-ref", "refs/heads/integration"], {
       env: { ...process.env, UPSTREAM_SYNC_DATABASE_URL: u.toString() },
     });
     const { stdout } = await run();
@@ -122,5 +122,22 @@ test("cli merge-plan: plans assessed rows, names the blocker, and exits cleanly 
     assert.equal(out.kind, "clean");
     assert.deepEqual(out.shas, [fx.U1, fx.U2]);
     assert.deepEqual(out.blockedBy, { sha: fx.U3, status: "pending" });
+  });
+});
+
+test("cli merge-plan: deprecated --integration-ref emits warning to stderr while stdout remains clean JSON", { skip }, async () => {
+  await withLedger(async ({ admin, fx, seed }) => {
+    await seed(fx.U1, "assessed");
+    await seed(fx.U2, "assessed");
+    const u = new URL(url);
+    u.searchParams.set("options", `-c search_path=${SCHEMA}`);
+    const run = () => promisify(execFile)(process.execPath, [CLI, "merge-plan", "--repo", fx.dir, "--integration-ref", "refs/heads/integration"], {
+      env: { ...process.env, UPSTREAM_SYNC_DATABASE_URL: u.toString() },
+    });
+    const { stdout, stderr } = await run();
+    assert.match(stderr, /--integration-ref is deprecated; use --trunk-ref instead/);
+    const out = JSON.parse(stdout);
+    assert.equal(out.kind, "clean");
+    assert.deepEqual(out.shas, [fx.U1, fx.U2]);
   });
 });

@@ -6,16 +6,17 @@ array of positive integers: the PR numbers the privileged reusable workflow is c
 
 - workflow_dispatch: exactly the one typed PR number.
 - workflow_run: a completed `pull_request` CI run of this repository; resolves fork and branch PRs
-  via bounded open PR listings (one per base in `gate_lib.ELIGIBLE_BASE_BRANCHES`) matching
-  head_sha + head_repo_id (does not rely on pull_requests[] or /commits/{sha}/pulls, which may be
-  empty for fork PRs).
-- schedule: a bounded sweep of the open PRs into every eligible base branch (this is how an Argus
-  approval that lands after CI is noticed). Every eligible open PR is queued on every sweep,
-  including PRs whose head already holds green gate checks: the planner has no Argus API key and
-  cannot tell whether a newer BLOCKING verdict now exists for the same SHA, and only the privileged
-  re-evaluation can revoke or confirm. Only ineligible PRs (missing/deleted head repo, wrong base,
-  closed, authored by the gate App) are dropped. More than MAX_PRS candidates, or more list pages
-  than allowed, fails the sweep loudly instead of silently skipping PRs.
+  via bounded open PR listings (one per base in `gate_lib.ELIGIBLE_BASE_BRANCHES`, now master only
+  under TECH-8283) matching head_sha + head_repo_id (does not rely on pull_requests[] or
+  /commits/{sha}/pulls, which may be empty for fork PRs).
+- schedule: a bounded sweep of the open PRs into every eligible base branch (`gate_lib.ELIGIBLE_BASE_BRANCHES`,
+  master only under TECH-8283; this is how an Argus approval that lands after CI is noticed). Every
+  eligible open PR is queued on every sweep, including PRs whose head already holds green gate checks:
+  the planner has no Argus API key and cannot tell whether a newer BLOCKING verdict now exists for the
+  same SHA, and only the privileged re-evaluation can revoke or confirm. Only ineligible PRs
+  (missing/deleted head repo, wrong base, closed, authored by the gate App) are dropped. More than
+  MAX_PRS candidates, or more list pages than allowed, fails the sweep loudly instead of silently
+  skipping PRs.
 
 Unconfigured repository (role ARN or App id missing): the sweep and event paths do nothing, so the
 old human-review ruleset keeps protecting `master`; a manual dispatch fails loudly.
@@ -36,7 +37,7 @@ MAX_LIST_PAGES = 10
 
 
 def _open_pulls_by_eligible_base(gh: Any) -> list[Any]:
-    """Open PRs across every eligible base branch (TECH-8201), one bounded listing per base."""
+    """Open PRs across every eligible base branch (TECH-8283: master only), one bounded listing per base."""
     pulls: list[Any] = []
     for base in sorted(gate_lib.ELIGIBLE_BASE_BRANCHES):
         pulls.extend(gh.paginate(f"/repos/{gate_lib.REPO}/pulls?state=open&base={base}", max_pages=MAX_LIST_PAGES))
