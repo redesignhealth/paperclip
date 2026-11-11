@@ -65,6 +65,19 @@ test("sweep-tenant ledger operations", async (t) => {
         "paperclip_memory_upgrade_staging",
       ],
     );
+
+    const indexes = await sql`
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'public'
+        AND tablename = 'paperclip_memory_upgrade_staging'
+      ORDER BY indexname;
+    `;
+    const idxNames = indexes.map((r: any) => r.indexname);
+    assert.ok(idxNames.includes("pmu_staging_output_id_idx"));
+    assert.ok(idxNames.includes("pmu_staging_output_id_lower_idx"));
+    assert.ok(idxNames.includes("pmu_staging_src_idx"));
+    assert.ok(idxNames.includes("pmu_staging_unpublished_idx"));
   });
 
   await t.test("commitSourceOutcome upserts ledger records correctly", async () => {
