@@ -33,6 +33,12 @@ export const LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
     return this.DRAIN_NOT_CONFIRMED;
   },
 
+  DRAIN_BLOCKED_MISSING_SCOPE:
+    "Drain refused: the live collection contains memory rows with no 'user_id' scope. A catch-up sweep while draining only adopts company-scoped rows, so waiting cannot clear this. Investigate how unscoped rows were written, repair or remove them, then re-run 'pnpm memory:upgrade drain'. Nothing was changed.",
+  get drain_blocked_missing_scope(): string {
+    return this.DRAIN_BLOCKED_MISSING_SCOPE;
+  },
+
   VERIFY_QUARANTINE_PRESENT:
     "Verify refused: quarantined sources remain in the ledger. Quarantined content never reached agent scope. Resolve them, or pass --allow-quarantined to accept the gap explicitly.",
   get verify_quarantine_present(): string {

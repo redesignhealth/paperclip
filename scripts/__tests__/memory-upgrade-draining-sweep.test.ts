@@ -64,6 +64,8 @@ test("sweep accepts draining state and restricts to company scope (embedded post
   const [upgrade] = await cpDb.insert(companyMemoryUpgrades).values({
     companyId, state: "draining", converterId: "paperclip.memory-upgrade.atomic-converter",
     converterVersion: 1, collectionName: "mem0_memories", embeddingModel: "text-embedding-3-small", embeddingDimensions: 1536,
+    drainProbeStreakStartedAt: new Date(),
+    drainConfirmedAt: new Date(),
   }).returning();
 
   const legacySourceId = randomUUID();
@@ -87,6 +89,13 @@ test("sweep accepts draining state and restricts to company scope (embedded post
   assert.equal(report.upgradeId, upgrade.id);
   assert.equal(report.counts.stagedPendingPublishCount, 1);
   assert.equal(convCalls, 1);
+
+  const [upgradeAfterSweep] = await cpDb
+    .select()
+    .from(companyMemoryUpgrades)
+    .where(eq(companyMemoryUpgrades.id, upgrade.id));
+  assert.equal(upgradeAfterSweep.drainProbeStreakStartedAt, null);
+  assert.equal(upgradeAfterSweep.drainConfirmedAt, null);
 
   const [staged] = await workerSql`SELECT source_id::text FROM paperclip_memory_upgrade_staging WHERE upgrade_id = ${upgrade.id}::uuid;`;
   assert.equal(staged.source_id.toLowerCase(), legacySourceId.toLowerCase());

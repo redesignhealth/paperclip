@@ -109,7 +109,7 @@
 
 import { randomUUID } from "node:crypto";
 import { companyMemoryUpgrades, type Db } from "@paperclipai/db";
-import { eq, sql as dsql } from "drizzle-orm";
+import { and, eq, sql as dsql } from "drizzle-orm";
 import type postgres from "postgres";
 import { CompanyMemoryUpgradeError, type UpgradeState } from "./types.js";
 
@@ -341,6 +341,28 @@ export async function claimTenantFenceGuarded(
           "Cannot claim tenant fence: control-plane lease already expired according to database clock",
           "LEASE_FENCED_OUT",
         );
+      }
+
+      // A catch-up sweep or publish is about to mutate tenant sources while the upgrade is
+      // draining. Drain's evidence (an empty probe streak, and any confirmation derived from
+      // it) describes a pre-mutation world, so invalidate it durably here — the mutator is the
+      // only party that reliably knows a mutation is starting, and this is the single door all
+      // tenant mutators pass through. Atomic with the fence bump: if the tenant claim fails,
+      // this rolls back and nothing was mutated. Fenced by the same CP lease token.
+      if (row.state === "draining") {
+        await tx
+          .update(companyMemoryUpgrades)
+          .set({
+            drainProbeStreakStartedAt: null,
+            drainConfirmedAt: null,
+            updatedAt: row.dbNow instanceof Date ? row.dbNow : new Date(row.dbNow),
+          })
+          .where(
+            and(
+              eq(companyMemoryUpgrades.id, params.upgradeId),
+              eq(companyMemoryUpgrades.leaseToken, params.cpLeaseToken),
+            ),
+          );
       }
 
       // Bounded round trip: while this CP row lock is held, perform the tenant-side claim in

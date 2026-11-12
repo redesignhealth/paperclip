@@ -81,10 +81,25 @@ test("publish accepts draining state and publishes pending rows (embedded postgr
   assert.equal(dryReport.counts.pendingRows, 1);
 
   // 2. Confirmed publish succeeds against draining upgrade
+  await env.cpDb
+    .update(companyMemoryUpgrades)
+    .set({
+      drainProbeStreakStartedAt: new Date(),
+      drainConfirmedAt: new Date(),
+    })
+    .where(eq(companyMemoryUpgrades.id, upgrade.id));
+
   const report = await runPublish({ companyId: env.company.id, confirm: env.company.id }, workerDeps);
   assert.equal(report.isDryRun, false);
   assert.equal(report.state, "draining");
   assert.equal(report.counts.publishedCount, 1);
+
+  const [upgradeAfterPub] = await env.cpDb
+    .select()
+    .from(companyMemoryUpgrades)
+    .where(eq(companyMemoryUpgrades.id, upgrade.id));
+  assert.equal(upgradeAfterPub.drainProbeStreakStartedAt, null);
+  assert.equal(upgradeAfterPub.drainConfirmedAt, null);
 
   // Verify row published to live collection
   const liveRows = await env.tenantSql`
