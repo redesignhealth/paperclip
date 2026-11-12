@@ -28,3 +28,5 @@ export * from "./drain.js";
 export * from "./verify.js";
 export * from "./rollback-report.js";
 export * from "./rollback.js";
+export * from "./recover-report.js";
+export * from "./recover.js";

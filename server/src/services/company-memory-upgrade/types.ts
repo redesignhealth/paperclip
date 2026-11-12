@@ -40,6 +40,9 @@ export const UPGRADE_ERROR_CODES = [
   "drain_timeout",
   "drain_blocked_missing_scope",
   "rollback_failed",
+  "recover_lease_present",
+  "recover_not_applied",
+  "recover_outcome_unknown",
   "aborted_by_operator",
   "unexpected_failure",
 ] as const;
@@ -135,6 +138,12 @@ export const SWEEP_ERROR_CODE_MAP: Record<string, UpgradeErrorCode> = {
   illegal_transition: "state_mismatch",
   ROLLBACK_REFUSED: "rollback_failed",
   rollback_refused: "rollback_failed",
+  RECOVER_LEASE_PRESENT: "recover_lease_present",
+  recover_lease_present: "recover_lease_present",
+  RECOVER_NOT_APPLIED: "recover_not_applied",
+  recover_not_applied: "recover_not_applied",
+  RECOVER_OUTCOME_UNKNOWN: "recover_outcome_unknown",
+  recover_outcome_unknown: "recover_outcome_unknown",
   // Conversion / embedding / staging / publish / drain / rollback
   CONVERSION_FAILED: "conversion_failed",
   conversion_failed: "conversion_failed",

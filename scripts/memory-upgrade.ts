@@ -26,7 +26,6 @@ import {
 import { CompanyMemoryUpgradeError } from "../server/src/services/company-memory-upgrade/types.js";
 export const STUB_SUBCOMMANDS = new Set([
   "prune",
-  "recover",
   "status",
 ]);
 
@@ -71,7 +70,12 @@ import {
   type RunRollbackCliDependencies,
 } from "./memory-upgrade-rollback.js";
 import { ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS } from "./memory-upgrade-status-flags.js";
-import { ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS } from "./memory-upgrade-recover-flags.js";
+import {
+  ALLOWED_RECOVER_FLAGS,
+  BOOLEAN_RECOVER_FLAGS,
+  runRecoverCli,
+  type RunRecoverCliDependencies,
+} from "./memory-upgrade-recover.js";
 import {
   LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES,
   LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES,
@@ -85,7 +89,7 @@ export {
   ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS, runVerifyCli, type RunVerifyCliDependencies,
   ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS, runRollbackCli, type RunRollbackCliDependencies,
   ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS,
-  ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS,
+  ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS, runRecoverCli, type RunRecoverCliDependencies,
 };
 
 export const VALUE_FLAGS = new Set([
@@ -1088,6 +1092,10 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     return await runRollbackCli(args.slice(1));
   }
 
+  if (subcommand === "recover") {
+    return await runRecoverCli(args.slice(1));
+  }
+
   if (STUB_SUBCOMMANDS.has(subcommand)) {
     console.error(`Error: Subcommand '${subcommand}' is not implemented yet.`);
     return 1;
@@ -1099,7 +1107,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback");
+  console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback, recover");
   return 1;
 }
 

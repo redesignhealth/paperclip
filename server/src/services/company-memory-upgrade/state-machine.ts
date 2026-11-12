@@ -753,6 +753,115 @@ export async function recoverUpgrade(
   return recovered;
 }
 
+/**
+ * Recovers an upgrade from 'needs_recovery' back to its recorded prior state,
+ * clearing the lease atomically in the same database transaction.
+ */
+export async function recoverUpgradeAndReleaseLease(
+  db: Db,
+  id: string,
+  options: {
+    _internalTxHook?: (phase: "before_update" | "after_update") => Promise<void> | void;
+  } = {},
+): Promise<{
+  row: CompanyMemoryUpgradeRow;
+  restoredState: UpgradeState;
+  clearedLastError: string | null;
+  recoveredAt: Date;
+}> {
+  return await db.transaction(async (tx) => {
+    const [existing] = await tx
+      .select()
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.id, id))
+      .for("update");
+
+    if (!existing) {
+      throw new CompanyMemoryUpgradeError("Upgrade record not found", "UPGRADE_NOT_FOUND");
+    }
+
+    if (existing.state !== "needs_recovery") {
+      throw new CompanyMemoryUpgradeError(
+        "Cannot recover upgrade: current state is not needs_recovery",
+        "INVALID_RECOVERY",
+      );
+    }
+
+    const priorState = existing.recoverToState as UpgradeState | null;
+    if (!priorState || !ACTIVE_PRE_LAPSE_STATES.has(priorState)) {
+      throw new CompanyMemoryUpgradeError(
+        "Cannot recover upgrade: invalid or missing recover_to_state",
+        "INVALID_RECOVERY",
+      );
+    }
+
+    assertValidRecoveryTransition(priorState, priorState);
+
+    // The lifecycle always nulls the lease on entering needs_recovery and claimUpgradeLease
+    // excludes needs_recovery, so this means an out-of-band write; refuse rather than stomp another owner's lease.
+    if (existing.leaseToken !== null || existing.leaseOwner !== null) {
+      throw new CompanyMemoryUpgradeError(
+        "Cannot recover upgrade: the upgrade row still holds a lease.",
+        "RECOVER_LEASE_PRESENT",
+      );
+    }
+
+    if (existing.lastError) {
+      logger.info(
+        { upgradeId: id, priorLastError: existing.lastError },
+        "Recovering upgrade; clearing prior lastError",
+      );
+    }
+
+    if (options._internalTxHook) {
+      await options._internalTxHook("before_update");
+    }
+
+    const [recovered] = await tx
+      .update(companyMemoryUpgrades)
+      .set({
+        state: priorState,
+        recoverToState: null,
+        lastError: null,
+        leaseToken: null,
+        leaseOwner: null,
+        leaseAcquiredAt: null,
+        leaseExpiresAt: sql`clock_timestamp()`,
+        updatedAt: sql`clock_timestamp()`,
+      })
+      .where(
+        and(
+          eq(companyMemoryUpgrades.id, id),
+          eq(companyMemoryUpgrades.state, "needs_recovery"),
+          eq(companyMemoryUpgrades.recoverToState, priorState),
+          isNull(companyMemoryUpgrades.leaseToken),
+        ),
+      )
+      .returning();
+
+    if (!recovered) {
+      throw new CompanyMemoryUpgradeError(
+        `Concurrent recovery conflict for upgrade ${id}`,
+        "CAS_FAILED",
+      );
+    }
+
+    if (options._internalTxHook) {
+      await options._internalTxHook("after_update");
+    }
+
+    const recoveredAt =
+      recovered.updatedAt instanceof Date ? recovered.updatedAt : new Date(recovered.updatedAt);
+
+    return {
+      row: recovered,
+      restoredState: priorState,
+      clearedLastError: existing.lastError,
+      recoveredAt,
+    };
+  });
+}
+
 export const MAX_INT32 = 2_147_483_647;
 export const MAX_INT64 = 9_223_372_036_854_775_807n;
 
