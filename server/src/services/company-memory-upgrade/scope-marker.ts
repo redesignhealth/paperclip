@@ -5,7 +5,7 @@
 import { companyMemoryDatabases, companyMemoryUpgrades, type Db } from "@paperclipai/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { isValidUuid } from "./census.js";
-import { CompanyMemoryUpgradeError } from "./types.js";
+import { CompanyMemoryUpgradeError, type UpgradeState } from "./types.js";
 
 export interface SetScopeMigrationMarkerParams {
   companyId: string;
@@ -37,6 +37,14 @@ export interface ClearedScopeMigrationMarker {
   completedAt: Date | null;
   mode: string | null;
   agentScopeObservedAt: Date | null;
+}
+
+export interface ClearScopeMigrationMarkerFencedParams {
+  upgradeId: string;
+  leaseToken: string;
+  companyId: string;
+  expectedState?: UpgradeState | readonly UpgradeState[];
+  now?: Date;
 }
 
 export async function setScopeMigrationMarkerFenced(
@@ -217,4 +225,96 @@ export async function clearScopeMigrationMarker(
     mode: first.scope_migration_mode ?? null,
     agentScopeObservedAt: first.scope_migration_agent_scope_observed_at ? new Date(first.scope_migration_agent_scope_observed_at) : null,
   };
+}
+
+export async function clearScopeMigrationMarkerFenced(
+  cpDb: Db,
+  params: ClearScopeMigrationMarkerFencedParams,
+): Promise<ClearedScopeMigrationMarker> {
+  const { upgradeId, leaseToken, companyId } = params;
+  if (!isValidUuid(companyId)) {
+    throw new CompanyMemoryUpgradeError(`Invalid company ID: "${companyId}"`, "INVALID_ARGUMENT");
+  }
+  if (!isValidUuid(upgradeId)) {
+    throw new CompanyMemoryUpgradeError(`Invalid upgrade ID: "${upgradeId}"`, "INVALID_ARGUMENT");
+  }
+
+  const expectedStates: readonly string[] = params.expectedState
+    ? (Array.isArray(params.expectedState) ? params.expectedState : [params.expectedState])
+    : ["flipping", "draining", "verified"];
+
+  return await cpDb.transaction(async (tx) => {
+    // 1. Lock the upgrade row with FOR UPDATE
+    const [upgradeRow] = await tx
+      .select({
+        id: companyMemoryUpgrades.id,
+        companyId: companyMemoryUpgrades.companyId,
+        state: companyMemoryUpgrades.state,
+        leaseToken: companyMemoryUpgrades.leaseToken,
+        leaseExpiresAt: companyMemoryUpgrades.leaseExpiresAt,
+      })
+      .from(companyMemoryUpgrades)
+      .where(eq(companyMemoryUpgrades.id, upgradeId))
+      .for("update");
+
+    // 2. Authoritative CP database clock sampled AFTER acquiring FOR UPDATE
+    const [clockRow] = (await tx.execute(
+      sql`SELECT clock_timestamp() AS db_now`,
+    )) as unknown as Array<{ db_now: string | Date }>;
+    const dbNow = clockRow?.db_now instanceof Date ? clockRow.db_now : new Date(clockRow?.db_now);
+
+    // 3. Require matching companyId, token, expected state, and non-expired lease by DB clock
+    if (
+      !upgradeRow ||
+      upgradeRow.companyId !== companyId ||
+      upgradeRow.leaseToken !== leaseToken ||
+      !expectedStates.includes(upgradeRow.state) ||
+      !upgradeRow.leaseExpiresAt ||
+      upgradeRow.leaseExpiresAt.getTime() <= dbNow.getTime()
+    ) {
+      throw new CompanyMemoryUpgradeError(
+        "Upgrade lease lost, expired, or state mismatch during marker clear",
+        "LEASE_FENCED_OUT",
+      );
+    }
+
+    // 4. Clear marker on company_memory_databases while preserving agentScopeObservedAt
+    const result = (await tx.execute(sql`
+      WITH prior AS (
+        SELECT company_id, scope_migration_completed_at, scope_migration_mode,
+               scope_migration_agent_scope_observed_at
+        FROM company_memory_databases WHERE company_id = ${companyId}::uuid
+      ), cleared AS (
+        UPDATE company_memory_databases
+        SET scope_migration_completed_at = NULL,
+            scope_migration_mode = NULL,
+            updated_at = now()
+        WHERE company_id = ${companyId}::uuid
+        RETURNING company_id
+      )
+      SELECT * FROM prior;
+    `)) as unknown as Array<{
+      company_id: string;
+      scope_migration_completed_at: Date | string | null;
+      scope_migration_mode: string | null;
+      scope_migration_agent_scope_observed_at: Date | string | null;
+    }>;
+
+    const first = result[0];
+    if (!first) {
+      throw new CompanyMemoryUpgradeError(
+        `Failed to clear scope migration marker for company ${companyId}`,
+        "ROLLBACK_MARKER_CLEAR_FAILED",
+      );
+    }
+
+    return {
+      companyId: first.company_id,
+      completedAt: first.scope_migration_completed_at ? new Date(first.scope_migration_completed_at) : null,
+      mode: first.scope_migration_mode ?? null,
+      agentScopeObservedAt: first.scope_migration_agent_scope_observed_at
+        ? new Date(first.scope_migration_agent_scope_observed_at)
+        : null,
+    };
+  });
 }
