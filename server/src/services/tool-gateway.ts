@@ -166,7 +166,7 @@ import {
 } from "./tool-access-policy.js";
 import { toolDiscoveryScheduler, ToolDiscoveryBusyError } from "./tool-discovery-scheduler.js";
 import { managedConnectionsMissingInstall, managedInstallCheck } from "./default-mcp-install-gate.js";
-import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns, defaultToolTimeoutMs, isPersonalDefaultMcpInstance } from "./default-mcp-spec.js";
+import { agentMayUseConnectionTool, agentReadCeilingForConnection, connectionHealthColumns, defaultToolTimeoutMs, grantHasPersonalOAuthAccessToken, isPersonalDefaultMcpInstance } from "./default-mcp-spec.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -4993,11 +4993,7 @@ export function createToolGatewayService(
             )
             .limit(1),
         );
-        ownerHasCredential = Boolean(
-          ownerGrant &&
-          Array.isArray(ownerGrant.credentialSecretRefs) &&
-          ownerGrant.credentialSecretRefs.some((r) => r.configPath === "oauth.access_token"),
-        );
+        ownerHasCredential = grantHasPersonalOAuthAccessToken(ownerGrant);
         if (!ownerHasCredential) {
           await markRemoteConnectionHealth(
             connection,

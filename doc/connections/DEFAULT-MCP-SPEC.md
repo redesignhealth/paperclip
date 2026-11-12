@@ -704,3 +704,11 @@ connection to rh-mcp named `rh-mcp-service`, so no agent depends on one person's
   live agents. New agents get it from `defaultEnabled`. The token is re-issued into a new vault version 60 days before expiry
   (expiry kept in `config.rhMcpServiceTokenExpiresAt`).
 - **Opt-out:** archive the `rh-mcp-service` connection; it is not re-created.
+
+## Credential health and OAuth callback failures
+
+Failed OAuth callbacks record connection health (`error` status and message) on the `tool_connections` row only when establishing the connection's own credential:
+- Organization identity (`!subjectUserId && !subjectAgentId`) under an allowlisted credential policy (`shared` or `per_user_with_fallback`).
+- Strict personal default MCP instance where the consenting subject is the instance owner (`subjectUserId === createdByUserId`).
+
+Per-user and per-agent OAuth callback failures never mutate the shared connection row. This ensures that an individual user's consent denial or upstream authorization error does not poison or disrupt the shared connection health for other users and agents across the organization.

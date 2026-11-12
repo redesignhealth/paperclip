@@ -808,6 +808,23 @@ export function isPersonalDefaultMcpInstance(
   return spec.some((entry) => entry.key === entryTag && entry.authKind === "oauth");
 }
 
+/**
+ * Whether a connection grant contains an active personal OAuth access token reference.
+ * Checks for a valid array of credentialSecretRefs containing a non-null object with
+ * configPath === "oauth.access_token".
+ */
+export function grantHasPersonalOAuthAccessToken(
+  grant: { credentialSecretRefs?: unknown } | null | undefined,
+): boolean {
+  if (!grant || !Array.isArray(grant.credentialSecretRefs)) return false;
+  return grant.credentialSecretRefs.some(
+    (ref) =>
+      Boolean(ref) &&
+      typeof ref === "object" &&
+      (ref as { configPath?: unknown }).configPath === "oauth.access_token",
+  );
+}
+
 /** Copy of `config` without the server-owned markers (for public create/update payloads). */
 export function stripDefaultMcpProtectedConfigKeys<T extends Record<string, unknown>>(config: T): T {
   const next = { ...config };

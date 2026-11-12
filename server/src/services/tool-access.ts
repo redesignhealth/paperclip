@@ -52,6 +52,7 @@ import {
   managedConnectionRole,
   staticCatalogAllowlist,
   stripDefaultMcpProtectedConfigKeys,
+  grantHasPersonalOAuthAccessToken,
 } from "./default-mcp-spec.js";
 import {
   isCompanyInDefaultMcpTemplateScope,
@@ -129,6 +130,7 @@ import {
   toolProfiles,
   toolRuntimeMetricCounters,
   toolRuntimeSlots,
+  withCompanyScope,
 } from "@paperclipai/db";
 import type {
   AppDefinition,
@@ -8513,35 +8515,43 @@ export function toolAccessService(
 
     if (!targetsWithOwner.length) return missing;
 
-    const companyIds = Array.from(new Set(targetsWithOwner.map((t) => t.companyId)));
-    const connectionIds = targetsWithOwner.map((t) => t.id);
-
-    const grants = await db
-      .select({
-        connectionId: connectionGrants.connectionId,
-        subjectUserId: connectionGrants.subjectUserId,
-        credentialSecretRefs: connectionGrants.credentialSecretRefs,
-      })
-      .from(connectionGrants)
-      .where(
-        and(
-          inArray(connectionGrants.companyId, companyIds),
-          inArray(connectionGrants.connectionId, connectionIds),
-          eq(connectionGrants.kind, "user"),
-          eq(connectionGrants.status, "active"),
-        ),
-      );
-
+    const targetsByCompany = new Map<string, typeof targetsWithOwner>();
     for (const target of targetsWithOwner) {
-      const hasOwnerGrantWithToken = grants.some(
-        (grant) =>
-          grant.connectionId === target.id &&
-          grant.subjectUserId === target.createdByUserId &&
-          Array.isArray(grant.credentialSecretRefs) &&
-          grant.credentialSecretRefs.some((r) => r?.configPath === "oauth.access_token"),
+      const list = targetsByCompany.get(target.companyId) ?? [];
+      list.push(target);
+      targetsByCompany.set(target.companyId, list);
+    }
+
+    for (const [companyId, companyTargets] of targetsByCompany) {
+      const connectionIds = companyTargets.map((t) => t.id);
+      const grants = await withCompanyScope(db, companyId, async (tx) =>
+        tx
+          .select({
+            connectionId: connectionGrants.connectionId,
+            subjectUserId: connectionGrants.subjectUserId,
+            credentialSecretRefs: connectionGrants.credentialSecretRefs,
+          })
+          .from(connectionGrants)
+          .where(
+            and(
+              eq(connectionGrants.companyId, companyId),
+              inArray(connectionGrants.connectionId, connectionIds),
+              eq(connectionGrants.kind, "user"),
+              eq(connectionGrants.status, "active"),
+            ),
+          ),
       );
-      if (!hasOwnerGrantWithToken) {
-        missing.add(target.id);
+
+      for (const target of companyTargets) {
+        const hasOwnerGrantWithToken = grants.some(
+          (grant) =>
+            grant.connectionId === target.id &&
+            grant.subjectUserId === target.createdByUserId &&
+            grantHasPersonalOAuthAccessToken(grant),
+        );
+        if (!hasOwnerGrantWithToken) {
+          missing.add(target.id);
+        }
       }
     }
     return missing;
@@ -18042,6 +18052,26 @@ export function toolAccessService(
     };
   }
 
+  function callbackFailureIsConnectionWide(
+    connection: typeof toolConnections.$inferSelect,
+    stateRow: typeof toolOauthStates.$inferSelect,
+  ): boolean {
+    if (!stateRow.subjectUserId && !stateRow.subjectAgentId) {
+      return (
+        connection.credentialPolicy === "shared" ||
+        connection.credentialPolicy === "per_user_with_fallback"
+      );
+    }
+    if (
+      isPersonalDefaultMcpInstance(connection) &&
+      Boolean(connection.createdByUserId) &&
+      stateRow.subjectUserId === connection.createdByUserId
+    ) {
+      return true;
+    }
+    return false;
+  }
+
   async function markCallbackFailureHealth(
     stateRow: typeof toolOauthStates.$inferSelect,
     error: unknown,
@@ -18060,6 +18090,17 @@ export function toolAccessService(
         )
         .limit(1);
       if (!connection || connection.status === "archived") return;
+      // Per-user and per-agent OAuth callback failures never mutate the shared
+      // connection row. Only failures establishing the connection's own credential
+      // (org identity under shared/per_user_with_fallback policy, or personal owner)
+      // reflect connection health.
+      // Underreport tradeoff: We deliberately do not split error codes here. While
+      // an upstream provider failure during a per-user callback might reflect a
+      // connection-level misconfiguration, treating it as connection-wide would
+      // allow a single user's failed sign-in to mark the entire connection broken
+      // for all other users and agents. We trade off underreporting health issues
+      // on per-user flows to preserve shared connection availability.
+      if (!callbackFailureIsConnectionWide(connection, stateRow)) return;
       const now = new Date();
       const healthCols = connectionHealthColumns(
         connection,

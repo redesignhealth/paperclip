@@ -2686,5 +2686,195 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       expect(result2.connection.status).toBe("active");
       expect(result2.createdProfile).toBe(false);
     });
+
+    it("11. owner callback failure marks error and non-owner callback failure doesn't", async () => {
+      const { companyId, userA, userB } = await seededCompanyWithMembers();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await svc().ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+
+      // Configure mock OAuth endpoints on instance.config so endpoint discovery succeeds
+      // without extra network calls and directs token exchange to a mock token endpoint.
+      await db
+        .update(toolConnections)
+        .set({
+          status: "draft",
+          healthStatus: "ok",
+          healthMessage: "Connected",
+          lastError: null,
+          config: {
+            ...((instance.config as Record<string, unknown>) ?? {}),
+            oauth: {
+              authorizationUrl: "https://8.8.8.8/authorize",
+              tokenUrl: "https://8.8.8.8/token",
+              clientRegistrationSource: "manual",
+              clientId: "test-client",
+              clientTokenEndpointAuthMethod: "none",
+            },
+          },
+        })
+        .where(eq(toolConnections.id, instance.id));
+
+      // Service with remoteHttpRequest returning 401 invalid_client on token exchange
+      const failingService = toolAccessService(db, {
+        remoteHttpRequest: async () =>
+          new Response(JSON.stringify({ error: "invalid_client" }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+      });
+
+      // Part A: Owner userA callback failure marks connection as error
+      const ownerState = randomUUID();
+      await db.insert(toolOauthStates).values({
+        state: ownerState,
+        companyId,
+        connectionId: instance.id,
+        codeVerifier: "verifier-owner",
+        createdByActorType: "user",
+        createdByActorId: userA,
+        subjectUserId: userA,
+        expiresAt: new Date(Date.now() + 600_000),
+      });
+
+      await expect(
+        failingService.completeOAuthCallback({
+          state: ownerState,
+          code: "owner-auth-code",
+          redirectUri: "https://paperclip.example.test/api/tools/oauth/callback",
+          actor: userActor(userA),
+        }),
+      ).rejects.toMatchObject({ details: { code: "oauth_token_exchange_failed" } });
+
+      const [rowAfterOwner] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instance.id));
+      expect(rowAfterOwner!.healthStatus).toBe("error");
+      expect(rowAfterOwner!.healthMessage).toBe("Sign-in failed. Reconnect this app to continue.");
+      expect(rowAfterOwner!.lastError).toBe("oauth_token_exchange_failed");
+
+      // Reset connection health back to ok
+      await db
+        .update(toolConnections)
+        .set({ healthStatus: "ok", healthMessage: "Connected", lastError: null })
+        .where(eq(toolConnections.id, instance.id));
+
+      // Part B: Non-owner userB callback failure does NOT mark connection as error
+      const nonOwnerState = randomUUID();
+      await db.insert(toolOauthStates).values({
+        state: nonOwnerState,
+        companyId,
+        connectionId: instance.id,
+        codeVerifier: "verifier-non-owner",
+        createdByActorType: "user",
+        createdByActorId: userB,
+        subjectUserId: userB,
+        expiresAt: new Date(Date.now() + 600_000),
+      });
+
+      await expect(
+        failingService.completeOAuthCallback({
+          state: nonOwnerState,
+          code: "non-owner-auth-code",
+          redirectUri: "https://paperclip.example.test/api/tools/oauth/callback",
+          actor: userActor(userB),
+        }),
+      ).rejects.toMatchObject({ details: { code: "oauth_token_exchange_failed" } });
+
+      const [rowAfterNonOwner] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instance.id));
+      expect(rowAfterNonOwner!.healthStatus).toBe("ok");
+      expect(rowAfterNonOwner!.healthMessage).toBe("Connected");
+      expect(rowAfterNonOwner!.lastError).toBeNull();
+    });
+
+    it("12. actual sweepConnectionHealth cross-company: A personal owner no grant => missing_secret, B owner active access-token grant not missing_secret", async () => {
+      const companyA = await seededCompanyWithMembers();
+      const companyB = await seededCompanyWithMembers();
+
+      const seedA = (await googleSeed(companyA.companyId))!;
+      const instanceA = await svc().ensurePersonalDefaultMcpInstance(companyA.companyId, seedA.id, companyA.userA);
+
+      const seedB = (await googleSeed(companyB.companyId))!;
+      const instanceB = await svc().ensurePersonalDefaultMcpInstance(companyB.companyId, seedB.id, companyB.userA);
+
+      // Company A: instanceA owner (companyA.userA) has NO grant.
+      // Set to active & enabled, healthStatus ok, past healthCheckedAt so it's due for sweep.
+      await db
+        .update(toolConnections)
+        .set({
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          healthMessage: "Connected",
+          healthCheckedAt: new Date(Date.now() - 3600_000),
+        })
+        .where(eq(toolConnections.id, instanceA.id));
+
+      // Company B: instanceB owner (companyB.userA) HAS an active user grant with oauth.access_token.
+      const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+      const { secret: secretB } = await writeConnectionCredential(db, {
+        companyId: companyB.companyId,
+        connectionName: instanceB.name,
+        configPath: "oauth.access_token",
+        label: "owner google token B",
+        value: "owner-b-token-value",
+        ownerUserId: companyB.userA,
+        definitionKey: `test.google.${randomUUID()}`,
+      });
+      await db.insert(connectionGrants).values({
+        companyId: companyB.companyId,
+        connectionId: instanceB.id,
+        kind: "user",
+        subjectUserId: companyB.userA,
+        status: "active",
+        isDefault: false,
+        credentialSecretRefs: [{ secretId: secretB.id, configPath: "oauth.access_token" }],
+        createdByUserId: companyB.userA,
+      });
+
+      const { syncConnectionCredentialBindings } = await import("../services/connection-credential-bindings.js");
+      await syncConnectionCredentialBindings(db, instanceB);
+
+      await db
+        .update(toolConnections)
+        .set({
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          healthMessage: "Connected",
+          healthCheckedAt: new Date(Date.now() - 3600_000),
+        })
+        .where(eq(toolConnections.id, instanceB.id));
+
+      const remote = vi.fn(async (_url: string, init?: RequestInit) =>
+        mcpRemoteResponse(init, { tools: [] }),
+      );
+      const sweepService = toolAccessService(db, {
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: remote,
+      });
+
+      // Run actual sweepConnectionHealth across both companies
+      await sweepService.sweepConnectionHealth({ staleAfterMs: 0 });
+
+      // Instance A in Company A has no owner grant => marked missing_secret
+      const [rowA] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instanceA.id));
+      expect(rowA!.healthStatus).toBe("missing_secret");
+      expect(rowA!.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+
+      // Instance B in Company B has active owner grant with access token => not missing_secret (remains ok)
+      const [rowB] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instanceB.id));
+      expect(rowB!.healthStatus).not.toBe("missing_secret");
+      expect(rowB!.healthStatus).toBe("ok");
+    });
   });
 });

@@ -392,10 +392,11 @@ async function createCompany(db: ReturnType<typeof createDb>) {
 function createRouteApp(
   db: ReturnType<typeof createDb>,
   deployment?: {
-    deploymentMode: "authenticated" | "local_trusted";
-    deploymentExposure: "public" | "private";
+    deploymentMode?: "authenticated" | "local_trusted";
+    deploymentExposure?: "public" | "private";
     remoteHttpEndpointLookup?: NonNullable<Parameters<typeof toolAccessService>[1]>["remoteHttpEndpointLookup"];
     remoteHttpRequest?: NonNullable<Parameters<typeof toolAccessService>[1]>["remoteHttpRequest"];
+    actor?: Record<string, unknown>;
   },
   requestLogger?: express.RequestHandler,
 ) {
@@ -403,14 +404,14 @@ function createRouteApp(
   app.use(express.json());
   if (requestLogger) app.use(requestLogger);
   app.use((req, _res, next) => {
-    req.actor = {
+    req.actor = (deployment?.actor ?? {
       type: "board",
       userId: "board-user",
       userName: "Board User",
       userEmail: null,
       isInstanceAdmin: true,
       source: "local_implicit",
-    };
+    }) as any;
     next();
   });
   app.use("/api", toolAccessRoutes(db, { ...deployment }));
@@ -3480,6 +3481,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       .select()
       .from(toolConnections)
       .where(eq(toolConnections.id, connected.connectionId));
+    expect(row1!.credentialPolicy).toBe("shared");
     expect(row1!.healthStatus).toBe("error");
     expect(row1!.healthMessage).toBe("Sign-in failed. Reconnect this app to continue.");
     expect(row1!.lastError).toBe("oauth_token_exchange_failed");
@@ -3503,9 +3505,87 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       .select()
       .from(toolConnections)
       .where(eq(toolConnections.id, connected.connectionId));
+    expect(row2!.credentialPolicy).toBe("shared");
     expect(row2!.healthStatus).toBe("error");
     expect(row2!.healthMessage).toBe("Sign-in failed. Reconnect this app to continue.");
     expect(row2!.lastError).toBe("oauth_token_exchange_failed");
+  });
+
+  it("TECH-8349 #10b: shared connection userB callback failure leaves health/message/lastError unchanged while request fails", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      dcr: false,
+      tokenEndpointAuthMethods: ["none"],
+      tokenFailure: {
+        status: 401,
+        body: {
+          error: "invalid_client",
+        },
+      },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db, {
+      actor: {
+        type: "board",
+        userId: "user-b",
+        userName: "User B",
+        userEmail: "user-b@example.test",
+        isInstanceAdmin: false,
+        source: "local_implicit",
+      },
+    });
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture failed token userB",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", publicClient: true },
+    });
+
+    // Ensure connection starts in "ok" health with shared credential policy
+    await db
+      .update(toolConnections)
+      .set({ healthStatus: "ok", healthMessage: "Connected", lastError: null })
+      .where(eq(toolConnections.id, connected.connectionId));
+
+    const [initialRow] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(initialRow!.credentialPolicy).toBe("shared");
+    expect(initialRow!.healthStatus).toBe("ok");
+    expect(initialRow!.healthMessage).toBe("Connected");
+    expect(initialRow!.lastError).toBeNull();
+
+    // userB starts OAuth with explicit subjectUserId
+    const actorB = { actorType: "user" as const, actorId: "user-b" };
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: actorB,
+      subjectUserId: "user-b",
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    // Callback fails upstream
+    const jsonRes = await request(app)
+      .get("/api/tools/oauth/callback")
+      .set("Accept", "application/json")
+      .query({ state, code });
+    expect(jsonRes.status).toBe(502);
+    expect(jsonRes.body.details).toMatchObject({ code: "oauth_token_exchange_failed" });
+
+    // Connection health, message, and lastError must remain unchanged
+    const [afterRow] = await db
+      .select()
+      .from(toolConnections)
+      .where(eq(toolConnections.id, connected.connectionId));
+    expect(afterRow!.credentialPolicy).toBe("shared");
+    expect(afterRow!.healthStatus).toBe("ok");
+    expect(afterRow!.healthMessage).toBe("Connected");
+    expect(afterRow!.lastError).toBeNull();
   });
 
   it("TECH-8349 #11: access_denied does NOT set health error", async () => {
