@@ -106,13 +106,19 @@ test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGV
     const dimsRows = (await sql`
       SELECT
         vector_dims(embedding) AS dims,
-        (embedding)::text AS vec_text
+        (embedding)::text AS vec_text,
+        jsonb_typeof(payload) AS payload_type,
+        payload->>'text' AS payload_text,
+        payload->>'migration_id' AS payload_migration_id
       FROM paperclip_memory_upgrade_staging
       WHERE upgrade_id = ${upgradeId}::uuid AND output_id = ${outputId}::uuid;
-    `) as Array<{ dims: number; vec_text: string }>;
+    `) as Array<{ dims: number; vec_text: string; payload_type: string; payload_text: string; payload_migration_id: string }>;
 
     assert.equal(dimsRows.length, 1);
     assert.equal(dimsRows[0].dims, 1536);
+    assert.equal(dimsRows[0].payload_type, "object");
+    assert.equal(dimsRows[0].payload_text, "real pgvector memory");
+    assert.equal(dimsRows[0].payload_migration_id, upgradeId);
   });
 
   // Test 26: publishSourceBatch with resolveLiveVectorCast returning null
@@ -144,12 +150,16 @@ test("pgvector docker integration", { skip: process.env.PAPERCLIP_RUN_DOCKER_PGV
 
     // Inspect live table row
     const liveVecRows = (await sql.unsafe(`
-      SELECT vector_dims(vector) as dims, vector::text as vec_text
+      SELECT vector_dims(vector) as dims, vector::text as vec_text, jsonb_typeof(payload) as payload_type, payload->>'text' as payload_text, payload
       FROM "${liveTable}" WHERE id = $1::uuid;
-    `, [outputId])) as Array<{ dims: number; vec_text: string }>;
+    `, [outputId])) as Array<{ dims: number; vec_text: string; payload_type: string; payload_text: string; payload: any }>;
 
     assert.equal(liveVecRows.length, 1);
     assert.equal(liveVecRows[0].dims, 1536);
+    assert.equal(liveVecRows[0].payload_type, "object");
+    assert.equal(liveVecRows[0].payload_text, "real pgvector memory");
+    assert.equal(typeof liveVecRows[0].payload, "object");
+    assert.notEqual(liveVecRows[0].payload, null);
 
     // Verify live table vector exactly matches staged embedding and roundtrips input floats
     assert.equal(liveVecRows[0].vec_text, stagingVecRows[0].vec_text);

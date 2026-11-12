@@ -87,11 +87,16 @@ test("publish accepts draining state and publishes pending rows (embedded postgr
   assert.equal(report.counts.publishedCount, 1);
 
   // Verify row published to live collection
-  const liveRows = await env.tenantSql`SELECT id::text, payload FROM mem0_memories WHERE id = ${outputId}::uuid`;
+  const liveRows = await env.tenantSql`
+    SELECT id::text, payload, jsonb_typeof(payload) as payload_type
+    FROM mem0_memories WHERE id = ${outputId}::uuid
+  `;
   assert.equal(liveRows.length, 1);
-  const parsed = typeof liveRows[0].payload === "string" ? JSON.parse(liveRows[0].payload) : liveRows[0].payload;
-  assert.equal(parsed.data, payload.data);
-  assert.equal(parsed.user_id, env.agent.id);
+  assert.equal(liveRows[0].payload_type, "object");
+  assert.equal(typeof liveRows[0].payload, "object");
+  assert.notEqual(liveRows[0].payload, null);
+  assert.equal(liveRows[0].payload.data, payload.data);
+  assert.equal(liveRows[0].payload.user_id, env.agent.id);
 
   // 3. Refuses non-work active states with STATE_MISMATCH
   for (const st of ["flipping", "verified", "pruning", "needs_recovery"] as const) {
