@@ -17,6 +17,8 @@ export const ALLOWED_VERIFY_FLAGS = new Set([
   "--company",
   "--confirm",
   "--table",
+  "--probe-limit",
+  "--blocking-run-limit",
   "--output",
   "--out",
   "--format",
