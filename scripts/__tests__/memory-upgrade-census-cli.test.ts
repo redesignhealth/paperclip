@@ -327,7 +327,7 @@ describe("validation, path, and CLI flags unit tests", () => {
       /Unknown option '--write'/,
     );
 
-    // Subcommands: flip, drain, prune, rollback, recover, status reject with not implemented yet
+    // Subcommands: drain, prune, rollback, recover, status reject with not implemented yet
     let stderrLogged = "";
     const origError = console.error;
     console.error = (msg: string) => {
@@ -335,9 +335,9 @@ describe("validation, path, and CLI flags unit tests", () => {
     };
 
     try {
-      const exitFlip = await runMemoryUpgradeCli(["node", "memory-upgrade.ts", "flip"]);
-      assert.equal(exitFlip, 1);
-      assert.ok(stderrLogged.includes("Subcommand 'flip' is not implemented yet."));
+      const exitDrain = await runMemoryUpgradeCli(["node", "memory-upgrade.ts", "drain"]);
+      assert.equal(exitDrain, 1);
+      assert.ok(stderrLogged.includes("Subcommand 'drain' is not implemented yet."));
 
       stderrLogged = "";
       const exitStatus = await runMemoryUpgradeCli(["node", "memory-upgrade.ts", "status"]);

@@ -20,3 +20,6 @@ export * from "./publish.js";
 export * from "./drain-runs.js";
 export * from "./drain-probe-preflight.js";
 export * from "./drain-probe.js";
+export * from "./scope-marker.js";
+export * from "./flip-preconditions.js";
+export * from "./flip.js";
