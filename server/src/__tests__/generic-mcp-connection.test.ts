@@ -5597,6 +5597,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect(new URL(preconfStart.authorizationUrl).searchParams.get("client_id")).toBe("env-preconfigured-id");
       } finally {
         vi.unstubAllEnvs();
+        stubPublicUrl();
       }
 
       // 4. Manual public client (TECH-7973)
@@ -5829,6 +5830,13 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const oldSecretRef = current!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
       expect(oldSecretRef).toBeDefined();
 
+      const [oldSecretRowBefore] = await db
+        .select()
+        .from(companySecrets)
+        .where(eq(companySecrets.id, oldSecretRef.secretId));
+      expect(oldSecretRowBefore).toBeDefined();
+
+      const registerCallsBefore = fixture.requestsTo("/register").length;
       const realSecrets = secretService(db);
       const mockSecretClient = {
         ...realSecrets,
@@ -5851,7 +5859,6 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
       const customService = toolAccessService(db, { secretClient: mockSecretClient });
 
-      const registerCallsBefore = fixture.requestsTo("/register").length;
       const redirectUri = new URL(start.body.authorizationUrl).searchParams.get("redirect_uri")!;
       const restart = await customService.startOAuth(company.id, instanceId, {
         redirectUri,
@@ -5859,8 +5866,21 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       });
       expect(restart).toBeDefined();
       expect(restart.authorizationUrl).toContain("client_id=");
+
+      const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      const newSecretRef = updated!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
+      expect(newSecretRef).toBeDefined();
+      expect(newSecretRef.secretId).not.toBe(oldSecretRef.secretId);
+
+      const [oldSecretRowAfter] = await db
+        .select()
+        .from(companySecrets)
+        .where(eq(companySecrets.id, oldSecretRef.secretId));
+      expect(oldSecretRowAfter).toBeDefined();
+      expect(oldSecretRowAfter!.latestVersion).toBe(oldSecretRowBefore!.latestVersion);
+
       const registerCallsAfter = fixture.requestsTo("/register").length;
-      expect(registerCallsAfter).toBeGreaterThan(registerCallsBefore);
+      expect(registerCallsAfter).toBe(registerCallsBefore + 1);
     });
 
     it("TECH-8347: unrelated details-coded 404 from secret resolution rethrows without re-registering", async () => {
@@ -5940,6 +5960,62 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
       const registerCallsAfter = fixture.requestsTo("/register").length;
       expect(registerCallsAfter).toBe(registerCallsBefore);
+    });
+
+    it("TECH-8347 T1: connectGalleryApp with google-chat, customer-read-oauth, clientId only, no secret succeeds and runs offline", async () => {
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const connected = await service.connectGalleryApp(company.id, {
+        galleryKey: "google-chat",
+        connectionMethodKey: "customer-read-oauth",
+        oauthClient: { clientId: "google-chat-client-id" },
+      }, actor);
+
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor,
+      });
+
+      expect(start.registrationSource).toBe("manual");
+      const authUrl = new URL(start.authorizationUrl);
+      expect(authUrl.hostname).toBe("accounts.google.com");
+      expect(authUrl.searchParams.get("client_id")).toBe("google-chat-client-id");
+      expect(authUrl.searchParams.get("access_type")).toBe("offline");
+    });
+
+    it("TECH-8347 T2: same connection with an explicitly stored client_secret_post method is rejected with 422 code oauth_client_secret_missing", async () => {
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const connected = await service.connectGalleryApp(company.id, {
+        galleryKey: "google-chat",
+        connectionMethodKey: "customer-read-oauth",
+        oauthClient: { clientId: "google-chat-client-id" },
+      }, actor);
+
+      const [connRow] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+      await db.update(toolConnections).set({
+        config: {
+          ...connRow!.config,
+          oauth: {
+            ...(connRow!.config.oauth as Record<string, unknown>),
+            clientTokenEndpointAuthMethod: "client_secret_post",
+          },
+        },
+      }).where(eq(toolConnections.id, connected.connectionId));
+
+      await expect(
+        service.startOAuth(company.id, connected.connectionId, {
+          redirectUri: REDIRECT_URI,
+          actor,
+        }),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: { code: "oauth_client_secret_missing" },
+      });
     });
   });
 

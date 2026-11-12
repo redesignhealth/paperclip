@@ -1730,26 +1730,21 @@ function withoutInlineOAuthTokens(
 function withoutRemovedOAuthRegistration(
   config: Record<string, unknown>,
 ): Record<string, unknown> {
-  const oauth = config.oauth;
+  const stripped = withoutInlineOAuthTokens(config);
+  const oauth = stripped.oauth;
   if (!oauth || typeof oauth !== "object" || Array.isArray(oauth))
-    return config;
+    return stripped;
+  if ((oauth as Record<string, unknown>).clientRegistrationSource !== "dcr")
+    return stripped;
   const next = { ...(oauth as Record<string, unknown>) };
   let changed = false;
-  for (const field of INLINE_OAUTH_TOKEN_FIELDS) {
+  for (const field of DCR_CLIENT_REGISTRATION_FIELDS) {
     if (field in next) {
       delete next[field];
       changed = true;
     }
   }
-  if (next.clientRegistrationSource === "dcr") {
-    for (const field of DCR_CLIENT_REGISTRATION_FIELDS) {
-      if (field in next) {
-        delete next[field];
-        changed = true;
-      }
-    }
-  }
-  return changed ? { ...config, oauth: next } : config;
+  return changed ? { ...stripped, oauth: next } : stripped;
 }
 
 function isSecretNotFoundError(error: unknown): boolean {
@@ -1762,6 +1757,7 @@ function isSecretNotFoundError(error: unknown): boolean {
     if (detailsCode === "secret_deleted" || detailsCode === "version_missing") {
       return true;
     }
+    // TODO(TECH-8347): replace message match once secret service returns structured secret_not_found code
     if (!detailsCode && error.message === "Secret not found") {
       return true;
     }
@@ -10744,13 +10740,16 @@ export function toolAccessService(
       actor?: ActorInfo;
       existingRefs?: typeof connectionGrants.$inferSelect.credentialSecretRefs;
       ownerUserId?: string;
+      forceNewSecret?: boolean;
     },
     context?: {
       dbClient: Db | DbTransaction;
       secretClient: ReturnType<typeof secretService>;
     },
   ) {
-    const existing = input.existingRefs === undefined
+    const existing = input.forceNewSecret
+      ? null
+      : input.existingRefs === undefined
       ? oauthSecretRef(input.connection, input.configPath)
       : input.existingRefs.find((ref) => ref.configPath === input.configPath);
     const write = (client: Db | DbTransaction) => writeConnectionCredential(client, {
@@ -10983,6 +10982,7 @@ export function toolAccessService(
     endpoints: OAuthProviderEndpoints;
     redirectUri: string;
     actor?: ActorInfo;
+    replaceStaleClientSecret?: boolean;
   }) {
     if (!input.endpoints.registrationUrl) {
       throw unprocessable(
@@ -11148,9 +11148,11 @@ export function toolAccessService(
         label: "OAuth client secret",
         value: clientSecret,
         actor: input.actor,
+        forceNewSecret: input.replaceStaleClientSecret,
       });
       nextCredentialSecretRefs.push(clientSecretRef);
     } else if (
+      !input.replaceStaleClientSecret &&
       existingClientSecretRef &&
       oauthConfig(input.connection).clientId === clientId
     ) {
@@ -11599,6 +11601,7 @@ export function toolAccessService(
           source: "preconfigured" as const,
         };
       }
+      let staleClientSecret = false;
       if (
         oauthClientBindingMatches(
           latest,
@@ -11637,6 +11640,7 @@ export function toolAccessService(
             source: storedOAuthClientRegistrationSource(bound),
           };
         }
+        staleClientSecret = true;
       }
       // 3. By default, Client ID Metadata Documents need no registration call,
       //    so prefer them over DCR when the authorization server advertises
@@ -11670,6 +11674,7 @@ export function toolAccessService(
         endpoints: input.endpoints,
         redirectUri: input.redirectUri,
         actor: input.actor,
+        replaceStaleClientSecret: staleClientSecret,
       });
       return {
         connection: registered,
@@ -16612,11 +16617,13 @@ export function toolAccessService(
       advertisedMethods.length === 0 ||
       (advertisedMethods.some(isConfidentialOAuthMethod) &&
         !advertisedMethods.includes("none"));
+    // The save path only persists "none" for !galleryEntry, and curated pinned
+    // endpoints advertise no auth methods.
     const isManualConfidential =
       resolvedClient.source === "manual" &&
       resolvedOAuth.clientTokenEndpointAuthMethod !== "none" &&
       (isConfidentialOAuthMethod(resolvedOAuth.clientTokenEndpointAuthMethod) ||
-        serverSupportsConfidential);
+        (!galleryEntry && serverSupportsConfidential));
     if (
       (galleryMethod?.oauthClientSecretRequired || isManualConfidential) &&
       !client.clientSecret
