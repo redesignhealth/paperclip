@@ -29,6 +29,9 @@ export const automaticRepositoryTask: RunnerTaskFixture = {
 };
 
 export interface AutomaticRepositoryObservation {
+  expectedModel: string;
+  expectedProvider: string;
+  actualProviders: Array<{ model: string | null; kind: string | null }>;
   reference: string;
   issueDone: boolean;
   runCount: number;
@@ -54,6 +57,25 @@ export interface AutomaticRepositoryObservation {
   monitorScheduled: boolean;
 }
 
+export function automaticRepositoryApiState(phase: string, issue: Record<string, unknown>, runs: readonly {
+  id?: string; companyId?: string; agentId?: string; issueId?: string | null; nativeIssueId?: string | null;
+  status?: string; runtimeMode?: string; nativePhase?: string | null; startedAt?: string | null; finishedAt?: string | null;
+  errorCode?: string | null; wakeupRequestId?: string | null;
+  contextSnapshot?: { source?: unknown; nativeStatusWakeIntentId?: unknown } | null;
+  resultJson?: { finalizationPhase?: unknown } | null;
+}[], checks: ReturnType<typeof gradeAutomaticRepository>) {
+  return { capturePhase: phase,
+    issue: { id: issue.id, companyId: issue.companyId, identifier: issue.identifier, status: issue.status,
+      assigneeAgentId: issue.assigneeAgentId, executionWorkspaceId: issue.executionWorkspaceId, statusVersion: issue.statusVersion },
+    runs: runs.map(run => ({ id: run.id, companyId: run.companyId, agentId: run.agentId, issueId: run.issueId,
+      nativeIssueId: run.nativeIssueId, status: run.status, runtimeMode: run.runtimeMode, nativePhase: run.nativePhase,
+      startedAt: run.startedAt, finishedAt: run.finishedAt, errorCode: run.errorCode, wakeupRequestId: run.wakeupRequestId,
+      source: typeof run.contextSnapshot?.source === "string" ? run.contextSnapshot.source : null,
+      nativeStatusWakeIntentId: typeof run.contextSnapshot?.nativeStatusWakeIntentId === "string" ? run.contextSnapshot.nativeStatusWakeIntentId : null,
+      finalizationPhase: typeof run.resultJson?.finalizationPhase === "string" ? run.resultJson.finalizationPhase : null })),
+    checks };
+}
+
 export function automaticRepositoryStopReason(issue: { status: string }, runs: readonly { status: string }[]) {
   if (runs.length > 2) return "Unexpected extra provider admission";
   if (runs.some(run => ["failed", "cancelled", "timed_out"].includes(run.status))) return "A provider admission failed";
@@ -75,6 +97,9 @@ export function gradeAutomaticRepository(value: AutomaticRepositoryObservation) 
       /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.continuationReceipt.dispatchId) &&
       value.continuationReceipt.intentId !== value.continuationReceipt.dispatchId,
       "The saved same-agent intent must bind a distinct successor dispatch after the unmodified predecessor finishes, without a timer or user message."),
+    check("configured-provider", value.actualProviders.length === 2 && value.actualProviders.every(provider =>
+      provider.model === value.expectedModel && provider.kind === value.expectedProvider),
+      "Both admitted runs must retain the configured provider and model."),
     check("retained-workspace", value.workspaceIds.length === 2 && Boolean(value.workspaceIds[0]) && value.workspaceIds.every(id => id === value.workspaceIds[0]) && value.readyRepository,
       "Both admissions must retain the same task workspace and its prepared repository."),
     check("retained-context", value.firstContextAttributed && value.firstContextObservedAt !== null && value.successorStartedAt !== null &&

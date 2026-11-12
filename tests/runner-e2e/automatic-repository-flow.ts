@@ -6,7 +6,7 @@ import { expect, type Page } from "@playwright/test";
 import { pollUntil, type RunnerApi } from "./api.js";
 import { createTaskThroughUi } from "./user-actions.js";
 import { readRegisteredArtifacts } from "./registered-artifact.js";
-import { automaticRepositoryFiles, automaticRepositoryStopReason, gradeAutomaticRepository, type AutomaticRepositoryObservation } from "./automatic-repository.js";
+import { automaticRepositoryApiState, automaticRepositoryFiles, automaticRepositoryStopReason, gradeAutomaticRepository, type AutomaticRepositoryObservation } from "./automatic-repository.js";
 import type { LiveFixtureValues } from "./live-fixtures.js";
 import type { MatrixExecution } from "./types.js";
 
@@ -24,7 +24,8 @@ export async function runAutomaticRepositoryFlow(input: {
   const files = automaticRepositoryFiles(nonce);
   let issue: Row | undefined;
   let runs: Row[] = [];
-  const observation: AutomaticRepositoryObservation = { reference: "", issueDone: false, runCount: 0,
+  const observation: AutomaticRepositoryObservation = { expectedModel: execution.profile.model,
+    expectedProvider: execution.profile.provider === "codex" ? "codex" : "acpx:claude", actualProviders: [], reference: "", issueDone: false, runCount: 0,
     successfulCommittedRuns: 0, sourceContinuation: null, successorSource: null, workspaceIds: [], readyRepository: false,
     savedContext: null, firstSavedContext: null, firstContextAttributed: false,
     firstContextObservedAt: null, successorStartedAt: null, predecessorFinishedAt: null, predecessorRetagged: true, continuationReceipt: null,
@@ -56,12 +57,19 @@ export async function runAutomaticRepositoryFlow(input: {
         observation.firstContextObservedAt = Date.now();
       }
     }
+    observation.actualProviders = runs.map(run => {
+      const provider = run.runnerProfileJson?.nativeExecutionInput?.provider;
+      return { model: provider?.model ?? null, kind: provider ? provider.kind === "acpx" ? `acpx:${provider.agent}` : provider.kind : null };
+    });
     observation.workspaceIds = runs.map(run => run.runnerProfileJson?.nativeExecutionInput?.binding?.executionWorkspaceId ?? null);
     observation.monitorScheduled ||= Boolean(issue.monitorNextCheckAt || runs.some(run => String(run.resultJson?.finalizationReasonCode).startsWith("scheduled_monitor_")));
   }
   async function save(phase: string) {
     const checks = gradeAutomaticRepository(observation);
-    if (issue) input.observe(issue, runs, checks);
+    if (issue) {
+      input.observe(issue, runs, checks);
+      await input.evidence("api-state.json", automaticRepositoryApiState(phase, issue, runs, checks));
+    }
     await input.evidence("automatic-repository.json", { schema: "paperclip.e2e.automatic-repository.v1", phase, observation, checks,
       runs: runs.map(run => ({ id: run.id, status: run.status, nativePhase: run.nativePhase, source: run.contextSnapshot?.source,
         finalizationReason: run.resultJson?.finalizationReasonCode, startedAt: run.startedAt, finishedAt: run.finishedAt })) });
