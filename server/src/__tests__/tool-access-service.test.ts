@@ -18828,13 +18828,15 @@ describeEmbeddedPostgres("tool access service", () => {
       { name: "dynamic_declined", description: "v2 drifted", inputSchema: { type: "object", properties: { a: { type: "number" }, newField: { type: "string" } } }, annotations: { readOnlyHint: false } },
     ];
 
-    // Refresh with enableAllByDefault: true
+    // First refresh with enableAllByDefault: true after drift
     await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" }, { enableAllByDefault: true });
 
     const [driftedAfter] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
     expect(driftedAfter?.status).toBe("quarantined");
     expect(driftedAfter?.quarantineReason).toBe("pending_review");
     expect(driftedAfter?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
+    const quarantinedAtDrift = driftedAfter!.quarantinedAt!;
+    expect(quarantinedAtDrift).toBeInstanceOf(Date);
 
     // Absent from profile
     const profileEntries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, finished.profile.id));
@@ -18850,6 +18852,48 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
+
+    // Second sequential refresh with enableAllByDefault: true after drift must keep prior decline quarantined and blocked
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" }, { enableAllByDefault: true });
+
+    const [driftedAfterSecond] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
+    expect(driftedAfterSecond?.status).toBe("quarantined");
+    expect(driftedAfterSecond?.quarantineReason).toBe("pending_review");
+    expect(driftedAfterSecond?.quarantinedAt?.getTime()).toBe(quarantinedAtDrift.getTime());
+    expect(driftedAfterSecond?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
+
+    const profileEntriesSecond = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, finished.profile.id));
+    expect(profileEntriesSecond.map((e) => e.catalogEntryId)).not.toContain(toolEntry.id);
+
+    const attentionSecond = await service.listAppsNeedingAttention(company.id);
+    expect(attentionSecond.apps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          connection: expect.objectContaining({ id: connect.connectionId }),
+          quarantinedCatalogEntryCount: 1,
+        }),
+      ]),
+    );
+
+    // Explicit review settles the rearmed decline back to reviewed_declined and clears attention
+    await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [],
+        askFirstCatalogEntryIds: [],
+        reviewedCatalogEntryIds: [toolEntry.id],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    const [settledAgain] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
+    expect(settledAgain?.status).toBe("quarantined");
+    expect(settledAgain?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED);
+
+    const attentionFinal = await service.listAppsNeedingAttention(company.id);
+    expect(attentionFinal.apps.filter((a) => a.connection.id === connect.connectionId)).toHaveLength(0);
   });
 
   it("SQL upsert protects concurrent decline committed after existingRows read", async () => {
@@ -18881,6 +18925,47 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(after?.status).toBe("quarantined");
     expect(after?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED);
     expect(after?.quarantinedAt?.getTime()).toBe(quarantinedAtInitial.getTime());
+    expect(after?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
+  });
+
+  it("SQL upsert concurrent drift guard sets pending_review and non-null quarantinedAt via refreshedAt when hashes drift", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    let toolPayload = [
+      { name: "drift_race_tool", description: "v2 drifted", inputSchema: { type: "object", properties: { x: { type: "number" } } }, annotations: { readOnlyHint: false } },
+    ];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return mcpHttpResponse({ jsonrpc: "2.0", id: body.id,
+        result: body.method === "initialize" ? { protocolVersion: "2025-06-18" } : { tools: toolPayload } });
+    });
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, { galleryKey: "zapier", credentialValues: { "credentials.authorization": "zap-secret" } }, { actorType: "user", actorId: "board" }),
+    );
+    const entry = connect.catalog.find((e) => e.toolName === "drift_race_tool")!;
+
+    // Set DB to a declined state with old hashes
+    const reviewedAtInitial = new Date(Date.now() - 30_000);
+    await db.update(toolCatalogEntries).set({
+      status: "quarantined",
+      quarantineReason: TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
+      versionHash: "stale-version-hash",
+      schemaHash: "stale-schema-hash",
+      quarantinedAt: new Date(Date.now() - 60_000),
+      reviewedAt: reviewedAtInitial,
+    }).where(eq(toolCatalogEntries.id, entry.id));
+
+    // Refresh with enableAllByDefault: true tries to upsert with status: 'active', quarantinedAt: null
+    // The DB upsert CASE statement detects version/schema drift and sets pending_review + nonnull refreshedAt
+    const beforeRefresh = Date.now();
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" }, { enableAllByDefault: true });
+
+    const [after] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entry.id));
+    expect(after?.status).toBe("quarantined");
+    expect(after?.quarantineReason).toBe("pending_review");
+    expect(after?.quarantinedAt).toBeInstanceOf(Date);
+    expect(after!.quarantinedAt!.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
     expect(after?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
   });
 

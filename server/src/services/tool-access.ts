@@ -8991,6 +8991,11 @@ export function toolAccessService(
       const isSettledDecline =
         existing?.status === "quarantined" &&
         existing.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED;
+      const isRearmedPriorDecline =
+        existing?.status === "quarantined" &&
+        existing.quarantineReason === "pending_review" &&
+        existing.reviewedAt !== null &&
+        existing.reviewedAt !== undefined;
 
       let status: typeof toolCatalogEntries.$inferInsert.status;
       let quarantineReason: string | null = null;
@@ -9000,15 +9005,19 @@ export function toolAccessService(
         status = "disabled";
       } else if (existing?.status === "disabled" && existing.quarantineReason !== "mcp_tool_removed") {
         status = "disabled";
-      } else if (isSettledDecline) {
+      } else if (isSettledDecline || isRearmedPriorDecline) {
         status = "quarantined";
         if (changed) {
           quarantineReason = "pending_review";
           quarantinedAt = refreshedAt;
           quarantinedCount += 1;
-        } else {
+        } else if (isSettledDecline) {
           quarantineReason = TOOL_QUARANTINE_REASON_REVIEWED_DECLINED;
           quarantinedAt = existing.quarantinedAt;
+        } else {
+          quarantineReason = "pending_review";
+          quarantinedAt = existing.quarantinedAt ?? refreshedAt;
+          quarantinedCount += 1;
         }
       } else if (shouldQuarantine) {
         status = "quarantined";
@@ -9044,12 +9053,18 @@ export function toolAccessService(
           name: toolCatalogEntries.name,
           status: toolCatalogEntries.status,
           quarantineReason: toolCatalogEntries.quarantineReason,
+          reviewedAt: toolCatalogEntries.reviewedAt,
         })
           .from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.name, chunk.map(entry => entry.name))));
         const existingDecidedNames = new Set(
           current
-            .filter(entry => entry.status !== "quarantined" || entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED)
-            .map(entry => entry.name),
+            .filter(
+              (entry) =>
+                entry.status !== "quarantined" ||
+                entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED ||
+                (entry.quarantineReason === "pending_review" && entry.reviewedAt !== null),
+            )
+            .map((entry) => entry.name),
         );
         const rows = await tx.insert(toolCatalogEntries).values(chunk)
           .onConflictDoUpdate({ target: [toolCatalogEntries.connectionId, toolCatalogEntries.name], set: {
@@ -9058,7 +9073,7 @@ export function toolAccessService(
             isWrite: sql`excluded.is_write`, isDestructive: sql`excluded.is_destructive`,
             status: sql`CASE
               WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN 'disabled'
-              WHEN ${toolCatalogEntries.status} = 'quarantined' AND ${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} THEN
+              WHEN ${toolCatalogEntries.status} = 'quarantined' AND (${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} OR (${toolCatalogEntries.quarantineReason} = 'pending_review' AND ${toolCatalogEntries.reviewedAt} IS NOT NULL)) THEN
                 CASE
                   WHEN excluded.status = 'disabled' THEN 'disabled'
                   ELSE 'quarantined'
@@ -9068,17 +9083,17 @@ export function toolAccessService(
             versionHash: sql`excluded.version_hash`, schemaHash: sql`excluded.schema_hash`, lastSeenAt: sql`excluded.last_seen_at`,
             quarantinedAt: sql`CASE
               WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN ${toolCatalogEntries.quarantinedAt}
-              WHEN ${toolCatalogEntries.status} = 'quarantined' AND ${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} THEN
+              WHEN ${toolCatalogEntries.status} = 'quarantined' AND (${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} OR (${toolCatalogEntries.quarantineReason} = 'pending_review' AND ${toolCatalogEntries.reviewedAt} IS NOT NULL)) THEN
                 CASE
                   WHEN excluded.status = 'disabled' THEN excluded.quarantined_at
-                  WHEN ${toolCatalogEntries.versionHash} IS DISTINCT FROM excluded.version_hash OR ${toolCatalogEntries.schemaHash} IS DISTINCT FROM excluded.schema_hash THEN excluded.quarantined_at
+                  WHEN ${toolCatalogEntries.versionHash} IS DISTINCT FROM excluded.version_hash OR ${toolCatalogEntries.schemaHash} IS DISTINCT FROM excluded.schema_hash THEN COALESCE(excluded.quarantined_at, ${refreshedAt.toISOString()}::timestamptz)
                   ELSE ${toolCatalogEntries.quarantinedAt}
                 END
               ELSE excluded.quarantined_at
             END`,
             quarantineReason: sql`CASE
               WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN ${toolCatalogEntries.quarantineReason}
-              WHEN ${toolCatalogEntries.status} = 'quarantined' AND ${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} THEN
+              WHEN ${toolCatalogEntries.status} = 'quarantined' AND (${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} OR (${toolCatalogEntries.quarantineReason} = 'pending_review' AND ${toolCatalogEntries.reviewedAt} IS NOT NULL)) THEN
                 CASE
                   WHEN excluded.status = 'disabled' THEN excluded.quarantine_reason
                   WHEN ${toolCatalogEntries.versionHash} IS DISTINCT FROM excluded.version_hash OR ${toolCatalogEntries.schemaHash} IS DISTINCT FROM excluded.schema_hash THEN 'pending_review'
