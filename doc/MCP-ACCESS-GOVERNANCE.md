@@ -232,7 +232,7 @@ During connection setup or gallery review save:
 
 If an upstream server alters an already-reviewed tool's schema (input schema change, version hash drift, or risk classification change), the next catalog refresh resets `quarantineReason` back to `pending_review` and updates `quarantinedAt`, while preserving sticky `reviewedAt` history. This re-arms the quarantine, bringing the drifted action back into the operator's attention queue for re-review.
 
-To inspect and re-enable a quarantined entry, use the UI Catalog view, or PATCH the entry's status via the catalog routes (see [Reference](#reference)).
+To inspect quarantined entries, inspect the connection's catalog or retrieve apps needing attention via `GET /api/companies/:companyId/tools/apps/attention`. To re-enable any quarantined entry (including settled `reviewed_declined` actions, or in connections where all actions were quarantined), submit `POST /api/companies/:companyId/tools/apps/:connectionId/finish` including the target entry ID in both `enabledCatalogEntryIds` and `reviewedCatalogEntryIds`. This updates the entry to `status: active`, clears its quarantine reason, records review timestamps, and adds it to the connection's access profile.
 
 ## Profiles and bindings
 
