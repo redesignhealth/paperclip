@@ -413,7 +413,7 @@ export async function runSweep(
       }
     } else if (upgrade.state === "needs_recovery") {
       throw new CompanyMemoryUpgradeError(
-        "Upgrade is in needs_recovery. Recovery/status/rollback are unavailable in this slice.",
+        "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' before resuming sweep.",
         "STATE_MISMATCH",
       );
     } else {

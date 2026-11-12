@@ -50,6 +50,24 @@ export const LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   get rollback_marker_clear_failed(): string {
     return this.ROLLBACK_MARKER_CLEAR_FAILED;
   },
+
+  RECOVER_LEASE_PRESENT:
+    "Recover refused: the upgrade is in 'needs_recovery' but still holds a lease, which the lifecycle never produces. Nothing was changed. Do not hand-edit lease columns; investigate who wrote the lease, and wait for it to expire or have the owning worker release it before running recover.",
+  get recover_lease_present(): string {
+    return this.RECOVER_LEASE_PRESENT;
+  },
+
+  RECOVER_NOT_APPLIED:
+    "Recover failed before anything changed: the upgrade is still in 'needs_recovery', its recover_to_state is intact, and no lease is held. Nothing was modified and no lease was left behind. Re-run 'pnpm memory:upgrade recover --company <uuid> --confirm <uuid>'.",
+  get recover_not_applied(): string {
+    return this.RECOVER_NOT_APPLIED;
+  },
+
+  RECOVER_OUTCOME_UNKNOWN:
+    "Recover could not confirm its outcome: the control-plane database became unreachable and the upgrade row could not be re-read. Recovery is applied in one transaction, so the upgrade is either fully recovered and lease-free, or completely unchanged; it is never left half-recovered or holding a lease. Re-run 'pnpm memory:upgrade recover' once the control-plane database is reachable. If the recovery already landed, recover reports that the upgrade is no longer in 'needs_recovery' and changes nothing.",
+  get recover_outcome_unknown(): string {
+    return this.RECOVER_OUTCOME_UNKNOWN;
+  },
 };
 
 export const LIFECYCLE_SAFE_STATE_MISMATCH_MESSAGES = [
@@ -67,4 +85,6 @@ export const LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = [
   "Flag '--ack-agent-scope-flag' is required for flip. The scope marker alone has no effect unless 'agent-scoped-mem0' is enabled for this company's agent processes.",
   "Invalid --max-drain-hours. Must be a positive number of hours not exceeding 168.",
   "Invalid --probe-interval-minutes. Must be an integer of at least 10.",
+  "Confirmation company ID does not match target company ID.",
+  "Flag --confirm <uuid> must strictly match --company <uuid>.",
 ] as const;
