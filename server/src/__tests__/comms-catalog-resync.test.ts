@@ -9,7 +9,7 @@ import { activityLog, agents, authUsers, companies, companyMemberships, companyS
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
-import { commsReviewedAllowlist, readDefaultMcpState } from "../services/default-mcp-spec.js";
+import { DEFAULT_MCP_TEMPLATE_UID, commsReviewedAllowlist, readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import {
@@ -264,7 +264,7 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
       remoteHttpRequest: mcpServer(descriptors),
     } as never).refreshCatalog(connectionId, { actorType: "system", actorId: "test" });
   const markManagedTemplate = (connectionId: string) =>
-    db.update(toolConnections).set({ config: { url: TEMPLATE_URL, defaultMcpManaged: "template", quarantineNewEntries: true }, credentialRefs: [] }).where(eq(toolConnections.id, connectionId));
+    db.update(toolConnections).set({ uid: DEFAULT_MCP_TEMPLATE_UID, config: { url: TEMPLATE_URL, defaultMcpManaged: "template", quarantineNewEntries: true }, credentialRefs: [] }).where(eq(toolConnections.id, connectionId));
   /** The mock board needs no credential; the refresh only has to reach tools/list. */
   const dropCredentials = async (connectionId: string) => {
     const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
@@ -290,6 +290,9 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
         const result = await refreshWith(connectionId, [...LIVE(), liveTool("brand_new_tool")]);
         const statuses = await cloneStatus(connectionId);
         expect(statuses.proposals_submit).toBe("active");
+        const [submit] = await db.select().from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, connectionId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+        expect(submit!.quarantineReason).toBeNull();
+        expect(submit!.quarantinedAt).toBeNull();
         expect(statuses.proposals_get).toBe("active");
         expect(statuses.comms_admin_register).toBe("disabled");
         // A tool outside the reviewed list is still held for review.
@@ -336,6 +339,22 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
       await db.update(toolConnections).set({ config: { url: TEMPLATE_URL, quarantineNewEntries: true }, credentialRefs: [] }).where(eq(toolConnections.id, template.id));
       await refreshWith(template.id, LIVE());
       expect((await cloneStatus(template.id)).proposals_submit).toBe("quarantined");
+    });
+
+    it("a clone repointed away from the template's endpoint loses the exemption: its drift is quarantined", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, cloneId));
+      const repointed = "https://9.9.9.9/mcp";
+      await db.update(toolConnections).set({ config: { ...(row!.config as Record<string, unknown>), url: repointed }, transportConfig: { url: repointed } }).where(eq(toolConnections.id, cloneId));
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
     });
 
     it("commsReviewedAllowlist only covers managed comms-board connections", () => {

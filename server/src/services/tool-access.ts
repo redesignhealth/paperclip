@@ -51,6 +51,7 @@ import {
   isPersonalDefaultMcpTemplate,
   managedConnectionRole,
   commsReviewedAllowlist,
+  DEFAULT_MCP_TEMPLATE_UID,
   staticCatalogAllowlist,
   stripDefaultMcpProtectedConfigKeys,
   grantHasPersonalOAuthAccessToken,
@@ -8886,7 +8887,19 @@ export function toolAccessService(
     const staticAllowlist = staticCatalogAllowlist(connection.config);
     // The managed comms-board template and its clones keep their reviewed tools active when the board's descriptor
     // drifts (see `commsReviewedAllowlist`). Unlike the static catalog this does not filter what is discovered.
-    const commsReviewed = commsReviewedAllowlist(connection);
+    let commsReviewed = commsReviewedAllowlist(connection);
+    if (commsReviewed !== null && isManagedDedicated(connection.config)) {
+      // A clone's config can be edited by PATCH (the managed marker is kept, the URL is not pinned). Trust the reviewed
+      // list only while the clone still points at the endpoint of its company's immutable managed template.
+      const [template] = await db
+        .select({ config: toolConnections.config })
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.uid, DEFAULT_MCP_TEMPLATE_UID)))
+        .limit(1);
+      const templateUrl = typeof asRecord(template?.config).url === "string" ? String(asRecord(template?.config).url) : null;
+      const cloneUrls = [asRecord(connection.config).url, asRecord(connection.transportConfig).url].filter((url) => url !== undefined);
+      if (templateUrl === null || cloneUrls.length === 0 || cloneUrls.some((url) => url !== templateUrl)) commsReviewed = null;
+    }
     const discoveredCount = descriptors.length;
     if (staticAllowlist) {
       descriptors = descriptors.filter((descriptor) => staticAllowlist.has(descriptor.name));
