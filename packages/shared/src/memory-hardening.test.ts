@@ -13,6 +13,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
   });
 
@@ -24,6 +25,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
 
     expect(
@@ -33,6 +35,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
   });
 
@@ -46,6 +49,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
 
     expect(
@@ -57,6 +61,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: true,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
 
     expect(
@@ -68,6 +73,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: true,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
 
     expect(
@@ -79,6 +85,19 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: true,
+      mem0AutoSyncOff: false,
+    });
+
+    expect(
+      resolveMemoryHardeningFlags({
+        PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off",
+      }),
+    ).toEqual({
+      hermesMemoryConfig: false,
+      hermesPromptSplit: false,
+      agentScopedMem0: false,
+      capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: true,
     });
   });
 
@@ -92,6 +111,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: true,
       agentScopedMem0: true,
       capabilityMemoryGuidance: true,
+      mem0AutoSyncOff: true,
     });
   });
 
@@ -104,6 +124,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: true,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
   });
 
@@ -117,6 +138,7 @@ describe("resolveMemoryHardeningFlags", () => {
       hermesPromptSplit: true,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     });
   });
 
@@ -145,6 +167,7 @@ describe("resolveMemoryHardeningFlags", () => {
           hermesPromptSplit: false,
           agentScopedMem0: false,
           capabilityMemoryGuidance: true,
+          mem0AutoSyncOff: false,
         });
 
         process.env.PAPERCLIP_MEMORY_HARDENING = "invalid-token";
@@ -169,6 +192,7 @@ describe("resolveMemoryHardeningFlags", () => {
           hermesPromptSplit: false,
           agentScopedMem0: false,
           capabilityMemoryGuidance: false,
+          mem0AutoSyncOff: false,
         });
       } finally {
         if (prevEnv === undefined) {
@@ -192,6 +216,7 @@ describe("resolveMemoryHardeningFlags", () => {
           hermesPromptSplit: false,
           agentScopedMem0: false,
           capabilityMemoryGuidance: false,
+          mem0AutoSyncOff: false,
         });
       } finally {
         if (origDescriptor) {
@@ -215,6 +240,7 @@ describe("resolveMemoryHardeningFlags", () => {
           hermesPromptSplit: false,
           agentScopedMem0: false,
           capabilityMemoryGuidance: false,
+          mem0AutoSyncOff: false,
         });
       } finally {
         if (origDescriptor) {
@@ -236,6 +262,7 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: true,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
     });
   });
@@ -248,12 +275,14 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       expect(resolveEffectiveMemoryHardeningFlags(serverEnv, null)).toEqual({
         hermesMemoryConfig: true,
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
     });
 
@@ -266,6 +295,7 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
 
       // Server sets hermes-memory-config; agent sets hermes-prompt-split
@@ -275,6 +305,7 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: true,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
 
       // Server sets nothing; agent sets all
@@ -284,6 +315,7 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: true,
         agentScopedMem0: true,
         capabilityMemoryGuidance: true,
+        mem0AutoSyncOff: true,
       });
 
       // Agent-only agent-scoped-mem0 enables the flag
@@ -293,6 +325,17 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: false,
         agentScopedMem0: true,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
+      });
+
+      // Agent-only mem0-auto-sync-off enables the flag
+      const agentEnvAutoSyncOff = { PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off" };
+      expect(resolveEffectiveMemoryHardeningFlags({}, agentEnvAutoSyncOff)).toEqual({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: true,
       });
 
       // Server-on agent-scoped-mem0 cannot be disabled by agent-empty
@@ -302,6 +345,17 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: false,
         agentScopedMem0: true,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
+      });
+
+      // Server-on mem0-auto-sync-off cannot be disabled by agent-empty
+      const serverEnvAutoSyncOff = { PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off" };
+      expect(resolveEffectiveMemoryHardeningFlags(serverEnvAutoSyncOff, agentEnvEmpty)).toEqual({
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: true,
       });
     });
 
@@ -312,12 +366,14 @@ describe("resolveMemoryHardeningFlags", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       expect(resolveEffectiveMemoryHardeningFlags({}, nonStringEnv)).toEqual({
         hermesMemoryConfig: false,
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
     });
 

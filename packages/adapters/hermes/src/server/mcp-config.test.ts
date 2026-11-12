@@ -54,6 +54,7 @@ describe("Hermes MCP Config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       }, 45));
       expect(generated.providers.anthropic.request_timeout_seconds).toBe(45);
       expect(generated.memory).toEqual({
@@ -1924,6 +1925,7 @@ print(json.dumps(data))
           hermesPromptSplit: false,
           agentScopedMem0: false,
           capabilityMemoryGuidance: false,
+          mem0AutoSyncOff: false,
         });
         expect(explicitOff).toBe("model: gpt-5.4\n\nmemory:\n  provider: mem0\n");
 
@@ -1934,6 +1936,7 @@ print(json.dumps(data))
           hermesPromptSplit: false,
           agentScopedMem0: false,
           capabilityMemoryGuidance: false,
+          mem0AutoSyncOff: false,
         });
         expect(explicitOn).toBe(
           "model: gpt-5.4\n\nmemory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n",
@@ -1963,6 +1966,7 @@ print(json.dumps(data))
             hermesPromptSplit: false,
             agentScopedMem0: false,
             capabilityMemoryGuidance: false,
+            mem0AutoSyncOff: false,
           },
         });
         cleanupDirs.push(prepared.homeDir);
@@ -2004,6 +2008,57 @@ print(json.dumps(data))
 
       const mem0Content = JSON.parse(await fs.readFile(prepared.mem0JsonPath!, "utf8"));
       expect(mem0Content.sync_max_chars).toBe(6000);
+      expect(mem0Content.auto_sync).toBeUndefined();
+    });
+
+    it("prepareHermesMcpHome emits auto_sync: false under mem0-auto-sync-off hardening", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-flags-auto-sync-off-"));
+      cleanupDirs.push(mockHost);
+
+      const prepared = await prepareHermesMcpHome({
+        servers: [],
+        memory: validMemConfig,
+        config: {
+          env: {
+            HERMES_HOME: mockHost,
+            PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off,hermes-memory-config",
+          },
+        },
+      });
+      cleanupDirs.push(prepared.homeDir);
+
+      const rawMem0 = await fs.readFile(prepared.mem0JsonPath!, "utf8");
+      const parsedMem0 = JSON.parse(rawMem0);
+      expect(parsedMem0.sync_max_chars).toBe(6000);
+      expect(parsedMem0.auto_sync).toBe(false);
+
+      // Verify key ordering: auto_sync immediately follows sync_max_chars
+      const lines = rawMem0.split("\n");
+      const syncMaxCharsIdx = lines.findIndex((l) => l.includes('"sync_max_chars":'));
+      const autoSyncIdx = lines.findIndex((l) => l.includes('"auto_sync":'));
+      expect(autoSyncIdx).toBe(syncMaxCharsIdx + 1);
+    });
+
+    it("prepareHermesMcpHome preserves legacy mem0.json without auto_sync when mem0-auto-sync-off is absent", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-flags-legacy-mem0-"));
+      cleanupDirs.push(mockHost);
+
+      const prepared = await prepareHermesMcpHome({
+        servers: [],
+        memory: validMemConfig,
+        config: {
+          env: {
+            HERMES_HOME: mockHost,
+            PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config",
+          },
+        },
+      });
+      cleanupDirs.push(prepared.homeDir);
+
+      const rawMem0 = await fs.readFile(prepared.mem0JsonPath!, "utf8");
+      const parsedMem0 = JSON.parse(rawMem0);
+      expect(parsedMem0.auto_sync).toBeUndefined();
+      expect(rawMem0).not.toContain("auto_sync");
     });
 
     it("never emits disabled_toolsets in serialized YAML", () => {

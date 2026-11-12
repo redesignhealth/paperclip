@@ -3,6 +3,7 @@ export interface MemoryHardeningFlags {
   readonly hermesPromptSplit: boolean;
   readonly agentScopedMem0: boolean;
   readonly capabilityMemoryGuidance: boolean;
+  readonly mem0AutoSyncOff: boolean;
 }
 
 export class MemoryHardeningConfigurationError extends Error {
@@ -17,6 +18,7 @@ const ALL_OFF_FLAGS: MemoryHardeningFlags = Object.freeze({
   hermesPromptSplit: false,
   agentScopedMem0: false,
   capabilityMemoryGuidance: false,
+  mem0AutoSyncOff: false,
 });
 
 export function resolveMemoryHardeningFlags(
@@ -36,6 +38,7 @@ export function resolveMemoryHardeningFlags(
   let hermesPromptSplit = false;
   let agentScopedMem0 = false;
   let capabilityMemoryGuidance = false;
+  let mem0AutoSyncOff = false;
 
   for (const rawSegment of raw.split(",")) {
     const token = rawSegment.trim();
@@ -56,11 +59,15 @@ export function resolveMemoryHardeningFlags(
       case "capability-memory-guidance":
         capabilityMemoryGuidance = true;
         break;
+      case "mem0-auto-sync-off":
+        mem0AutoSyncOff = true;
+        break;
       case "all":
         hermesMemoryConfig = true;
         hermesPromptSplit = true;
         agentScopedMem0 = true;
         capabilityMemoryGuidance = true;
+        mem0AutoSyncOff = true;
         break;
       default:
         throw new MemoryHardeningConfigurationError(
@@ -74,6 +81,7 @@ export function resolveMemoryHardeningFlags(
     hermesPromptSplit,
     agentScopedMem0,
     capabilityMemoryGuidance,
+    mem0AutoSyncOff,
   });
 }
 
@@ -86,6 +94,7 @@ export function mergeMemoryHardeningFlags(
     hermesPromptSplit: a.hermesPromptSplit || b.hermesPromptSplit,
     agentScopedMem0: a.agentScopedMem0 || b.agentScopedMem0,
     capabilityMemoryGuidance: a.capabilityMemoryGuidance || b.capabilityMemoryGuidance,
+    mem0AutoSyncOff: a.mem0AutoSyncOff || b.mem0AutoSyncOff,
   });
 }
 

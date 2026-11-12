@@ -96,6 +96,7 @@ export interface ValidatedHermesMemoryConfig {
   readonly userId: string;
   readonly agentId: string;
   readonly syncMaxChars?: number;
+  readonly autoSync?: boolean;
   readonly llm: {
     readonly provider: "openai" | "ollama";
     readonly config: Readonly<Record<string, unknown>>;
@@ -150,6 +151,7 @@ export interface CanonicalMem0Json {
   readonly user_id: string;
   readonly agent_id: string;
   readonly sync_max_chars?: number;
+  readonly auto_sync?: boolean;
 }
 
 function assertNoControlChars(val: string, fieldName: string): void {
@@ -473,6 +475,8 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
     "agent_id",
     "syncMaxChars",
     "sync_max_chars",
+    "autoSync",
+    "auto_sync",
     "llm",
     "embedder",
     "vectorStore",
@@ -529,6 +533,18 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
       throw new Error("Invalid memory configuration: syncMaxChars must be an integer between 1 and 16000");
     }
     syncMaxChars = rawSyncMaxChars;
+  }
+
+  if (raw.autoSync !== undefined && raw.auto_sync !== undefined && raw.autoSync !== raw.auto_sync) {
+    throw new Error("Invalid memory configuration: conflicting autoSync and auto_sync values provided");
+  }
+  const rawAutoSync = raw.autoSync ?? raw.auto_sync;
+  let autoSync: boolean | undefined;
+  if (rawAutoSync !== undefined) {
+    if (typeof rawAutoSync !== "boolean") {
+      throw new Error("Invalid memory configuration: autoSync must be a boolean");
+    }
+    autoSync = rawAutoSync;
   }
 
   // LLM block
@@ -588,6 +604,7 @@ export function validateHermesMemoryConfig(input: unknown): ValidatedHermesMemor
     embedder: validatedEmbedder,
     vectorStore: validatedVectorStore,
     ...(syncMaxChars !== undefined ? { syncMaxChars } : {}),
+    ...(autoSync !== undefined ? { autoSync } : {}),
   };
 }
 
@@ -758,6 +775,7 @@ export function buildCanonicalMem0Object(
     ...(hardening.hermesMemoryConfig
       ? { sync_max_chars: config.syncMaxChars ?? 6000 }
       : {}),
+    ...(hardening.mem0AutoSyncOff ? { auto_sync: false } : {}),
   };
 }
 

@@ -191,6 +191,9 @@ jobs:
         # server/src/__tests__/docker-hermes-cli.test.ts enforces this step's presence.
         run: python3 scripts/compile-hermes-requirements.py --check
 
+      - name: Validate Hermes Mem0 auto-sync provider patch
+        run: pnpm test:hermes-mem0-patch
+
       - name: Validate Node version policy
         run: pnpm check:node-version
 

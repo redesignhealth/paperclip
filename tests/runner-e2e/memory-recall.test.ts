@@ -547,6 +547,127 @@ describe("memory recall grader: baseline and hardened behavior", () => {
     expect(result.checks.find((c) => c.id === "hardened-noise-bounded")?.passed).toBe(true);
   });
 
+  it("evaluates auto-sync-zero-writes when mem0-auto-sync-off is enabled", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, false);
+    const emptyObservation = { ...observation, memories: [] };
+    const passResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation: emptyObservation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off" },
+    });
+    expect(passResult.passed).toBe(true);
+    const zeroCheck = passResult.checks.find((c) => c.id === "auto-sync-zero-writes");
+    expect(zeroCheck?.passed).toBe(true);
+    expect(zeroCheck?.detail).toContain("Zero automatic memory writes observed");
+
+    const failResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off" },
+    });
+    expect(failResult.passed).toBe(false);
+    const failCheck = failResult.checks.find((c) => c.id === "auto-sync-zero-writes");
+    expect(failCheck?.passed).toBe(false);
+    expect(failCheck?.detail).toContain("Expected 0 automatic memory writes under mem0-auto-sync-off");
+  });
+
+  it("prioritizes auto-sync-zero-writes when both hermes-memory-config and mem0-auto-sync-off are combined", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, true);
+    const emptyObservation = { ...observation, memories: [] };
+
+    // Zero writes pass: auto-sync-zero-writes evaluated, hardened-noise-bounded suppressed
+    const passResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation: emptyObservation,
+      env: {
+        PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config,mem0-auto-sync-off",
+      },
+    });
+    expect(passResult.passed).toBe(true);
+    expect(passResult.checks.find((c) => c.id === "auto-sync-zero-writes")?.passed).toBe(true);
+    expect(passResult.checks.find((c) => c.id === "hardened-noise-bounded")).toBeUndefined();
+
+    // Unexpected writes fail under combined flags
+    const failResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation, // has 6 memories
+      env: {
+        PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config,mem0-auto-sync-off",
+      },
+    });
+    expect(failResult.passed).toBe(false);
+    expect(failResult.checks.find((c) => c.id === "auto-sync-zero-writes")?.passed).toBe(false);
+    expect(failResult.checks.find((c) => c.id === "hardened-noise-bounded")).toBeUndefined();
+  });
+
+  it("prioritizes auto-sync-zero-writes under PAPERCLIP_MEMORY_HARDENING='all'", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, true);
+    const emptyObservation = { ...observation, memories: [] };
+
+    // Under 'all', auto-sync-zero-writes takes precedence and passes for zero writes
+    const passResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation: emptyObservation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "all" },
+    });
+    expect(passResult.passed).toBe(true);
+    expect(passResult.checks.find((c) => c.id === "auto-sync-zero-writes")?.passed).toBe(true);
+    expect(passResult.checks.find((c) => c.id === "hardened-noise-bounded")).toBeUndefined();
+
+    // Under 'all', unexpected writes fail auto-sync-zero-writes
+    const failResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "all" },
+    });
+    expect(failResult.passed).toBe(false);
+    expect(failResult.checks.find((c) => c.id === "auto-sync-zero-writes")?.passed).toBe(false);
+    expect(failResult.checks.find((c) => c.id === "hardened-noise-bounded")).toBeUndefined();
+  });
+
+  it("preserves legacy hardened-noise-bounded behavior when mem0-auto-sync-off is absent", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, true);
+
+    // Old noise-only path with hermes-memory-config and valid memories passes
+    const passResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" },
+    });
+    expect(passResult.passed).toBe(true);
+    expect(passResult.checks.find((c) => c.id === "hardened-noise-bounded")?.passed).toBe(true);
+    expect(passResult.checks.find((c) => c.id === "auto-sync-zero-writes")).toBeUndefined();
+
+    // Old noise-only path fails when insufficient sample (< 5 memories)
+    const emptyObservation = { ...observation, memories: [] };
+    const failSampleResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation: emptyObservation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "hermes-memory-config" },
+    });
+    expect(failSampleResult.passed).toBe(false);
+    const boundedCheck = failSampleResult.checks.find((c) => c.id === "hardened-noise-bounded");
+    expect(boundedCheck?.passed).toBe(false);
+    expect(boundedCheck?.detail).toContain("Insufficient sample");
+    expect(failSampleResult.checks.find((c) => c.id === "auto-sync-zero-writes")).toBeUndefined();
+  });
+
   it("throws defensively when an unimplemented hardening flag is passed to grader", () => {
     const { marker, observation } = buildValidObservation("implicit-recall", 1, false);
     expect(() =>
@@ -931,6 +1052,7 @@ describe("server boot proof extraction and server-resolved flags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     };
 
     const result = gradeMemoryRecall({

@@ -237,12 +237,16 @@ export function gradeMemoryRecall(input: {
   const { caseId, rep, marker, observation: obs } = input;
   const flags = input.flags ?? resolveMemoryHardeningFlags(input.env ?? process.env);
 
-  // Defensive throw if any enabled flag is not implemented
-  for (const [flagKey, status] of Object.entries(MEMORY_HARDENING_CAPABILITIES) as [
-    keyof MemoryHardeningFlags,
-    "implemented" | "not-implemented",
-  ][]) {
-    if (flags[flagKey] && status === "not-implemented") {
+  // Defensive throw if any enabled flag relevant to this case is not implemented
+  const caseRelevantFlags: Record<MemoryRecallCase, ReadonlyArray<keyof MemoryHardeningFlags>> = {
+    "save-then-fresh-recall": ["hermesMemoryConfig", "hermesPromptSplit"],
+    "implicit-recall": ["hermesMemoryConfig", "hermesPromptSplit", "capabilityMemoryGuidance"],
+    "cross-agent-leak": ["hermesMemoryConfig", "hermesPromptSplit", "agentScopedMem0"],
+    "noise": ["hermesMemoryConfig", "hermesPromptSplit", "mem0AutoSyncOff"],
+  };
+
+  for (const flagKey of caseRelevantFlags[caseId] ?? []) {
+    if (flags[flagKey] && MEMORY_HARDENING_CAPABILITIES[flagKey] === "not-implemented") {
       const info =
         UNIMPLEMENTED_MEMORY_HARDENING_TICKETS[
           flagKey as keyof typeof UNIMPLEMENTED_MEMORY_HARDENING_TICKETS
@@ -476,7 +480,17 @@ export function gradeMemoryRecall(input: {
               : "Valid memory observation recorded.",
       );
 
-      if (flags.hermesMemoryConfig) {
+      if (flags.mem0AutoSyncOff) {
+        // When auto_sync is disabled, zero automatic writes takes precedence over sample/noise-ratio checks
+        const zeroWrites = memoriesArray.length === 0;
+        check(
+          "auto-sync-zero-writes",
+          zeroWrites,
+          zeroWrites
+            ? "Zero automatic memory writes observed with auto_sync disabled."
+            : `Expected 0 automatic memory writes under mem0-auto-sync-off, but observed ${memoriesArray.length}.`,
+        );
+      } else if (flags.hermesMemoryConfig) {
         // Min-sample guard that FAILS if fewer than 5 memories, else ratio <= 0.3
         const minSampleMet = allWellFormed && summary.totalCount >= 5;
         const bounded = minSampleMet && summary.noiseRatio <= 0.3;

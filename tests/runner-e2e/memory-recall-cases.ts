@@ -15,6 +15,7 @@ export const MEMORY_HARDENING_CAPABILITIES: Record<
   hermesPromptSplit: "implemented",
   agentScopedMem0: "not-implemented",
   capabilityMemoryGuidance: "not-implemented",
+  mem0AutoSyncOff: "implemented",
 } as const;
 
 export const UNIMPLEMENTED_MEMORY_HARDENING_TICKETS: Record<

@@ -61,6 +61,23 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     const patchBytes = readFileSync(patchFilePath);
     const actualSha = createHash("sha256").update(patchBytes).digest("hex");
     expect(actualSha).toBe(patchesLock.patch_sha256);
+
+    // Optional second patch validation (TECH-8191)
+    expect(patchesLock.patch_file_2).toBe("patches/0002-mem0-auto-sync.patch");
+    expect(patchesLock.postpatch_marker_2).toBe("TECH-8191-MEM0-AUTO-SYNC");
+    expect(patchesLock.extension_version_2).toBe("0.21.3+tech8191.1");
+
+    const patchFile2 = patchesLock.patch_file_2;
+    expect(patchFile2.startsWith("patches/")).toBe(true);
+    expect(patchFile2.includes("..")).toBe(false);
+    expect(path.isAbsolute(patchFile2)).toBe(false);
+
+    const patchFilePath2 = path.join(hermesDockerDir, patchFile2);
+    expect(existsSync(patchFilePath2), "patch file 2 must exist").toBe(true);
+
+    const patchBytes2 = readFileSync(patchFilePath2);
+    const actualSha2 = createHash("sha256").update(patchBytes2).digest("hex");
+    expect(actualSha2).toBe(patchesLock.patch_sha256_2);
   });
 
   it("verifies Dockerfile pins multi-arch Tirith releases for both amd64 and arm64", () => {
@@ -92,6 +109,29 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     expect(patchContent).toContain("--offline");
     expect(patchContent).toContain("_MandatoryCircuitBreaker");
     expect(patchContent).toContain("_run_scanner_bounded");
+  });
+
+  it("verifies Dockerfile validates and applies optional second patch (TECH-8191)", () => {
+    const dockerfilePath = path.join(repoRoot, "Dockerfile");
+    const dockerfile = readFileSync(dockerfilePath, "utf8");
+
+    expect(dockerfile).toContain("PATCH_FILE_2=");
+    expect(dockerfile).toContain("PATCH_SHA_2=");
+    expect(dockerfile).toContain("POSTPATCH_MARKER_2=");
+    expect(dockerfile).toContain('case "$PATCH_FILE_2" in patches/0002-*.patch)');
+    expect(dockerfile).toContain('grep -q "$POSTPATCH_MARKER_2" /opt/hermes-src/plugins/memory/mem0/__init__.py');
+  });
+
+  it("verifies patch 2 contains the marker and auto_sync gate logic", () => {
+    const patchesLockPath = path.join(hermesDockerDir, "patches.lock");
+    const lock = parseLockfile(readFileSync(patchesLockPath, "utf8"));
+    const patchContent = readFileSync(path.join(hermesDockerDir, lock.patch_file_2), "utf8");
+
+    expect(patchContent).toContain(lock.postpatch_marker_2);
+    expect(patchContent).toContain("auto_sync");
+    expect(patchContent).toContain("MEM0_AUTO_SYNC_PATCH_MARKER");
+    expect(patchContent).toContain("_coerce_bool");
+    expect(patchContent).toContain("Mem0 sync_turn skipped (auto_sync disabled)");
   });
 
   it("executes independent locked-source Python regression harness in CI", () => {
