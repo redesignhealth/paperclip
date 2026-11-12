@@ -9898,6 +9898,20 @@ export function toolAccessService(
     }
   }
 
+  function isConfidentialOAuthMethod(method: unknown): boolean {
+    return method === "client_secret_post" || method === "client_secret_basic";
+  }
+
+  function isConfidentialDcrClient(
+    connection: typeof toolConnections.$inferSelect,
+  ): boolean {
+    const oauth = oauthConfig(connection);
+    return (
+      oauth.clientRegistrationSource === "dcr" &&
+      isConfidentialOAuthMethod(oauth.clientTokenEndpointAuthMethod)
+    );
+  }
+
   async function oauthClientForConnection(
     connection: typeof toolConnections.$inferSelect,
     provider: string,
@@ -9977,7 +9991,13 @@ export function toolAccessService(
             },
           )
           .catch((error) => {
-            if (options?.allowMissingSecret && isSecretNotFoundError(error)) return null;
+            if (
+              options?.allowMissingSecret &&
+              isConfidentialDcrClient(connection) &&
+              isSecretNotFoundError(error)
+            ) {
+              return null;
+            }
             throw error;
           })
       : null;
@@ -11449,20 +11469,6 @@ export function toolAccessService(
     );
   }
 
-  function isConfidentialOAuthMethod(method: unknown): boolean {
-    return method === "client_secret_post" || method === "client_secret_basic";
-  }
-
-  function isConfidentialDcrClient(
-    connection: typeof toolConnections.$inferSelect,
-  ): boolean {
-    const oauth = oauthConfig(connection);
-    return (
-      oauth.clientRegistrationSource === "dcr" &&
-      isConfidentialOAuthMethod(oauth.clientTokenEndpointAuthMethod)
-    );
-  }
-
   async function ensureOAuthClient(input: {
     connection: typeof toolConnections.$inferSelect;
     endpoints: OAuthProviderEndpoints;
@@ -11511,12 +11517,23 @@ export function toolAccessService(
       )
     ) {
       const isConfidentialDcr = isConfidentialDcrClient(input.connection);
-      const existingClient = await oauthClientForConnection(
-        input.connection,
-        input.endpoints.provider,
-        input.actor,
-        { allowMissingSecret: true },
-      );
+      let existingClient;
+      try {
+        existingClient = await oauthClientForConnection(
+          input.connection,
+          input.endpoints.provider,
+          input.actor,
+          { allowMissingSecret: isConfidentialDcr },
+        );
+      } catch (error) {
+        if (!isConfidentialDcr && isSecretNotFoundError(error)) {
+          throw unprocessable(
+            "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+            { code: "oauth_client_secret_missing" },
+          );
+        }
+        throw error;
+      }
       if (!isConfidentialDcr || existingClient.clientSecret) {
         const bound = await stampOAuthClientBinding(
           input.connection,
@@ -11591,12 +11608,23 @@ export function toolAccessService(
         )
       ) {
         const isConfidentialDcr = isConfidentialDcrClient(latest);
-        const existingClient = await oauthClientForConnection(
-          latest,
-          input.endpoints.provider,
-          input.actor,
-          { allowMissingSecret: true },
-        );
+        let existingClient;
+        try {
+          existingClient = await oauthClientForConnection(
+            latest,
+            input.endpoints.provider,
+            input.actor,
+            { allowMissingSecret: isConfidentialDcr },
+          );
+        } catch (error) {
+          if (!isConfidentialDcr && isSecretNotFoundError(error)) {
+            throw unprocessable(
+              "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+              { code: "oauth_client_secret_missing" },
+            );
+          }
+          throw error;
+        }
         if (!isConfidentialDcr || existingClient.clientSecret) {
           const bound = await stampOAuthClientBinding(
             latest,

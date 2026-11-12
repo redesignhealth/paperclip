@@ -51,6 +51,8 @@ import {
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
+import { SecretProviderClientError } from "../secrets/types.js";
+import { notFound } from "../errors.js";
 import { ensureCompanyDefaultMcpOAuthSeeds } from "../services/default-mcp-oauth-seed.js";
 import {
   DEFAULT_MCP_TEMPLATE_COMPANY_IDS_ENV,
@@ -5761,7 +5763,149 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         }),
       ).rejects.toMatchObject({
         status: 404,
+        message: "Secret not found",
       });
+    });
+
+    it("TECH-8347: manual client with deleted secret ref and omitted auth method on dual-method AS rejects 422 oauth_client_secret_missing before consent", async () => {
+      installMcpOAuthFixture({ auth: "oauth", dcr: false, tokenEndpointAuthMethods: ["none", "client_secret_post"] });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+
+      const [app] = await db.insert(toolApplications).values({ companyId: company.id, applicationKey: `app:${randomUUID()}`, name: "Manual App Deleted Ref", type: "mcp_http", status: "active", metadata: {} }).returning();
+      const [connection] = await db.insert(toolConnections).values({
+        companyId: company.id,
+        applicationId: app!.id,
+        uid: randomUUID(),
+        name: "Manual App Deleted Ref Conn",
+        transport: "mcp_remote",
+        status: "active",
+        enabled: true,
+        credentialPolicy: "shared",
+        config: {
+          url: MCP_URL,
+          oauth: {
+            clientId: "manual-client-deleted-ref",
+            clientRegistrationSource: "manual",
+            clientCompanyId: company.id,
+          },
+        },
+        transportConfig: { url: MCP_URL },
+        credentialRefs: [],
+        credentialSecretRefs: [
+          {
+            configPath: "oauth.client_secret",
+            secretId: randomUUID(),
+            versionSelector: "latest",
+          },
+        ],
+      }).returning();
+
+      await expect(
+        service.startOAuth(company.id, connection!.id, { redirectUri: REDIRECT_URI, actor }),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: { code: "oauth_client_secret_missing" },
+      });
+    });
+
+    it("TECH-8347: typed SecretProviderClientError not_found triggers DCR registration at start", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+
+      const [current] = await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId));
+      const oldSecretRef = current!.credentialSecretRefs.find((r) => r.configPath === "oauth.client_secret")!;
+      expect(oldSecretRef).toBeDefined();
+
+      const realSecrets = secretService(db);
+      const mockSecretClient = {
+        ...realSecrets,
+        resolveSecretValue: vi.fn(async (...args: Parameters<typeof realSecrets.resolveSecretValue>) => {
+          const [, , , context] = args;
+          if (
+            fixture.requestsTo("/register").length === registerCallsBefore &&
+            context?.configPath === "oauth.client_secret"
+          ) {
+            throw new SecretProviderClientError({
+              code: "not_found",
+              provider: "aws_secrets_manager",
+              operation: "resolveSecret",
+              message: "Resource not found in AWS Secrets Manager",
+            });
+          }
+          return realSecrets.resolveSecretValue(...args);
+        }),
+      };
+
+      const customService = toolAccessService(db, { secretClient: mockSecretClient });
+
+      const registerCallsBefore = fixture.requestsTo("/register").length;
+      const redirectUri = new URL(start.body.authorizationUrl).searchParams.get("redirect_uri")!;
+      const restart = await customService.startOAuth(company.id, instanceId, {
+        redirectUri,
+        actor: { actorType: "user", actorId: alice },
+      });
+      expect(restart).toBeDefined();
+      expect(restart.authorizationUrl).toContain("client_id=");
+      const registerCallsAfter = fixture.requestsTo("/register").length;
+      expect(registerCallsAfter).toBeGreaterThan(registerCallsBefore);
+    });
+
+    it("TECH-8347: unrelated details-coded 404 from secret resolution rethrows without re-registering", async () => {
+      const fixture = installMcpOAuthFixture({
+        auth: "oauth",
+        tools: GOOGLE_TOOLS,
+        tokenEndpointAuthMethods: ["client_secret_post"],
+      });
+      const company = await createCompany(db);
+      await seedOauthSeeds(company.id);
+      const seed = (await googleSeed(company.id))!;
+      const alice = await addHumanMember(company.id);
+
+      const start = await startSeedConnect(company.id, seed.id, alice);
+      const instanceId = start.body.connectionId as string;
+      await completeSeedConnect(company.id, alice, start.body.authorizationUrl, fixture);
+
+      const realSecrets = secretService(db);
+      const mockSecretClient = {
+        ...realSecrets,
+        resolveSecretValue: vi.fn(async (...args: Parameters<typeof realSecrets.resolveSecretValue>) => {
+          const [, , , context] = args;
+          if (context?.configPath === "oauth.client_secret") {
+            throw notFound("Unrelated 404", { code: "unrelated_not_found" });
+          }
+          return realSecrets.resolveSecretValue(...args);
+        }),
+      };
+
+      const customService = toolAccessService(db, { secretClient: mockSecretClient });
+
+      const registerCallsBefore = fixture.requestsTo("/register").length;
+
+      await expect(
+        customService.startOAuth(company.id, instanceId, {
+          redirectUri: REDIRECT_URI,
+          actor: { actorType: "user", actorId: alice },
+        }),
+      ).rejects.toMatchObject({
+        status: 404,
+        details: { code: "unrelated_not_found" },
+      });
+
+      const registerCallsAfter = fixture.requestsTo("/register").length;
+      expect(registerCallsAfter).toBe(registerCallsBefore);
     });
 
     it("TECH-8347: unrelated resolve 422 secret_inactive during startOAuth propagates without re-registering", async () => {
