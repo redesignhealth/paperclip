@@ -19,9 +19,36 @@ describe("Paperclip HTTP server runner transport", () => {
       authority: { handleUpgrade } as unknown as DurablePrpControlPlane,
     });
     expect(authority.connectUrl).toBe(`ws://127.0.0.1:3210/api/runner/v1/connect/${runId}`);
-    expect(server.listenerCount("upgrade")).toBe(1);
+    // fork(TECH-8283 F7): Exactly 2 upgrade listeners: runner PRP and fallback destroyer
+    expect(server.listenerCount("upgrade")).toBe(2);
     await authority.release();
     server.close();
+  });
+
+  // fork(TECH-8283 F7): Fallback upgrade listener destroys unhandled upgrade requests
+  it("destroys socket on unhandled upgrade paths", async () => {
+    const server = createPaperclipHttpServer((_req, res) => res.end("ready"), {
+      apiUrl: "http://127.0.0.1:3210",
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Listener not bound");
+    const origin = `http://127.0.0.1:${address.port}`;
+    try {
+      const error = await new Promise<Error | null>((resolve) => {
+        const req = request(`${origin}/unhandled/upgrade/path`, {
+          headers: { connection: "Upgrade", upgrade: "websocket" },
+        });
+        req.on("error", (err) => resolve(err));
+        req.on("upgrade", () => resolve(null));
+        req.end();
+      });
+      expect(error).toBeDefined();
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
   it("serves HTTP and rejects an unregistered runner over the real listener", async () => {
