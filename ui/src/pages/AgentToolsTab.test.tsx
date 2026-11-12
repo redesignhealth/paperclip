@@ -1110,5 +1110,139 @@ describe("AgentToolsTab", () => {
       ]);
       expect(bobRow!.getAttribute("data-state")).toBe("checked");
     });
+
+    it("TECH-8350: null-owner installed peer disables own row due to conflict", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-null",
+            uid: "rh-google-mcp/default-mcp-personal/null-user",
+            createdByUserId: null,
+            name: "Legacy Google MCP",
+            installs: [{ targetType: "agent", targetId: "agent-1" }],
+          }),
+          personalInstance({
+            id: "pi-b",
+            uid: "rh-google-mcp/default-mcp-personal/user-b",
+            createdByUserId: "user-b",
+            name: "Bob Google MCP",
+            installs: [],
+          }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [{ principalId: "user-b", status: "active", user: { name: "Bob Member" } }],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+
+      const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
+      expect(bobRow).toBeTruthy();
+      expect(bobRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((bobRow as HTMLButtonElement).disabled).toBe(true);
+      expect(container.textContent).toContain("Another user's personal instance is already installed for this app on this agent.");
+    });
+
+    it("TECH-8350: enables personal instance row for local-board owner in local_trusted mode when session is null", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-local",
+            uid: "rh-google-mcp/default-mcp-personal/local-board",
+            createdByUserId: "local-board",
+            name: "Local Google MCP",
+            installs: [],
+          }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockHealthApi.get.mockResolvedValue({ deploymentMode: "local_trusted" });
+      mockAuthApi.getSession.mockResolvedValue(null);
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-local") });
+
+      const localRow = container.querySelector<HTMLElement>('[aria-label="Install Local Google MCP on Coder"]');
+      expect(localRow).toBeTruthy();
+      expect(localRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((localRow as HTMLButtonElement).disabled).toBe(false);
+
+      await act(async () => {
+        localRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("pi-local", [
+        { targetType: "agent", targetId: "agent-1" },
+      ]);
+    });
+
+    it("TECH-8350: autosave selects changed uninstalls before installs to avoid peer-uninstall race", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      const aliceConn = personalInstance({
+        id: "pi-a",
+        uid: "rh-google-mcp/default-mcp-personal/user-a",
+        createdByUserId: "user-a",
+        name: "Alice Google MCP",
+        installs: [{ targetType: "agent", targetId: "agent-1" }],
+      });
+      const bobConn = personalInstance({
+        id: "pi-b",
+        uid: "rh-google-mcp/default-mcp-personal/user-b",
+        createdByUserId: "user-b",
+        name: "Bob Google MCP",
+        installs: [],
+      });
+      // Put pi-b first in connectionList to guarantee that order in connectionList doesn't dictate order
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [bobConn, aliceConn],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [
+          { principalId: "user-a", status: "active", user: { name: "Alice Member" } },
+          { principalId: "user-b", status: "active", user: { name: "Bob Member" } },
+        ],
+      });
+
+      mockToolsApi.putConnectionInstalls.mockResolvedValueOnce({
+        connectionId: "pi-a",
+        installs: [],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+
+      const aliceRow = container.querySelector<HTMLElement>('[aria-label="Install Alice Google MCP on Coder"]');
+      expect(aliceRow).toBeTruthy();
+      expect(aliceRow!.getAttribute("data-state")).toBe("checked");
+
+      // Alice's instance is currently installed. Bob clicks Alice to uninstall it:
+      await act(async () => {
+        aliceRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+
+      // And Bob clicks his own instance to install it:
+      const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
+      expect(bobRow).toBeTruthy();
+      await act(async () => {
+        bobRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      // The first call sent to putConnectionInstalls MUST be the uninstall (pi-a with []), NOT pi-b
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenNthCalledWith(1, "pi-a", []);
+    });
   });
 });

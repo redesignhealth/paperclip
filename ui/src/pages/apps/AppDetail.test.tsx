@@ -1379,7 +1379,7 @@ describe("AppDetail", () => {
   it("TECH-8350: personal instance owner picker reflects installs and persists installs on change", async () => {
     mockParams.tab = "permissions";
     const personalConn = connection({
-      id: "conn-personal",
+      id: "conn-1",
       createdByUserId: "user-1",
       config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
       credentialPolicy: "per_user",
@@ -1387,19 +1387,19 @@ describe("AppDetail", () => {
     });
     getConnectionMock.mockResolvedValue(personalConn);
     listConnectionGrantsMock.mockResolvedValue({
-      connection: { id: "conn-personal", uid: "conn-uid-personal" },
+      connection: { id: "conn-1", uid: "conn-uid-1" },
       grants: [],
       currentUserId: "user-1",
       members: [],
       capabilities: fullCapabilities({ canConfigure: true }),
     });
     getConnectionInstallsMock.mockResolvedValue({
-      connectionId: "conn-personal",
+      connectionId: "conn-1",
       installs: [{ targetType: "agent", targetId: "agent-1" }],
     });
     listProfilesMock.mockResolvedValue({
       profiles: [{
-        profileKey: "app:conn-personal",
+        profileKey: "app:conn-1",
         entries: [],
         bindings: [{ targetType: "agent", targetId: "agent-1" }],
       }],
@@ -1450,26 +1450,26 @@ describe("AppDetail", () => {
   it("TECH-8350: personal instance owner picker uses authoritative empty installs despite profile bindings", async () => {
     mockParams.tab = "permissions";
     const personalConn = connection({
-      id: "conn-personal",
+      id: "conn-1",
       createdByUserId: "user-1",
       config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
       credentialPolicy: "per_user",
     });
     getConnectionMock.mockResolvedValue(personalConn);
     listConnectionGrantsMock.mockResolvedValue({
-      connection: { id: "conn-personal", uid: "conn-uid-personal" },
+      connection: { id: "conn-1", uid: "conn-uid-1" },
       grants: [],
       currentUserId: "user-1",
       members: [],
       capabilities: fullCapabilities({ canConfigure: true }),
     });
     getConnectionInstallsMock.mockResolvedValue({
-      connectionId: "conn-personal",
+      connectionId: "conn-1",
       installs: [],
     });
     listProfilesMock.mockResolvedValue({
       profiles: [{
-        profileKey: "app:conn-personal",
+        profileKey: "app:conn-1",
         entries: [],
         bindings: [{ targetType: "agent", targetId: "agent-1" }],
       }],
@@ -1491,6 +1491,182 @@ describe("AppDetail", () => {
     const checkbox = document.body.querySelector<HTMLButtonElement>('[aria-label="Allow Coder"]');
     expect(checkbox).toBeTruthy();
     expect(checkbox!.getAttribute("data-state")).toBe("unchecked");
+  });
+
+  it("TECH-8350: non-owner saving access preserves installed agent IDs without calling putConnectionInstalls", async () => {
+    mockParams.tab = "permissions";
+    vi.mocked(agentsApi.list).mockResolvedValue([
+      { id: "agent-1", name: "Coder", title: "Engineer", status: "active" },
+      { id: "agent-2", name: "Reviewer", title: "Reviewer", status: "active" },
+    ] as unknown as Awaited<ReturnType<typeof agentsApi.list>>);
+    const personalConn = connection({
+      id: "conn-1",
+      createdByUserId: "user-owner",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+      installs: [{ targetType: "agent", targetId: "agent-1" }],
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-uid-1" },
+      grants: [],
+      currentUserId: "user-other",
+      members: [],
+      capabilities: fullCapabilities({ canConfigure: true }),
+    });
+    getConnectionInstallsMock.mockResolvedValue({
+      connectionId: "conn-1",
+      installs: [{ targetType: "agent", targetId: "agent-1" }],
+    });
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-1",
+        entries: [],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+    finishAppMock.mockResolvedValue({
+      connection: personalConn,
+      profile: { id: "prof-1", bindings: [] },
+      profileEntries: [],
+      profileBindings: [],
+      policies: [],
+    });
+
+    await renderAppDetail();
+
+    const trigger = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("1 agent selected") || b.textContent?.includes("Coder"),
+    );
+    expect(trigger).toBeTruthy();
+
+    await act(async () => {
+      trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // agent-1 is installed on a non-owned connection, so its checkbox is disabled and marked required
+    const coderCheckbox = document.body.querySelector<HTMLButtonElement>('[aria-label="Allow Coder"]');
+    expect(coderCheckbox).toBeTruthy();
+    expect(coderCheckbox!.disabled).toBe(true);
+
+    const reviewerCheckbox = document.body.querySelector<HTMLButtonElement>('[aria-label="Allow Reviewer"]');
+    expect(reviewerCheckbox).toBeTruthy();
+    expect(reviewerCheckbox!.disabled).toBe(false);
+
+    putConnectionInstallsMock.mockClear();
+    finishAppMock.mockClear();
+
+    // Select Reviewer
+    await act(async () => {
+      reviewerCheckbox!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // finishApp is called preserving agent-1 alongside agent-2
+    expect(finishAppMock).toHaveBeenCalledWith(
+      "company-1",
+      "conn-1",
+      expect.objectContaining({
+        access: {
+          agentIds: expect.arrayContaining(["agent-1", "agent-2"]),
+        },
+      }),
+    );
+    // Non-owner does NOT manage installs via putConnectionInstalls
+    expect(putConnectionInstallsMock).not.toHaveBeenCalled();
+  });
+
+  it("TECH-8350: gates permissions with loading indicator while grantsQuery is loading for personal instance", async () => {
+    mockParams.tab = "permissions";
+    const personalConn = connection({
+      id: "conn-1",
+      createdByUserId: "user-1",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockReturnValue(new Promise(() => {}));
+    getConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Loading tools…");
+    expect(container.textContent).not.toContain("Choose agents");
+  });
+
+  it("TECH-8350: gates permissions with loading indicator while installsQuery is pending for personal instance owner", async () => {
+    mockParams.tab = "permissions";
+    const personalConn = connection({
+      id: "conn-1",
+      createdByUserId: "user-1",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-uid-1" },
+      grants: [],
+      currentUserId: "user-1",
+      members: [],
+      capabilities: fullCapabilities({ canConfigure: true }),
+    });
+    getConnectionInstallsMock.mockReturnValue(new Promise(() => {}));
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Loading tools…");
+    expect(container.textContent).not.toContain("Choose agents");
+  });
+
+  it("TECH-8350: displays permissions error card when installs query fails without spinning forever", async () => {
+    mockParams.tab = "permissions";
+    const personalConn = connection({
+      id: "conn-1",
+      createdByUserId: "user-1",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-uid-1" },
+      grants: [],
+      currentUserId: "user-1",
+      members: [],
+      capabilities: fullCapabilities({ canConfigure: true }),
+    });
+    getConnectionInstallsMock.mockRejectedValue(new Error("Installs fetch failed"));
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Couldn’t load tools for this app.");
+    expect(container.textContent).toContain("Try again");
+  });
+
+  it("TECH-8350: does not spin forever when session user is null for non-owner personal connection", async () => {
+    mockParams.tab = "permissions";
+    const personalConn = connection({
+      id: "conn-1",
+      createdByUserId: "user-1",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-uid-1" },
+      grants: [],
+      currentUserId: null,
+      members: [],
+      capabilities: fullCapabilities({ canConfigure: true }),
+    });
+    getSessionMock.mockResolvedValue(null);
+    getConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
+
+    await renderAppDetail();
+    await flushReact();
+
+    expect(container.textContent).not.toContain("Loading tools…");
+    expect(container.textContent).toContain("Which agents can use this connection?");
   });
 
   it("uses the setup-style agent access question without install terminology", async () => {

@@ -84,7 +84,7 @@ function hasPersonalInstanceConflict(
     if (!isPersonalDefaultMcpInstance(other.config)) return false;
     const otherConfig = other.config as Record<string, unknown> | null | undefined;
     if (otherConfig?.paperclipDefaultMcpEntry !== entryKey) return false;
-    if (!other.createdByUserId || other.createdByUserId === connection.createdByUserId) return false;
+    if (other.createdByUserId === connection.createdByUserId) return false;
     const installState = installStateFrom(other.installs, { ignoreCompanyInstall: isManagedConnection(other) });
     const isInstalled = draft[other.id] ?? isAgentInstalled(installState, agentId);
     return isInstalled;
@@ -514,6 +514,8 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
   });
+  // In local_trusted deployment mode, the backend sets req.actor to { type: "board", source: "local_implicit", userId: "local-board" }
+  // (see server/src/middleware/auth.ts), so local-board is the responsible user identity when no auth session exists.
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? (health?.deploymentMode === "local_trusted" ? "local-board" : null);
   // Personal instances whose ownership is not verified as "mine" (a peer's, a missing owner's, or any while the session is unresolved).
   const isUnverifiedPersonalInstance = (connection: ToolConnection) =>
@@ -669,12 +671,16 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
     }
     if (syncInstall.isPending) return;
 
-    const changedConnection = connectionList.find((connection) => {
-      const saved = lastSavedInstallRef.current[connection.id] ?? false;
-      const draft = installDraft[connection.id] ?? false;
-      const failed = failedInstallDraftRef.current;
-      return saved !== draft && !(failed?.connectionId === connection.id && failed.installed === draft);
-    });
+    // H1: Select uninstalls (draft === false) before installs (draft === true) to avoid peer-uninstall conflict race
+    const changed = (isUninstall: boolean) =>
+      connectionList.find((connection) => {
+        const saved = lastSavedInstallRef.current[connection.id] ?? false;
+        const draft = installDraft[connection.id] ?? false;
+        const failed = failedInstallDraftRef.current;
+        if (saved === draft || (failed?.connectionId === connection.id && failed.installed === draft)) return false;
+        return isUninstall ? !draft : true;
+      });
+    const changedConnection = changed(true) ?? changed(false);
     if (!changedConnection) return;
 
     const timeout = window.setTimeout(() => {
