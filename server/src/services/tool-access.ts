@@ -57,6 +57,7 @@ import {
   isCompanyInDefaultMcpTemplateScope,
   readDefaultMcpTemplateScope,
 } from "../secrets/default-mcp-template-scope.js";
+import { isSecretProviderClientError } from "../secrets/types.js";
 import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
 import { agentInstallsRefused, loadAgentDefaultMcpState, loadPersonalOwnerCaps } from "./default-mcp-install-gate.js";
 import { parseToolProfileEntryConditions as parseEntryConditions } from "./tool-profile-entry-conditions.js";
@@ -1685,12 +1686,22 @@ const INLINE_OAUTH_TOKEN_FIELDS = [
   "clientSecret",
 ];
 
+const DCR_CLIENT_REGISTRATION_FIELDS = [
+  "clientId",
+  "clientRegistrationSource",
+  "clientTokenEndpointAuthMethod",
+  "clientRedirectUri",
+  "clientIssuer",
+  "clientResource",
+  "clientCompanyId",
+  "clientIdIssuedAt",
+  "clientSecretExpiresAt",
+] as const;
+
 /**
- * Drop inline OAuth token material from a connection config, keeping the
- * non-secret identity (client id, issuer, registration source) a later
- * reconnect reuses. Current code stores tokens as secret refs, never in the
- * config; this exists so a row written by an older build cannot keep a usable
- * token after the operator removed the app.
+ * Drop inline OAuth token material from a connection config.
+ * For connection removal, prefer `withoutRemovedOAuthRegistration` which also
+ * clears DCR client registration material (TECH-8348).
  */
 function withoutInlineOAuthTokens(
   config: Record<string, unknown>,
@@ -1707,6 +1718,51 @@ function withoutInlineOAuthTokens(
     }
   }
   return changed ? { ...config, oauth: next } : config;
+}
+
+/**
+ * Drop inline OAuth token material and, for dynamically registered (DCR)
+ * clients, clear the stored client registration so reconnecting registers a
+ * fresh client with a valid secret rather than reusing an orphaned client id
+ * whose secret was deleted during removal (TECH-8348). CIMD and manual
+ * registrations are preserved for reconnect.
+ */
+function withoutRemovedOAuthRegistration(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const stripped = withoutInlineOAuthTokens(config);
+  const oauth = stripped.oauth;
+  if (!oauth || typeof oauth !== "object" || Array.isArray(oauth))
+    return stripped;
+  if ((oauth as Record<string, unknown>).clientRegistrationSource !== "dcr")
+    return stripped;
+  const next = { ...(oauth as Record<string, unknown>) };
+  let changed = false;
+  for (const field of DCR_CLIENT_REGISTRATION_FIELDS) {
+    if (field in next) {
+      delete next[field];
+      changed = true;
+    }
+  }
+  return changed ? { ...stripped, oauth: next } : stripped;
+}
+
+function isSecretNotFoundError(error: unknown): boolean {
+  if (!error) return false;
+  if (isSecretProviderClientError(error)) {
+    return error.code === "not_found";
+  }
+  if (error instanceof HttpError && error.status === 404) {
+    const detailsCode = asRecord(error.details).code;
+    if (detailsCode === "secret_deleted" || detailsCode === "version_missing") {
+      return true;
+    }
+    // TODO(TECH-8347): replace message match once secret service returns structured secret_not_found code
+    if (!detailsCode && error.message === "Secret not found") {
+      return true;
+    }
+  }
+  return false;
 }
 
 function actorBinding(actor: ActorInfo | undefined) {
@@ -7264,7 +7320,8 @@ export function toolAccessService(
    *
    * What stays behind is deliberate: the connection and application rows, their
    * ids, names and activity keep working so a later reconnect reuses the same
-   * identity — but with no credential, no install and no profile, so
+   * identity — but with no credential, no install and no profile (and for DCR,
+   * no client registration, since its client secret was deleted; TECH-8348), so
    * reconnecting has to ask for fresh authentication and rebuild access.
    */
   async function removeConnection(
@@ -7655,8 +7712,8 @@ export function toolAccessService(
       .set({
         credentialRefs: [],
         credentialSecretRefs: [],
-        config: withoutInlineOAuthTokens(connection.config),
-        transportConfig: withoutInlineOAuthTokens(connection.transportConfig),
+        config: withoutRemovedOAuthRegistration(connection.config),
+        transportConfig: withoutRemovedOAuthRegistration(connection.transportConfig),
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))
@@ -9826,7 +9883,7 @@ export function toolAccessService(
           inArray(connectionGrants.connectionId, personal.map((connection) => connection.id)),
           eq(connectionGrants.kind, "user"),
           eq(connectionGrants.subjectUserId, viewerUserId),
-          eq(connectionGrants.status, "active"),
+          ne(connectionGrants.status, "revoked"),
         ))
       : [];
     const savedPersonal = new Set(grants.filter((grant) => grant.refs.some((ref) => ref.configPath === "oauth.client_secret")).map((grant) => grant.connectionId));
@@ -9837,10 +9894,25 @@ export function toolAccessService(
     }
   }
 
+  function isConfidentialOAuthMethod(method: unknown): boolean {
+    return method === "client_secret_post" || method === "client_secret_basic";
+  }
+
+  function isConfidentialDcrClient(
+    connection: typeof toolConnections.$inferSelect,
+  ): boolean {
+    const oauth = oauthConfig(connection);
+    return (
+      oauth.clientRegistrationSource === "dcr" &&
+      isConfidentialOAuthMethod(oauth.clientTokenEndpointAuthMethod)
+    );
+  }
+
   async function oauthClientForConnection(
     connection: typeof toolConnections.$inferSelect,
     provider: string,
     actor?: ActorInfo,
+    options?: { allowMissingSecret?: boolean },
   ) {
     const configured = configuredOAuthClientForConnection(connection, provider);
     if (configured.clientId) return configured;
@@ -9875,6 +9947,8 @@ export function toolAccessService(
         (ref) => ref.configPath === "oauth.client_secret",
       )
     ) {
+      // Any non-revoked personal grant (such as 'needs_reauthorization') retains
+      // its client secret reference so reconnect/reauthorization can resolve it.
       const [personalGrant] = await db
         .select({
           credentialSecretRefs: connectionGrants.credentialSecretRefs,
@@ -9886,7 +9960,7 @@ export function toolAccessService(
             eq(connectionGrants.connectionId, connection.id),
             eq(connectionGrants.kind, "user"),
             eq(connectionGrants.subjectUserId, actor.actorId),
-            eq(connectionGrants.status, "active"),
+            ne(connectionGrants.status, "revoked"),
           ),
         )
         .limit(1);
@@ -9899,18 +9973,29 @@ export function toolAccessService(
           (ref) => ref.configPath === "oauth.client_secret",
         );
     const clientSecret = clientSecretRef
-      ? await secrets.resolveSecretValue(
-          connection.companyId,
-          clientSecretRef.secretId,
-          clientSecretRef.versionSelector ?? "latest",
-          {
-            consumerType: "tool_connection",
-            consumerId: connection.id,
-            configPath: "oauth.client_secret",
-            actorType: actor?.actorType ?? "system",
-            actorId: actor?.actorId ?? null,
-          },
-        )
+      ? await secrets
+          .resolveSecretValue(
+            connection.companyId,
+            clientSecretRef.secretId,
+            clientSecretRef.versionSelector ?? "latest",
+            {
+              consumerType: "tool_connection",
+              consumerId: connection.id,
+              configPath: "oauth.client_secret",
+              actorType: actor?.actorType ?? "system",
+              actorId: actor?.actorId ?? null,
+            },
+          )
+          .catch((error) => {
+            if (
+              options?.allowMissingSecret &&
+              isConfidentialDcrClient(connection) &&
+              isSecretNotFoundError(error)
+            ) {
+              return null;
+            }
+            throw error;
+          })
       : null;
     return {
       clientIdEnv: null,
@@ -10655,13 +10740,16 @@ export function toolAccessService(
       actor?: ActorInfo;
       existingRefs?: typeof connectionGrants.$inferSelect.credentialSecretRefs;
       ownerUserId?: string;
+      forceNewSecret?: boolean;
     },
     context?: {
       dbClient: Db | DbTransaction;
       secretClient: ReturnType<typeof secretService>;
     },
   ) {
-    const existing = input.existingRefs === undefined
+    const existing = input.forceNewSecret
+      ? null
+      : input.existingRefs === undefined
       ? oauthSecretRef(input.connection, input.configPath)
       : input.existingRefs.find((ref) => ref.configPath === input.configPath);
     const write = (client: Db | DbTransaction) => writeConnectionCredential(client, {
@@ -10894,6 +10982,7 @@ export function toolAccessService(
     endpoints: OAuthProviderEndpoints;
     redirectUri: string;
     actor?: ActorInfo;
+    replaceStaleClientSecret?: boolean;
   }) {
     if (!input.endpoints.registrationUrl) {
       throw unprocessable(
@@ -11059,9 +11148,11 @@ export function toolAccessService(
         label: "OAuth client secret",
         value: clientSecret,
         actor: input.actor,
+        forceNewSecret: input.replaceStaleClientSecret,
       });
       nextCredentialSecretRefs.push(clientSecretRef);
     } else if (
+      !input.replaceStaleClientSecret &&
       existingClientSecretRef &&
       oauthConfig(input.connection).clientId === clientId
     ) {
@@ -11427,20 +11518,36 @@ export function toolAccessService(
         metadataDocumentUrl,
       )
     ) {
-      const bound = await stampOAuthClientBinding(
-        input.connection,
-        input.endpoints,
-        input.redirectUri,
-      );
-      return {
-        connection: bound,
-        client: await oauthClientForConnection(
-          bound,
+      const isConfidentialDcr = isConfidentialDcrClient(input.connection);
+      let existingClient;
+      try {
+        existingClient = await oauthClientForConnection(
+          input.connection,
           input.endpoints.provider,
           input.actor,
-        ),
-        source: storedOAuthClientRegistrationSource(bound),
-      };
+          { allowMissingSecret: isConfidentialDcr },
+        );
+      } catch (error) {
+        if (!isConfidentialDcr && isSecretNotFoundError(error)) {
+          throw unprocessable(
+            "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+            { code: "oauth_client_secret_missing" },
+          );
+        }
+        throw error;
+      }
+      if (!isConfidentialDcr || existingClient.clientSecret) {
+        const bound = await stampOAuthClientBinding(
+          input.connection,
+          input.endpoints,
+          input.redirectUri,
+        );
+        return {
+          connection: bound,
+          client: existingClient,
+          source: storedOAuthClientRegistrationSource(bound),
+        };
+      }
     }
     const oauth = oauthConfig(input.connection);
     if (
@@ -11494,6 +11601,7 @@ export function toolAccessService(
           source: "preconfigured" as const,
         };
       }
+      let staleClientSecret = false;
       if (
         oauthClientBindingMatches(
           latest,
@@ -11502,20 +11610,37 @@ export function toolAccessService(
           metadataDocumentUrl,
         )
       ) {
-        const bound = await stampOAuthClientBinding(
-          latest,
-          input.endpoints,
-          input.redirectUri,
-        );
-        return {
-          connection: bound,
-          client: await oauthClientForConnection(
-            bound,
+        const isConfidentialDcr = isConfidentialDcrClient(latest);
+        let existingClient;
+        try {
+          existingClient = await oauthClientForConnection(
+            latest,
             input.endpoints.provider,
             input.actor,
-          ),
-          source: storedOAuthClientRegistrationSource(bound),
-        };
+            { allowMissingSecret: isConfidentialDcr },
+          );
+        } catch (error) {
+          if (!isConfidentialDcr && isSecretNotFoundError(error)) {
+            throw unprocessable(
+              "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+              { code: "oauth_client_secret_missing" },
+            );
+          }
+          throw error;
+        }
+        if (!isConfidentialDcr || existingClient.clientSecret) {
+          const bound = await stampOAuthClientBinding(
+            latest,
+            input.endpoints,
+            input.redirectUri,
+          );
+          return {
+            connection: bound,
+            client: existingClient,
+            source: storedOAuthClientRegistrationSource(bound),
+          };
+        }
+        staleClientSecret = true;
       }
       // 3. By default, Client ID Metadata Documents need no registration call,
       //    so prefer them over DCR when the authorization server advertises
@@ -11549,6 +11674,7 @@ export function toolAccessService(
         endpoints: input.endpoints,
         redirectUri: input.redirectUri,
         actor: input.actor,
+        replaceStaleClientSecret: staleClientSecret,
       });
       return {
         connection: registered,
@@ -16054,7 +16180,7 @@ export function toolAccessService(
             code: "personal_instance_conflict",
           });
         }
-        // If archived, revive to draft while preserving all grants/credentials/profiles
+        // If archived, revive to draft while preserving non-secret identity (DCR registration was cleared on removal; TECH-8348)
         if (existing.status === "archived") {
           const [revived] = await tx
             .update(toolConnections)
@@ -16465,8 +16591,47 @@ export function toolAccessService(
     });
     connection = resolvedClient.connection;
     const client = resolvedClient.client;
-    if (galleryMethod?.oauthClientSecretRequired && !client.clientSecret) {
-      throw unprocessable("This app requires an OAuth client secret. Add it in the app setup before signing in.");
+    const resolvedOAuth = oauthConfig(connection);
+    // Manual OAuth clients are confidential by default unless explicitly public
+    // (`clientTokenEndpointAuthMethod: "none"`, TECH-7973) or the authorization
+    // server advertises token endpoint auth methods that include "none".
+    //
+    // Rationale:
+    // When clientTokenEndpointAuthMethod is omitted on a manual client (the standard
+    // saved shape):
+    // 1. If the authorization server advertises no token endpoint auth methods (or omits
+    //    discovery), RFC 6749 defaults client authentication to confidential, so we
+    //    require a client secret.
+    // 2. If the authorization server advertises confidential methods without "none",
+    //    it only supports confidential clients and requires a client secret.
+    // 3. If the authorization server advertises "none" (either "none" alone or dual-method
+    //    "none" + "client_secret_post"), we must allow omitted stored method to continue
+    //    as public so legacy public manual clients without secrets are not broken.
+    //    Trade-off: a genuinely confidential manual client that omitted its auth method on
+    //    a dual-method server will not be rejected here at start and may fail later at the
+    //    token endpoint, but this avoids regressing working legacy public connections.
+    // Explicit stored confidential methods (client_secret_post / client_secret_basic)
+    // always reject missing secrets regardless of server advertisement.
+    const advertisedMethods = endpoints.tokenEndpointAuthMethodsSupported ?? [];
+    const serverSupportsConfidential =
+      advertisedMethods.length === 0 ||
+      (advertisedMethods.some(isConfidentialOAuthMethod) &&
+        !advertisedMethods.includes("none"));
+    // The save path only persists "none" for !galleryEntry, and curated pinned
+    // endpoints advertise no auth methods.
+    const isManualConfidential =
+      resolvedClient.source === "manual" &&
+      resolvedOAuth.clientTokenEndpointAuthMethod !== "none" &&
+      (isConfidentialOAuthMethod(resolvedOAuth.clientTokenEndpointAuthMethod) ||
+        (!galleryEntry && serverSupportsConfidential));
+    if (
+      (galleryMethod?.oauthClientSecretRequired || isManualConfidential) &&
+      !client.clientSecret
+    ) {
+      throw unprocessable(
+        "This app requires an OAuth client secret. Add it in the app setup before signing in.",
+        { code: "oauth_client_secret_missing" },
+      );
     }
     if (!client.clientId)
       throw unprocessable(
