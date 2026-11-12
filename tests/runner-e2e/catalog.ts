@@ -1,6 +1,7 @@
 import { caseHandoffTask, caseHandoffDefinitionDigest } from "./case-handoffs-cases.js";
 import { caseReceiptTask, caseReceiptDefinitionDigest, CASE_RECEIPT_BUDGET_CENTS, CASE_RECEIPT_MAX_TURNS, CASE_RECEIPT_RUN_TIMEOUT_MS } from "./case-receipt-cases.js";
 import { TASK_WORKSPACES_SUITE, taskWorkspaceTask, taskWorkspaceProfile, taskWorkspaceDefinitionDigest } from "./task-workspaces-cases.js";
+import { repositoryProofTasks, repositoryProofProfile, repositoryProofDigest } from "./repository-verification.js";
 import { automaticRepositoryTask, automaticRepositoryDigest } from "./automatic-repository.js";
 import { nativeActiveStopTasks } from "./native-active-stop-tasks.js";
 import { piControlTasks } from "./pi-controls-cases.js";
@@ -1206,6 +1207,23 @@ function copilotFilePrompt(nonce: string): string {
   ].join("\n");
 }
 
+const repositoryModelProfiles = [
+  {
+    native: nativeProfile({
+      id: "runner-codex", label: "Codie staging-model diagnostic", provider: "codex", model: "gpt-6.1-sol", credential: "OPENAI_API_KEY",
+      modelQualification: { source: "candidate_runner_profile", qualificationId: "observed-staging-codie-model-2026-10-20" },
+    }),
+    legacy: runnerProfiles.find(profile => profile.id === "legacy-codex")!,
+  },
+  {
+    native: nativeProfile({
+      id: "runner-acpx-claude", label: "Claude staging-model diagnostic", provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5", credential: "ANTHROPIC_API_KEY",
+      modelQualification: { source: "candidate_runner_profile", qualificationId: "observed-staging-claude-model-2026-10-20" },
+    }),
+    legacy: runnerProfiles.find(profile => profile.id === "legacy-claude")!,
+  },
+];
+
 export const runnerSuites: readonly RunnerSuiteFixture[] = [
   {
     id: "codie-latency-diagnostic",
@@ -1243,6 +1261,16 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 1, definitionDigest: taskWorkspaceDefinitionDigest(), scheduling: "explicit-only", providerTurns: 3,
       attempts: 1, budgetMonthlyCents: 1000, project: "none", cwd: "unconfigured-task-default", oracle: "public-file-download-and-host-nested-git", remoteLifecycle: "per_turn" },
   },
+  ...([false, true] as const).map(conversion => ({
+    id: conversion ? "legacy-conversion" : "configured-repository",
+    label: conversion ? "Legacy conversion with verified delivery" : "Configured repository with verified delivery",
+    manualOnly: true, description: "Production instructions, retained configuration, and a downloaded result checked against an independent Git and file baseline.",
+    groups: [], profiles: repositoryModelProfiles.map(({ native, legacy }) => repositoryProofProfile(native, conversion ? legacy : undefined)),
+    environments: runnerEnvironments, tasks: repositoryProofTasks.filter(task => task.id === (conversion ? "convert-and-deliver" : "repository-output")), expectedMatrixSize: 4,
+    definitionMetadata: { version: 1, definitionDigest: repositoryProofDigest(), scheduling: "explicit-only", providerTurns: 1, attempts: 1,
+      budgetMonthlyCents: 1000, instructions: "production-default", surface: "paperclip", oracle: "registered-download-and-independent-configured-checkout",
+      target: "isolated-development-instance", authentication: "api-key", stagingAuthentication: "subscription", remoteLifecycle: "per_turn", stagingQualification: false },
+  })),
   {
     id: "automatic-repository", label: "Automatic repository continuation", manualOnly: true,
     description: "A projectless user request stages its managed repository, continues automatically, and delivers independently verified downloaded bytes.",
@@ -1252,6 +1280,15 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     definitionMetadata: { version: 1, definitionDigest: automaticRepositoryDigest(), scheduling: "explicit-only",
       providerTurns: 2, attempts: 1, budgetMonthlyCents: 1000, project: "none", instructions: "production-default",
       surface: "paperclip", oracle: "registered-download-and-independent-checkout", remoteLifecycle: "per_turn" },
+  },
+  {
+    id: "automatic-repository-configured-models", label: "Automatic repository with recorded staging models", manualOnly: true,
+    description: "Replay projectless setup with the recorded Codie and Claude models while keeping development authentication and lifecycle differences explicit.",
+    groups: [], profiles: repositoryModelProfiles.map(({ native }) => productionDefaultHireProfile(taskWorkspaceProfile(native))),
+    environments: runnerEnvironments, tasks: [automaticRepositoryTask], expectedMatrixSize: 4,
+    definitionMetadata: { version: 1, definitionDigest: automaticRepositoryDigest(), scheduling: "explicit-only", providerTurns: 2, attempts: 1,
+      budgetMonthlyCents: 1000, instructions: "production-default", surface: "paperclip", target: "isolated-development-instance",
+      authentication: "api-key", stagingAuthentication: "subscription", remoteLifecycle: "per_turn", stagingQualification: false },
   },
   {
     id: "pi-controls", label: "Pi active controls", manualOnly: true,
