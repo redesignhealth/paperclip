@@ -64,6 +64,7 @@ import {
   getAvailableConnectionMethod,
   getConnectableAppDefinition,
   TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
+  TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED,
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
 import {
@@ -18783,7 +18784,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(profileEntries.map((e) => e.catalogEntryId)).not.toContain(deleteEntry.id);
   });
 
-  it("schema drift with enableAllByDefault true stays quarantined with pending_review, absent from profile, and re-arms attention while preserving reviewedAt", async () => {
+  it("schema drift with enableAllByDefault true stays quarantined with reviewed_declined_changed, absent from profile, and re-arms attention while preserving reviewedAt", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     let currentTools = [
@@ -18833,7 +18834,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     const [driftedAfter] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
     expect(driftedAfter?.status).toBe("quarantined");
-    expect(driftedAfter?.quarantineReason).toBe("pending_review");
+    expect(driftedAfter?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED);
     expect(driftedAfter?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
     const quarantinedAtDrift = driftedAfter!.quarantinedAt!;
     expect(quarantinedAtDrift).toBeInstanceOf(Date);
@@ -18858,7 +18859,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     const [driftedAfterSecond] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
     expect(driftedAfterSecond?.status).toBe("quarantined");
-    expect(driftedAfterSecond?.quarantineReason).toBe("pending_review");
+    expect(driftedAfterSecond?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED);
     expect(driftedAfterSecond?.quarantinedAt?.getTime()).toBe(quarantinedAtDrift.getTime());
     expect(driftedAfterSecond?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
 
@@ -18928,7 +18929,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(after?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
   });
 
-  it("SQL upsert concurrent drift guard sets pending_review and non-null quarantinedAt via refreshedAt when hashes drift", async () => {
+  it("SQL upsert concurrent drift guard sets reviewed_declined_changed and non-null quarantinedAt via refreshedAt when hashes drift", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     let toolPayload = [
@@ -18957,16 +18958,120 @@ describeEmbeddedPostgres("tool access service", () => {
     }).where(eq(toolCatalogEntries.id, entry.id));
 
     // Refresh with enableAllByDefault: true tries to upsert with status: 'active', quarantinedAt: null
-    // The DB upsert CASE statement detects version/schema drift and sets pending_review + nonnull refreshedAt
+    // The DB upsert CASE statement detects version/schema drift and sets reviewed_declined_changed + nonnull refreshedAt
     const beforeRefresh = Date.now();
     await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" }, { enableAllByDefault: true });
 
     const [after] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entry.id));
     expect(after?.status).toBe("quarantined");
-    expect(after?.quarantineReason).toBe("pending_review");
+    expect(after?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED);
     expect(after?.quarantinedAt).toBeInstanceOf(Date);
     expect(after!.quarantinedAt!.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
     expect(after?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
+  });
+
+  it("approve-via-reviewProfileNewTools allow then quarantineNewEntries pending then reconnect returns active/no sticky", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    let toolsList = [
+      { name: "read_zap", annotations: { readOnlyHint: true } },
+    ];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return mcpHttpResponse({ jsonrpc: "2.0", id: body.id,
+        result: body.method === "initialize" ? { protocolVersion: "2025-06-18" } : { tools: toolsList } });
+    });
+
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(
+        company.id,
+        { galleryKey: "zapier", credentialValues: { "credentials.authorization": "initial-secret" } },
+        { actorType: "user", actorId: "board" },
+      ),
+    );
+    const readEntry = connect.catalog.find((e) => e.toolName === "read_zap")!;
+    const finished = await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [readEntry.id],
+        askFirstCatalogEntryIds: [],
+        reviewedCatalogEntryIds: [],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    // Create a custom deny-default profile with connection-scoped include, watermark in past
+    const [customProfile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: "custom-agent-profile",
+      name: "Custom Agent Profile",
+      status: "active",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: customProfile.id,
+      selectorType: "catalog_entry",
+      catalogEntryId: readEntry.id,
+      connectionId: connect.connectionId,
+      effect: "include",
+    });
+    const pastWatermark = new Date(Date.now() - 60_000);
+    await db.update(toolProfiles).set({
+      newToolsReviewedAt: pastWatermark,
+      createdAt: pastWatermark,
+    }).where(eq(toolProfiles.id, customProfile.id));
+
+    // A newly discovered tool arrives
+    toolsList = [
+      { name: "read_zap", annotations: { readOnlyHint: true } },
+      { name: "write_zap", annotations: { readOnlyHint: false } },
+    ];
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+    const [writeEntry] = await db.select().from(toolCatalogEntries).where(
+      and(eq(toolCatalogEntries.connectionId, connect.connectionId), eq(toolCatalogEntries.name, "write_zap")),
+    );
+    expect(writeEntry).toBeDefined();
+
+    // Verify listProfileNewTools includes write_zap
+    const pendingReview = await service.listProfileNewTools(customProfile.id, company.id);
+    expect(pendingReview.tools.map((t) => t.catalogEntryId)).toContain(writeEntry.id);
+
+    // Approve via reviewProfileNewTools; stamps reviewedAt on write_zap
+    await service.reviewProfileNewTools(
+      customProfile.id,
+      { decisions: [{ catalogEntryId: writeEntry.id, decision: "allow" }] },
+      { actorType: "user", actorId: "board" },
+    );
+    const [stampedWrite] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, writeEntry.id));
+    expect(stampedWrite?.reviewedAt).toBeInstanceOf(Date);
+
+    // Put write_zap in quarantine with quarantineNewEntries pending
+    await db.update(toolCatalogEntries).set({
+      status: "quarantined",
+      quarantineReason: "pending_review",
+      quarantinedAt: new Date(),
+    }).where(eq(toolCatalogEntries.id, writeEntry.id));
+    await db.update(toolConnections).set({
+      config: { ...connect.connection.config, quarantineNewEntries: true },
+      transportConfig: { ...connect.connection.transportConfig, quarantineNewEntries: true },
+    }).where(eq(toolConnections.id, connect.connectionId));
+
+    // Reconnecting the app rotates credentials and resets quarantineNewEntries to false
+    await service.reconnectGalleryApp(
+      connect.connectionId,
+      company.id,
+      { credentialValues: { "credentials.authorization": "rotated-secret" } },
+      { actorType: "user", actorId: "board" },
+    );
+
+    // write_zap must be active with null quarantineReason (not sticky because of reviewedAt)
+    const [reconnectedWrite] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, writeEntry.id));
+    expect(reconnectedWrite?.status).toBe("active");
+    expect(reconnectedWrite?.quarantineReason).toBeNull();
   });
 
   it("enables newly discovered tools after setup while preserving tools explicitly turned off", async () => {
