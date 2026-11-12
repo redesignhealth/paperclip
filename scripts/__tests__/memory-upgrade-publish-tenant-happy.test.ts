@@ -73,13 +73,18 @@ test("publish-tenant: happy path and idempotency", async (t) => {
   assert.equal(res.publishedCount, 4);
 
   const liveRows = (await sql.unsafe(
-    `SELECT lower(id::text) as id, payload FROM ${liveTable} WHERE lower(id::text) = ANY($1::text[])`,
+    `SELECT lower(id::text) as id, payload, jsonb_typeof(payload) as payload_type FROM ${liveTable} WHERE lower(id::text) = ANY($1::text[])`,
     [[s1r1.outputId, s1r2.outputId, s2r1.outputId, s2r2.outputId]],
-  )) as Array<{ id: string; payload: Record<string, unknown> | string }>;
+  )) as Array<{ id: string; payload: Record<string, unknown>; payload_type: string }>;
 
   assert.equal(liveRows.length, 4);
+  for (const r of liveRows) {
+    assert.equal(r.payload_type, "object");
+    assert.equal(typeof r.payload, "object");
+    assert.notEqual(r.payload, null);
+  }
   const liveMap = new Map(
-    liveRows.map((r) => [r.id, typeof r.payload === "string" ? JSON.parse(r.payload) : r.payload]),
+    liveRows.map((r) => [r.id, r.payload]),
   );
   assert.deepEqual(liveMap.get(s1r1.outputId.toLowerCase()), s1r1.payload);
   assert.deepEqual(liveMap.get(s1r2.outputId.toLowerCase()), s1r2.payload);

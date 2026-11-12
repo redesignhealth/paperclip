@@ -72,9 +72,14 @@ test("publish-tenant: foreign ID collisions and fence violations", async (t) => 
   `) as Array<{ count: number }>;
   assert.equal(count, 1);
 
-  const [liveRow] = (await sql.unsafe(`SELECT payload FROM ${liveTable} WHERE id = $1::uuid`, [r.outputId])) as any[];
-  const parsed = typeof liveRow.payload === "string" ? JSON.parse(liveRow.payload) : liveRow.payload;
-  assert.deepEqual(parsed, foreignPayload);
+  const [liveRow] = (await sql.unsafe(
+    `SELECT payload, jsonb_typeof(payload) as payload_type FROM ${liveTable} WHERE id = $1::uuid`,
+    [r.outputId],
+  )) as any[];
+  assert.equal(liveRow.payload_type, "object");
+  assert.equal(typeof liveRow.payload, "object");
+  assert.notEqual(liveRow.payload, null);
+  assert.deepEqual(liveRow.payload, foreignPayload);
 
   // Test 11: Stale fence rejection
   const upgradeId2 = randomUUID();

@@ -75,6 +75,75 @@ test("publish-tenant: ledger inconsistency and pre-existing live rows", async (t
     (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "PUBLISH_LEDGER_INCONSISTENT",
   );
 
+  // (d) Malformed non-object staging payload (json string root) rejects fail-closed with PUBLISH_LEDGER_INCONSISTENT
+  const srcD = randomUUID();
+  const outD = randomUUID();
+  await sql.unsafe(`
+    INSERT INTO paperclip_memory_upgrade_staging (
+      upgrade_id, source_id, output_id, agent_id, payload, embedding, content_sha256, published_at, created_at
+    ) VALUES (
+      $1::uuid, $2::uuid, $3::uuid, $4::uuid, '"{\\"data\\":\\"malformed\\"}"'::jsonb, 'vec', 'shaD', NULL, now()
+    );
+  `, [upgradeId, srcD, outD, agentId]);
+  await seedLedgerRow(sql, { upgradeId, sourceId: srcD, agentId, outcome: "published", outputIds: [outD] });
+
+  const [{ count: liveBeforeD }] = (await sql.unsafe(`SELECT count(*)::int as count FROM ${liveTable}`)) as any[];
+
+  await assert.rejects(
+    () => publishSourceBatch(sql, { upgradeId, sourceIds: [srcD], tableName: liveTable, shape, vectorCast }, fence),
+    (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "PUBLISH_LEDGER_INCONSISTENT",
+  );
+
+  const [{ count: liveAfterD }] = (await sql.unsafe(`SELECT count(*)::int as count FROM ${liveTable}`)) as any[];
+  assert.equal(liveAfterD, liveBeforeD);
+
+  const [stagedD] = (await sql`
+    SELECT published_at FROM paperclip_memory_upgrade_staging WHERE output_id = ${outD}::uuid;
+  `) as Array<{ published_at: Date | null }>;
+  assert.equal(stagedD.published_at, null);
+
+  // (e) Multi-source batch with one valid and one malformed source rolls back atomically
+  const srcValid = randomUUID();
+  const rValid = await seedStagedMemory(sql, { upgradeId, sourceId: srcValid, agentId });
+  await seedLedgerRow(sql, { upgradeId, sourceId: srcValid, agentId, outcome: "published", outputIds: [rValid.outputId] });
+
+  const srcMalformed = randomUUID();
+  const outMalformed = randomUUID();
+  await sql.unsafe(`
+    INSERT INTO paperclip_memory_upgrade_staging (
+      upgrade_id, source_id, output_id, agent_id, payload, embedding, content_sha256, published_at, created_at
+    ) VALUES (
+      $1::uuid, $2::uuid, $3::uuid, $4::uuid, '"{\\"data\\":\\"bad\\"}"'::jsonb, 'vec', 'shaBad', NULL, now()
+    );
+  `, [upgradeId, srcMalformed, outMalformed, agentId]);
+  await seedLedgerRow(sql, { upgradeId, sourceId: srcMalformed, agentId, outcome: "published", outputIds: [outMalformed] });
+
+  const [{ count: liveBeforeMulti }] = (await sql.unsafe(`SELECT count(*)::int as count FROM ${liveTable}`)) as any[];
+
+  await assert.rejects(
+    () => publishSourceBatch(sql, { upgradeId, sourceIds: [srcValid, srcMalformed], tableName: liveTable, shape, vectorCast }, fence),
+    (err: any) => err instanceof CompanyMemoryUpgradeError && err.code === "PUBLISH_LEDGER_INCONSISTENT",
+  );
+
+  const [{ count: liveAfterMulti }] = (await sql.unsafe(`SELECT count(*)::int as count FROM ${liveTable}`)) as any[];
+  assert.equal(liveAfterMulti, liveBeforeMulti);
+
+  const liveMatches = (await sql.unsafe(
+    `SELECT id FROM ${liveTable} WHERE id = ANY($1::uuid[])`,
+    [[rValid.outputId, outMalformed]],
+  )) as any[];
+  assert.equal(liveMatches.length, 0);
+
+  const unpubRows = (await sql`
+    SELECT output_id, published_at
+    FROM paperclip_memory_upgrade_staging
+    WHERE output_id IN (${rValid.outputId}::uuid, ${outMalformed}::uuid);
+  `) as Array<{ output_id: string; published_at: Date | null }>;
+  assert.equal(unpubRows.length, 2);
+  for (const row of unpubRows) {
+    assert.equal(row.published_at, null);
+  }
+
   // Test 13: Pre-existing live rows untouched
   const preExisting = [
     { id: randomUUID(), payload: { text: "mem 1", unmanaged: true } },
@@ -104,8 +173,22 @@ test("publish-tenant: ledger inconsistency and pre-existing live rows", async (t
   assert.equal(countAfter, countBefore + 1);
 
   for (const p of preExisting) {
-    const [row] = (await sql.unsafe(`SELECT payload FROM ${liveTable} WHERE id = $1::uuid`, [p.id])) as any[];
-    const parsed = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
-    assert.deepEqual(parsed, p.payload);
+    const [row] = (await sql.unsafe(
+      `SELECT payload, jsonb_typeof(payload) as payload_type FROM ${liveTable} WHERE id = $1::uuid`,
+      [p.id],
+    )) as any[];
+    assert.equal(row.payload_type, "object");
+    assert.equal(typeof row.payload, "object");
+    assert.notEqual(row.payload, null);
+    assert.deepEqual(row.payload, p.payload);
   }
+
+  const [row2] = (await sql.unsafe(
+    `SELECT payload, jsonb_typeof(payload) as payload_type FROM ${liveTable} WHERE id = $1::uuid`,
+    [r2.outputId],
+  )) as any[];
+  assert.equal(row2.payload_type, "object");
+  assert.equal(typeof row2.payload, "object");
+  assert.notEqual(row2.payload, null);
+  assert.deepEqual(row2.payload, r2.payload);
 });

@@ -208,7 +208,7 @@ export async function publishSourceBatch(
 
     // Statement 1: lock and re-read candidates
     const stagingRows = (await tx.unsafe(
-      `SELECT output_id, source_id, agent_id
+      `SELECT output_id, source_id, agent_id, jsonb_typeof(payload) AS payload_type
        FROM paperclip_memory_upgrade_staging
        WHERE upgrade_id = $1::uuid
          AND source_id = ANY($2::uuid[])
@@ -216,10 +216,20 @@ export async function publishSourceBatch(
        ORDER BY output_id ASC
        FOR UPDATE;`,
       [upgradeId, sourceIds],
-    )) as Array<{ output_id: string; source_id: string; agent_id: string | null }>;
+    )) as Array<{ output_id: string; source_id: string; agent_id: string | null; payload_type: string }>;
 
     if (stagingRows.length === 0) {
       return { insertedCount: 0, alreadyPresentCount: 0, publishedCount: 0 };
+    }
+
+    // Fail-closed validation: all staging payloads must be JSON objects at root before live INSERT
+    for (const sr of stagingRows) {
+      if (sr.payload_type !== "object") {
+        throw new CompanyMemoryUpgradeError(
+          `Candidate staging record ${sr.output_id} has non-object payload (jsonb_typeof: ${sr.payload_type}).`,
+          "PUBLISH_LEDGER_INCONSISTENT",
+        );
+      }
     }
 
     const candidateOutputIds = stagingRows.map((r) => r.output_id);

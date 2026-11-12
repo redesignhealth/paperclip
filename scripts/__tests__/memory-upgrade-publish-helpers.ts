@@ -48,7 +48,7 @@ export async function seedStagedMemory(
       ${params.sourceId}::uuid,
       ${outputId}::uuid,
       ${agentId}::uuid,
-      ${JSON.stringify(payload)}::jsonb,
+      ${sql.json(payload)}::jsonb,
       ${vector},
       ${contentSha256},
       ${publishedAtSql},

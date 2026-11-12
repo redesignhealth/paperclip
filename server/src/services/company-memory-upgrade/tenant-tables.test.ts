@@ -266,16 +266,20 @@ describeEmbeddedPostgres("tenant-tables upgrade machinery", () => {
         upgrade_id, source_id, output_id, agent_id, payload, embedding, content_sha256
       ) VALUES (
         ${upgradeId}, ${sourceId}, ${outputId}, ${agentId},
-        ${JSON.stringify({ text: "Hello memory", user_id: agentId })},
+        ${sql.json({ text: "Hello memory", user_id: agentId })},
         'mock-embedding-vector', 'content-sha-abc'
       )
     `;
 
     const [staged] = await sql`
-      SELECT * FROM paperclip_memory_upgrade_staging WHERE output_id = ${outputId}
+      SELECT *, jsonb_typeof(payload) AS payload_type, payload->>'text' AS payload_text
+      FROM paperclip_memory_upgrade_staging WHERE output_id = ${outputId}
     `;
     expect(staged.upgrade_id).toBe(upgradeId);
     expect(staged.embedding).toBe("mock-embedding-vector");
+    expect(staged.payload_type).toBe("object");
+    expect(staged.payload_text).toBe("Hello memory");
+    expect(typeof staged.payload).toBe("object");
 
     // Ledger table with published outcome
     expect(UPGRADE_LEDGER_OUTCOMES).toContain("published");
