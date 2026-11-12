@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateDrainEvidence, type EvaluateDrainEvidenceParams } from "./drain-evidence.js";
+import { evaluateDrainEvidence, type EvaluateDrainEvidenceParams } from "../../server/src/services/company-memory-upgrade/drain-evidence.js";
 
 test("evaluateDrainEvidence pure function", async (t) => {
   const markedAt = new Date("2026-11-11T12:00:00.000Z");

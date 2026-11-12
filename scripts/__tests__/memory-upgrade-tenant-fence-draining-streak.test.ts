@@ -8,23 +8,19 @@ import {
   companies,
   companyMemoryUpgrades,
   createDb,
-} from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
-import {
+  eq,
   getEmbeddedPostgresTestSupport,
+  handleEmbeddedPostgresUnsupported,
   startEmbeddedPostgresTestDatabase,
-} from "../../__tests__/helpers/embedded-postgres.js";
-import { claimUpgradeLease, openUpgrade } from "./state-machine.js";
-import { ensureUpgradeTables, openTenantClient } from "./sweep-tenant.js";
-import { claimTenantFenceGuarded } from "./tenant-fence.js";
-import { CompanyMemoryUpgradeError } from "./types.js";
+} from "./memory-upgrade-sweep-helpers.js";
+import { claimUpgradeLease, openUpgrade } from "../../server/src/services/company-memory-upgrade/state-machine.js";
+import { ensureUpgradeTables, openTenantClient } from "../../server/src/services/company-memory-upgrade/sweep-tenant.js";
+import { claimTenantFenceGuarded } from "../../server/src/services/company-memory-upgrade/tenant-fence.js";
+import { CompanyMemoryUpgradeError } from "../../server/src/services/company-memory-upgrade/types.js";
 
 test("tenant-fence draining streak invalidation (Change A1)", async (t) => {
   const support = await getEmbeddedPostgresTestSupport();
-  if (!support.supported) {
-    t.skip("Embedded Postgres not supported in this environment");
-    return;
-  }
+  handleEmbeddedPostgresUnsupported(support, t);
 
   const fixture = await startEmbeddedPostgresTestDatabase("fence-streak-");
   const cpDb = createDb(fixture.connectionString);
