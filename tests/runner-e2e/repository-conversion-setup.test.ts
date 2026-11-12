@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { runnerSuites } from "./catalog.js";
 import { convertRepositoryProofAgent } from "./repository-conversion-setup.js";
 
 function fixtures(driver = "sandbox"): Parameters<typeof convertRepositoryProofAgent>[1] {
@@ -7,6 +8,22 @@ function fixtures(driver = "sandbox"): Parameters<typeof convertRepositoryProofA
 }
 
 describe("real legacy conversion prerequisites", () => {
+  it("constructs compatible legacy settings before recording a retention baseline", () => {
+    const suite = runnerSuites.find(suite => suite.id === "legacy-conversion")!;
+    for (const profile of suite.profiles) {
+      const agent = profile.buildAgent({ environmentId: "environment", environmentFixtureId: "local", workspacePath: "/owned/workspace",
+        executionId: "fixture", secretRefs: { OPENAI_API_KEY: { type: "secret_ref", secretId: "codex-reference", version: "latest" },
+          ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "claude-reference", version: "latest" } } });
+      expect(agent.runner).toBe("legacy");
+      expect(agent.adapterType).toBe(profile.provider === "codex" ? "codex_local" : "claude_local");
+      expect(agent.adapterConfig).toMatchObject({ model: profile.model, timeoutSec: 360, cwd: "/owned/workspace" });
+      expect(agent.adapterConfig).not.toHaveProperty("extraArgs");
+      expect(agent.adapterConfig).not.toHaveProperty("maxTurnsPerRun");
+      expect((agent.adapterConfig as Record<string, any>).env).toMatchObject(profile.provider === "codex"
+        ? { OPENAI_API_KEY: { type: "secret_ref", secretId: "codex-reference", version: "latest" } }
+        : { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "claude-reference", version: "latest" } });
+    }
+  });
   it("qualifies the sandbox before selecting Runner for either provider", async () => {
     const fixture = fixtures(); let qualified = false;
     const api = { post: vi.fn(async () => { qualified = true; return { ok: true, details: { platformQualificationRecorded: true, leaseId: "lease" } }; }),

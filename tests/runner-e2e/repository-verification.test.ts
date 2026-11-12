@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { gradeRepositoryProof, repositoryConfigurationDigest, type RepositoryProofObservation } from "./repository-verification.js";
+import { gradeRepositoryProof, repositoryConfigurationDigest, repositoryProofTasks, type RepositoryProofObservation } from "./repository-verification.js";
+import { runnerSuites } from "./catalog.js";
 
 function valid(): RepositoryProofObservation {
   const sourceBytes = `${"a7".repeat(32)}\n`, commit = "b".repeat(40);
@@ -43,5 +44,19 @@ describe("configured repository and conversion qualification", () => {
     expect(repositoryConfigurationDigest(before)).not.toContain("sensitive-fixture-reference");
     expect(repositoryConfigurationDigest({ ...before, defaultEnvironmentId: "other" })).not.toBe(repositoryConfigurationDigest(before));
     expect(repositoryConfigurationDigest({ ...before, adapterConfig: { ...before.adapterConfig, env: {} } })).not.toBe(repositoryConfigurationDigest(before));
+  });
+  it("registers explicit development cells with staging models and production instructions", () => {
+    for (const id of ["configured-repository", "legacy-conversion", "automatic-repository-configured-models"]) {
+      const suite = runnerSuites.find(suite => suite.id === id)!;
+      expect(suite.manualOnly).toBe(true);
+      expect(suite.groups).toEqual([]);
+      expect(suite.expectedMatrixSize).toBe(4);
+      expect(suite.profiles.map(profile => profile.model)).toEqual(["gpt-6.1-sol", "claude-opus-5-5"]);
+      expect(suite.definitionMetadata?.stagingQualification).toBe(false);
+      expect(suite.tasks).toHaveLength(1);
+      expect(suite.tasks[0]?.flow).toBe(id === "automatic-repository-configured-models" ? "automatic_repository" : "repository_verification");
+      expect(suite.tasks[0]?.automaticRetryPolicy).toBe("single_attempt");
+    }
+    expect(repositoryProofTasks.every(task => task.expectedRunCount === 1)).toBe(true);
   });
 });

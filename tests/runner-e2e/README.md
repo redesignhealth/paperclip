@@ -24,6 +24,45 @@ one attempt, two expected provider admissions, and 1,000-cent company and agent
 hard stops. Automatic infrastructure retries are disabled. Existing campaign
 reports retain failures, timings, usage, runtime costs, and source identity.
 
+## Configured repository and conversion checks
+
+The explicit-only `configured-repository` and `legacy-conversion` suites each
+have four development cells: Codex `gpt-6.1-sol` and Claude `claude-opus-5-5`,
+on local and Daytona environments. Each uses production hire instructions,
+one attempt, one expected provider admission, and 1,000-cent company and agent
+hard stops. The conversion journey creates a real legacy agent and selects
+Paperclip Runner through the public agent update API. It checks retained
+configuration, encrypted secret references, environment, instructions, and
+corresponding permission policy before submitting work through the browser.
+The disposable legacy profile starts without optional CLI-only extra arguments or turn limits;
+the journey does not remove settings from an existing user agent. For either
+provider, Daytona's public environment probe must save platform qualification
+before the same agent selects Runner. Probe leases and uncertain probe accounting
+remain included in attempt evidence and cleanup.
+
+The observer seeds a random reference in the fixture-owned Git checkout before
+task creation. It checks the downloaded JSON against the original file bytes,
+SHA-256 and commit, then checks the preserved source through the workspace API.
+A pass also requires the configured native provider/model, one committed run,
+a visible artifact link after reload, Done, and no pending question. No agent
+success claim or agent-authored test can replace these checks.
+
+The explicit-only `automatic-repository-configured-models` suite reuses the
+projectless continuation oracle above with those same two recorded staging
+models. Its four cells keep the first admission's artifact observation and the
+strict requirement for a saved same-agent continuation. A monitor fallback is
+still a failure of that requirement.
+
+These twelve development cells use API-key authentication and per-turn Runner
+lifecycle. They do not qualify staging subscription credentials, warm Runner
+reuse, Slack delivery, or the complete dependable-work matrix. Run one exact
+ID for a bounded check:
+
+```sh
+pnpm test:e2e:runner -- --id legacy-conversion.runner-codex.local.convert-and-deliver --max-automatic-retries 0
+pnpm test:e2e:runner -- --id automatic-repository-configured-models.runner-codex.local.automatic-repository-resume --max-automatic-retries 0
+```
+
 ## Latency observation bounds
 
 The explicit `codie-latency-diagnostic` arms its observation recorder before
