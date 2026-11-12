@@ -26,7 +26,6 @@ import {
 import { CompanyMemoryUpgradeError } from "../server/src/services/company-memory-upgrade/types.js";
 export const STUB_SUBCOMMANDS = new Set([
   "prune",
-  "rollback",
   "recover",
   "status",
 ]);
@@ -65,7 +64,12 @@ import {
   runVerifyCli,
   type RunVerifyCliDependencies,
 } from "./memory-upgrade-verify.js";
-import { ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS } from "./memory-upgrade-rollback-flags.js";
+import {
+  ALLOWED_ROLLBACK_FLAGS,
+  BOOLEAN_ROLLBACK_FLAGS,
+  runRollbackCli,
+  type RunRollbackCliDependencies,
+} from "./memory-upgrade-rollback.js";
 import { ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS } from "./memory-upgrade-status-flags.js";
 import { ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS } from "./memory-upgrade-recover-flags.js";
 import {
@@ -79,7 +83,7 @@ export {
   ALLOWED_FLIP_FLAGS, BOOLEAN_FLIP_FLAGS, runFlipCli, type RunFlipCliDependencies,
   ALLOWED_DRAIN_FLAGS, BOOLEAN_DRAIN_FLAGS, runDrainCli, type RunDrainCliDependencies,
   ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS, runVerifyCli, type RunVerifyCliDependencies,
-  ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS,
+  ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS, runRollbackCli, type RunRollbackCliDependencies,
   ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS,
   ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS,
 };
@@ -1052,7 +1056,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (!subcommand) {
     console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-    console.error("Available subcommands: census, sweep, publish, flip, drain, verify");
+    console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback");
     return 1;
   }
 
@@ -1080,6 +1084,10 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     return await runVerifyCli(args.slice(1));
   }
 
+  if (subcommand === "rollback") {
+    return await runRollbackCli(args.slice(1));
+  }
+
   if (STUB_SUBCOMMANDS.has(subcommand)) {
     console.error(`Error: Subcommand '${subcommand}' is not implemented yet.`);
     return 1;
@@ -1091,7 +1099,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census, sweep, publish, flip, drain, verify");
+  console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback");
   return 1;
 }
 
