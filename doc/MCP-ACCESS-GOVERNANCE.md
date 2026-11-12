@@ -218,9 +218,49 @@ Each tool discovered on a connection becomes a **catalog entry** with a risk lev
 | `write` | `annotations.readOnlyHint: false` or `writeHint: true` | Requires approval by default unless the profile or a policy says otherwise. |
 | `destructive` | `annotations.destructiveHint: true` | Quarantined on first sight. Requires explicit operator action before any agent call can succeed. |
 
-When a catalog refresh discovers a new write/destructive tool that did not exist on the prior schema, Paperclip sets `status: quarantined` and records the reason in `quarantineReason`. Quarantined entries are never returned to the agent's tool list until an operator reviews and re-enables them. This is the **changed-tool quarantine** rule and the primary defense against an upstream server silently adding a destructive verb.
+When a catalog refresh discovers a new write/destructive tool that did not exist on the prior schema, Paperclip sets `status: quarantined` and records the reason in `quarantineReason` (defaulting to `pending_review`). Quarantined entries are never returned to the agent's tool list until an operator reviews them. This is the **changed-tool quarantine** rule and the primary defense against an upstream server silently adding a destructive verb.
 
-To inspect and re-enable a quarantined entry, use the UI Catalog view, or PATCH the entry's status via the catalog routes (see [Reference](#reference)).
+### Quarantine review lifecycle and declined tools
+
+During connection setup or gallery review save:
+- **Activated tools**: Tools selected/ticked by the operator (including ask-first actions) transition to `status: active`, clear `quarantineReason` and `quarantinedAt`, and stamp `reviewedAt` and `reviewedBy` audit fields.
+- **Declined tools**: Quarantined tools that were reviewed but left unticked remain blocked (`status: quarantined`) and retain their original `quarantinedAt` timestamp. Their review audit fields (`reviewedAt`, `reviewedBy`) are stamped and their `quarantineReason` is set to `reviewed_declined`.
+- **Settled decisions**: Actions with `quarantineReason: reviewed_declined` represent settled operator decisions. They stay out of the runtime profile and do not trigger "needs attention" banners or increment attention counters. An operator can re-enable them at any time.
+- **Approved system defaults**: Automated connection workflows that apply approved default policies (such as `offRiskLevels` starting writes off for Granola, or allowlists like `shared-org-rh-mcp`) similarly settle un-enabled tools with `reviewed_declined`.
+
+### Drift re-arm and the three-state quarantine reason
+
+Paperclip tracks three quarantine reason states:
+- `pending_review`: initial quarantine for newly discovered actions awaiting first operator review.
+- `reviewed_declined`: settled operator decision leaving a reviewed action unticked. Excluded from attention counters.
+- `reviewed_declined_changed`: re-armed quarantine when an upstream server alters an already-declined action's schema. Drift is detected via `versionHash` or `schemaHash` changes; risk-classification changes trigger drift only indirectly, because `versionHash` includes `riskLevel`. The refresh updates `quarantineReason` to `reviewed_declined_changed` and sets `quarantinedAt` to the refresh timestamp (`refreshedAt`).
+
+Unlike settled `reviewed_declined` entries, `reviewed_declined_changed` actions are counted in the operator attention queue (`GET /api/companies/:companyId/tools/apps/attention`). Sequential refreshes without subsequent schema changes preserve `reviewed_declined_changed` and its timestamp, keeping the drifted action safely quarantined and in the operator's attention queue.
+
+To inspect quarantined entries, inspect the connection's catalog or retrieve apps needing attention via `GET /api/companies/:companyId/tools/apps/attention`.
+
+To re-enable any quarantined entry (including settled `reviewed_declined` actions, re-armed `reviewed_declined_changed` actions, or in connections where all actions were quarantined), submit `POST /api/companies/:companyId/tools/apps/:connectionId/finish`:
+- `access` is required; `finishToolAppSchema` has no default, so a request without it gets 400.
+- `reviewedCatalogEntryIds` must list every currently quarantined entry exactly once.
+- `preserveExistingAccess: true` is required to keep current access. Without it the endpoint deletes all profile entries and bindings, rebuilds from the request alone, and retires ask-first policies (`disableStale`).
+- Quarantined entries that are listed as reviewed but not enabled settle as `reviewed_declined` (clearing `reviewed_declined_changed` and clearing attention).
+- Each target entry included in `enabledCatalogEntryIds` transitions to `status: active`, clears its quarantine reason and timestamp, records review timestamps, and is added to the connection's access profile.
+
+Example: re-enabling a quarantined action while preserving existing access:
+
+```sh
+# Re-enable one quarantined action while preserving current access.
+# Note: preserveExistingAccess: true merges existing bindings back, so access: {"agentIds": []}
+# satisfies the required schema without dropping existing agent bindings.
+curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
+  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/apps/$CONNECTION_ID/finish" \
+  -d '{
+    "preserveExistingAccess": true,
+    "access": { "agentIds": [] },
+    "enabledCatalogEntryIds": ["$TARGET_ENTRY_ID"],
+    "reviewedCatalogEntryIds": ["$TARGET_ENTRY_ID", "$OTHER_QUARANTINED_ENTRY_ID"]
+  }' | jq .
+```
 
 ## Profiles and bindings
 

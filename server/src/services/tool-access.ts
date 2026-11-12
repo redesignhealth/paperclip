@@ -217,6 +217,8 @@ import type {
 } from "@paperclipai/shared";
 import {
   CLASS3_STATIC_LEASE_ALLOWLIST,
+  TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
+  TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED,
   shouldAllowPrivateNetworkTargets,
   GITHUB_CONNECTOR_PROFILES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
@@ -6650,7 +6652,7 @@ export function toolAccessService(
       : { askFirstRiskLevels: [] });
     const candidates = await dbClient.select().from(toolCatalogEntries)
       .where(inArray(toolCatalogEntries.id, candidateIds));
-    const eligibleIds = new Set(candidates.filter((entry) => !offRiskLevels.has(entry.riskLevel)).map((entry) => entry.id));
+    const eligibleIds = new Set(candidates.filter((entry) => entry.status === "active" && !offRiskLevels.has(entry.riskLevel)).map((entry) => entry.id));
     const entryIds = candidateIds.filter((id) => !configuredIds.has(id) && eligibleIds.has(id));
     if (entryIds.length === 0) return;
     await dbClient.insert(toolProfileEntries).values(
@@ -8914,6 +8916,9 @@ export function toolAccessService(
       // tools a successful, sufficiently authorized discovery actually removed.
       const removedStatus = nativeDaytona ? "removed" : "disabled";
       const removedIds = existingRows.filter((entry) => !discoveredNames.has(entry.toolName) && entry.status !== removedStatus
+        && !(entry.status === "quarantined"
+          && (entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED
+            || entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED))
         && !(otherWorkspaceGrants.some((scopes) => isGoogleWorkspaceToolGranted(entry.toolName, scopes))
           && !isGoogleWorkspaceToolGranted(entry.toolName, selectedWorkspaceScopes)
           && !unavailableServices.includes(googleWorkspaceToolTarget(entry.toolName)?.service ?? ""))).map((entry) => entry.id);
@@ -8987,16 +8992,41 @@ export function toolAccessService(
         googleProfile &&
         !isGoogleWorkspaceToolAllowed(googleProfile, descriptor),
       ) || (isRailwayEndpoint(connection.config.url) && isRailwayToolBlocked(descriptor.name));
-      const status = providerPermanentlyBlocked
-        ? "disabled"
-        : shouldQuarantine
-          ? "quarantined"
-          : existing?.status === "disabled" && existing.quarantineReason !== "mcp_tool_removed"
-            ? "disabled"
-            : quarantineOnRefresh && !staticReviewedRead && existing?.status === "quarantined"
-              ? "quarantined"
-              : "active";
-      if (shouldQuarantine && !providerPermanentlyBlocked) quarantinedCount += 1;
+      const isSettledDecline =
+        existing?.status === "quarantined" &&
+        (existing.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED ||
+          existing.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED);
+
+      let status: typeof toolCatalogEntries.$inferInsert.status;
+      let quarantineReason: string | null = null;
+      let quarantinedAt: Date | null = null;
+
+      if (providerPermanentlyBlocked) {
+        status = "disabled";
+      } else if (existing?.status === "disabled" && existing.quarantineReason !== "mcp_tool_removed") {
+        status = "disabled";
+      } else if (isSettledDecline) {
+        status = "quarantined";
+        if (changed) {
+          quarantineReason = TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED;
+          quarantinedAt = refreshedAt;
+          quarantinedCount += 1;
+        } else {
+          quarantineReason = existing.quarantineReason;
+          quarantinedAt = existing.quarantinedAt;
+        }
+      } else if (shouldQuarantine) {
+        status = "quarantined";
+        quarantineReason = "pending_review";
+        quarantinedAt = refreshedAt;
+        quarantinedCount += 1;
+      } else if (quarantineOnRefresh && !staticReviewedRead && existing?.status === "quarantined") {
+        status = "quarantined";
+        quarantineReason = existing.quarantineReason;
+        quarantinedAt = existing.quarantinedAt;
+      } else {
+        status = "active";
+      }
 
       catalogValues.push({
         id: existing?.id, companyId: connection.companyId, applicationId: connection.applicationId,
@@ -9005,12 +9035,8 @@ export function toolAccessService(
         inputSchema: descriptor.inputSchema ?? {}, annotations: descriptor.annotations ?? {}, riskLevel,
         isReadOnly: riskLevel === "read", isWrite: riskLevel === "write", isDestructive: riskLevel === "destructive",
         status, versionHash: hash, schemaHash, firstSeenAt: existing?.firstSeenAt ?? refreshedAt, lastSeenAt: refreshedAt,
-        quarantinedAt: existing
-          ? status === "quarantined" ? shouldQuarantine ? refreshedAt : existing.quarantinedAt : null
-          : shouldQuarantine ? refreshedAt : null,
-        quarantineReason: existing
-          ? status === "quarantined" ? shouldQuarantine ? "pending_review" : existing.quarantineReason : null
-          : shouldQuarantine ? "pending_review" : null,
+        quarantinedAt,
+        quarantineReason,
         updatedAt: existing ? refreshedAt : new Date(),
       });
     }
@@ -9019,19 +9045,60 @@ export function toolAccessService(
     for (let index = 0; index < catalogValues.length; index += 500) {
       const chunk = catalogValues.slice(index, index + 500);
       catalogRows.push(...await publish(async tx => {
-        const current = await tx.select({ name: toolCatalogEntries.name, status: toolCatalogEntries.status })
+        const current = await tx.select({
+          name: toolCatalogEntries.name,
+          status: toolCatalogEntries.status,
+          quarantineReason: toolCatalogEntries.quarantineReason,
+        })
           .from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.name, chunk.map(entry => entry.name))));
-        const existingNonQuarantinedNames = new Set(current.filter(entry => entry.status !== "quarantined").map(entry => entry.name));
+        const existingDecidedNames = new Set(
+          current
+            .filter(
+              (entry) =>
+                entry.status !== "quarantined" ||
+                entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED ||
+                entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED,
+            )
+            .map((entry) => entry.name),
+        );
         const rows = await tx.insert(toolCatalogEntries).values(chunk)
           .onConflictDoUpdate({ target: [toolCatalogEntries.connectionId, toolCatalogEntries.name], set: {
             title: sql`excluded.title`, description: sql`excluded.description`, inputSchema: sql`excluded.input_schema`,
             annotations: sql`excluded.annotations`, riskLevel: sql`excluded.risk_level`, isReadOnly: sql`excluded.is_read_only`,
             isWrite: sql`excluded.is_write`, isDestructive: sql`excluded.is_destructive`,
-            status: sql`CASE WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN 'disabled' ELSE excluded.status END`,
+            status: sql`CASE
+              WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN 'disabled'
+              WHEN ${toolCatalogEntries.status} = 'quarantined' AND (${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} OR ${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED}) THEN
+                CASE
+                  WHEN excluded.status = 'disabled' THEN 'disabled'
+                  ELSE 'quarantined'
+                END
+              ELSE excluded.status
+            END`,
             versionHash: sql`excluded.version_hash`, schemaHash: sql`excluded.schema_hash`, lastSeenAt: sql`excluded.last_seen_at`,
-            quarantinedAt: sql`excluded.quarantined_at`, quarantineReason: sql`excluded.quarantine_reason`, updatedAt: sql`excluded.updated_at`,
+            quarantinedAt: sql`CASE
+              WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN ${toolCatalogEntries.quarantinedAt}
+              WHEN ${toolCatalogEntries.status} = 'quarantined' AND (${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} OR ${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED}) THEN
+                CASE
+                  WHEN excluded.status = 'disabled' THEN excluded.quarantined_at
+                  WHEN ${toolCatalogEntries.versionHash} IS DISTINCT FROM excluded.version_hash OR ${toolCatalogEntries.schemaHash} IS DISTINCT FROM excluded.schema_hash THEN COALESCE(excluded.quarantined_at, ${refreshedAt.toISOString()}::timestamptz)
+                  ELSE ${toolCatalogEntries.quarantinedAt}
+                END
+              ELSE excluded.quarantined_at
+            END`,
+            quarantineReason: sql`CASE
+              WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN ${toolCatalogEntries.quarantineReason}
+              WHEN ${toolCatalogEntries.status} = 'quarantined' AND (${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED} OR ${toolCatalogEntries.quarantineReason} = ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED}) THEN
+                CASE
+                  WHEN excluded.status = 'disabled' THEN excluded.quarantine_reason
+                  WHEN ${toolCatalogEntries.versionHash} IS DISTINCT FROM excluded.version_hash OR ${toolCatalogEntries.schemaHash} IS DISTINCT FROM excluded.schema_hash THEN ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED}
+                  ELSE ${toolCatalogEntries.quarantineReason}
+                END
+              ELSE excluded.quarantine_reason
+            END`,
+            updatedAt: sql`excluded.updated_at`,
           } }).returning();
-        for (const row of rows) if (!existingNonQuarantinedNames.has(row.name)) newCatalogEntryIds.add(row.id);
+        for (const row of rows) if (!existingDecidedNames.has(row.name)) newCatalogEntryIds.add(row.id);
         return rows;
       }));
     }
@@ -9150,6 +9217,7 @@ export function toolAccessService(
           and(
             eq(toolCatalogEntries.companyId, companyId),
             eq(toolCatalogEntries.status, "quarantined"),
+            sql`${toolCatalogEntries.quarantineReason} is distinct from ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED}`,
           ),
         ),
       db
@@ -15803,7 +15871,10 @@ export function toolAccessService(
       }
 
       const reviewedAt = new Date();
-      if (reviewedIds.length > 0) {
+      const enabledIdSet = new Set(enabledIds);
+      const activatedReviewedIds = reviewedIds.filter((id) => enabledIdSet.has(id));
+      const declinedReviewedIds = reviewedIds.filter((id) => !enabledIdSet.has(id));
+      if (activatedReviewedIds.length > 0) {
         await tx
           .update(toolCatalogEntries)
           .set({
@@ -15821,7 +15892,28 @@ export function toolAccessService(
             and(
               eq(toolCatalogEntries.companyId, companyId),
               eq(toolCatalogEntries.connectionId, connection.id),
-              inArray(toolCatalogEntries.id, reviewedIds),
+              inArray(toolCatalogEntries.id, activatedReviewedIds),
+              eq(toolCatalogEntries.status, "quarantined"),
+            ),
+          );
+      }
+      if (declinedReviewedIds.length > 0) {
+        await tx
+          .update(toolCatalogEntries)
+          .set({
+            reviewedAt,
+            reviewedByAgentId:
+              actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+            reviewedByUserId:
+              actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+            quarantineReason: TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
+            updatedAt: reviewedAt,
+          })
+          .where(
+            and(
+              eq(toolCatalogEntries.companyId, companyId),
+              eq(toolCatalogEntries.connectionId, connection.id),
+              inArray(toolCatalogEntries.id, declinedReviewedIds),
               eq(toolCatalogEntries.status, "quarantined"),
             ),
           );
@@ -17800,18 +17892,24 @@ export function toolAccessService(
           actor: input.actor,
         })
       : null;
-    const activatedCatalogEntryIds = new Set(
-      shouldFinalizeManagedDefaults
-        ? refresh.catalog
-            .filter((entry) => entry.status === "quarantined")
-            .map((entry) => entry.id)
-        : [],
-    );
-    const catalog = refresh.catalog.map((entry) =>
-      activatedCatalogEntryIds.has(entry.id)
-        ? { ...entry, status: "active" as const }
-        : entry,
-    );
+    let catalog: ToolCatalogEntry[] = refresh.catalog;
+    if (finished) {
+      const currentRows = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, connection.companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+          ),
+        );
+      const rowById = new Map(currentRows.map((row) => [row.id, row]));
+      catalog = [];
+      for (const entry of refresh.catalog) {
+        const row = rowById.get(entry.id);
+        if (row) catalog.push(toCatalogEntryForConnection(row, connection));
+      }
+    }
     const [application] = await db
       .select()
       .from(toolApplications)
@@ -18895,12 +18993,30 @@ export function toolAccessService(
           actor: input.actor,
         })
       : null;
+    let catalog: ToolCatalogEntry[] = refresh.catalog;
+    if (finished) {
+      const currentRows = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, connection.companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+          ),
+        );
+      const rowById = new Map(currentRows.map((row) => [row.id, row]));
+      catalog = [];
+      for (const entry of refresh.catalog) {
+        const row = rowById.get(entry.id);
+        if (row) catalog.push(toCatalogEntryForConnection(row, connection));
+      }
+    }
     return {
       connectionId: refresh.connection.id,
       application: toApplication(application),
       connection: finished?.connection ?? refresh.connection,
-      catalog: refresh.catalog,
-      actions: groupedActions(refresh.catalog),
+      catalog,
+      actions: groupedActions(catalog),
       suggestedDefaults,
       auth: null,
     };

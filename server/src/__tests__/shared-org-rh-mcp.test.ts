@@ -3,11 +3,12 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, authUsers, companies, companyMemberships, companySecretBindings, companySecretVersions, companySecrets, connectionGrants, connectionTokenIssuances, createDb, heartbeatRuns, toolAccessAuditEvents, toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolMcpGatewayTokens, toolMcpGateways, toolOauthStates, toolProfileBindings, toolProfileEntries, toolProfiles, toolRuntimeSlots, principalPermissionGrants } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { logger } from "../middleware/logger.js";
 import { secretService } from "../services/secrets.js";
+import { toolAccessService } from "../services/tool-access.js";
 import {
   COMMS_BOARD_ADMIN_TOKEN_ENV,
   COMMS_BOARD_MCP_URL_ENV,
@@ -366,6 +367,63 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     expect(everywhere).not.toContain(MINTED_TOKEN);
     const secretId = connection!.credentialSecretRefs[0]!.secretId;
     expect(await secretService(db).resolveSecretValue(companyId, secretId, "latest")).toBe(MINTED_TOKEN);
+  });
+
+  it("shared-org allowlist leaves denied settled: quarantined unreviewed tools become reviewed_declined", async () => {
+    const companyId = await seedCompany();
+    await seedOwner(companyId);
+    await seedAgent(companyId);
+    const fetchMock = makeFetch();
+
+    // Provision the shared connection
+    await ensureSharedOrgRhMcp(ctxFor(fetchMock), companyId);
+    const [connection] = await connectionsOf(companyId);
+
+    // Now simulate an unreviewed tool and an allowlisted tool being quarantined (e.g. schema drift or new discovery)
+    const allowlistedTool = RH_MCP_SERVICE_REVIEWED_TOOLS[0]!;
+    const unreviewedTool = UNREVIEWED_TOOLS[0]!;
+    await db
+      .update(toolCatalogEntries)
+      .set({ status: "quarantined", quarantineReason: "pending_review" })
+      .where(
+        and(
+          eq(toolCatalogEntries.companyId, companyId),
+          eq(toolCatalogEntries.connectionId, connection!.id),
+          inArray(toolCatalogEntries.toolName, [allowlistedTool, unreviewedTool]),
+        ),
+      );
+
+    // Call finishConnection (by resetting enabled to false to trigger finish on next tick)
+    await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, connection!.id));
+    await ensureSharedOrgRhMcp(ctxFor(fetchMock), companyId);
+
+    const entries = await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(
+        and(
+          eq(toolCatalogEntries.companyId, companyId),
+          eq(toolCatalogEntries.connectionId, connection!.id),
+          inArray(toolCatalogEntries.toolName, [allowlistedTool, unreviewedTool]),
+        ),
+      );
+    const byName = new Map(entries.map((r) => [r.toolName, r]));
+
+    // Allowlisted tool was re-activated
+    expect(byName.get(allowlistedTool)?.status).toBe("active");
+    expect(byName.get(allowlistedTool)?.quarantineReason).toBeNull();
+
+    // Denied (unreviewed) tool was left quarantined with reviewed_declined (settled)
+    const denied = byName.get(unreviewedTool);
+    expect(denied?.status).toBe("quarantined");
+    expect(denied?.quarantineReason).toBe("reviewed_declined");
+    expect(denied?.reviewedAt).toBeInstanceOf(Date);
+    expect(denied?.reviewedByAgentId).toBeNull();
+    expect(denied?.reviewedByUserId).toBeNull();
+
+    // Settled decision means no attention needed for this connection
+    const attention = await toolAccessService(db).listAppsNeedingAttention(companyId);
+    expect(attention.apps.filter((app) => app.connection.id === connection!.id)).toHaveLength(0);
   });
 
   it("is idempotent: a second tick mints nothing and adds nothing", async () => {
