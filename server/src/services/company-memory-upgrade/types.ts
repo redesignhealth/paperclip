@@ -287,7 +287,7 @@ export interface UpdateCountersParams {
   // Timestamps to record
   markedAt?: Date;
   drainProbeStreakStartedAt?: Date | null;
-  drainConfirmedAt?: Date;
+  drainConfirmedAt?: Date | null;
 
   lastError?: UpgradeErrorCode | null;
 }

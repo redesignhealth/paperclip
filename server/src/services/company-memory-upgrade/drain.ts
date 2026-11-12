@@ -355,8 +355,12 @@ export async function runDrain(
           snap.streak !== null &&
           evalResult.nextStreakStartedAt.getTime() !== snap.streak.getTime());
 
+      const confirmationBroken = snap.confirmedAt !== null && !evalResult.confirmed;
+      const confirmationAchieved = snap.confirmedAt === null && evalResult.confirmed;
+      const confirmationChanged = confirmationBroken || confirmationAchieved;
+
       let effectiveStreakStart = snap.streak;
-      let confirmedAt: Date | null = snap.confirmedAt;
+      let confirmedAt: Date | null = evalResult.confirmed ? snap.confirmedAt : null;
       let evidenceInvalidated = false;
 
       // When another owner holds the lease, whoever holds the lease either already cleared
@@ -364,7 +368,7 @@ export async function runDrain(
       const needsWrite =
         !isDryRun &&
         !leaseHeldByOther &&
-        (streakChanged || (evalResult.confirmed && !snap.confirmedAt));
+        (streakChanged || confirmationChanged);
 
       if (needsWrite) {
         const tClaim = await readCpNow(cpDb);
@@ -398,19 +402,21 @@ export async function runDrain(
 
             if (!matchesSnapshot) {
               evidenceInvalidated = true;
+              confirmedAt = null;
               console.error(
                 "[drain_evidence_invalidated] Upgrade row changed between probe and lease claim; discarding observation.",
               );
             } else {
               const streakToWrite =
                 evalResult.nextStreakStartedAt === null ? null : (snap.streak ?? tWrite);
+              const confirmedToWrite = evalResult.confirmed ? (snap.confirmedAt ?? tWrite) : null;
               const updated = await updateUpgradeCounters(
                 cpDb,
                 currentUpgrade.id,
                 claimRes.leaseToken,
                 {
                   drainProbeStreakStartedAt: streakToWrite,
-                  ...(evalResult.confirmed ? { drainConfirmedAt: tWrite } : {}),
+                  drainConfirmedAt: confirmedToWrite,
                 },
                 { clock: frozenClock(tWrite) },
               );
@@ -423,6 +429,7 @@ export async function runDrain(
             });
           }
         } else {
+          confirmedAt = null;
           if (options.once) {
             throw new CompanyMemoryUpgradeError(
               "Failed to acquire lease for upgrade write. Another worker may hold the lease.",
@@ -435,11 +442,15 @@ export async function runDrain(
         effectiveStreakStart = evalResult.nextStreakStartedAt;
         if (evalResult.confirmed) {
           confirmedAt = tProbe;
+        } else {
+          confirmedAt = null;
         }
       }
 
       const isActuallyConfirmed =
-        !evidenceInvalidated && (isDryRun ? evalResult.confirmed : Boolean(confirmedAt));
+        !evidenceInvalidated &&
+        evalResult.confirmed &&
+        (isDryRun ? true : Boolean(confirmedAt));
 
       const report: DrainReport = {
         isDryRun,
@@ -458,7 +469,7 @@ export async function runDrain(
         streakStartedAt: effectiveStreakStart,
         nextStreakStartedAt: evalResult.nextStreakStartedAt,
         confirmed: isActuallyConfirmed,
-        confirmedAt,
+        confirmedAt: isActuallyConfirmed ? confirmedAt : null,
         blockedBy: evidenceInvalidated
           ? [...evalResult.blockedBy, "evidence_invalidated_by_concurrent_work"]
           : evalResult.blockedBy,
