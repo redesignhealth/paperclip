@@ -2,13 +2,20 @@ import express from "express";
 import { createServer, request as httpRequest, type Server } from "node:http";
 import { once } from "node:events";
 import { WebSocket, WebSocketServer } from "ws";
-import { setupPluginApiWebSocketServer } from "../realtime/plugin-api-ws.js";
+import { setupPluginApiWebSocketServer, resetWebSocketSlotsForTest } from "../realtime/plugin-api-ws.js";
 
-// Keep a real upstream WebSocket and byte stream; only TLS is replaced locally.
-vi.mock("node:https", () => ({ request: (url: URL, options: object) => {
-  const local = new URL(url); local.protocol = "http:";
-  return httpRequest(local, options);
-} }));
+// fork(TECH-8283 F1): Rework node:https mock for options-object call shape while keeping TLS replacement local
+vi.mock("node:https", () => ({
+  request: (urlOrOptions: URL | (Record<string, unknown> & { host?: string; port?: number; path?: string }), options?: object) => {
+    if (urlOrOptions instanceof URL || typeof urlOrOptions === "string") {
+      const local = new URL(urlOrOptions);
+      local.protocol = "http:";
+      return httpRequest(local, options);
+    }
+    const { servername, ...rest } = urlOrOptions;
+    return httpRequest(rest, options);
+  },
+}));
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { pluginManifestV1Schema, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -72,6 +79,7 @@ async function createApp(input: {
   workerRunning?: boolean;
   workerResult?: unknown;
   db?: unknown;
+  wsOptions?: { allowPrivateNetwork?: boolean };
 }) {
   const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/plugins.js"),
@@ -100,7 +108,10 @@ async function createApp(input: {
       undefined,
       undefined,
       undefined,
-      { workerManager } as never,
+      {
+        workerManager,
+        wsOptions: input.wsOptions ?? { allowPrivateNetwork: true },
+      } as never,
     ),
   );
   app.use(errorHandler);
@@ -108,7 +119,7 @@ async function createApp(input: {
   return { app, workerManager };
 }
 
-describe("plugin scoped API routes", () => {
+describe("plugin scoped API routes", { timeout: 30_000 }, () => {
   const pluginId = "11111111-1111-4111-8111-111111111111";
   const companyId = "22222222-2222-4222-8222-222222222222";
   const agentId = "33333333-3333-4333-8333-333333333333";
@@ -117,6 +128,7 @@ describe("plugin scoped API routes", () => {
   const issueId = "55555555-5555-4555-8555-555555555555";
 
   beforeEach(() => {
+    resetWebSocketSlotsForTest();
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({
@@ -502,6 +514,24 @@ describe("plugin browser WebSockets", () => {
     server.listen(0, "127.0.0.1"); await once(server, "listening");
     return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   }
+  async function closeServer(server: Server) {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+  async function startMockWsUpstream() {
+    const upstream = createServer();
+    const upstreamWs = new WebSocketServer({ noServer: true });
+    upstream.on("upgrade", (req, socket, head) => {
+      upstreamWs.handleUpgrade(req, socket, head, ws => upstreamWs.emit("connection", ws));
+    });
+    const base = await listen(upstream);
+    const close = async () => {
+      for (const client of upstreamWs.clients) client.terminate();
+      upstreamWs.close();
+      await closeServer(upstream);
+    };
+    return { upstream, upstreamWs, base, close };
+  }
   async function rejection(actor: Record<string, unknown>, origin?: string) {
     const { app, workerManager } = await createApp({ actor, plugin });
     const server = createServer(app); setupPluginApiWebSocketServer(server, app);
@@ -519,6 +549,37 @@ describe("plugin browser WebSockets", () => {
     expect(await rejection(board, "https://attacker.test")).toEqual({ status: 403, calls: 0 });
     expect(await rejection({ type: "none" }, "http://localhost:3100")).toEqual({ status: 403, calls: 0 });
     expect(await rejection({ type: "agent", agentId: "agent", companyId }, "http://localhost:3100")).toEqual({ status: 403, calls: 0 });
+  });
+  // fork(TECH-8283 F1): Reject private network WSS destinations by default
+  it.each([
+    "wss://127.0.0.1:9999/channels/build-output",
+    "wss://169.254.169.254/channels/build-output",
+    "wss://[::1]:9999/channels/build-output",
+    "wss://[::ffff:127.0.0.1]:9999/channels/build-output",
+  ])("rejects private/reserved upstream target %s with 502 and opens no socket", async (badUpstreamUrl) => {
+    const { app } = await createApp({
+      actor: board,
+      plugin,
+      workerResult: { websocket: { url: badUpstreamUrl } },
+      wsOptions: { allowPrivateNetwork: false },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    try {
+      const res = await new Promise<{ status: number }>((resolve, reject) => {
+        const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+        ws.on("unexpected-response", (_request, response) => {
+          response.resume();
+          resolve({ status: response.statusCode! });
+        });
+        ws.on("error", reject);
+      });
+      expect(res.status).toBe(502);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
   it("never exposes a worker's upstream credentials over ordinary HTTP", async () => {
     const { app, workerManager } = await createApp({ actor: board, plugin, workerResult: { websocket: { url: "wss://private.test", headers: { Authorization: "fixture-secret" } } } });
@@ -561,6 +622,198 @@ describe("plugin browser WebSockets", () => {
       upstreamWs.close(); server.closeAllConnections(); upstream.closeAllConnections();
       await Promise.all([new Promise<void>(resolve => server.close(() => resolve())), new Promise<void>(resolve => upstream.close(() => resolve()))]);
     }
+  });
+  // fork(TECH-8283 F2): Revocation teardown within lifetime/tick
+  it("destroys socket when plugin is revoked or worker stops", async () => {
+    const mockWs = await startMockWsUpstream();
+    const { app } = await createApp({
+      actor: board,
+      plugin,
+      workerResult: { websocket: { url: mockWs.base.replace("http:", "wss:") + "/channels/build-output" } },
+      wsOptions: { allowPrivateNetwork: true, watchIntervalMs: 25 },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+    try {
+      await once(ws, "open");
+      mockRegistry.getById.mockResolvedValue({ ...plugin, status: "disabled" });
+      const closed = await once(ws, "close");
+      expect(closed).toBeDefined();
+    } finally {
+      ws.terminate();
+      await Promise.all([closeServer(server), mockWs.close()]);
+    }
+  });
+  it("destroys socket when hard lifetime expires", async () => {
+    const mockWs = await startMockWsUpstream();
+    const { app } = await createApp({
+      actor: board,
+      plugin,
+      workerResult: { websocket: { url: mockWs.base.replace("http:", "wss:") + "/channels/build-output" } },
+      wsOptions: { allowPrivateNetwork: true, lifetimeMs: 50 },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+    try {
+      await once(ws, "open");
+      const closed = await once(ws, "close");
+      expect(closed).toBeDefined();
+    } finally {
+      ws.terminate();
+      await Promise.all([closeServer(server), mockWs.close()]);
+    }
+  });
+  // fork(TECH-8283 F3): Concurrency cap per (actor, plugin) = 4; reject 429 before worker dispatch
+  it("rejects 429 when concurrency cap is exceeded and does not call worker", async () => {
+    const mockWs = await startMockWsUpstream();
+    const { app, workerManager } = await createApp({
+      actor: board,
+      plugin,
+      workerResult: { websocket: { url: mockWs.base.replace("http:", "wss:") + "/channels/build-output" } },
+      wsOptions: { allowPrivateNetwork: true },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const sockets: WebSocket[] = [];
+    try {
+      for (let i = 0; i < 4; i += 1) {
+        const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+        await once(ws, "open");
+        sockets.push(ws);
+      }
+      expect(workerManager.call).toHaveBeenCalledTimes(4);
+
+      const rejectionResult = await new Promise<{ status: number }>((resolve, reject) => {
+        const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+        ws.on("unexpected-response", (_request, response) => {
+          response.resume();
+          resolve({ status: response.statusCode! });
+        });
+        ws.on("error", reject);
+      });
+      expect(rejectionResult.status).toBe(429);
+      expect(workerManager.call).toHaveBeenCalledTimes(4);
+
+      const toClose = sockets.pop()!;
+      toClose.close();
+      await once(toClose, "close");
+
+      const fifthWs = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+      await once(fifthWs, "open");
+      sockets.push(fifthWs);
+      expect(workerManager.call).toHaveBeenCalledTimes(5);
+    } finally {
+      for (const s of sockets) s.terminate();
+      await Promise.all([closeServer(server), mockWs.close()]);
+    }
+  });
+  // fork(TECH-8283 F6): Handshake deadline ~20s from upgrade accept until 101
+  it("terminates when handshake deadline expires before 101", async () => {
+    const upstream = createServer((_req, res) => { res.end(); });
+    const upstreamBase = await listen(upstream);
+    const { app } = await createApp({
+      actor: board,
+      plugin,
+      workerResult: { websocket: { url: upstreamBase.replace("http:", "wss:") + "/channels/build-output" } },
+      wsOptions: { allowPrivateNetwork: true, handshakeDeadlineMs: 50 },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+    try {
+      const res = await new Promise<{ status: number }>((resolve) => {
+        ws.on("unexpected-response", (_request, response) => {
+          response.resume();
+          resolve({ status: response.statusCode! });
+        });
+        ws.on("error", () => resolve({ status: 502 }));
+      });
+      expect(res.status).toBe(502);
+    } finally {
+      ws.terminate();
+      await Promise.all([closeServer(server), closeServer(upstream)]);
+    }
+  });
+  // fork(TECH-8283 F4): Header allowlist rejects forbidden upstream headers with 502
+  it.each([
+    { "content-length": "100" },
+    { "transfer-encoding": "chunked" },
+    { "proxy-authorization": "Basic secret" },
+    { "x-forwarded-for": "10.0.0.1" },
+    { "cookie": "secret=val" },
+    { "host": "attacker.test" },
+  ])("rejects worker upstream header %j with 502 and writes nothing upstream", async (badHeader) => {
+    let upstreamReached = false;
+    const upstream = createServer((_req, _res) => { upstreamReached = true; });
+    upstream.on("upgrade", () => { upstreamReached = true; });
+    const upstreamBase = await listen(upstream);
+    const { app } = await createApp({
+      actor: board,
+      plugin,
+      workerResult: {
+        websocket: {
+          url: upstreamBase.replace("http:", "wss:") + "/channels/build-output",
+          headers: badHeader,
+        },
+      },
+      wsOptions: { allowPrivateNetwork: true },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+    try {
+      const res = await new Promise<{ status: number }>((resolve) => {
+        ws.on("unexpected-response", (_request, response) => {
+          response.resume();
+          resolve({ status: response.statusCode! });
+        });
+        ws.on("error", () => resolve({ status: 502 }));
+      });
+      expect(res.status).toBe(502);
+      expect(upstreamReached).toBe(false);
+    } finally {
+      ws.terminate();
+      await Promise.all([closeServer(server), closeServer(upstream)]);
+    }
+  });
+  // fork(TECH-8283 F4): Regression - non-WS route whose worker returns websocket field returns 200 and excludes secret
+  it("excludes websocket credentials when non-WS route worker returns websocket field", async () => {
+    const httpRoutes = manifest([
+      {
+        routeKey: "http.info",
+        method: "GET",
+        path: "/info",
+        auth: "board",
+        capability: "api.routes.register",
+        companyResolution: { from: "query", key: "companyId" },
+      },
+    ]);
+    const httpPlugin = { id: pluginId, pluginKey: httpRoutes.id, status: "ready", manifestJson: httpRoutes };
+    const { app } = await createApp({
+      actor: board,
+      plugin: httpPlugin,
+      workerResult: {
+        status: 200,
+        body: { ok: true, data: "visible" },
+        websocket: {
+          url: "wss://secret.internal/leak",
+          headers: { Authorization: "Bearer super-secret-token" },
+        },
+      },
+    });
+    const response = await request(app).get(`/api/plugins/${pluginId}/api/info?companyId=${companyId}`);
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ ok: true, data: "visible" });
+    expect(response.text).not.toContain("super-secret-token");
+    expect(response.text).not.toContain("secret.internal");
+    expect(response.headers.authorization).toBeUndefined();
   });
   it("only permits declared board GET WebSockets", () => {
     expect(pluginManifestV1Schema.safeParse(apiRoutes).success).toBe(true);

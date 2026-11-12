@@ -22,7 +22,12 @@
 import { access, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { pluginApiUpgrade, proxyPluginApiWebSocket } from "../realtime/plugin-api-ws.js";
+import {
+  pluginApiUpgrade,
+  proxyPluginApiWebSocket,
+  acquireWebSocketSlot,
+} from "../realtime/plugin-api-ws.js";
+import type { GuardedRemoteHttpFetchOptions } from "../services/plugin-egress-guard.js";
 import { trustedBoardMutationOrigin } from "../middleware/board-mutation-guard.js";
 import { authorizationService } from "../services/authorization.js";
 import { fileURLToPath } from "node:url";
@@ -33,6 +38,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   companies,
+  companyMemberships,
   heartbeatRuns,
   pluginLogs,
   pluginWebhookDeliveries,
@@ -445,6 +451,8 @@ export interface PluginRouteBridgeDeps {
   workerManager: PluginWorkerManager;
   /** Optional stream bus for SSE push from worker to UI. */
   streamBus?: PluginStreamBus;
+  // fork(TECH-8283 F1): injected test seam for guarded egress
+  wsOptions?: GuardedRemoteHttpFetchOptions;
 }
 
 export interface PluginRouteToolGatewayDeps {
@@ -1919,6 +1927,19 @@ export function pluginRoutes(
       }
 
       const actor = getActorInfo(req);
+
+      // fork(TECH-8283 F3): Concurrency cap per (actor, plugin) = 4, per company = 32. Reject 429 BEFORE worker dispatch.
+      let releaseSlot: (() => void) | null = null;
+      if (match.route.transport === "websocket") {
+        releaseSlot = acquireWebSocketSlot(companyId, actor.actorId, plugin.id);
+        if (!releaseSlot) {
+          res.status(429).json({ error: "Too many concurrent plugin WebSocket connections" });
+          return;
+        }
+        res.once("close", releaseSlot);
+        res.once("finish", releaseSlot);
+      }
+
       const input: PluginScopedApiRequest = {
         routeKey: match.route.routeKey,
         method: req.method,
@@ -1944,7 +1965,44 @@ export function pluginRoutes(
       ) as PluginScopedApiResponse;
       if (match.route.transport === "websocket") {
         if (result.websocket) {
-          proxyPluginApiWebSocket(req, res, result.websocket, () => bridgeDeps.workerManager.isRunning(plugin.id));
+          // fork(TECH-8283 F2): Re-check company access and plugin enabled/installed status on each tick
+          const checkAvailable = async () => {
+            if (!bridgeDeps.workerManager.isRunning(plugin.id)) return false;
+            try {
+              const currentPlugin = await registry.getById(plugin.id);
+              if (!currentPlugin || currentPlugin.status !== "ready") return false;
+              if (req.actor.source !== "local_implicit") {
+                if (req.actor.type === "board" && req.actor.userId && typeof db.select === "function") {
+                  const [membership] = await db
+                    .select({ id: companyMemberships.id })
+                    .from(companyMemberships)
+                    .where(
+                      and(
+                        eq(companyMemberships.companyId, companyId),
+                        eq(companyMemberships.principalType, "user"),
+                        eq(companyMemberships.principalId, req.actor.userId),
+                        eq(companyMemberships.status, "active"),
+                      ),
+                    )
+                    .limit(1);
+                  if (!membership) return false;
+                } else if (!hasCompanyAccess(req, companyId)) {
+                  return false;
+                }
+              }
+              return true;
+            } catch {
+              return false;
+            }
+          };
+          // fork(TECH-8283 F1): Pass injected egress options / test seam
+          await proxyPluginApiWebSocket(
+            req,
+            res,
+            result.websocket,
+            checkAvailable,
+            bridgeDeps?.wsOptions,
+          );
         } else {
           res.status(result.status && result.status >= 400 && result.status <= 599 ? result.status : 502).json({ error: "Plugin connection unavailable" });
         }
