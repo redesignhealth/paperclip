@@ -1109,6 +1109,8 @@ export type ToolCatalogEntryKind = (typeof TOOL_CATALOG_ENTRY_KINDS)[number];
 export const TOOL_CATALOG_ENTRY_STATUSES = ["active", "disabled", "quarantined", "removed"] as const;
 export type ToolCatalogEntryStatus = (typeof TOOL_CATALOG_ENTRY_STATUSES)[number];
 
+export const TOOL_QUARANTINE_REASON_REVIEWED_DECLINED = "reviewed_declined";
+
 export const TOOL_RISK_LEVELS = ["low", "medium", "high", "critical", "read", "write", "destructive"] as const;
 export type ToolRiskLevel = (typeof TOOL_RISK_LEVELS)[number];
 

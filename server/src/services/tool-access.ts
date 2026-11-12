@@ -217,6 +217,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   CLASS3_STATIC_LEASE_ALLOWLIST,
+  TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
   shouldAllowPrivateNetworkTargets,
   GITHUB_CONNECTOR_PROFILES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
@@ -9150,6 +9151,7 @@ export function toolAccessService(
           and(
             eq(toolCatalogEntries.companyId, companyId),
             eq(toolCatalogEntries.status, "quarantined"),
+            sql`${toolCatalogEntries.quarantineReason} is distinct from ${TOOL_QUARANTINE_REASON_REVIEWED_DECLINED}`,
           ),
         ),
       db
@@ -15803,7 +15805,9 @@ export function toolAccessService(
       }
 
       const reviewedAt = new Date();
-      const activatedReviewedIds = reviewedIds.filter((id) => enabledIds.includes(id));
+      const enabledIdSet = new Set(enabledIds);
+      const activatedReviewedIds = reviewedIds.filter((id) => enabledIdSet.has(id));
+      const declinedReviewedIds = reviewedIds.filter((id) => !enabledIdSet.has(id));
       if (activatedReviewedIds.length > 0) {
         await tx
           .update(toolCatalogEntries)
@@ -15823,6 +15827,27 @@ export function toolAccessService(
               eq(toolCatalogEntries.companyId, companyId),
               eq(toolCatalogEntries.connectionId, connection.id),
               inArray(toolCatalogEntries.id, activatedReviewedIds),
+              eq(toolCatalogEntries.status, "quarantined"),
+            ),
+          );
+      }
+      if (declinedReviewedIds.length > 0) {
+        await tx
+          .update(toolCatalogEntries)
+          .set({
+            reviewedAt,
+            reviewedByAgentId:
+              actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+            reviewedByUserId:
+              actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+            quarantineReason: TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
+            updatedAt: reviewedAt,
+          })
+          .where(
+            and(
+              eq(toolCatalogEntries.companyId, companyId),
+              eq(toolCatalogEntries.connectionId, connection.id),
+              inArray(toolCatalogEntries.id, declinedReviewedIds),
               eq(toolCatalogEntries.status, "quarantined"),
             ),
           );
@@ -17801,18 +17826,24 @@ export function toolAccessService(
           actor: input.actor,
         })
       : null;
-    const activatedCatalogEntryIds = new Set(
-      shouldFinalizeManagedDefaults
-        ? refresh.catalog
-            .filter((entry) => entry.status === "quarantined")
-            .map((entry) => entry.id)
-        : [],
-    );
-    const catalog = refresh.catalog.map((entry) =>
-      activatedCatalogEntryIds.has(entry.id)
-        ? { ...entry, status: "active" as const }
-        : entry,
-    );
+    let catalog: ToolCatalogEntry[] = refresh.catalog;
+    if (finished) {
+      const currentRows = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, connection.companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+          ),
+        );
+      const rowById = new Map(currentRows.map((row) => [row.id, row]));
+      catalog = [];
+      for (const entry of refresh.catalog) {
+        const row = rowById.get(entry.id);
+        if (row) catalog.push(toCatalogEntryForConnection(row, connection));
+      }
+    }
     const [application] = await db
       .select()
       .from(toolApplications)
@@ -18896,12 +18927,30 @@ export function toolAccessService(
           actor: input.actor,
         })
       : null;
+    let catalog: ToolCatalogEntry[] = refresh.catalog;
+    if (finished) {
+      const currentRows = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, connection.companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+          ),
+        );
+      const rowById = new Map(currentRows.map((row) => [row.id, row]));
+      catalog = [];
+      for (const entry of refresh.catalog) {
+        const row = rowById.get(entry.id);
+        if (row) catalog.push(toCatalogEntryForConnection(row, connection));
+      }
+    }
     return {
       connectionId: refresh.connection.id,
       application: toApplication(application),
       connection: finished?.connection ?? refresh.connection,
-      catalog: refresh.catalog,
-      actions: groupedActions(refresh.catalog),
+      catalog,
+      actions: groupedActions(catalog),
       suggestedDefaults,
       auth: null,
     };

@@ -153,7 +153,7 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
       {
         enabledCatalogEntryIds: enabled.map((entry) => entry.id),
         askFirstCatalogEntryIds: [],
-        // Every currently quarantined action must get a decision exactly once; the rest stay off.
+        // Every currently quarantined action gets a settled review decision: allowlisted tools activate and the rest are recorded as reviewed-declined.
         reviewedCatalogEntryIds: catalog.filter((entry) => entry.status === "quarantined").map((entry) => entry.id),
         // Per-agent installs below are what turn it on; no company-wide binding.
         access: { agentIds: [] },

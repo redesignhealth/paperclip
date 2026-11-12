@@ -4745,8 +4745,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const search = catalog.find((entry) => entry.toolName === "gmail_search")!;
       const send = catalog.find((entry) => entry.toolName === "gmail_send")!;
 
-      // The owner's explicit review: approving the quarantined tools, but ENABLED
-      // (permitted for the agent) is only the read tool — the write tool stays out of the profile.
+      // The owner's explicit review: activating the chosen read tool and declining
+      // the unticked write tool (which stays quarantined as reviewed_declined).
       stubPublicUrl();
       const aliceApp = createActorApp(sessionActor(company.id, alice));
       const finish = await request(aliceApp)
@@ -4758,6 +4758,11 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
           access: { agentIds: [agent!.id] },
         });
       expect(finish.status).toBe(200);
+      const entriesAfterFinish = await catalogOf(instanceId);
+      const sendAfterFinish = entriesAfterFinish.find((entry) => entry.toolName === "gmail_send")!;
+      expect(sendAfterFinish.status).toBe("quarantined");
+      expect(sendAfterFinish.quarantineReason).toBe("reviewed_declined");
+      expect(sendAfterFinish.reviewedAt).toBeInstanceOf(Date);
       const profileEntriesAfterFinish = await db
         .select()
         .from(toolProfileEntries)
@@ -4767,9 +4772,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect.objectContaining({ targetType: "agent", targetId: agent!.id }),
       ]);
 
-      // A later catalog refresh (same tools) preserves the owner's reviewed choices (no
-      // re-quarantine of the reviewed entries) and manufactures no company-wide install,
-      // profile entry, or binding for the personal instance.
+      // A later catalog refresh (same tools) preserves the owner's reviewed choices (declined
+      // entries stay quarantined with reviewed_declined, active entries stay active) and
+      // manufactures no company-wide install, profile entry, or binding for the personal instance.
       const refresh = await request(aliceApp).post(`/api/tool-connections/${instanceId}/catalog/refresh`).send({});
       expect(refresh.status).toBe(200);
       const statusesAfterRefresh = (await catalogOf(instanceId))
@@ -4779,6 +4784,10 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         ["gmail_search", "active"],
         ["gmail_send", "quarantined"],
       ]);
+      const entriesAfterRefresh = await catalogOf(instanceId);
+      const sendAfterRefresh = entriesAfterRefresh.find((entry) => entry.toolName === "gmail_send")!;
+      expect(sendAfterRefresh.quarantineReason).toBe("reviewed_declined");
+      expect(sendAfterRefresh.reviewedAt).toBeInstanceOf(Date);
       const profileEntriesAfterRefresh = await db
         .select()
         .from(toolProfileEntries)

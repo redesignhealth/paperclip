@@ -218,7 +218,19 @@ Each tool discovered on a connection becomes a **catalog entry** with a risk lev
 | `write` | `annotations.readOnlyHint: false` or `writeHint: true` | Requires approval by default unless the profile or a policy says otherwise. |
 | `destructive` | `annotations.destructiveHint: true` | Quarantined on first sight. Requires explicit operator action before any agent call can succeed. |
 
-When a catalog refresh discovers a new write/destructive tool that did not exist on the prior schema, Paperclip sets `status: quarantined` and records the reason in `quarantineReason`. Quarantined entries are never returned to the agent's tool list until an operator reviews and re-enables them. This is the **changed-tool quarantine** rule and the primary defense against an upstream server silently adding a destructive verb.
+When a catalog refresh discovers a new write/destructive tool that did not exist on the prior schema, Paperclip sets `status: quarantined` and records the reason in `quarantineReason` (defaulting to `pending_review`). Quarantined entries are never returned to the agent's tool list until an operator reviews them. This is the **changed-tool quarantine** rule and the primary defense against an upstream server silently adding a destructive verb.
+
+### Quarantine review lifecycle and declined tools
+
+During connection setup or gallery review save:
+- **Activated tools**: Tools selected/ticked by the operator (including ask-first actions) transition to `status: active`, clear `quarantineReason` and `quarantinedAt`, and stamp `reviewedAt` and `reviewedBy` audit fields.
+- **Declined tools**: Quarantined tools that were reviewed but left unticked remain blocked (`status: quarantined`) and retain their original `quarantinedAt` timestamp. Their review audit fields (`reviewedAt`, `reviewedBy`) are stamped and their `quarantineReason` is set to `reviewed_declined`.
+- **Settled decisions**: Actions with `quarantineReason: reviewed_declined` represent settled operator decisions. They stay out of the runtime profile and do not trigger "needs attention" banners or increment attention counters. An operator can re-enable them at any time.
+- **Approved system defaults**: Automated connection workflows that apply approved default policies (such as `offRiskLevels` starting writes off for Granola, or allowlists like `shared-org-rh-mcp`) similarly settle un-enabled tools with `reviewed_declined`.
+
+### Drift re-arm
+
+If an upstream server alters an already-reviewed tool's schema (input schema change, version hash drift, or risk classification change), the next catalog refresh resets `quarantineReason` back to `pending_review` and updates `quarantinedAt`, while preserving sticky `reviewedAt` history. This re-arms the quarantine, bringing the drifted action back into the operator's attention queue for re-review.
 
 To inspect and re-enable a quarantined entry, use the UI Catalog view, or PATCH the entry's status via the catalog routes (see [Reference](#reference)).
 

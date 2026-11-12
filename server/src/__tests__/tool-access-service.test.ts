@@ -63,6 +63,7 @@ import {
   GOOGLE_WORKSPACE_DEFAULT_SELECTION,
   getAvailableConnectionMethod,
   getConnectableAppDefinition,
+  TOOL_QUARANTINE_REASON_REVIEWED_DECLINED,
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
 import {
@@ -18346,7 +18347,8 @@ describeEmbeddedPostgres("tool access service", () => {
         expect.objectContaining({
           id: updateEntry.id,
           status: "quarantined",
-          quarantineReason: "pending_review",
+          quarantineReason: "reviewed_declined",
+          reviewedAt: expect.any(Date),
         }),
         expect.objectContaining({
           id: createEntry.id,
@@ -18359,12 +18361,10 @@ describeEmbeddedPostgres("tool access service", () => {
     const attentionAfterReview = await service.listAppsNeedingAttention(
       company.id,
     );
-    expect(attentionAfterReview.apps).toEqual([
-      expect.objectContaining({ connection: expect.objectContaining({ id: connect.connectionId }), quarantinedCatalogEntryCount: 1 }),
-    ]);
+    expect(attentionAfterReview.apps).toEqual([]);
   });
 
-  it("keeps unticked quarantined tools quarantined during review save while activating ticked ones (TECH-8350)", async () => {
+  it("keeps unticked quarantined tools quarantined during review save while activating ticked ones", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     mockToolsList([
@@ -18389,9 +18389,10 @@ describeEmbeddedPostgres("tool access service", () => {
     const deleteEntry = connect.catalog.find((entry) => entry.toolName === "delete_items")!;
     const sendEntry = connect.catalog.find((entry) => entry.toolName === "send_items")!;
 
+    const quarantinedAtInitial = new Date(Date.now() - 30_000);
     await db
       .update(toolCatalogEntries)
-      .set({ status: "quarantined", quarantineReason: "manual" })
+      .set({ status: "quarantined", quarantineReason: "manual", quarantinedAt: quarantinedAtInitial })
       .where(inArray(toolCatalogEntries.id, [deleteEntry.id, sendEntry.id]));
 
     // User reviews both quarantined entries, but only ticks deleteEntry; sendEntry is left unticked.
@@ -18414,10 +18415,271 @@ describeEmbeddedPostgres("tool access service", () => {
     const byName = new Map(entries.map((e) => [e.toolName, e]));
     expect(byName.get("delete_items")?.status).toBe("active");
     expect(byName.get("delete_items")?.reviewedAt).toBeInstanceOf(Date);
+    expect(byName.get("delete_items")?.reviewedByUserId).toBe("board");
     expect(byName.get("delete_items")?.quarantineReason).toBeNull();
+    expect(byName.get("delete_items")?.quarantinedAt).toBeNull();
 
     expect(byName.get("send_items")?.status).toBe("quarantined");
-    expect(byName.get("send_items")?.quarantineReason).toBe("manual");
+    expect(byName.get("send_items")?.quarantineReason).toBe("reviewed_declined");
+    expect(byName.get("send_items")?.reviewedAt).toBeInstanceOf(Date);
+    expect(byName.get("send_items")?.reviewedByUserId).toBe("board");
+    expect(byName.get("send_items")?.quarantinedAt?.getTime()).toBe(quarantinedAtInitial.getTime());
+
+    const attention = await service.listAppsNeedingAttention(company.id);
+    expect(attention.apps).toEqual([]);
+  });
+
+  it("direct OAuth default-off callback response equals DB (B1)", async () => {
+    const company = await createCompany(db);
+    const userId = `oauth-b1-user-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, []);
+    const actor = { actorType: "user" as const, actorId: userId };
+    const service = createTestToolAccessService(db, {
+      paperclipCloudConnector: fakeGoogleWorkspaceConnector(company.id, userId, "gmail.draft"),
+    });
+
+    const gmailDefinition = getConnectableAppDefinition("gmail")!;
+    const previousOwnershipAvailability = gmailDefinition.ownershipAvailability;
+    gmailDefinition.ownershipAvailability = {
+      ...previousOwnershipAvailability,
+      platform_shared: true,
+    };
+
+    mockToolsList([
+      { name: "search-messages", annotations: { readOnlyHint: true } },
+      { name: "create_draft", annotations: { readOnlyHint: false } },
+    ]);
+
+    const appDefModule = await import("@paperclipai/shared");
+    const origRecommended = appDefModule.recommendedDefaultsForApp;
+    vi.spyOn(appDefModule, "recommendedDefaultsForApp").mockImplementation((app, methodKey) => {
+      const base = origRecommended(app, methodKey);
+      return {
+        ...base,
+        offRiskLevels: ["write", "destructive"],
+      };
+    });
+
+    try {
+      const connected = await service.connectGalleryApp(
+        company.id,
+        {
+          galleryKey: "gmail",
+          connectionMethodKey: "paperclip-draft",
+          grantKind: "user",
+          name: "Gmail B1 Test",
+        },
+        actor,
+      );
+
+      const start = await service.startOAuth(
+        company.id,
+        connected.connectionId,
+        {
+          redirectUri: "https://paperclip.example/api/tools/oauth/cloud-connector/callback",
+          actor,
+        },
+      );
+
+      const completed = await service.completePaperclipCloudConnectorCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        claimId: "b1-test-claim",
+        actor,
+      });
+
+      const dbEntries = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, company.id),
+            eq(toolCatalogEntries.connectionId, connected.connectionId),
+          ),
+        );
+      const dbByName = new Map(dbEntries.map((e) => [e.toolName, e]));
+      const catalogByName = new Map(completed.catalog.map((e) => [e.toolName, e]));
+
+      expect(completed.catalog).toHaveLength(2);
+      expect(catalogByName.get("search-messages")?.status).toBe("active");
+      expect(catalogByName.get("search-messages")?.quarantineReason).toBeNull();
+      expect(dbByName.get("search-messages")?.status).toBe("active");
+
+      expect(catalogByName.get("create_draft")?.status).toBe("quarantined");
+      expect(catalogByName.get("create_draft")?.quarantineReason).toBe("reviewed_declined");
+      expect(dbByName.get("create_draft")?.status).toBe("quarantined");
+      expect(dbByName.get("create_draft")?.quarantineReason).toBe("reviewed_declined");
+
+      for (const entry of completed.catalog) {
+        const dbEntry = dbByName.get(entry.toolName);
+        expect(entry.status).toBe(dbEntry?.status);
+        expect(entry.quarantineReason).toBe(dbEntry?.quarantineReason);
+      }
+    } finally {
+      gmailDefinition.ownershipAvailability = previousOwnershipAvailability;
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("considers tools with pending_review or NULL quarantineReason as needing attention while excluding reviewed_declined", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([
+      { name: "tool_pending", annotations: { readOnlyHint: false } },
+      { name: "tool_null", annotations: { readOnlyHint: false } },
+      { name: "tool_declined", annotations: { readOnlyHint: false } },
+    ]);
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, { galleryKey: "zapier", credentialValues: { "credentials.authorization": "z1" } }, { actorType: "user", actorId: "board" }),
+    );
+    const entryPending = connect.catalog.find((e) => e.toolName === "tool_pending")!;
+    const entryNull = connect.catalog.find((e) => e.toolName === "tool_null")!;
+    const entryDeclined = connect.catalog.find((e) => e.toolName === "tool_declined")!;
+
+    await db.update(toolCatalogEntries).set({ status: "quarantined", quarantineReason: "pending_review" })
+      .where(eq(toolCatalogEntries.id, entryPending.id));
+    await db.update(toolCatalogEntries).set({ status: "quarantined", quarantineReason: null })
+      .where(eq(toolCatalogEntries.id, entryNull.id));
+    await db.update(toolCatalogEntries).set({ status: "quarantined", quarantineReason: "reviewed_declined" })
+      .where(eq(toolCatalogEntries.id, entryDeclined.id));
+
+    let attention = await service.listAppsNeedingAttention(company.id);
+    const app = attention.apps.find((a) => a.connection.id === connect.connectionId);
+    expect(app).toBeDefined();
+    // Excludes reviewed_declined (1), includes pending_review (1) and NULL (1) -> count is 2
+    expect(app?.quarantinedCatalogEntryCount).toBe(2);
+
+    // Settle the remaining two tools
+    await db.update(toolCatalogEntries).set({ status: "quarantined", quarantineReason: "reviewed_declined" })
+      .where(inArray(toolCatalogEntries.id, [entryPending.id, entryNull.id]));
+
+    attention = await service.listAppsNeedingAttention(company.id);
+    expect(attention.apps.find((a) => a.connection.id === connect.connectionId)).toBeUndefined();
+  });
+
+  it("activates tools in askFirstCatalogEntryIds even if not in enabledCatalogEntryIds", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([
+      { name: "read_item", annotations: { readOnlyHint: true } },
+      { name: "ask_first_item", annotations: { readOnlyHint: false } },
+    ]);
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, { galleryKey: "zapier", credentialValues: { "credentials.authorization": "zap-secret" } }, { actorType: "user", actorId: "board" }),
+    );
+    const readEntry = connect.catalog.find((entry) => entry.toolName === "read_item")!;
+    const askEntry = connect.catalog.find((entry) => entry.toolName === "ask_first_item")!;
+
+    await db.update(toolCatalogEntries).set({ status: "quarantined", quarantineReason: "pending_review" })
+      .where(eq(toolCatalogEntries.id, askEntry.id));
+
+    await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [readEntry.id],
+        askFirstCatalogEntryIds: [askEntry.id],
+        reviewedCatalogEntryIds: [askEntry.id],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    const [updatedAsk] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, askEntry.id));
+    expect(updatedAsk?.status).toBe("active");
+    expect(updatedAsk?.quarantineReason).toBeNull();
+    expect(updatedAsk?.reviewedAt).toBeInstanceOf(Date);
+  });
+
+  it("leaves active unticked tools active in catalog but absent from profile", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([
+      { name: "tool_a", annotations: { readOnlyHint: true } },
+      { name: "tool_b", annotations: { readOnlyHint: true } },
+    ]);
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, { galleryKey: "zapier", credentialValues: { "credentials.authorization": "zap-secret" } }, { actorType: "user", actorId: "board" }),
+    );
+    const toolA = connect.catalog.find((e) => e.toolName === "tool_a")!;
+    const toolB = connect.catalog.find((e) => e.toolName === "tool_b")!;
+
+    expect(toolA.status).toBe("active");
+    expect(toolB.status).toBe("active");
+
+    const finish = await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [toolA.id],
+        askFirstCatalogEntryIds: [],
+        reviewedCatalogEntryIds: [],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    const [rowB] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolB.id));
+    expect(rowB?.status).toBe("active");
+
+    const profileEntries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, finish.profile.id));
+    expect(profileEntries.map((e) => e.catalogEntryId)).toEqual([toolA.id]);
+    expect(profileEntries.some((e) => e.catalogEntryId === toolB.id)).toBe(false);
+  });
+
+  it("resets quarantineReason to pending_review and re-arms attention on catalog schema drift while preserving sticky reviewedAt", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    let currentTools = [
+      { name: "dynamic_tool", description: "v1", inputSchema: { type: "object", properties: { q: { type: "string" } } }, annotations: { readOnlyHint: false } },
+    ];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return mcpHttpResponse({ jsonrpc: "2.0", id: body.id,
+        result: body.method === "initialize" ? { protocolVersion: "2025-06-18" } : { tools: currentTools } });
+    });
+
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, { galleryKey: "zapier", credentialValues: { "credentials.authorization": "zap-secret" } }, { actorType: "user", actorId: "board" }),
+    );
+    const toolEntry = connect.catalog.find((e) => e.toolName === "dynamic_tool")!;
+
+    await db.update(toolConnections).set({
+      status: "active",
+      config: { ...connect.connection.config, quarantineNewEntries: true },
+    }).where(eq(toolConnections.id, connect.connectionId));
+
+    const reviewedAtInitial = new Date(Date.now() - 60_000);
+    await db.update(toolCatalogEntries).set({
+      status: "quarantined",
+      quarantineReason: "reviewed_declined",
+      reviewedAt: reviewedAtInitial,
+      reviewedByUserId: "board",
+    }).where(eq(toolCatalogEntries.id, toolEntry.id));
+
+    let attention = await service.listAppsNeedingAttention(company.id);
+    expect(attention.apps.filter((a) => a.connection.id === connect.connectionId)).toHaveLength(0);
+
+    currentTools = [
+      { name: "dynamic_tool", description: "v2 with changes", inputSchema: { type: "object", properties: { q: { type: "number" } } }, annotations: { readOnlyHint: false } },
+    ];
+
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+
+    const [driftedEntry] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
+    expect(driftedEntry?.status).toBe("quarantined");
+    expect(driftedEntry?.quarantineReason).toBe("pending_review");
+    expect(driftedEntry?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
+
+    attention = await service.listAppsNeedingAttention(company.id);
+    expect(attention.apps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          connection: expect.objectContaining({ id: connect.connectionId }),
+          quarantinedCatalogEntryCount: 1,
+        }),
+      ]),
+    );
   });
 
   it("enables newly discovered tools after setup while preserving tools explicitly turned off", async () => {
