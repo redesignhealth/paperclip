@@ -25,3 +25,4 @@ export * from "./flip-preconditions.js";
 export * from "./flip.js";
 export * from "./drain-evidence.js";
 export * from "./drain.js";
+export * from "./verify.js";

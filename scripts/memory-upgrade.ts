@@ -59,7 +59,12 @@ import {
   runDrainCli,
   type RunDrainCliDependencies,
 } from "./memory-upgrade-drain.js";
-import { ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS } from "./memory-upgrade-verify-flags.js";
+import {
+  ALLOWED_VERIFY_FLAGS,
+  BOOLEAN_VERIFY_FLAGS,
+  runVerifyCli,
+  type RunVerifyCliDependencies,
+} from "./memory-upgrade-verify.js";
 import { ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS } from "./memory-upgrade-rollback-flags.js";
 import { ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS } from "./memory-upgrade-status-flags.js";
 import { ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS } from "./memory-upgrade-recover-flags.js";
@@ -73,7 +78,7 @@ export {
   ALLOWED_PUBLISH_FLAGS, BOOLEAN_PUBLISH_FLAGS, runPublishCli, type RunPublishCliDependencies,
   ALLOWED_FLIP_FLAGS, BOOLEAN_FLIP_FLAGS, runFlipCli, type RunFlipCliDependencies,
   ALLOWED_DRAIN_FLAGS, BOOLEAN_DRAIN_FLAGS, runDrainCli, type RunDrainCliDependencies,
-  ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS,
+  ALLOWED_VERIFY_FLAGS, BOOLEAN_VERIFY_FLAGS, runVerifyCli, type RunVerifyCliDependencies,
   ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS,
   ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS,
   ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS,
@@ -1047,7 +1052,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (!subcommand) {
     console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-    console.error("Available subcommands: census, sweep, publish, flip, drain");
+    console.error("Available subcommands: census, sweep, publish, flip, drain, verify");
     return 1;
   }
 
@@ -1071,6 +1076,10 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     return await runDrainCli(args.slice(1));
   }
 
+  if (subcommand === "verify") {
+    return await runVerifyCli(args.slice(1));
+  }
+
   if (STUB_SUBCOMMANDS.has(subcommand)) {
     console.error(`Error: Subcommand '${subcommand}' is not implemented yet.`);
     return 1;
@@ -1082,7 +1091,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census, sweep, publish, flip, drain");
+  console.error("Available subcommands: census, sweep, publish, flip, drain, verify");
   return 1;
 }
 
