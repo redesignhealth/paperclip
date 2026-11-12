@@ -19,8 +19,8 @@ describe("Paperclip HTTP server runner transport", () => {
       authority: { handleUpgrade } as unknown as DurablePrpControlPlane,
     });
     expect(authority.connectUrl).toBe(`ws://127.0.0.1:3210/api/runner/v1/connect/${runId}`);
-    // fork(TECH-8283 F7): Exactly 2 upgrade listeners: runner PRP and fallback destroyer
-    expect(server.listenerCount("upgrade")).toBe(2);
+    // fork(TECH-8283 F7): Exactly 3 upgrade listeners: runner PRP, plugin API, and fallback destroyer
+    expect(server.listenerCount("upgrade")).toBe(3);
     await authority.release();
     server.close();
   });
