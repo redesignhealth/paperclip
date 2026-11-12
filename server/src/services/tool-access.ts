@@ -8896,9 +8896,17 @@ export function toolAccessService(
         .from(toolConnections)
         .where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.uid, DEFAULT_MCP_TEMPLATE_UID)))
         .limit(1);
-      const templateUrl = typeof asRecord(template?.config).url === "string" ? String(asRecord(template?.config).url) : null;
-      const cloneUrls = [asRecord(connection.config).url, asRecord(connection.transportConfig).url].filter((url) => url !== undefined);
-      if (templateUrl === null || cloneUrls.length === 0 || cloneUrls.some((url) => url !== templateUrl)) commsReviewed = null;
+      // Compare the endpoints the refresh itself resolves (`url`, then the `endpoint`/`remoteUrl` aliases), normalized.
+      // Any config that does not resolve to a valid endpoint, on either side, loses the exemption.
+      const endpointOf = (config: unknown): string | null => {
+        try {
+          return remoteEndpoint(asRecord(config));
+        } catch {
+          return null;
+        }
+      };
+      const templateEndpoint = template ? endpointOf(template.config) : null;
+      if (templateEndpoint === null || endpointOf(connection.config) !== templateEndpoint) commsReviewed = null;
     }
     const discoveredCount = descriptors.length;
     if (staticAllowlist) {

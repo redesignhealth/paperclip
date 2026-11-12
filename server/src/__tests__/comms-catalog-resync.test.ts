@@ -357,6 +357,40 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
       expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
     });
 
+    it.each([
+      ["the endpoint alias with url removed", (config: Record<string, unknown>) => { const { url: _url, ...rest } = config; return { ...rest, endpoint: "https://9.9.9.9/mcp" }; }],
+      ["the remoteUrl alias with url removed", (config: Record<string, unknown>) => { const { url: _url, ...rest } = config; return { ...rest, remoteUrl: "https://9.9.9.9/mcp" }; }],
+      ["an explicit default port (same endpoint) does NOT lose the exemption", (config: Record<string, unknown>) => ({ ...config, url: String(config.url).replace("8.8.8.8", "8.8.8.8:443") })],
+    ])("endpoint pin: %s", async (label, mutate) => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, cloneId));
+      await db.update(toolConnections).set({ config: mutate(row!.config as Record<string, unknown>) }).where(eq(toolConnections.id, cloneId));
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      const exempt = label.includes("does NOT lose");
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe(exempt ? "active" : "quarantined");
+    });
+
+    it("a clone whose company has no managed template loses the exemption", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await dropCredentials(cloneId);
+      // The seeded template keeps its random uid (not DEFAULT_MCP_TEMPLATE_UID), so no managed template resolves.
+      expect(template.uid).not.toBe(DEFAULT_MCP_TEMPLATE_UID);
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
+    });
+
     it("commsReviewedAllowlist only covers managed comms-board connections", () => {
       const config = { defaultMcpManaged: "dedicated" };
       expect(commsReviewedAllowlist({ name: "rh-comms-board:agent-1", config })?.has("proposals_submit")).toBe(true);
