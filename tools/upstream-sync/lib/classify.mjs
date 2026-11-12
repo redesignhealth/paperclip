@@ -21,6 +21,30 @@ const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:[ \t]*([^\n]*)/gm;
 const NEGATED_VALUE_RE = /^(none|n\/a|na|nil|no|not applicable|no breaking changes?)\b[\s.!]*$/i;
 const TEST_OR_DOC_RE = /(^|\/)(__tests__|tests?)\/|\.test\.|\.spec\.|\.md$|^doc(s)?\//;
 
+// Security signals. STRONG ones are unambiguous identifiers/labels and count in any
+// path set; WEAK ones are prose keywords that only count when the change touches
+// non-test/doc/CI files. Bare "redact" is deliberately in neither: it is ordinary
+// prose ("secrets are redacted") and was the #21173 false positive.
+const SECURITY_STRONG_TEXT_RE = /\b(cve-\d|ghsa-[0-9a-z]{4}-)/;
+const SECURITY_WEAK_TEXT_RE = /\b(vulnerab|security|xss|csrf|ssrf|sql injection|\brce\b|auth bypass|privilege escalation|secret leak)/;
+
+function isNonProdFile(f) {
+  return INFRA_FILE_RE.test(f) || TEST_OR_DOC_RE.test(f);
+}
+
+// "strong" | "weak" | null. Strong: CVE/GHSA id, or `security` as conventional-commit
+// type or scope. Weak: keyword in title/body, ignored when every changed file is a
+// test/doc/CI file (a tests-only PR cannot be a security fix by keyword alone).
+export function securitySignal(c) {
+  const t = c.title.toLowerCase();
+  const text = `${c.title}\n${c.body || ""}`.toLowerCase();
+  const m = t.match(/^([a-z]+)(?:\(([^)]*)\))?!?:/);
+  if (SECURITY_STRONG_TEXT_RE.test(text)) return "strong";
+  if (m && (m[1] === "security" || (m[2] || "").split(/[,/ ]+/).includes("security"))) return "strong";
+  if (SECURITY_WEAK_TEXT_RE.test(text) && !(c.files.length && c.files.every(isNonProdFile))) return "weak";
+  return null;
+}
+
 // True for `type!:` / `type(scope)!:` titles and for a `BREAKING CHANGE:` /
 // `BREAKING-CHANGE:` footer in the body, unless the footer is negated ("none", "N/A").
 export function isBreaking(c) {
@@ -35,11 +59,10 @@ export function isBreaking(c) {
 // so rows never stay unclassified and feature alerts are not silently skipped.
 export function heuristicClassify(c) {
   const t = c.title.toLowerCase();
-  const text = `${c.title}\n${c.body || ""}`.toLowerCase();
   const prefix = (t.match(/^([a-z]+)(\([^)]*\))?(!)?:/) || [])[1];
   let category;
   if (isBreaking(c)) category = "breaking";
-  else if (/\b(cve-\d|vulnerab|security|xss|csrf|ssrf|sql injection|\brce\b|auth bypass|privilege escalation|secret leak|redact)/.test(text) || prefix === "security") category = "security";
+  else if (securitySignal(c)) category = "security";
   else if (prefix === "perf" || /\b(perf|performance|faster|speed up|reduce latency|optimi[sz])/.test(t)) category = "perf";
   else if (["ci", "build", "chore", "docs", "test", "tests", "refactor", "style", "release", "deps"].includes(prefix)) category = "infra";
   else if (prefix === "feat" || /^(add|introduce|support|implement)\b/.test(t)) category = "feature";
@@ -123,7 +146,10 @@ export async function llmClassifyBatch(cfg, batch, fetchImpl = fetch) {
 
 // Security/breaking heuristics are safety-relevant: an alert that is suppressed
 // because a crafted commit message talked the model into "infra" is unrecoverable,
-// so a heuristic security/breaking verdict always wins over the model's category.
+// so a heuristic breaking verdict, or a STRONG security verdict (CVE/GHSA id,
+// `security` type/scope), always wins over the model's category. A WEAK security
+// verdict (prose keyword) is only a hint: the model decides, so a false positive
+// can be corrected.
 // The model's summary is still used (it is only display text, escaped at the
 // sink). `classified_by` records which side actually decided the category, so the
 // value `heuristic(kept)+llm:<model>` means "the heuristic pinned the
@@ -131,7 +157,7 @@ export async function llmClassifyBatch(cfg, batch, fetchImpl = fetch) {
 export function mergeClassification(c, llmResult, model = "llm") {
   if (!llmResult) return { ...heuristicClassify(c), by: "heuristic" };
   const h = heuristicClassify(c);
-  if (h.category === "security" || h.category === "breaking") {
+  if (h.category === "breaking" || (h.category === "security" && securitySignal(c) === "strong")) {
     return { category: h.category, summary: llmResult.summary || h.summary, by: `heuristic(kept)+llm:${model}` };
   }
   // A model result whose summary the parser accepted is non-empty, but be

@@ -205,6 +205,30 @@ test("heuristic classifier", () => {
   assert.equal(f("fix: retained-source containment (#7)"), "fix"); // "source" must not match rce
 });
 
+test("security heuristic: no false positive on tests-only PRs (#21173)", () => {
+  const pr = {
+    title: "test(restart-chaos): add restart chaos harness (#21173)",
+    body: "Known secret values are redacted from the logs.",
+    files: ["tests/restart-chaos/a.ts", "tests/restart-chaos/b.ts", "tests/restart-chaos/README.md"],
+  };
+  assert.equal(heuristicClassify(pr).category, "infra");
+  // bare "redact" in a non-test PR is not a security signal either
+  assert.equal(heuristicClassify({ title: "feat: redact tokens in logs (#2)", body: "", files: ["server/src/log.ts"] }).category, "feature");
+  // body keyword on a docs/CI-only PR does not yield security
+  assert.equal(heuristicClassify({ title: "docs: security notes (#3)", body: "vulnerability overview", files: ["docs/a.md"] }).category, "infra");
+});
+
+test("security heuristic: real signals still yield security", () => {
+  const h = (title, body = "", files = ["server/src/x.ts"]) => heuristicClassify({ title, body, files }).category;
+  assert.equal(h("fix(security): validate redirect (#4)"), "security");
+  assert.equal(h("security: harden auth (#5)"), "security");
+  assert.equal(h("fix: bump dep", "Fixes GHSA-abcd-1234-wxyz"), "security");
+  assert.equal(h("fix: bump dep", "Fixes CVE-2026-12345", ["package.json"]), "security");
+  assert.equal(h("fix: close auth bypass (#6)"), "security");
+  const strong = commit({ title: "fix(security): validate redirect (#4)" });
+  assert.equal(mergeClassification(strong, { category: "infra", summary: "x" }, "m").category, "security");
+});
+
 // Excerpts of the real PR bodies (paperclipai/paperclip #21013, #21096) that raised false
 // `[upstream-sync BREAKING]` alerts: the PR template's `**Breaking changes**` heading
 // followed by "None.". Only the sections around the heading are kept.
@@ -356,7 +380,7 @@ test("prompt fence differs per call", () => {
 });
 
 test("heuristic security/breaking cannot be downgraded by the model", () => {
-  const sec = commit({ title: "fix: patch XSS in comments (#5)" });
+  const sec = commit({ title: "fix: patch XSS in comments (CVE-2026-1234) (#5)" });
   const downgraded = { category: "infra", summary: "chore" };
   const r = mergeClassification(sec, downgraded, "m");
   assert.equal(r.category, "security");
@@ -365,6 +389,11 @@ test("heuristic security/breaking cannot be downgraded by the model", () => {
 
   const brk = commit({ title: "feat!: drop v1 api (#6)" });
   assert.equal(mergeClassification(brk, { category: "feature", summary: "x" }, "m").category, "breaking");
+
+  // A weak (prose-keyword) security verdict is only a hint: the model can correct it.
+  const weak = commit({ title: "fix: patch XSS in comments (#5)" });
+  assert.equal(heuristicClassify(weak).category, "security");
+  assert.equal(mergeClassification(weak, { category: "fix", summary: "x" }, "m").category, "fix");
 
   // Otherwise the model still wins.
   const plain = commit({ title: "feat: add y (#7)" });
