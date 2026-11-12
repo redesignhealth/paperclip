@@ -86,6 +86,7 @@ import {
 } from "../services/paperclip-cloud-connector-enrollment.js";
 import { reconcilePaperclipCloudConnectorEnrollmentStatus } from "../services/paperclip-cloud-connector-status.js";
 import {
+  OAUTH_CALLBACK_UPSTREAM_FAILURE_CODES,
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
   normalizeOAuthProviderError,
   oauthClientIdMetadataDocument,
@@ -1449,15 +1450,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       // Paperclip's own status stays what the response/activity row reports.
       // Deliberately absent: codes, tokens, state, verifier, secrets, raw
       // provider payloads/descriptions, and whole URLs.
-      const upstreamFailureCodes = new Set([
-        "oauth_token_exchange_failed",
-        "oauth_reauthorization_required",
-        "oauth_dynamic_client_registration_failed",
-        "oauth_client_secret_missing",
-        "oauth_access_token_missing",
-        "oauth_metadata_failed",
-      ]);
-      if (callbackErrorCode && upstreamFailureCodes.has(callbackErrorCode)) {
+      if (callbackErrorCode && OAUTH_CALLBACK_UPSTREAM_FAILURE_CODES.has(callbackErrorCode)) {
         const providerError = normalizeOAuthProviderError(details?.providerError);
         const rawUpstreamStatus = details?.status;
         const upstreamStatus =

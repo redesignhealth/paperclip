@@ -762,6 +762,45 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     const seed = (await googleSeed(companyId))!;
     const aInstance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
     const bInstance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userB);
+    const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+    const { secret: aSecret } = await writeConnectionCredential(db, {
+      companyId,
+      connectionName: aInstance.name,
+      configPath: "oauth.access_token",
+      label: "a token",
+      value: "token-a",
+      ownerUserId: userA,
+      definitionKey: `test.a.${randomUUID()}`,
+    });
+    await db.insert(connectionGrants).values({
+      companyId,
+      connectionId: aInstance.id,
+      kind: "user",
+      subjectUserId: userA,
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [{ secretId: aSecret.id, configPath: "oauth.access_token" }],
+      createdByUserId: userA,
+    });
+    const { secret: bSecret } = await writeConnectionCredential(db, {
+      companyId,
+      connectionName: bInstance.name,
+      configPath: "oauth.access_token",
+      label: "b token",
+      value: "token-b",
+      ownerUserId: userB,
+      definitionKey: `test.b.${randomUUID()}`,
+    });
+    await db.insert(connectionGrants).values({
+      companyId,
+      connectionId: bInstance.id,
+      kind: "user",
+      subjectUserId: userB,
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [{ secretId: bSecret.id, configPath: "oauth.access_token" }],
+      createdByUserId: userB,
+    });
     const agent = await seedAgent(companyId, { state: agentState() });
     const otherAgent = await seedAgent(companyId, { state: agentState() });
     const [entry] = await db
@@ -2166,5 +2205,676 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     // The agent actor on the same request is the cap.
     const agentDecision = await decideFor(ctx.companyId, ctx.agent.id, { connectionId: ctx.instance.id, toolName: "gmail_send" });
     expect(agentDecision).toMatchObject({ decision: "deny", reasonCode: "deny_personal_owner_profile" });
+  });
+
+  describe("TECH-8349: never show personal connection with no credential as connected", () => {
+    it("1. /finish returns 409 oauth_sign_in_required with exact message; row not active and no profile created", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+
+      await expect(
+        service.finishGalleryAppConnection(
+          companyId,
+          instance.id,
+          { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [] } },
+          userActor(userA),
+        ),
+      ).rejects.toMatchObject({
+        status: 409,
+        message:
+          "Sign in to this app before saving permissions. Click Connect to finish signing in, then set your actions.",
+        details: { code: "oauth_sign_in_required" },
+      });
+
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, instance.id));
+      expect(row!.status).not.toBe("active");
+      const profiles = await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${instance.id}`));
+      expect(profiles).toHaveLength(0);
+    });
+
+    it("2. /finish succeeds once an owner grant with an oauth.access_token ref exists", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+
+      const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+      const { secret } = await writeConnectionCredential(db, {
+        companyId,
+        connectionName: instance.name,
+        configPath: "oauth.access_token",
+        label: "owner google token",
+        value: "owner-access-token-value",
+        ownerUserId: userA,
+        definitionKey: `test.google.${randomUUID()}`,
+      });
+      await db.insert(connectionGrants).values({
+        companyId,
+        connectionId: instance.id,
+        kind: "user",
+        subjectUserId: userA,
+        status: "active",
+        isDefault: false,
+        credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+        createdByUserId: userA,
+      });
+
+      const result = await service.finishGalleryAppConnection(
+        companyId,
+        instance.id,
+        { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [] } },
+        userActor(userA),
+      );
+      expect(result.connection.status).toBe("active");
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, instance.id));
+      expect(row!.status).toBe("active");
+    });
+
+    it("3. /finish on an API-key/org connection and on a manual public OAuth connection with no grant still works", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+
+      // (a) API-key/org connection
+      const [apiKeyApp] = await db.insert(toolApplications).values({ companyId, applicationKey: `app-${randomUUID()}`, name: "API Key App", type: "mcp_http", status: "active" }).returning();
+      const [apiKeyConn] = await db.insert(toolConnections).values({
+        companyId,
+        applicationId: apiKeyApp!.id,
+        name: "API Key Conn",
+        uid: `uid-${randomUUID()}`,
+        connectionKind: "custom",
+        ownership: "customer",
+        transport: "mcp_remote",
+        authKind: "api_key",
+        credentialPolicy: "shared",
+        status: "draft",
+        enabled: true,
+        config: { url: "https://example.com/mcp" },
+        transportConfig: { url: "https://example.com/mcp" },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      const apiKeyResult = await service.finishGalleryAppConnection(
+        companyId,
+        apiKeyConn!.id,
+        { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: "all_agents" },
+        userActor(userA),
+      );
+      expect(apiKeyResult.connection.status).toBe("active");
+
+      // (b) Manual public OAuth connection with no grant
+      const [manualApp] = await db.insert(toolApplications).values({ companyId, applicationKey: `app-${randomUUID()}`, name: "Manual OAuth App", type: "mcp_http", status: "active" }).returning();
+      const [manualConn] = await db.insert(toolConnections).values({
+        companyId,
+        applicationId: manualApp!.id,
+        name: "Manual OAuth Conn",
+        uid: `uid-${randomUUID()}`,
+        connectionKind: "custom",
+        ownership: "customer",
+        transport: "mcp_remote",
+        authKind: "oauth",
+        credentialPolicy: "shared",
+        status: "draft",
+        enabled: true,
+        config: { url: "https://example.com/mcp" },
+        transportConfig: { url: "https://example.com/mcp" },
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      }).returning();
+
+      const manualResult = await service.finishGalleryAppConnection(
+        companyId,
+        manualConn!.id,
+        { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: "all_agents" },
+        userActor(userA),
+      );
+      expect(manualResult.connection.status).toBe("active");
+    });
+
+    it("4. Gateway, owner is responsible and has no grant: rejects with user_authorization_required, and health becomes missing_secret with message", async () => {
+      const ctx = await cappedGoogleSetup();
+      const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
+      const gateway = createToolGatewayService(db, {
+        toolActionSigningSecret: "s5-owner-cap-signing-secret",
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: remote,
+      } as never);
+
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({ companyId: ctx.companyId, agentId: ctx.agent.id, status: "running", contextSnapshot: {}, responsibleUserId: ctx.userA })
+        .returning();
+      const session = await gateway.createSession({ companyId: ctx.companyId, agentId: ctx.agent.id, runId: run!.id });
+
+      const allListed = await gateway.listToolsForSession(session.token);
+      const readName = allListed.find((tool) => tool.connectionId === ctx.instance.id && tool.name.includes("gmail-read"))?.name;
+      expect(readName).toBeTruthy();
+
+      await expect(
+        gateway.executeTool({ sessionToken: session.token, tool: readName!, parameters: {} }),
+      ).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+      const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, ctx.instance.id));
+      expect(updated!.healthStatus).toBe("missing_secret");
+      expect(updated!.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+    });
+
+    it("5. Gateway, responsible user ≠ owner and the owner HAS a grant: rejects, and health is UNCHANGED", async () => {
+      const ctx = await cappedGoogleSetup();
+      // Owner A has a grant with token
+      const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+      const { secret } = await writeConnectionCredential(db, {
+        companyId: ctx.companyId,
+        connectionName: ctx.instance.name,
+        configPath: "oauth.access_token",
+        label: "owner google token",
+        value: "owner-access-token-value",
+        ownerUserId: ctx.userA,
+        definitionKey: `test.google.${randomUUID()}`,
+      });
+      await db.insert(connectionGrants).values({
+        companyId: ctx.companyId,
+        connectionId: ctx.instance.id,
+        kind: "user",
+        subjectUserId: ctx.userA,
+        status: "active",
+        isDefault: false,
+        credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+        createdByUserId: ctx.userA,
+      });
+      // Set initial healthStatus to "ok"
+      await db.update(toolConnections).set({ healthStatus: "ok", healthMessage: "Connected" }).where(eq(toolConnections.id, ctx.instance.id));
+
+      const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
+      const gateway = createToolGatewayService(db, {
+        toolActionSigningSecret: "s5-owner-cap-signing-secret",
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: remote,
+      } as never);
+
+      // Responsible user is userB (≠ owner userA)
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({ companyId: ctx.companyId, agentId: ctx.agent.id, status: "running", contextSnapshot: {}, responsibleUserId: ctx.userB })
+        .returning();
+      const session = await gateway.createSession({ companyId: ctx.companyId, agentId: ctx.agent.id, runId: run!.id });
+
+      const allListed = await gateway.listToolsForSession(session.token);
+      const readName = allListed.find((tool) => tool.connectionId === ctx.instance.id && tool.name.includes("gmail-read"))?.name;
+      expect(readName).toBeTruthy();
+
+      await expect(
+        gateway.executeTool({ sessionToken: session.token, tool: readName!, parameters: {} }),
+      ).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+      const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, ctx.instance.id));
+      expect(updated!.healthStatus).toBe("ok");
+      expect(updated!.healthMessage).toBe("Connected");
+    });
+
+    it("5b. Gateway, responsible user ≠ owner and the owner HAS NO grant: rejects, and health is UNCHANGED", async () => {
+      const ctx = await cappedGoogleSetup();
+      // Owner A has NO grant.
+      // Set initial healthStatus to "ok"
+      await db.update(toolConnections).set({ healthStatus: "ok", healthMessage: "Connected" }).where(eq(toolConnections.id, ctx.instance.id));
+
+      const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
+      const gateway = createToolGatewayService(db, {
+        toolActionSigningSecret: "s5-owner-cap-signing-secret",
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: remote,
+      } as never);
+
+      // Responsible user is userB (≠ owner userA)
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({ companyId: ctx.companyId, agentId: ctx.agent.id, status: "running", contextSnapshot: {}, responsibleUserId: ctx.userB })
+        .returning();
+      const session = await gateway.createSession({ companyId: ctx.companyId, agentId: ctx.agent.id, runId: run!.id });
+
+      const allListed = await gateway.listToolsForSession(session.token);
+      const readName = allListed.find((tool) => tool.connectionId === ctx.instance.id && tool.name.includes("gmail-read"))?.name;
+      expect(readName).toBeTruthy();
+
+      await expect(
+        gateway.executeTool({ sessionToken: session.token, tool: readName!, parameters: {} }),
+      ).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+      const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, ctx.instance.id));
+      // Non-owner run must NOT mutate connection health to missing_secret even when owner has no grant
+      expect(updated!.healthStatus).toBe("ok");
+      expect(updated!.healthMessage).toBe("Connected");
+    });
+
+    it("6. Gateway idempotence: two failing calls produce exactly one health update", async () => {
+      const ctx = await cappedGoogleSetup();
+      const remote = vi.fn(async (_url: string, init?: RequestInit) => mcpRemoteResponse(init));
+      const gateway = createToolGatewayService(db, {
+        toolActionSigningSecret: "s5-owner-cap-signing-secret",
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: remote,
+      } as never);
+
+      const [run] = await db
+        .insert(heartbeatRuns)
+        .values({ companyId: ctx.companyId, agentId: ctx.agent.id, status: "running", contextSnapshot: {}, responsibleUserId: ctx.userA })
+        .returning();
+      const session = await gateway.createSession({ companyId: ctx.companyId, agentId: ctx.agent.id, runId: run!.id });
+
+      const allListed = await gateway.listToolsForSession(session.token);
+      const readName = allListed.find((tool) => tool.connectionId === ctx.instance.id && tool.name.includes("gmail-read"))?.name;
+      expect(readName).toBeTruthy();
+
+      await expect(
+        gateway.executeTool({ sessionToken: session.token, tool: readName!, parameters: {} }),
+      ).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+      const [firstUpdated] = await db.select().from(toolConnections).where(eq(toolConnections.id, ctx.instance.id));
+      expect(firstUpdated!.healthStatus).toBe("missing_secret");
+
+      const auditEvents1 = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, ctx.companyId),
+            eq(activityLog.action, "tool_gateway.personal_credential_resolution_error"),
+          ),
+        );
+      expect(auditEvents1).toHaveLength(1);
+
+      // Second failing call
+      await expect(
+        gateway.executeTool({ sessionToken: session.token, tool: readName!, parameters: {} }),
+      ).rejects.toMatchObject({ status: 403, reasonCode: "user_authorization_required" });
+
+      const auditEvents2 = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, ctx.companyId),
+            eq(activityLog.action, "tool_gateway.personal_credential_resolution_error"),
+          ),
+        );
+      expect(auditEvents2).toHaveLength(1);
+    });
+
+    it("7. listAppsNeedingAttention includes credential-less instance and excludes healthy instance", async () => {
+      const { companyId, userA, userB } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+
+      // Instance 1: userA has no grant
+      const instance1 = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+      await db.update(toolConnections).set({ status: "active", enabled: true, healthStatus: "ok" }).where(eq(toolConnections.id, instance1.id));
+
+      // Instance 2: userB has a grant with token
+      const instance2 = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userB);
+      await db.update(toolConnections).set({ status: "active", enabled: true, healthStatus: "ok" }).where(eq(toolConnections.id, instance2.id));
+      const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+      const { secret } = await writeConnectionCredential(db, {
+        companyId,
+        connectionName: instance2.name,
+        configPath: "oauth.access_token",
+        label: "owner google token",
+        value: "owner-access-token-value",
+        ownerUserId: userB,
+        definitionKey: `test.google.${randomUUID()}`,
+      });
+      await db.insert(connectionGrants).values({
+        companyId,
+        connectionId: instance2.id,
+        kind: "user",
+        subjectUserId: userB,
+        status: "active",
+        isDefault: false,
+        credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+        createdByUserId: userB,
+      });
+
+      const attention = await service.listAppsNeedingAttention(companyId);
+      expect(attention.totals.health).toBe(1);
+      const app1 = attention.apps.find((a) => a.connection.id === instance1.id);
+      expect(app1).toBeDefined();
+      expect(app1!.healthNeedsAttention).toBe(true);
+      expect(app1!.reasons).toContain("health");
+      expect(app1!.connection.healthStatus).toBe("missing_secret");
+      expect(app1!.connection.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+
+      const app2 = attention.apps.find((a) => a.connection.id === instance2.id);
+      expect(app2).toBeUndefined();
+
+      // Verify DB row remains unchanged (stays read-only)
+      const [row1] = await db.select().from(toolConnections).where(eq(toolConnections.id, instance1.id));
+      expect(row1!.healthStatus).toBe("ok");
+    });
+
+    it("8. get/listConnections with a viewer are annotated; without a viewer they return raw values", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+      // userA has no grant. Set DB healthStatus to "ok".
+      await db.update(toolConnections).set({ status: "active", enabled: true, healthStatus: "ok", healthMessage: "All good" }).where(eq(toolConnections.id, instance.id));
+
+      // With viewer
+      const withViewerGet = await service.getConnection(instance.id, companyId, userA);
+      expect(withViewerGet.healthStatus).toBe("missing_secret");
+      expect(withViewerGet.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+      expect(withViewerGet.requiresReauthorization).toBe(true);
+
+      const withViewerList = await service.listConnections(companyId, userA);
+      const itemWithViewer = withViewerList.find((c) => c.id === instance.id);
+      expect(itemWithViewer!.healthStatus).toBe("missing_secret");
+      expect(itemWithViewer!.requiresReauthorization).toBe(true);
+
+      // Without viewer
+      const withoutViewerGet = await service.getConnection(instance.id, companyId, undefined);
+      expect(withoutViewerGet.healthStatus).toBe("ok");
+      expect(withoutViewerGet.healthMessage).toBe("All good");
+
+      const withoutViewerList = await service.listConnections(companyId, undefined);
+      const itemWithoutViewer = withoutViewerList.find((c) => c.id === instance.id);
+      expect(itemWithoutViewer!.healthStatus).toBe("ok");
+    });
+
+    it("9. The sweep guard doesn't write ok, and the exact status is asserted", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+      // userA has no grant. Set initial DB healthStatus to "ok".
+      await db.update(toolConnections).set({ status: "active", enabled: true, healthStatus: "ok" }).where(eq(toolConnections.id, instance.id));
+
+      await expect(
+        service.checkHealth(instance.id, userActor(userA)),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: { code: "oauth_sign_in_required" },
+      });
+
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, instance.id));
+      expect(row!.healthStatus).toBe("missing_secret");
+      expect(row!.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+    });
+
+    it("8b. Ownerless personal instances are annotated as missing_secret with viewer and appear in listAppsNeedingAttention", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+      // Simulate legacy or orphaned ownerless row by clearing createdByUserId
+      await db.update(toolConnections).set({
+        createdByUserId: null,
+        status: "active",
+        enabled: true,
+        healthStatus: "ok",
+        healthMessage: "All good",
+      }).where(eq(toolConnections.id, instance.id));
+
+      // 1. With viewer, getConnection & listConnections annotate as missing_secret
+      const withViewerGet = await service.getConnection(instance.id, companyId, userA);
+      expect(withViewerGet.healthStatus).toBe("missing_secret");
+      expect(withViewerGet.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+      expect(withViewerGet.requiresReauthorization).toBe(true);
+
+      const withViewerList = await service.listConnections(companyId, userA);
+      const itemWithViewer = withViewerList.find((c) => c.id === instance.id);
+      expect(itemWithViewer!.healthStatus).toBe("missing_secret");
+      expect(itemWithViewer!.requiresReauthorization).toBe(true);
+
+      // 2. Without viewer, raw un-annotated DB values are returned
+      const withoutViewerGet = await service.getConnection(instance.id, companyId, undefined);
+      expect(withoutViewerGet.healthStatus).toBe("ok");
+
+      // 3. listAppsNeedingAttention includes the ownerless personal instance
+      const needingAttention = await service.listAppsNeedingAttention(companyId);
+      const appItem = needingAttention.apps.find((a) => a.connection.id === instance.id);
+      expect(appItem).toBeTruthy();
+      expect(appItem!.reasons).toContain("health");
+      expect(appItem!.connection.healthStatus).toBe("missing_secret");
+      expect(appItem!.connection.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+    });
+
+    it("10. finishGalleryAppConnection returns createdProfile: true for fresh profile and false when profile exists", async () => {
+      const { companyId, userA } = await seededCompanyWithMembers();
+      const service = svc();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+
+      const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+      const { secret } = await writeConnectionCredential(db, {
+        companyId,
+        connectionName: instance.name,
+        configPath: "oauth.access_token",
+        label: "owner google token",
+        value: "owner-access-token-value",
+        ownerUserId: userA,
+        definitionKey: `test.google.${randomUUID()}`,
+      });
+      await db.insert(connectionGrants).values({
+        companyId,
+        connectionId: instance.id,
+        kind: "user",
+        subjectUserId: userA,
+        status: "active",
+        isDefault: false,
+        credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+        createdByUserId: userA,
+      });
+
+      // First finish: creates profile
+      const result1 = await service.finishGalleryAppConnection(
+        companyId,
+        instance.id,
+        { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [] } },
+        userActor(userA),
+      );
+      expect(result1.connection.status).toBe("active");
+      expect(result1.createdProfile).toBe(true);
+
+      // Second finish: profile already exists
+      const result2 = await service.finishGalleryAppConnection(
+        companyId,
+        instance.id,
+        { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [] } },
+        userActor(userA),
+      );
+      expect(result2.connection.status).toBe("active");
+      expect(result2.createdProfile).toBe(false);
+    });
+
+    it("11. owner callback failure marks error and non-owner callback failure doesn't", async () => {
+      const { companyId, userA, userB } = await seededCompanyWithMembers();
+      const seed = (await googleSeed(companyId))!;
+      const instance = await svc().ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+
+      // Configure mock OAuth endpoints on instance.config so endpoint discovery succeeds
+      // without extra network calls and directs token exchange to a mock token endpoint.
+      await db
+        .update(toolConnections)
+        .set({
+          status: "draft",
+          healthStatus: "ok",
+          healthMessage: "Connected",
+          lastError: null,
+          config: {
+            ...((instance.config as Record<string, unknown>) ?? {}),
+            oauth: {
+              authorizationUrl: "https://8.8.8.8/authorize",
+              tokenUrl: "https://8.8.8.8/token",
+              clientRegistrationSource: "manual",
+              clientId: "test-client",
+              clientTokenEndpointAuthMethod: "none",
+            },
+          },
+        })
+        .where(eq(toolConnections.id, instance.id));
+
+      // Service with remoteHttpRequest returning 401 invalid_client on token exchange
+      const failingService = toolAccessService(db, {
+        remoteHttpRequest: async () =>
+          new Response(JSON.stringify({ error: "invalid_client" }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+      });
+
+      // Part A: Owner userA callback failure marks connection as error
+      const ownerState = randomUUID();
+      await db.insert(toolOauthStates).values({
+        state: ownerState,
+        companyId,
+        connectionId: instance.id,
+        codeVerifier: "verifier-owner",
+        createdByActorType: "user",
+        createdByActorId: userA,
+        subjectUserId: userA,
+        expiresAt: new Date(Date.now() + 600_000),
+      });
+
+      await expect(
+        failingService.completeOAuthCallback({
+          state: ownerState,
+          code: "owner-auth-code",
+          redirectUri: "https://paperclip.example.test/api/tools/oauth/callback",
+          actor: userActor(userA),
+        }),
+      ).rejects.toMatchObject({ details: { code: "oauth_token_exchange_failed" } });
+
+      const [rowAfterOwner] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instance.id));
+      expect(rowAfterOwner!.healthStatus).toBe("error");
+      expect(rowAfterOwner!.healthMessage).toBe("Sign-in failed. Reconnect this app to continue.");
+      expect(rowAfterOwner!.lastError).toBe("oauth_token_exchange_failed");
+
+      // Reset connection health back to ok
+      await db
+        .update(toolConnections)
+        .set({ healthStatus: "ok", healthMessage: "Connected", lastError: null })
+        .where(eq(toolConnections.id, instance.id));
+
+      // Part B: Non-owner userB callback failure does NOT mark connection as error
+      const nonOwnerState = randomUUID();
+      await db.insert(toolOauthStates).values({
+        state: nonOwnerState,
+        companyId,
+        connectionId: instance.id,
+        codeVerifier: "verifier-non-owner",
+        createdByActorType: "user",
+        createdByActorId: userB,
+        subjectUserId: userB,
+        expiresAt: new Date(Date.now() + 600_000),
+      });
+
+      await expect(
+        failingService.completeOAuthCallback({
+          state: nonOwnerState,
+          code: "non-owner-auth-code",
+          redirectUri: "https://paperclip.example.test/api/tools/oauth/callback",
+          actor: userActor(userB),
+        }),
+      ).rejects.toMatchObject({ details: { code: "oauth_token_exchange_failed" } });
+
+      const [rowAfterNonOwner] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instance.id));
+      expect(rowAfterNonOwner!.healthStatus).toBe("ok");
+      expect(rowAfterNonOwner!.healthMessage).toBe("Connected");
+      expect(rowAfterNonOwner!.lastError).toBeNull();
+    });
+
+    it("12. actual sweepConnectionHealth cross-company: A personal owner no grant => missing_secret, B owner active access-token grant not missing_secret", async () => {
+      const companyA = await seededCompanyWithMembers();
+      const companyB = await seededCompanyWithMembers();
+
+      const seedA = (await googleSeed(companyA.companyId))!;
+      const instanceA = await svc().ensurePersonalDefaultMcpInstance(companyA.companyId, seedA.id, companyA.userA);
+
+      const seedB = (await googleSeed(companyB.companyId))!;
+      const instanceB = await svc().ensurePersonalDefaultMcpInstance(companyB.companyId, seedB.id, companyB.userA);
+
+      // Company A: instanceA owner (companyA.userA) has NO grant.
+      // Set to active & enabled, healthStatus ok, past healthCheckedAt so it's due for sweep.
+      await db
+        .update(toolConnections)
+        .set({
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          healthMessage: "Connected",
+          healthCheckedAt: new Date(Date.now() - 3600_000),
+        })
+        .where(eq(toolConnections.id, instanceA.id));
+
+      // Company B: instanceB owner (companyB.userA) HAS an active user grant with oauth.access_token.
+      const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+      const { secret: secretB } = await writeConnectionCredential(db, {
+        companyId: companyB.companyId,
+        connectionName: instanceB.name,
+        configPath: "oauth.access_token",
+        label: "owner google token B",
+        value: "owner-b-token-value",
+        ownerUserId: companyB.userA,
+        definitionKey: `test.google.${randomUUID()}`,
+      });
+      await db.insert(connectionGrants).values({
+        companyId: companyB.companyId,
+        connectionId: instanceB.id,
+        kind: "user",
+        subjectUserId: companyB.userA,
+        status: "active",
+        isDefault: false,
+        credentialSecretRefs: [{ secretId: secretB.id, configPath: "oauth.access_token" }],
+        createdByUserId: companyB.userA,
+      });
+
+      const { syncConnectionCredentialBindings } = await import("../services/connection-credential-bindings.js");
+      await syncConnectionCredentialBindings(db, instanceB);
+
+      await db
+        .update(toolConnections)
+        .set({
+          status: "active",
+          enabled: true,
+          healthStatus: "ok",
+          healthMessage: "Connected",
+          healthCheckedAt: new Date(Date.now() - 3600_000),
+        })
+        .where(eq(toolConnections.id, instanceB.id));
+
+      const remote = vi.fn(async (_url: string, init?: RequestInit) =>
+        mcpRemoteResponse(init, { tools: [] }),
+      );
+      const sweepService = toolAccessService(db, {
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: remote,
+      });
+
+      // Run actual sweepConnectionHealth across both companies
+      await sweepService.sweepConnectionHealth({ staleAfterMs: 0 });
+
+      // Instance A in Company A has no owner grant => marked missing_secret
+      const [rowA] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instanceA.id));
+      expect(rowA!.healthStatus).toBe("missing_secret");
+      expect(rowA!.healthMessage).toBe("This app has no connected account. Click Connect to sign in again.");
+
+      // Instance B in Company B has active owner grant with access token => not missing_secret (remains ok)
+      const [rowB] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, instanceB.id));
+      expect(rowB!.healthStatus).not.toBe("missing_secret");
+      expect(rowB!.healthStatus).toBe("ok");
+    });
   });
 });
