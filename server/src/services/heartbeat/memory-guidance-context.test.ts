@@ -135,6 +135,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       },
       adapterType: "hermes_local",
     });
@@ -150,6 +151,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: true,
+        mem0AutoSyncOff: false,
       },
       adapterType: "hermes_local",
     });
@@ -172,6 +174,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: true,
+        mem0AutoSyncOff: false,
       },
       adapterType: "hermes_local",
     });
@@ -201,6 +204,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: true,
+        mem0AutoSyncOff: false,
       },
       adapterType: "hermes_local",
     });
@@ -225,6 +229,7 @@ describe("buildHeartbeatMemoryGuidanceContext", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: true,
+        mem0AutoSyncOff: false,
       },
       adapterType: "claude_local",
     });

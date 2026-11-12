@@ -6,3 +6,7 @@ patch_file=patches/0001-require-command-scan.patch
 patch_sha256=f05c5c004a6d8f480462f0d7c5b2f535cb728948e679c9e648933e5b6943100c
 postpatch_marker=TECH-7355-MANDATORY-COMMAND-SCAN
 extension_version=0.21.3+tech7355.2
+patch_file_2=patches/0002-mem0-auto-sync.patch
+patch_sha256_2=674b9d614b6077d0535583832453e9791ddcbc9f7e104346605df9a5669115d7
+postpatch_marker_2=TECH-8191-MEM0-AUTO-SYNC
+extension_version_2=0.21.3+tech8191.1

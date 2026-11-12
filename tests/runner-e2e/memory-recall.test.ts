@@ -547,6 +547,34 @@ describe("memory recall grader: baseline and hardened behavior", () => {
     expect(result.checks.find((c) => c.id === "hardened-noise-bounded")?.passed).toBe(true);
   });
 
+  it("evaluates auto-sync-zero-writes when mem0-auto-sync-off is enabled", () => {
+    const { marker, observation } = buildValidObservation("noise", 1, false);
+    const emptyObservation = { ...observation, memories: [] };
+    const passResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation: emptyObservation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off" },
+    });
+    expect(passResult.passed).toBe(true);
+    const zeroCheck = passResult.checks.find((c) => c.id === "auto-sync-zero-writes");
+    expect(zeroCheck?.passed).toBe(true);
+    expect(zeroCheck?.detail).toContain("Zero automatic memory writes observed");
+
+    const failResult = gradeMemoryRecall({
+      caseId: "noise",
+      rep: 1,
+      marker,
+      observation,
+      env: { PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off" },
+    });
+    expect(failResult.passed).toBe(false);
+    const failCheck = failResult.checks.find((c) => c.id === "auto-sync-zero-writes");
+    expect(failCheck?.passed).toBe(false);
+    expect(failCheck?.detail).toContain("Expected 0 automatic memory writes under mem0-auto-sync-off");
+  });
+
   it("throws defensively when an unimplemented hardening flag is passed to grader", () => {
     const { marker, observation } = buildValidObservation("implicit-recall", 1, false);
     expect(() =>
@@ -931,6 +959,7 @@ describe("server boot proof extraction and server-resolved flags", () => {
       hermesPromptSplit: false,
       agentScopedMem0: false,
       capabilityMemoryGuidance: false,
+      mem0AutoSyncOff: false,
     };
 
     const result = gradeMemoryRecall({

@@ -383,7 +383,8 @@ export function extractBootProof(serverLogContent: string): ServerBootProof {
             typeof parsed.hermesMemoryConfig === "boolean" &&
             typeof parsed.hermesPromptSplit === "boolean" &&
             typeof parsed.agentScopedMem0 === "boolean" &&
-            typeof parsed.capabilityMemoryGuidance === "boolean"
+            typeof parsed.capabilityMemoryGuidance === "boolean" &&
+            (parsed.mem0AutoSyncOff === undefined || typeof parsed.mem0AutoSyncOff === "boolean")
           ) {
             if (
               (currentBoot.flags !== undefined && currentBoot.initLine !== undefined) ||

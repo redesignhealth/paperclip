@@ -223,6 +223,7 @@ describe("runtime connection tool delivery", () => {
       expect(flags.hermesMemoryConfig).toBe(true);
       expect(flags.agentScopedMem0).toBe(true);
       expect(flags.hermesPromptSplit).toBe(true);
+      expect(flags.mem0AutoSyncOff).toBe(true);
     });
   });
 });

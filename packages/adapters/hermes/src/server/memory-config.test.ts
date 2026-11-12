@@ -187,6 +187,55 @@ describe("memory-config", () => {
       ).toThrow("conflicting syncMaxChars and sync_max_chars values provided");
     });
 
+    it("accepts valid autoSync and auto_sync boolean values", () => {
+      const c1 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        autoSync: false,
+      });
+      expect(c1.autoSync).toBe(false);
+
+      const c2 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        auto_sync: true,
+      });
+      expect(c2.autoSync).toBe(true);
+
+      const c3 = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        autoSync: true,
+        auto_sync: true,
+      });
+      expect(c3.autoSync).toBe(true);
+    });
+
+    it("rejects non-boolean autoSync values ('false', 'true', 0, 1)", () => {
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, autoSync: "false" as unknown as boolean }),
+      ).toThrow(/autoSync must be a boolean/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, auto_sync: "true" as unknown as boolean }),
+      ).toThrow(/autoSync must be a boolean/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, autoSync: 0 as unknown as boolean }),
+      ).toThrow(/autoSync must be a boolean/);
+
+      expect(() =>
+        validateHermesMemoryConfig({ ...validMemoryInput, auto_sync: 1 as unknown as boolean }),
+      ).toThrow(/autoSync must be a boolean/);
+    });
+
+    it("throws on camel/snake conflict for autoSync and auto_sync", () => {
+      expect(() =>
+        validateHermesMemoryConfig({
+          ...validMemoryInput,
+          autoSync: true,
+          auto_sync: false,
+        }),
+      ).toThrow("conflicting autoSync and auto_sync values provided");
+    });
+
     it("fails closed on non-mem0 provider or non-oss mode", () => {
       expect(() =>
         validateHermesMemoryConfig({
@@ -992,6 +1041,7 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
 
       expect(Object.keys(canonical)).toEqual(["mode", "oss", "user_id", "agent_id"]);
@@ -1000,8 +1050,10 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       expect(serialized).not.toContain("sync_max_chars");
+      expect(serialized).not.toContain("auto_sync");
     });
 
     it("preserves exact serialized key order with flag on (sync_max_chars immediately after agent_id)", () => {
@@ -1014,6 +1066,7 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
 
       expect(Object.keys(canonicalWithChars)).toEqual([
@@ -1030,6 +1083,7 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       const lines = serializedWithChars.split("\n");
       const agentIdIdx = lines.findIndex((l) => l.includes('"agent_id":'));
@@ -1043,8 +1097,81 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       expect(canonicalDefault.sync_max_chars).toBe(6000);
+    });
+
+    it("does not emit auto_sync when mem0AutoSyncOff flag is off, even if configured in input", () => {
+      const validated = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        autoSync: false,
+      });
+      const canonical = buildCanonicalMem0Object(validated, {
+        hermesMemoryConfig: false,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
+      });
+      expect(Object.keys(canonical)).toEqual(["mode", "oss", "user_id", "agent_id"]);
+      expect(canonical.auto_sync).toBeUndefined();
+
+      const serialized = serializeMem0Json(validated, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
+      });
+      expect(serialized).not.toContain("auto_sync");
+    });
+
+    it("emits auto_sync: false immediately after sync_max_chars when mem0AutoSyncOff is on", () => {
+      const validated = validateHermesMemoryConfig(validMemoryInput);
+      const canonical = buildCanonicalMem0Object(validated, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: true,
+      });
+      expect(Object.keys(canonical)).toEqual([
+        "mode",
+        "oss",
+        "user_id",
+        "agent_id",
+        "sync_max_chars",
+        "auto_sync",
+      ]);
+      expect(canonical.auto_sync).toBe(false);
+
+      const serialized = serializeMem0Json(validated, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: true,
+      });
+      const lines = serialized.split("\n");
+      const syncMaxCharsIdx = lines.findIndex((l) => l.includes('"sync_max_chars":'));
+      const autoSyncIdx = lines.findIndex((l) => l.includes('"auto_sync":'));
+      expect(autoSyncIdx).toBe(syncMaxCharsIdx + 1);
+    });
+
+    it("forces auto_sync: false under flag even if config specifies autoSync: true", () => {
+      const validated = validateHermesMemoryConfig({
+        ...validMemoryInput,
+        autoSync: true,
+      });
+      const canonical = buildCanonicalMem0Object(validated, {
+        hermesMemoryConfig: true,
+        hermesPromptSplit: false,
+        agentScopedMem0: false,
+        capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: true,
+      });
+      expect(canonical.auto_sync).toBe(false);
     });
   });
 
@@ -1055,6 +1182,7 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       expect(yaml).toBe("memory:\n  provider: mem0\n");
     });
@@ -1065,6 +1193,7 @@ describe("memory-config", () => {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       });
       expect(yaml).toBe(
         "memory:\n  provider: mem0\n  memory_enabled: false\n  user_profile_enabled: false\n",

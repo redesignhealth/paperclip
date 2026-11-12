@@ -490,6 +490,17 @@ export function gradeMemoryRecall(input: {
               : `Noise ratio under hardening must be bounded <= 30% (observed: ${(summary.noiseRatio * 100).toFixed(1)}%, count: ${summary.noiseCount}/${summary.totalCount}).`,
         );
       }
+
+      if (flags.mem0AutoSyncOff) {
+        const zeroWrites = memoriesArray.length === 0;
+        check(
+          "auto-sync-zero-writes",
+          zeroWrites,
+          zeroWrites
+            ? "Zero automatic memory writes observed with auto_sync disabled."
+            : `Expected 0 automatic memory writes under mem0-auto-sync-off, but observed ${memoriesArray.length}.`,
+        );
+      }
       break;
     }
   }

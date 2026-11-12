@@ -447,11 +447,26 @@ Executing this suite requires:
 
 ### Hardening Flags and Blocked Lanes
 
-- **Implemented flags on this branch**: `hermes-memory-config`, `hermes-prompt-split`.
+- **Implemented flags on this branch**: `hermes-memory-config`, `hermes-prompt-split`, `mem0-auto-sync-off`.
 - **Blocked pending future tickets**:
-  - `agent-scoped-mem0` is blocked pending TECH-8191.
+  - `agent-scoped-mem0` is evaluated via per-agent isolation branching (`memory-recall-scoring.ts:401`), requiring completed scope migration.
   - `capability-memory-guidance` is blocked pending TECH-8192.
   Enabling either unimplemented token in `PAPERCLIP_MEMORY_HARDENING` causes preflight and grading to fail closed with an explicit error naming the token and ticket.
+
+### Database Observation SQL Note
+
+In PostgreSQL pgvector, `mem0_memories` stores memory attributes inside its JSON `payload` column (`id`, `vector`, `payload`), rather than separate top-level columns. Use payload projection:
+
+```sql
+SELECT id::text AS id,
+       payload->>'data'       AS data,
+       payload->>'agent_id'   AS agent_id,
+       payload->>'user_id'    AS user_id,
+       payload->>'created_at' AS created_at
+FROM mem0_memories;
+```
+
+Delta-counting snapshots `SELECT id::text FROM mem0_memories ORDER BY id ASC` before and after task runs to measure exact new rows.
 
 ### Live Validation Status
 

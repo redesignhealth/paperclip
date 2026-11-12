@@ -144,6 +144,7 @@ export async function runMemoryRecallFlow(input: {
         hermesPromptSplit: false,
         agentScopedMem0: false,
         capabilityMemoryGuidance: false,
+        mem0AutoSyncOff: false,
       },
       toString() {
         return this.line;
