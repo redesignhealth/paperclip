@@ -15668,7 +15668,8 @@ export function toolAccessService(
       }
 
       const reviewedAt = new Date();
-      if (reviewedIds.length > 0) {
+      const activatedReviewedIds = reviewedIds.filter((id) => enabledIds.includes(id));
+      if (activatedReviewedIds.length > 0) {
         await tx
           .update(toolCatalogEntries)
           .set({
@@ -15686,7 +15687,7 @@ export function toolAccessService(
             and(
               eq(toolCatalogEntries.companyId, companyId),
               eq(toolCatalogEntries.connectionId, connection.id),
-              inArray(toolCatalogEntries.id, reviewedIds),
+              inArray(toolCatalogEntries.id, activatedReviewedIds),
               eq(toolCatalogEntries.status, "quarantined"),
             ),
           );

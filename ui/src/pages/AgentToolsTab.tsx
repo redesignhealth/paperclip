@@ -12,6 +12,7 @@ import { Link } from "@/lib/router";
 import { queryKeys } from "../lib/queryKeys";
 import { toolsApi } from "../api/tools";
 import { authApi } from "../api/auth";
+import { healthApi } from "@/api/health";
 import { oauthStartFailureMessage } from "@/lib/oauth-start-feedback";
 import { accessApi } from "../api/access";
 import { buildCompanyUserProfileMap, type CompanyUserProfile } from "@/lib/company-members";
@@ -65,6 +66,29 @@ function isOwnPersonalInstance(connection: ToolConnection, currentUserId: string
     Boolean(connection.createdByUserId) &&
     connection.createdByUserId === currentUserId
   );
+}
+
+function hasPersonalInstanceConflict(
+  connection: ToolConnection,
+  connections: ToolConnection[],
+  agentId: string,
+  isManagedConnection: (connection: ToolConnection) => boolean,
+  draft: Record<string, boolean>,
+): boolean {
+  if (!isPersonalDefaultMcpInstance(connection.config)) return false;
+  const config = connection.config as Record<string, unknown> | null | undefined;
+  const entryKey = config?.paperclipDefaultMcpEntry;
+  if (!entryKey || typeof entryKey !== "string") return false;
+  return connections.some((other) => {
+    if (other.id === connection.id) return false;
+    if (!isPersonalDefaultMcpInstance(other.config)) return false;
+    const otherConfig = other.config as Record<string, unknown> | null | undefined;
+    if (otherConfig?.paperclipDefaultMcpEntry !== entryKey) return false;
+    if (!other.createdByUserId || other.createdByUserId === connection.createdByUserId) return false;
+    const installState = installStateFrom(other.installs, { ignoreCompanyInstall: isManagedConnection(other) });
+    const isInstalled = draft[other.id] ?? isAgentInstalled(installState, agentId);
+    return isInstalled;
+  });
 }
 
 function isGitHubConnection(connection: ToolConnection): boolean {
@@ -344,6 +368,7 @@ function InstalledAppsSection({
               const isOwn = isOwnPersonalInstance(connection, currentUserId);
               // Personal-instance mutation fails closed until the verified session identity has resolved.
               const identityPending = isPersonal && !currentUserId;
+              const hasConflict = isPersonal && hasPersonalInstanceConflict(connection, connections, agentId, isManagedConnection, draft);
               // A peer's or unverified instance may only be cancelled/restored while the server still has it installed here;
               // a foreign instance that is not already installed can never be switched on.
               const serverInstalled = isAgentInstalled(installState, agentId);
@@ -353,7 +378,13 @@ function InstalledAppsSection({
                   <label className="flex items-start gap-3">
                     <Checkbox
                       checked={checked}
-                      disabled={installedForAll || rowPending || identityPending || (isPersonal && !isOwn && !serverInstalled)}
+                      disabled={
+                        installedForAll ||
+                        rowPending ||
+                        identityPending ||
+                        (isPersonal && !isOwn && !serverInstalled) ||
+                        (isPersonal && isOwn && !checked && hasConflict)
+                      }
                       aria-label={`Install ${connection.name} on ${agentName}`}
                       onCheckedChange={(next) => onChange(connection.id, Boolean(next))}
                     />
@@ -369,9 +400,11 @@ function InstalledAppsSection({
                       <span className="mt-0.5 block text-xs text-muted-foreground">
                         {installedForAll
                           ? "Installed from the app page for every agent. Remove the all-agents install there."
-                          : checked
-                            ? "Loaded into this agent's runtime context."
-                            : INSTALLED_HINT}
+                          : hasConflict && !checked
+                            ? "Another user's personal instance is already installed for this app on this agent."
+                            : checked
+                              ? "Loaded into this agent's runtime context."
+                              : INSTALLED_HINT}
                       </span>
                     </span>
                   </label>
@@ -476,11 +509,12 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
   const skipNextInstallAutosaveRef = useRef(true);
   const failedInstallDraftRef = useRef<{ connectionId: string; installed: boolean } | null>(null);
 
+  const { data: health } = useQuery({ queryKey: queryKeys.health, queryFn: healthApi.get });
   const { data: session } = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
   });
-  const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  const currentUserId = session?.user?.id ?? session?.session?.userId ?? (health?.deploymentMode === "local_trusted" ? "local-board" : null);
   // Personal instances whose ownership is not verified as "mine" (a peer's, a missing owner's, or any while the session is unresolved).
   const isUnverifiedPersonalInstance = (connection: ToolConnection) =>
     isPersonalDefaultMcpInstance(connection.config) &&

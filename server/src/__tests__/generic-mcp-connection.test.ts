@@ -4588,7 +4588,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         .sort();
       expect(statusesAfterRefresh).toEqual([
         ["gmail_search", "active"],
-        ["gmail_send", "active"],
+        ["gmail_send", "quarantined"],
       ]);
       const profileEntriesAfterRefresh = await db
         .select()

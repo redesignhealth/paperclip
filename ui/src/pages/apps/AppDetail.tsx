@@ -34,6 +34,7 @@ import { consumeSkillSourceReturn } from "@/lib/skill-source-connect-return";
 import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { accessApi } from "@/api/access";
+import { authApi } from "@/api/auth";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
 import { installStateFrom, isPersonalDefaultMcpInstance, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
 import { navigateTopLevel } from "@/lib/browserNavigation";
@@ -160,6 +161,11 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     queryKey: queryKeys.tools.connectionGrants(connectionId),
     queryFn: () => toolsApi.listConnectionGrants(connectionId),
     enabled: !!connectionId && !!activeTab,
+  });
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+    enabled: !!activeTab,
   });
 
   const connection = connectionQuery.data;
@@ -298,24 +304,42 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     () => installStateFrom(installsQuery.data?.installs ?? connection?.installs),
     [connection?.installs, installsQuery.data?.installs],
   );
+  const currentUserId = grantsQuery.data?.currentUserId ?? session?.user?.id ?? session?.session?.userId ?? null;
+  const isPersonal = isPersonalDefaultMcpInstance(connection?.config);
+  const isPersonalOwner = Boolean(
+    isPersonal
+    && connection?.createdByUserId
+    && currentUserId
+    && connection.createdByUserId === currentUserId,
+  );
   const access = useMemo(
-    () => accessForConnection(
-      accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install),
-      install,
-      isPersonalDefaultMcpInstance(connection?.config),
-    ),
-    [connection?.connectionPurpose, connection?.config, profile, install],
+    () => {
+      const fromProfile = accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install);
+      if (isPersonalOwner) {
+        const agentIds = install.agentIds.size > 0
+          ? install.agentIds
+          : fromProfile.agentIds;
+        return { mode: "specific" as const, agentIds: new Set(agentIds) };
+      }
+      return accessForConnection(
+        fromProfile,
+        install,
+        isPersonal,
+      );
+    },
+    [connection?.connectionPurpose, connection?.config, profile, install, isPersonalOwner, isPersonal],
   );
   const managesRemoteMcpAccess = isRemoteMcpConnectorMethod(connection?.config?.sourceTemplateKey, connection?.config?.connectionMethodKey);
   const agents = agentsQuery.data ?? [];
   // On an ordinary tool connection the agent picker IS the install: an agent only gets a connection's tools
   // with an explicit per-agent install row (a permission binding does not turn a default-MCP agent on), so
-  // choosing an agent installs it and clearing it uninstalls it. Personal default-MCP instances install through
-  // their own guarded setup path, and AI / remote-MCP connections manage installs elsewhere.
+  // choosing an agent installs it and clearing it uninstalls it. The owner of a personal default-MCP instance
+  // also manages installs directly through this picker, while non-owners, AI connections, and remote-MCP
+  // connections manage installs elsewhere.
   const pickerInstallsAgents =
     connection?.connectionPurpose !== "ai"
     && !managesRemoteMcpAccess
-    && !isPersonalDefaultMcpInstance(connection?.config)
+    && (!isPersonal || isPersonalOwner)
     && managedDefaultMcpKind(connection?.config) === null;
   const disconnectRemote = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
@@ -797,7 +821,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                     ? "Shell Git and gh use this account for the run and are not constrained by per-tool Ask-first controls."
                     : undefined
                 }
-                onSaveAccess={(next) => apply({ access: connection.connectionPurpose === "ai" || managesRemoteMcpAccess || pickerInstallsAgents ? next : accessIncludingInstalls(next, install) })}
+                onSaveAccess={(next) => apply({ access: next })}
                 onRefreshActions={() => refreshTools.mutate()}
                 onSetActionPermission={(ids, next) => apply(actionPermissionMutation(ids, next, enabledIds, askFirstIds))}
                 onReviewQuarantined={reviewQuarantined}
@@ -1057,16 +1081,6 @@ function accessFrom(
   return install.onAll
     ? { mode: "all", agentIds: new Set() }
     : { mode: "specific", agentIds: new Set(install.agentIds) };
-}
-
-function accessIncludingInstalls(next: AccessDraft, install: InstallState): AccessDraft {
-  if (install.onAll || next.mode === "all") {
-    return { mode: "all", agentIds: new Set() };
-  }
-  return {
-    mode: "specific",
-    agentIds: new Set([...next.agentIds, ...install.agentIds]),
-  };
 }
 
 function galleryEntryFor(
