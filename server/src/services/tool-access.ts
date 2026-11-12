@@ -8916,6 +8916,9 @@ export function toolAccessService(
       // tools a successful, sufficiently authorized discovery actually removed.
       const removedStatus = nativeDaytona ? "removed" : "disabled";
       const removedIds = existingRows.filter((entry) => !discoveredNames.has(entry.toolName) && entry.status !== removedStatus
+        && !(entry.status === "quarantined"
+          && (entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED
+            || entry.quarantineReason === TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED))
         && !(otherWorkspaceGrants.some((scopes) => isGoogleWorkspaceToolGranted(entry.toolName, scopes))
           && !isGoogleWorkspaceToolGranted(entry.toolName, selectedWorkspaceScopes)
           && !unavailableServices.includes(googleWorkspaceToolTarget(entry.toolName)?.service ?? ""))).map((entry) => entry.id);

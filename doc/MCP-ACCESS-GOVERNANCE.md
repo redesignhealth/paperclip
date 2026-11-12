@@ -233,11 +233,34 @@ During connection setup or gallery review save:
 Paperclip tracks three quarantine reason states:
 - `pending_review`: initial quarantine for newly discovered actions awaiting first operator review.
 - `reviewed_declined`: settled operator decision leaving a reviewed action unticked. Excluded from attention counters.
-- `reviewed_declined_changed`: re-armed quarantine when an upstream server alters an already-declined action's schema (input schema change, version hash drift, or risk classification change). The refresh updates `quarantineReason` to `reviewed_declined_changed` and sets `quarantinedAt` to the refresh timestamp (`refreshedAt`).
+- `reviewed_declined_changed`: re-armed quarantine when an upstream server alters an already-declined action's schema. Drift is detected via `versionHash` or `schemaHash` changes; risk-classification changes trigger drift only indirectly, because `versionHash` includes `riskLevel`. The refresh updates `quarantineReason` to `reviewed_declined_changed` and sets `quarantinedAt` to the refresh timestamp (`refreshedAt`).
 
 Unlike settled `reviewed_declined` entries, `reviewed_declined_changed` actions are counted in the operator attention queue (`GET /api/companies/:companyId/tools/apps/attention`). Sequential refreshes without subsequent schema changes preserve `reviewed_declined_changed` and its timestamp, keeping the drifted action safely quarantined and in the operator's attention queue.
 
-To inspect quarantined entries, inspect the connection's catalog or retrieve apps needing attention via `GET /api/companies/:companyId/tools/apps/attention`. To re-enable any quarantined entry (including settled `reviewed_declined` actions, re-armed `reviewed_declined_changed` actions, or in connections where all actions were quarantined), submit `POST /api/companies/:companyId/tools/apps/:connectionId/finish` with `reviewedCatalogEntryIds` covering every currently quarantined action on the connection (action review decisions must cover every currently quarantined action on the connection exactly once), and `enabledCatalogEntryIds` containing the target entry ID(s) to activate. Any quarantined action included in `reviewedCatalogEntryIds` but omitted from `enabledCatalogEntryIds` settles as `reviewed_declined` (clearing `reviewed_declined_changed` and clearing attention). This updates each target entry to `status: active`, clears its quarantine reason, records review timestamps, and adds it to the connection's access profile.
+To inspect quarantined entries, inspect the connection's catalog or retrieve apps needing attention via `GET /api/companies/:companyId/tools/apps/attention`.
+
+To re-enable any quarantined entry (including settled `reviewed_declined` actions, re-armed `reviewed_declined_changed` actions, or in connections where all actions were quarantined), submit `POST /api/companies/:companyId/tools/apps/:connectionId/finish`:
+- `access` is required; `finishToolAppSchema` has no default, so a request without it gets 400.
+- `reviewedCatalogEntryIds` must list every currently quarantined entry exactly once.
+- `preserveExistingAccess: true` is required to keep current access. Without it the endpoint deletes all profile entries and bindings, rebuilds from the request alone, and retires ask-first policies (`disableStale`).
+- Quarantined entries that are listed as reviewed but not enabled settle as `reviewed_declined` (clearing `reviewed_declined_changed` and clearing attention).
+- Each target entry included in `enabledCatalogEntryIds` transitions to `status: active`, clears its quarantine reason and timestamp, records review timestamps, and is added to the connection's access profile.
+
+Example: re-enabling a quarantined action while preserving existing access:
+
+```sh
+# Re-enable one quarantined action while preserving current access.
+# Note: preserveExistingAccess: true merges existing bindings back, so access: {"agentIds": []}
+# satisfies the required schema without dropping existing agent bindings.
+curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
+  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/apps/$CONNECTION_ID/finish" \
+  -d '{
+    "preserveExistingAccess": true,
+    "access": { "agentIds": [] },
+    "enabledCatalogEntryIds": ["$TARGET_ENTRY_ID"],
+    "reviewedCatalogEntryIds": ["$TARGET_ENTRY_ID", "$OTHER_QUARANTINED_ENTRY_ID"]
+  }' | jq .
+```
 
 ## Profiles and bindings
 

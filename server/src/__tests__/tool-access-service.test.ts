@@ -18784,6 +18784,120 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(profileEntries.map((e) => e.catalogEntryId)).not.toContain(deleteEntry.id);
   });
 
+  it("settled decline survives a disappear and reappear cycle", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const toolA = { name: "tool_a", annotations: { readOnlyHint: true } };
+    const toolB = { name: "tool_b", annotations: { readOnlyHint: false } };
+    mockToolsList([toolA, toolB]);
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(
+        company.id,
+        { galleryKey: "zapier", credentialValues: { "credentials.authorization": "zap-secret" } },
+        { actorType: "user", actorId: "board" },
+      ),
+    );
+    const entryA = connect.catalog.find((entry) => entry.toolName === "tool_a")!;
+    const entryB = connect.catalog.find((entry) => entry.toolName === "tool_b")!;
+
+    const originalQuarantinedAt = new Date("2026-01-15T12:00:00Z");
+    await db.update(toolCatalogEntries)
+      .set({
+        status: "quarantined",
+        quarantineReason: "pending_review",
+        quarantinedAt: originalQuarantinedAt,
+      })
+      .where(eq(toolCatalogEntries.id, entryB.id));
+
+    const finished = await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [entryA.id],
+        askFirstCatalogEntryIds: [],
+        reviewedCatalogEntryIds: [entryB.id],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    const [bAfterFinish] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entryB.id));
+    expect(bAfterFinish?.status).toBe("quarantined");
+    expect(bAfterFinish?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED);
+    expect(bAfterFinish?.quarantinedAt?.getTime()).toBe(originalQuarantinedAt.getTime());
+
+    // Refresh with tools/list returning only A (B disappears)
+    mockToolsList([toolA]);
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+
+    const [bAfterDisappear] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entryB.id));
+    expect(bAfterDisappear?.status).toBe("quarantined");
+    expect(bAfterDisappear?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED);
+    expect(bAfterDisappear?.quarantinedAt?.getTime()).toBe(originalQuarantinedAt.getTime());
+
+    // Refresh again with A and B (B reappears)
+    mockToolsList([toolA, toolB]);
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+
+    const [bAfterReappear] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entryB.id));
+    expect(bAfterReappear?.status).toBe("quarantined");
+    expect(bAfterReappear?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED);
+    expect(bAfterReappear?.quarantinedAt?.getTime()).toBe(originalQuarantinedAt.getTime());
+
+    const profileEntriesForB = await db
+      .select()
+      .from(toolProfileEntries)
+      .where(eq(toolProfileEntries.catalogEntryId, entryB.id));
+    expect(profileEntriesForB).toHaveLength(0);
+  });
+
+  it("never-declined tool that disappears still becomes disabled / mcp_tool_removed, and reactivates on reappearance", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const toolA = { name: "tool_a", annotations: { readOnlyHint: true } };
+    const toolB = { name: "tool_b", annotations: { readOnlyHint: false } };
+    mockToolsList([toolA, toolB]);
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(
+        company.id,
+        { galleryKey: "zapier", credentialValues: { "credentials.authorization": "zap-secret" } },
+        { actorType: "user", actorId: "board" },
+      ),
+    );
+    const entryA = connect.catalog.find((entry) => entry.toolName === "tool_a")!;
+    const entryB = connect.catalog.find((entry) => entry.toolName === "tool_b")!;
+
+    await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [entryA.id, entryB.id],
+        askFirstCatalogEntryIds: [],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    const [aInitial] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entryA.id));
+    expect(aInitial?.status).toBe("active");
+
+    // Refresh with tools/list returning only B (A disappears)
+    mockToolsList([toolB]);
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+
+    const [aAfterDisappear] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entryA.id));
+    expect(aAfterDisappear?.status).toBe("disabled");
+    expect(aAfterDisappear?.quarantineReason).toBe("mcp_tool_removed");
+
+    // Refresh again with A and B (A reappears)
+    mockToolsList([toolA, toolB]);
+    await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+
+    const [aAfterReappear] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entryA.id));
+    expect(aAfterReappear?.status).toBe("active");
+    expect(aAfterReappear?.quarantineReason).toBeNull();
+  });
+
   it("schema drift with enableAllByDefault true stays quarantined with reviewed_declined_changed, absent from profile, and re-arms attention while preserving reviewedAt", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
