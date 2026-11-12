@@ -18345,9 +18345,8 @@ describeEmbeddedPostgres("tool access service", () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: updateEntry.id,
-          status: "active",
-          reviewedAt: expect.any(Date),
-          quarantineReason: null,
+          status: "quarantined",
+          quarantineReason: "pending_review",
         }),
         expect.objectContaining({
           id: createEntry.id,
@@ -18360,7 +18359,65 @@ describeEmbeddedPostgres("tool access service", () => {
     const attentionAfterReview = await service.listAppsNeedingAttention(
       company.id,
     );
-    expect(attentionAfterReview.apps).toEqual([]);
+    expect(attentionAfterReview.apps).toEqual([
+      expect.objectContaining({ connection: expect.objectContaining({ id: connect.connectionId }), quarantinedCatalogEntryCount: 1 }),
+    ]);
+  });
+
+  it("keeps unticked quarantined tools quarantined during review save while activating ticked ones (TECH-8350)", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([
+      { name: "read_items", annotations: { readOnlyHint: true } },
+      { name: "delete_items", annotations: { readOnlyHint: false } },
+      { name: "send_items", annotations: { readOnlyHint: false } },
+    ]);
+    const connect = await withGalleryServerUrl(
+      "zapier",
+      PUBLIC_MCP_FIXTURE_URL,
+      () =>
+        service.connectGalleryApp(
+          company.id,
+          {
+            galleryKey: "zapier",
+            credentialValues: { "credentials.authorization": "zap-secret" },
+          },
+          { actorType: "user", actorId: "board" },
+        ),
+    );
+    const readEntry = connect.catalog.find((entry) => entry.toolName === "read_items")!;
+    const deleteEntry = connect.catalog.find((entry) => entry.toolName === "delete_items")!;
+    const sendEntry = connect.catalog.find((entry) => entry.toolName === "send_items")!;
+
+    await db
+      .update(toolCatalogEntries)
+      .set({ status: "quarantined", quarantineReason: "manual" })
+      .where(inArray(toolCatalogEntries.id, [deleteEntry.id, sendEntry.id]));
+
+    // User reviews both quarantined entries, but only ticks deleteEntry; sendEntry is left unticked.
+    await service.finishGalleryAppConnection(
+      company.id,
+      connect.connectionId,
+      {
+        enabledCatalogEntryIds: [readEntry.id, deleteEntry.id],
+        askFirstCatalogEntryIds: [],
+        reviewedCatalogEntryIds: [deleteEntry.id, sendEntry.id],
+        access: "all_agents",
+      },
+      { actorType: "user", actorId: "board" },
+    );
+
+    const entries = await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connect.connectionId));
+    const byName = new Map(entries.map((e) => [e.toolName, e]));
+    expect(byName.get("delete_items")?.status).toBe("active");
+    expect(byName.get("delete_items")?.reviewedAt).toBeInstanceOf(Date);
+    expect(byName.get("delete_items")?.quarantineReason).toBeNull();
+
+    expect(byName.get("send_items")?.status).toBe("quarantined");
+    expect(byName.get("send_items")?.quarantineReason).toBe("manual");
   });
 
   it("enables newly discovered tools after setup while preserving tools explicitly turned off", async () => {
