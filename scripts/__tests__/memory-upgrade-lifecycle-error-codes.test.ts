@@ -25,6 +25,8 @@ const LIFECYCLE_CODE_MAPPINGS: Array<[string, UpgradeErrorCode]> = [
   ["verify_quarantine_present", "verification_failed"],
   ["ROLLBACK_MARKER_CLEAR_FAILED", "rollback_failed"],
   ["rollback_marker_clear_failed", "rollback_failed"],
+  ["DRAIN_BLOCKED_MISSING_SCOPE", "drain_blocked_missing_scope"],
+  ["drain_blocked_missing_scope", "drain_blocked_missing_scope"],
 ];
 
 test("lifecycle error codes mapping and generic CLI messages", async (t) => {
@@ -32,6 +34,7 @@ test("lifecycle error codes mapping and generic CLI messages", async (t) => {
     assert.ok(UPGRADE_ERROR_CODES.includes("flip_precondition_failed"));
     assert.ok(UPGRADE_ERROR_CODES.includes("flip_marker_write_failed"));
     assert.ok(UPGRADE_ERROR_CODES.includes("agent_scope_not_observed"));
+    assert.ok(UPGRADE_ERROR_CODES.includes("drain_blocked_missing_scope"));
   });
 
   await t.test("mapSweepErrorCode maps every lifecycle code in both case forms", () => {
