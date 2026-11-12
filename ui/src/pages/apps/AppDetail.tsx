@@ -316,7 +316,11 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     () => {
       const fromProfile = accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install);
       if (isPersonalOwner) {
-        const agentIds = install.agentIds.size > 0
+        const installsAvailable =
+          installsQuery.isSuccess ||
+          installsQuery.data?.installs !== undefined ||
+          connection?.installs !== undefined;
+        const agentIds = installsAvailable
           ? install.agentIds
           : fromProfile.agentIds;
         return { mode: "specific" as const, agentIds: new Set(agentIds) };
@@ -327,7 +331,17 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
         isPersonal,
       );
     },
-    [connection?.connectionPurpose, connection?.config, profile, install, isPersonalOwner, isPersonal],
+    [
+      connection?.connectionPurpose,
+      connection?.config,
+      connection?.installs,
+      profile,
+      install,
+      isPersonalOwner,
+      isPersonal,
+      installsQuery.isSuccess,
+      installsQuery.data?.installs,
+    ],
   );
   const managesRemoteMcpAccess = isRemoteMcpConnectorMethod(connection?.config?.sourceTemplateKey, connection?.config?.connectionMethodKey);
   const agents = agentsQuery.data ?? [];

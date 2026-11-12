@@ -1447,6 +1447,52 @@ describe("AppDetail", () => {
     );
   });
 
+  it("TECH-8350: personal instance owner picker uses authoritative empty installs despite profile bindings", async () => {
+    mockParams.tab = "permissions";
+    const personalConn = connection({
+      id: "conn-personal",
+      createdByUserId: "user-1",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-personal", uid: "conn-uid-personal" },
+      grants: [],
+      currentUserId: "user-1",
+      members: [],
+      capabilities: fullCapabilities({ canConfigure: true }),
+    });
+    getConnectionInstallsMock.mockResolvedValue({
+      connectionId: "conn-personal",
+      installs: [],
+    });
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-personal",
+        entries: [],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+
+    await renderAppDetail();
+
+    const trigger = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Choose agents"),
+    );
+    expect(trigger).toBeTruthy();
+    expect(container.textContent).not.toContain("1 agent selected");
+
+    await act(async () => {
+      trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const checkbox = document.body.querySelector<HTMLButtonElement>('[aria-label="Allow Coder"]');
+    expect(checkbox).toBeTruthy();
+    expect(checkbox!.getAttribute("data-state")).toBe("unchecked");
+  });
+
   it("uses the setup-style agent access question without install terminology", async () => {
     mockParams.tab = "permissions";
     listProfilesMock.mockResolvedValue({

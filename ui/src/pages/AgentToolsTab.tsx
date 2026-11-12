@@ -612,12 +612,9 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
       ]);
     },
     onError: (_error, variables) => {
-      failedInstallDraftRef.current = {
-        connectionId: variables.connection.id,
-        installed: variables.installed,
-      };
-      if (isUnverifiedPersonalInstance(variables.connection)) {
-        // Restore the authoritative server state for this row so the UI never claims OFF while the backend is ON.
+      if (isPersonalDefaultMcpInstance(variables.connection.config)) {
+        // Restore the authoritative server state for this row so the UI never claims OFF while the backend is ON,
+        // and refetch authoritative state so concurrent peer conflicts are brought up to date.
         const serverInstalled = isAgentInstalled(
           installStateFrom(variables.connection.installs, { ignoreCompanyInstall: isManagedConnection(variables.connection) }),
           agent.id,
@@ -625,11 +622,18 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         failedInstallDraftRef.current = null;
         lastSavedInstallRef.current = { ...lastSavedInstallRef.current, [variables.connection.id]: serverInstalled };
         setInstallDraft((current) => ({ ...current, [variables.connection.id]: serverInstalled }));
+        void queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(companyId) });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.tools.effectiveProfilesForAgent(companyId, agent.id) });
         toast?.pushToast({
           title: "Couldn't update the connection",
           body: "The connection was not changed. Please try again.",
           tone: "error",
         });
+      } else {
+        failedInstallDraftRef.current = {
+          connectionId: variables.connection.id,
+          installed: variables.installed,
+        };
       }
     },
   });
