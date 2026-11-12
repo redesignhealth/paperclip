@@ -18627,7 +18627,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(profileEntries.some((e) => e.catalogEntryId === toolB.id)).toBe(false);
   });
 
-  it("resets quarantineReason to pending_review and re-arms attention on catalog schema drift while preserving sticky reviewedAt", async () => {
+  it("resets quarantineReason to reviewed_declined_changed and re-arms attention on catalog schema drift while preserving sticky reviewedAt", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     let currentTools = [
@@ -18669,7 +18669,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     const [driftedEntry] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, toolEntry.id));
     expect(driftedEntry?.status).toBe("quarantined");
-    expect(driftedEntry?.quarantineReason).toBe("pending_review");
+    expect(driftedEntry?.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED_CHANGED);
     expect(driftedEntry?.reviewedAt?.getTime()).toBe(reviewedAtInitial.getTime());
 
     attention = await service.listAppsNeedingAttention(company.id);
