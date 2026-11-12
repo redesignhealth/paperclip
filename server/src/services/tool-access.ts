@@ -50,6 +50,7 @@ import {
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
   managedConnectionRole,
+  commsReviewedAllowlist,
   staticCatalogAllowlist,
   stripDefaultMcpProtectedConfigKeys,
   grantHasPersonalOAuthAccessToken,
@@ -8883,6 +8884,9 @@ export function toolAccessService(
     // review trigger for a reviewed verb (the seeded placeholder descriptors always differ from the real ones), and
     // any other tool the server reports is never added.
     const staticAllowlist = staticCatalogAllowlist(connection.config);
+    // The managed comms-board template and its clones keep their reviewed tools active when the board's descriptor
+    // drifts (see `commsReviewedAllowlist`). Unlike the static catalog this does not filter what is discovered.
+    const commsReviewed = commsReviewedAllowlist(connection);
     const discoveredCount = descriptors.length;
     if (staticAllowlist) {
       descriptors = descriptors.filter((descriptor) => staticAllowlist.has(descriptor.name));
@@ -8982,9 +8986,12 @@ export function toolAccessService(
       // Reviewed static-catalog verbs are accepted on drift while they still classify as plain reads; one that no
       // longer does (write/destructive annotation) takes the normal quarantine path instead (fail closed).
       const staticReviewedRead = staticAllowlist !== null && riskLevel === "read";
+      // A reviewed comms-board tool is accepted on drift unless it now classifies as destructive (fail closed).
+      const commsReviewedTool = commsReviewed !== null && commsReviewed.has(descriptor.name) && riskLevel !== "destructive";
       const shouldQuarantine =
         quarantineOnRefresh &&
         !staticReviewedRead &&
+        !commsReviewedTool &&
         (!existing || changed) &&
         existing?.status !== "disabled" &&
         (!safeDefault || riskLevel !== "read" || nativeDaytona);
@@ -9020,7 +9027,7 @@ export function toolAccessService(
         quarantineReason = "pending_review";
         quarantinedAt = refreshedAt;
         quarantinedCount += 1;
-      } else if (quarantineOnRefresh && !staticReviewedRead && existing?.status === "quarantined") {
+      } else if (quarantineOnRefresh && !staticReviewedRead && !commsReviewedTool && existing?.status === "quarantined") {
         status = "quarantined";
         quarantineReason = existing.quarantineReason;
         quarantinedAt = existing.quarantinedAt;
