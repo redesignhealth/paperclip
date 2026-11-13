@@ -301,6 +301,12 @@ COPY docker/claude/rh-memory-hook /usr/local/bin/rh-memory-hook
 RUN chmod 0644 /etc/claude-code/managed-settings.json \
   && chmod 0755 /usr/local/bin/rh-memory-hook
 
+# Codex memory hooks (TECH-8416): Codex loads /etc/codex/managed_config.toml for
+# every run, whatever CODEX_HOME the adapter seeds. It reuses the hook above and
+# is a no-op unless the agent's env supplies RH_MEMORY_TOKEN and RH_MEMORY_URL.
+COPY docker/codex/managed_config.toml /etc/codex/managed_config.toml
+RUN chmod 0644 /etc/codex/managed_config.toml
+
 # TECH-7095: the server runs from a root-owned, exec-only (mode 0111) copy of node. The kernel marks a
 # process that exec'd a binary its user cannot read as non-dumpable, which makes its /proc/<pid>/environ,
 # fd and mem root-owned. Agent children run as the same uid as the server; without this they could read

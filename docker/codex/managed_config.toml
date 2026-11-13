@@ -1,0 +1,16 @@
+# Codex memory hooks (TECH-8416). Codex loads /etc/codex/managed_config.toml for
+# every run in the image, whatever CODEX_HOME the adapter seeds. The hook does
+# nothing unless the agent's env sets RH_MEMORY_TOKEN and RH_MEMORY_URL.
+# See docker/claude/rh-memory-hook.
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/usr/local/bin/rh-memory-hook recall"
+timeout = 10
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/usr/local/bin/rh-memory-hook capture --format codex"
+timeout = 10

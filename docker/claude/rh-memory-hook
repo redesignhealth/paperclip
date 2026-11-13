@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Claude Code memory hook for rh-memory-mcp (TECH-8410).
+"""Claude Code and Codex memory hook for rh-memory-mcp (TECH-8410, TECH-8416).
 
-Registered by /etc/claude-code/managed-settings.json for every Claude run in
-the image. It does nothing unless the agent's adapterConfig.env provides
-RH_MEMORY_TOKEN (a secret_ref) and RH_MEMORY_URL, so agents opt in per agent.
+Claude Code: registered by /etc/claude-code/managed-settings.json for every
+Claude run in the image. Codex: registered by /etc/codex/managed_config.toml
+with `--format codex`. It does nothing unless the agent's adapterConfig.env
+provides RH_MEMORY_TOKEN and RH_MEMORY_URL, so agents opt in per agent.
 
     rh-memory-hook recall    UserPromptSubmit: search memories for the prompt
-                             and return them as additionalContext.
+                             and return them as additionalContext. Claude Code
+                             and Codex use the same event input and output.
     rh-memory-hook capture   Stop: send the last user/assistant exchange to
                              POST /memories (the service extracts facts). The
                              request runs in a detached child so the run is
                              not held up.
+    --format claude|codex    Transcript format for capture (default claude).
+                             Codex reads its rollout file and uses the event's
+                             turn_id and last_assistant_message.
 
 Environment:
     RH_MEMORY_TOKEN    agent-memory-<agentId> rh-auth token (X-API-Key)
@@ -190,8 +195,68 @@ def last_exchange(transcript_path: str) -> list[dict[str, str]]:
     ]
 
 
+def _codex_item_text(item: dict[str, Any]) -> str:
+    """Plain text of a Codex rollout UserMessage/AgentMessage item."""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def codex_last_exchange(
+    transcript_path: str, turn_id: Any = None, last_assistant_message: Any = None
+) -> list[dict[str, str]]:
+    """The user prompt and assistant text of one Codex turn.
+
+    Codex writes a rollout JSONL. The clean conversation is in `event_msg`
+    entries whose payload is an `item_completed` with a UserMessage or
+    AgentMessage item. Injected context (recalled notes, environment, AGENTS.md)
+    is stored as developer or system messages and never appears there. When the
+    event names a turn, only that turn is used; otherwise the last prompt is.
+    """
+    user = ""
+    assistant: list[str] = []
+    want_turn = turn_id if isinstance(turn_id, str) and turn_id else None
+    with open(transcript_path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not isinstance(payload, dict) or entry.get("type") != "event_msg":
+                continue
+            if payload.get("type") != "item_completed":
+                continue
+            if want_turn is not None and payload.get("turn_id") != want_turn:
+                continue
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                continue
+            text = _codex_item_text(item)
+            if not text:
+                continue
+            if item.get("type") == "UserMessage":
+                user, assistant = text, []
+            elif item.get("type") == "AgentMessage" and user:
+                assistant.append(text)
+    if not assistant and isinstance(last_assistant_message, str) and last_assistant_message.strip():
+        assistant = [last_assistant_message.strip()]
+    if not user or not assistant:
+        return []
+    return [
+        {"role": "user", "content": user[:MAX_MESSAGE_CHARS]},
+        {"role": "assistant", "content": "\n".join(assistant)[-MAX_MESSAGE_CHARS:]},
+    ]
+
+
 def _detach_stdio() -> None:
-    """Point fds 0-2 at /dev/null so Claude sees the hook's pipes close."""
+    """Point fds 0-2 at /dev/null so the agent sees the hook's pipes close."""
     devnull = os.open(os.devnull, os.O_RDWR)
     for fd in (0, 1, 2):
         os.dup2(devnull, fd)
@@ -199,20 +264,25 @@ def _detach_stdio() -> None:
         os.close(devnull)
 
 
-def capture(event: dict[str, Any]) -> None:
+def capture(event: dict[str, Any], fmt: str = "claude") -> None:
     config = _config()
     transcript_path = event.get("transcript_path")
     if config is None or not isinstance(transcript_path, str) or not transcript_path:
         return
     token, url, proxy = config
-    # Detach before any slow work: Claude waits for the hook's stdio to close,
+    # Detach before any slow work: the agent waits for the hook's stdio to close,
     # so the child must not hold the pipes it inherited.
     if os.fork() != 0:
         return
     try:
         os.setsid()
         _detach_stdio()
-        messages = last_exchange(transcript_path)
+        if fmt == "codex":
+            messages = codex_last_exchange(
+                transcript_path, event.get("turn_id"), event.get("last_assistant_message")
+            )
+        else:
+            messages = last_exchange(transcript_path)
         if messages:
             _post(
                 url,
@@ -236,6 +306,7 @@ def _raise_deadline(_signum: int, _frame: object) -> None:
 
 def main(argv: list[str]) -> int:
     mode = argv[1] if len(argv) > 1 else ""
+    fmt = "codex" if argv[2:] == ["--format", "codex"] else "claude"
     try:
         event = _read_event()
         if mode == "recall":
@@ -250,7 +321,7 @@ def main(argv: list[str]) -> int:
             if output:
                 sys.stdout.write(output)
         elif mode == "capture":
-            capture(event)
+            capture(event, fmt)
     except Exception as exc:  # noqa: BLE001 - fail open by design
         sys.stderr.write(f"rh-memory-hook {mode}: {type(exc).__name__}\n")
     return 0

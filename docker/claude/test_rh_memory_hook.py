@@ -1,4 +1,4 @@
-"""Tests for docker/claude/rh-memory-hook (TECH-8410).
+"""Tests for docker/claude/rh-memory-hook (TECH-8410, TECH-8416).
 
 Run: python3 -m unittest discover -s docker/claude -p 'test_*.py'
 """
@@ -14,6 +14,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None  # type: ignore[assignment]
 
 _PATH = Path(__file__).with_name("rh-memory-hook")
 _loader = importlib.machinery.SourceFileLoader("rh_memory_hook", str(_PATH))
@@ -137,6 +142,69 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual([m["role"] for m in body["messages"]], ["user", "assistant"])
 
 
+def _codex_rollout(turn: str = "t1") -> str:
+    def item(kind: str, text: str, turn_id: str = turn) -> dict:
+        return {"type": "event_msg", "payload": {
+            "type": "item_completed", "turn_id": turn_id,
+            "item": {"type": kind, "id": "x", "content": [{"type": "text" if kind == "UserMessage" else "Text", "text": text}]},
+        }}
+    return _transcript([
+        {"type": "session_meta", "payload": {}},
+        {"type": "response_item", "payload": {"type": "message", "role": "developer",
+                                              "content": [{"type": "input_text", "text": "Notes recalled: secret"}]}},
+        item("UserMessage", "old question", "t0"),
+        item("AgentMessage", "old answer", "t0"),
+        item("UserMessage", "Use Postgres for the cache"),
+        item("AgentMessage", "Switching to Postgres."),
+        item("AgentMessage", "Done."),
+        "not a dict",
+        {"type": "event_msg", "payload": "bad"},
+    ])
+
+
+class CodexLastExchangeTest(unittest.TestCase):
+    def test_reads_only_the_named_turn_and_skips_injected_context(self) -> None:
+        self.assertEqual(hook.codex_last_exchange(_codex_rollout(), "t1"), [
+            {"role": "user", "content": "Use Postgres for the cache"},
+            {"role": "assistant", "content": "Switching to Postgres.\nDone."},
+        ])
+
+    def test_without_turn_id_uses_last_prompt(self) -> None:
+        out = hook.codex_last_exchange(_codex_rollout())
+        self.assertEqual(out[0]["content"], "Use Postgres for the cache")
+
+    def test_falls_back_to_last_assistant_message(self) -> None:
+        path = _transcript([{"type": "event_msg", "payload": {
+            "type": "item_completed", "turn_id": "t1",
+            "item": {"type": "UserMessage", "content": [{"type": "text", "text": "remember Falcon"}]}}}])
+        self.assertEqual(hook.codex_last_exchange(path, "t1", " Noted. "), [
+            {"role": "user", "content": "remember Falcon"},
+            {"role": "assistant", "content": "Noted."},
+        ])
+
+    def test_empty_without_user_or_assistant(self) -> None:
+        self.assertEqual(hook.codex_last_exchange(_codex_rollout(), "other"), [])
+        self.assertEqual(hook.codex_last_exchange(_transcript([]), "t1", "reply"), [])
+
+    def test_capture_uses_codex_parser_and_main_parses_format(self) -> None:
+        event = {"transcript_path": _codex_rollout(), "turn_id": "t1"}
+        with mock.patch.dict(os.environ, ENV, clear=True), \
+                mock.patch.object(hook.os, "fork", return_value=0), \
+                mock.patch.object(hook.os, "setsid"), \
+                mock.patch.object(hook, "_detach_stdio"), \
+                mock.patch.object(hook.os, "_exit", side_effect=SystemExit), \
+                mock.patch.object(hook, "_post") as post:
+            with self.assertRaises(SystemExit):
+                hook.capture(event, "codex")
+        body = post.call_args.args[4]
+        self.assertEqual(body["messages"][0]["content"], "Use Postgres for the cache")
+        with mock.patch.object(hook, "_read_event", return_value=event), \
+                mock.patch.object(hook, "capture") as cap:
+            hook.main(["rh-memory-hook", "capture", "--format", "codex"])
+            hook.main(["rh-memory-hook", "capture"])
+        self.assertEqual([c.args[1] for c in cap.call_args_list], ["codex", "claude"])
+
+
 class HelpersTest(unittest.TestCase):
     def test_context_is_framed_as_notes_and_capped(self) -> None:
         many = {"results": [{"memory": "x" * 300} for _ in range(40)]}
@@ -251,6 +319,20 @@ class ManagedSettingsTest(unittest.TestCase):
         self.assertEqual(commands, {
             "UserPromptSubmit": ["/usr/local/bin/rh-memory-hook recall"],
             "Stop": ["/usr/local/bin/rh-memory-hook capture"],
+        })
+
+
+@unittest.skipUnless(tomllib, "tomllib needs Python 3.11+")
+class CodexManagedConfigTest(unittest.TestCase):
+    def test_registers_both_hooks(self) -> None:
+        config = tomllib.loads(_PATH.parent.parent.joinpath("codex", "managed_config.toml").read_text())
+        commands = {
+            event: [h["command"] for group in groups for h in group["hooks"]]
+            for event, groups in config["hooks"].items()
+        }
+        self.assertEqual(commands, {
+            "UserPromptSubmit": ["/usr/local/bin/rh-memory-hook recall"],
+            "Stop": ["/usr/local/bin/rh-memory-hook capture --format codex"],
         })
 
 
