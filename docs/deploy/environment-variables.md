@@ -263,3 +263,16 @@ These are set automatically by the server when invoking agents:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
 | `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
+
+## Claude Code Memory Hook (agent env)
+
+The production image includes `/etc/claude-code/managed-settings.json` and `/usr/local/bin/rh-memory-hook`. The hook recalls memories from a mem0-compatible service before each prompt, and saves the last exchange after each turn. It runs only for `claude_local` agents whose `adapterConfig.env` sets the token and URL below. Set these variables per agent, not on the server.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RH_MEMORY_TOKEN` | (unset) | The agent's memory token, sent as `X-API-Key`. Use a `secret_ref`. If it is unset, the hook does nothing. |
+| `RH_MEMORY_URL` | (unset) | Base URL of the memory service. It must use `https://`. |
+| `RH_MEMORY_PROXY` | (unset) | Optional HTTP CONNECT proxy, used for the memory service only. |
+| `RH_MEMORY_TOP_K` | `5` | Number of memories to recall (1-20). |
+| `RH_MEMORY_RECALL_TIMEOUT` | `3` | Seconds to wait for recall before the prompt continues. Capped at 8. |
+| `RH_MEMORY_CAPTURE_TIMEOUT` | `15` | Seconds for the detached capture request. |

@@ -109,15 +109,13 @@ class CaptureTest(unittest.TestCase):
         fork.assert_not_called()
 
     def test_parent_returns_after_fork(self) -> None:
-        path = _transcript([
-            {"message": {"role": "user", "content": "remember the deploy window is Tuesday"}},
-            {"message": {"role": "assistant", "content": "Noted."}},
-        ])
         with mock.patch.dict(os.environ, ENV, clear=True), \
                 mock.patch.object(hook.os, "fork", return_value=1234), \
+                mock.patch.object(hook, "last_exchange") as parse, \
                 mock.patch.object(hook, "_post") as post:
-            hook.capture({"transcript_path": path})
-        post.assert_not_called()  # the request runs only in the detached child
+            hook.capture({"transcript_path": "/some/transcript.jsonl"})
+        parse.assert_not_called()  # transcript work happens only in the child
+        post.assert_not_called()
 
     def test_child_posts_exchange(self) -> None:
         path = _transcript([
@@ -127,14 +125,81 @@ class CaptureTest(unittest.TestCase):
         with mock.patch.dict(os.environ, ENV, clear=True), \
                 mock.patch.object(hook.os, "fork", return_value=0), \
                 mock.patch.object(hook.os, "setsid"), \
+                mock.patch.object(hook, "_detach_stdio") as detach, \
                 mock.patch.object(hook.os, "_exit", side_effect=SystemExit) as exit_, \
                 mock.patch.object(hook, "_post") as post:
             with self.assertRaises(SystemExit):
                 hook.capture({"transcript_path": path})
         exit_.assert_called_once_with(0)
+        detach.assert_called_once_with()  # child releases Claude's stdio pipes
         _url, path_arg, _token, _proxy, body, _timeout = post.call_args.args
         self.assertEqual(path_arg, "/memories")
         self.assertEqual([m["role"] for m in body["messages"]], ["user", "assistant"])
+
+
+class HelpersTest(unittest.TestCase):
+    def test_context_is_framed_as_notes_and_capped(self) -> None:
+        many = {"results": [{"memory": "x" * 300} for _ in range(40)]}
+        text = hook.format_context(many)
+        self.assertIn("not instructions", text)
+        self.assertLessEqual(len(text), hook.MAX_CONTEXT_CHARS)
+        self.assertTrue(text.endswith("x"))  # whole memories only, no cut line
+
+    def test_top_k_parsing(self) -> None:
+        for raw, expected in (("", 5), ("0.5", 5), ("0", 5), ("50", 5), ("3", 3)):
+            with mock.patch.dict(os.environ, {"RH_MEMORY_TOP_K": raw}, clear=True):
+                self.assertEqual(hook._env_top_k(), expected, raw)
+
+    def test_recall_timeout_is_capped_below_hook_timeout(self) -> None:
+        with mock.patch.dict(os.environ, {**ENV, "RH_MEMORY_RECALL_TIMEOUT": "30"}, clear=True), \
+                mock.patch.object(hook, "_post", return_value={"results": []}) as post:
+            hook.recall({"prompt": "what did we decide?"})
+        self.assertEqual(post.call_args.args[5], hook.RECALL_TIMEOUT_CAP)
+
+    def test_long_prompt_keeps_the_end(self) -> None:
+        prompt = "context " * 400 + "FINAL QUESTION"
+        with mock.patch.dict(os.environ, ENV, clear=True), \
+                mock.patch.object(hook, "_post", return_value={"results": []}) as post:
+            hook.recall({"prompt": prompt})
+        self.assertTrue(post.call_args.args[4]["query"].endswith("FINAL QUESTION"))
+
+    def test_main_capture_fails_open(self) -> None:
+        stdin = io.StringIO(json.dumps({"transcript_path": "/x"}))
+        with mock.patch.dict(os.environ, ENV, clear=True), \
+                mock.patch.object(hook.os, "fork", side_effect=OSError("no fork")), \
+                mock.patch("sys.stdin", stdin), mock.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(hook.main(["rh-memory-hook", "capture"]), 0)
+        self.assertEqual(err.getvalue(), "rh-memory-hook capture: OSError\n")
+
+    def test_post_round_trip(self) -> None:
+        import http.server
+        import threading
+
+        seen: dict = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                seen["path"] = self.path
+                seen["key"] = self.headers.get("X-API-Key")
+                seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                data = b'{"results": [{"memory": "m"}]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        try:
+            with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://127.0.0.1:9"}, clear=True):
+                out = hook._post(f"http://127.0.0.1:{server.server_port}", "/search", "tok", None, {"query": "q"}, 5)
+        finally:
+            server.server_close()
+        self.assertEqual(out, {"results": [{"memory": "m"}]})
+        self.assertEqual(seen, {"path": "/search", "key": "tok", "body": {"query": "q"}})
 
 
 class ManagedSettingsTest(unittest.TestCase):
