@@ -728,6 +728,22 @@ export async function rotateCommsBoardCredential(
   return rotateCredentialWithScopes(config, request.baseSub, COMMS_BOARD_TOKEN_SCOPES, fetchImpl, timeoutMs);
 }
 
+/**
+ * Re-issues an agent's memory credential (`AGENT_MEMORY_TOKEN_SCOPES`, 90 days) for its EXISTING `agent-memory-<id>`
+ * sub (TECH-8409). The registry has no revocation: the old token stays valid until its own expiry, so a retry after a
+ * partial failure is safe. The returned token is the only secret and is never logged.
+ */
+export async function rotateAgentMemoryCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { agentId: string },
+  fetchImpl: FetchLike = tailnetAwareFetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<RotateOutcome> {
+  const baseSub = composeAgentMemorySub(request.agentId);
+  if (!baseSub) return { ok: false, reason: "invalid_subject" };
+  return rotateCredentialWithScopes(config, baseSub, AGENT_MEMORY_TOKEN_SCOPES, fetchImpl, timeoutMs, AGENT_MEMORY_TOKEN_EXPIRES_IN_DAYS);
+}
+
 /** Re-issues the per-org rh-mcp service credential with the CURRENT `RH_MCP_SERVICE_TOKEN_SCOPES` (TECH-8066). */
 export async function rotateRhMcpServiceCredential(
   config: CommsBoardProvisionerConfig,
@@ -746,6 +762,7 @@ async function rotateCredentialWithScopes(
   scopes: readonly string[],
   fetchImpl: FetchLike,
   timeoutMs: number,
+  expiresInDays: number = COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
 ): Promise<RotateOutcome> {
   if (!BASE_SUB_PATTERN.test(baseSub)) return { ok: false, reason: "invalid_subject" };
   let response: Response;
@@ -756,7 +773,7 @@ async function rotateCredentialWithScopes(
         authorization: `Bearer ${config.ownershipApiToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ scopes: [...scopes], expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS }),
+      body: JSON.stringify({ scopes: [...scopes], expires_in_days: expiresInDays }),
       signal: AbortSignal.timeout(timeoutMs),
       redirect: "error",
     });

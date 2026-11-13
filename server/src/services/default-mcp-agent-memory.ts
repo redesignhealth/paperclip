@@ -136,6 +136,13 @@ export function agentMemoryEligibleForNewAgent(
   return agentMemoryProfileFor(adapterType, adapterConfig) !== null && resolveAgentMemoryConfig(env).ok;
 }
 
+/** `2027-03-01T00:00:00+00:00` and friends to one canonical UTC form; null when absent or unparseable. */
+export function normalizeIso(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
@@ -256,7 +263,8 @@ export const agentMemoryHook: DefaultMcpSetupHook = async (input) => {
       secretVersion: "latest",
       connectionId: null,
       grantId: null,
-      tokenExpiresAt: minted.tokenExpiresAt,
+      // Normalized so the rotation sweep can compare expiry times as text.
+      tokenExpiresAt: normalizeIso(minted.tokenExpiresAt),
     };
     await input.checkpoint({ binding });
   }
