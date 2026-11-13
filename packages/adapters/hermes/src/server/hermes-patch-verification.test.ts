@@ -159,6 +159,9 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     expect(dockerfile).toContain("PATCH_SHA_3=");
     expect(dockerfile).toContain("POSTPATCH_MARKER_3=");
     expect(dockerfile).toContain('case "$PATCH_FILE_3" in patches/0003-*.patch)');
+    expect(dockerfile).toContain('echo "$PATCH_SHA_3  /tmp/hermes/$PATCH_FILE_3" | sha256sum -c -');
+    expect(dockerfile).toContain('git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE_3"');
+    expect(dockerfile).toContain('git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE_3"');
     expect(dockerfile).toContain('grep -q "$POSTPATCH_MARKER_3" /opt/hermes-src/plugins/memory/mem0/_backend.py');
   });
 

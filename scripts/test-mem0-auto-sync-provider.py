@@ -6,7 +6,8 @@ Verifies:
 2. patches.lock checksums and markers for both 0001 and 0002 patches.
 3. Clean application of 0001 and 0002 patches to freshly unpacked 0.21.3 source.
 4. Python module marker and _coerce_bool parsing behavior.
-5. Mem0 provider behavior with doubles:
+5. Patch 0003 applies cleanly and SelfHostedBackend honors the opt-in MEM0_PROXY (and only that variable).
+6. Mem0 provider behavior with doubles:
    - Missing auto_sync defaults to existing automatic turn sync (client.add called).
    - auto_sync: false completely disables automatic sync_turn writes (zero client.add from sync_turn).
    - Explicit memory operations (mem0_add, mem0_search, mem0_update, mem0_delete, prefetch) remain fully functional.
@@ -56,6 +57,51 @@ def parse_lockfile(path: Path) -> dict[str, str]:
             k, v = line.split("=", 1)
             result[k.strip()] = v.strip()
     return result
+
+
+HTTPX_CLOSURE = ("httpx", "httpcore", "h11", "anyio", "idna", "certifi", "sniffio", "typing-extensions", "socksio")
+
+
+def ensure_httpx(cleanup_list: list) -> None:
+    """Make `httpx` importable for the SelfHostedBackend proxy tests (patch 0003).
+
+    CI runs this harness on the runner's bare python3, which has no httpx. Install the exact hash-pinned
+    versions from docker/hermes/requirements-*.txt (no dependency resolution, hashes required) into a managed
+    temp dir and put it on sys.path. A no-op when httpx is already importable.
+    """
+    try:
+        import httpx  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+    wanted: list[str] = []
+    for req_file in sorted(HERMES_DOCKER_DIR.glob("requirements-*.txt")):
+        block: list[str] = []
+        keep = False
+        for line in req_file.read_text(encoding="utf-8").splitlines():
+            if line and not line[0].isspace() and not line.startswith(("#", "-")):
+                if keep and block:
+                    wanted.append("\n".join(block))
+                block = [line]
+                keep = line.split("==", 1)[0].strip().lower().replace("_", "-") in HTTPX_CLOSURE
+            elif block and line.strip().startswith("--hash"):
+                block.append(line)
+        if keep and block:
+            wanted.append("\n".join(block))
+    names = {b.split("==", 1)[0].strip().lower().replace("_", "-") for b in wanted}
+    missing = set(HTTPX_CLOSURE) - names
+    assert not missing, f"pinned closure is missing {sorted(missing)}"
+    target = tempfile.TemporaryDirectory(prefix="hermes-httpx-")
+    cleanup_list.append(target.cleanup)
+    req_path = Path(target.name) / "requirements.txt"
+    req_path.write_text("\n".join(wanted) + "\n", encoding="utf-8")
+    site = Path(target.name) / "site"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "--require-hashes", "--target", str(site), "-r", str(req_path)],
+        check=True,
+    )
+    sys.path.insert(0, str(site))
 
 
 def sha256_file(path: Path) -> str:
@@ -240,6 +286,7 @@ class TestMem0AutoSyncControl(unittest.TestCase):
         assert patches_lock["postpatch_marker_3"] in backend_py.read_text(encoding="utf-8")
 
         # 7. Import patched mem0 module
+        ensure_httpx(cls._cleanup_callbacks)
         sys.path.insert(0, str(cls.source_tree))
         import plugins.memory.mem0 as mem0_mod
         import plugins.memory.mem0._backend as backend_mod
@@ -448,7 +495,8 @@ class TestMem0AutoSyncControl(unittest.TestCase):
         return type(backend._client._transport._pool).__name__
 
     def _make_backend(self, env: dict, **kwargs):
-        base = {k: v for k, v in os.environ.items() if k not in ("MEM0_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")}
+        scrubbed = {"MEM0_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"}
+        base = {k: v for k, v in os.environ.items() if k.upper() not in scrubbed}
         with unittest.mock.patch.dict(os.environ, {**base, **env}, clear=True):
             return self.backend_mod.SelfHostedBackend("k", "https://mem.example.ts.net", **kwargs)
 
@@ -470,7 +518,14 @@ class TestMem0AutoSyncControl(unittest.TestCase):
 
     def test_generic_proxy_env_is_not_adopted(self):
         # The explicit transport disables generic proxy env; only MEM0_PROXY opts in.
-        backend = self._make_backend({"HTTPS_PROXY": "http://127.0.0.1:9", "ALL_PROXY": "http://127.0.0.1:9"})
+        backend = self._make_backend(
+            {
+                "HTTPS_PROXY": "http://127.0.0.1:9",
+                "https_proxy": "http://127.0.0.1:9",
+                "ALL_PROXY": "http://127.0.0.1:9",
+                "all_proxy": "http://127.0.0.1:9",
+            }
+        )
         self.assertEqual(self._pool_class(backend), "ConnectionPool")
 
     def test_injected_transport_still_wins(self):
