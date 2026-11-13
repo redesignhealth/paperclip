@@ -11,6 +11,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { ApiError } from "../api/client";
+import { queryKeys } from "../lib/queryKeys";
 
 const mockToolsApi = vi.hoisted(() => ({
   getEffectiveProfilesForAgent: vi.fn(),
@@ -172,9 +173,9 @@ describe("AgentToolsTab", () => {
     vi.clearAllMocks();
   });
 
-  async function renderTab(agentOverrides: Record<string, unknown> = {}) {
+  async function renderTab(agentOverrides: Record<string, unknown> = {}, queryClient?: QueryClient) {
     const { AgentToolsTab } = await import("./AgentToolsTab");
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const client = queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const agent = { id: "agent-1", name: "Coder", ...agentOverrides } as never;
     await act(async () => {
       root = createRoot(container);
@@ -187,6 +188,7 @@ describe("AgentToolsTab", () => {
       );
     });
     await flushReact();
+    return { client };
   }
 
   it("preserves checkbox changes made after the last saved install state", async () => {
@@ -962,7 +964,8 @@ describe("AgentToolsTab", () => {
       mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
       mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
 
-      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+      const { client } = await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+      client.setQueryData(queryKeys.tools.connectionInstalls("pi-b"), []);
 
       const ownRow = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
       expect(ownRow).toBeTruthy();
@@ -978,6 +981,7 @@ describe("AgentToolsTab", () => {
       expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("pi-b", [
         { targetType: "agent", targetId: "agent-1" },
       ]);
+      expect(client.getQueryState(queryKeys.tools.connectionInstalls("pi-b"))?.isInvalidated).toBe(true);
     });
 
     it("TECH-8350: disables own personal instance when another owner's personal instance for the same entry is installed (conflict check)", async () => {
@@ -1056,7 +1060,8 @@ describe("AgentToolsTab", () => {
         ],
       });
 
-      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+      const { client } = await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+      client.setQueryData(queryKeys.tools.connectionInstalls("pi-b"), []);
 
       const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
       expect(bobRow).toBeTruthy();
@@ -1081,6 +1086,7 @@ describe("AgentToolsTab", () => {
       // Alice's concurrent install was loaded by the refetch, so Bob's row is now disabled by conflict.
       expect((bobRow as HTMLButtonElement).disabled).toBe(true);
       expect(container.textContent).toContain("Another user's personal instance is already installed for this app on this agent.");
+      expect(client.getQueryState(queryKeys.tools.connectionInstalls("pi-b"))?.isInvalidated).toBe(true);
 
       // Alice's peer instance is removed, clearing the conflict.
       peerInstalled = false;

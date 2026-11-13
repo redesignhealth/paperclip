@@ -1643,6 +1643,46 @@ describe("AppDetail", () => {
     expect(container.textContent).toContain("Try again");
   });
 
+  it("TECH-8350: displays permissions error card and retries when listConnectionGrants rejects for a personal connection", async () => {
+    mockParams.tab = "permissions";
+    const personalConn = connection({
+      id: "conn-1",
+      createdByUserId: "user-1",
+      config: { defaultMcpManaged: "personal", paperclipDefaultMcpEntry: "rh-google-mcp" },
+      credentialPolicy: "per_user",
+    });
+    getConnectionMock.mockResolvedValue(personalConn);
+    listConnectionGrantsMock.mockRejectedValueOnce(new Error("Grants fetch failed"));
+    getConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Couldn’t load tools for this app.");
+    expect(container.textContent).toContain("Try again");
+    expect(container.textContent).not.toContain("Choose agents");
+    expect(container.textContent).not.toContain("agent selected");
+
+    const retryButton = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Try again",
+    );
+    expect(retryButton).toBeTruthy();
+
+    listConnectionGrantsMock.mockResolvedValueOnce({
+      connection: { id: "conn-1", uid: "conn-uid-1" },
+      grants: [],
+      currentUserId: "user-1",
+      members: [],
+      capabilities: fullCapabilities({ canConfigure: true }),
+    });
+
+    await act(async () => {
+      retryButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(listConnectionGrantsMock).toHaveBeenCalledTimes(2);
+  });
+
   it("TECH-8350: does not spin forever when session user is null for non-owner personal connection", async () => {
     mockParams.tab = "permissions";
     const personalConn = connection({

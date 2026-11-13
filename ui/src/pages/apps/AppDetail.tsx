@@ -389,7 +389,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
           if (wanted) {
             await toolsApi.putConnectionInstalls(connectionId, [
               // PUT replaces the whole list, so a company-wide install row must be sent back to survive.
-              ...(install.onAll ? [{ targetType: "company" as const, targetId: selectedCompanyId! }] : []),
+              ...(install.onAll && !isPersonal ? [{ targetType: "company" as const, targetId: selectedCompanyId! }] : []),
               ...wanted.map((targetId) => ({ targetType: "agent" as const, targetId })),
             ]);
           }
@@ -670,7 +670,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     (isPersonalOwner && !installsResolved) ||
     (isPersonal && grantsQuery.isLoading);
   const reviewFailed = catalogQuery.isError || profilesQuery.isError || policiesQuery.isError;
-  const permissionsFailed = reviewFailed || installsQuery.isError || agentsQuery.isError;
+  const permissionsFailed = reviewFailed || installsQuery.isError || agentsQuery.isError || (isPersonal && grantsQuery.isError);
 
   return (
     <div className="max-w-4xl space-y-10 pb-12">
@@ -753,6 +753,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
               void policiesQuery.refetch();
               void installsQuery.refetch();
               void agentsQuery.refetch();
+              void grantsQuery.refetch();
             }} />
           : permissionsLoading
           ? <ToolsLoading />

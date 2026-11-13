@@ -611,9 +611,11 @@ export function AgentToolsTab({ agent, companyId }: { agent: AgentDetailRecord; 
         queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(companyId) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.tools.effectiveProfilesForAgent(companyId, agent.id) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.tools.testAgentAccessesForConnection(variables.connection.id) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.tools.connectionInstalls(variables.connection.id) }),
       ]);
     },
     onError: (_error, variables) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.tools.connectionInstalls(variables.connection.id) });
       if (isPersonalDefaultMcpInstance(variables.connection.config)) {
         // Restore the authoritative server state for this row so the UI never claims OFF while the backend is ON,
         // and refetch authoritative state so concurrent peer conflicts are brought up to date.
