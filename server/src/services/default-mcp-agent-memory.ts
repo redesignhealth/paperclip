@@ -77,26 +77,22 @@ export const AGENT_MEMORY_ADAPTER_PROFILES: Readonly<Record<string, AgentMemoryA
 });
 
 /**
- * A native-runner (`paperclip_runner`) config that names Codex explicitly: `provider: "codex"`, or `provider: "acpx"`
- * with `acpxAgent: "codex"`. `agentHarnessType` also maps a native-runner config with NO provider to `codex_local`
- * (the runner default), so one table line alone would enroll every such agent. Enrollment mints a token and writes
- * config, so it needs the operator to have chosen Codex, not the default to have fallen through to it.
- */
-function paperclipRunnerNamesCodex(config: Record<string, unknown>): boolean {
-  if (config.provider === "codex") return true;
-  return config.provider === "acpx" && config.acpxAgent === "codex";
-}
-
-/**
  * The profile of an agent, keyed by its HARNESS: `agentHarnessType` maps a native-runner agent (`paperclip_runner`) to
  * the harness its config selects (for example provider `acpx` with agent `claude` is `claude_local`), and returns every
- * other adapter type unchanged. Codex through the native runner must be named explicitly (see `paperclipRunnerNamesCodex`).
+ * other adapter type unchanged.
+ *
+ * Codex is matched by harness, not by adapter type alone: `codex_local`, or a native runner whose provider is `codex`
+ * (also the runner default with no provider) or `acpx` with agent `codex`. Every other runner provider and ACP agent
+ * (opencode, muse, openai_dot, grok_bot, pi, grok, cursor, copilot) has no profile. Agent creation normalizes a
+ * runner config to an explicit `provider: "codex"`, so a new default runner agent is a Codex agent and is enrolled.
  */
 export function agentMemoryProfileFor(adapterType: string | null | undefined, adapterConfig?: unknown): AgentMemoryAdapterProfile | null {
   if (!adapterType) return null;
   const config = asRecord(adapterConfig);
+  // `agentHarnessType` returns an unknown runner provider string as is, so a provider named after a harness (such as
+  // "hermes_local") would borrow that harness's profile. Only the providers that select Claude or Codex may match.
+  if (adapterType === "paperclip_runner" && ![undefined, "codex", "acpx"].includes(config.provider as string | undefined)) return null;
   const harness = agentHarnessType(adapterType, config);
-  if (adapterType === "paperclip_runner" && harness === "codex_local" && !paperclipRunnerNamesCodex(config)) return null;
   return Object.prototype.hasOwnProperty.call(AGENT_MEMORY_ADAPTER_PROFILES, harness) ? AGENT_MEMORY_ADAPTER_PROFILES[harness]! : null;
 }
 

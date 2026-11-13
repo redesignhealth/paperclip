@@ -111,16 +111,14 @@ describe("agent memory config", () => {
     expect(agentMemoryEligibleForNewAgent("toString", {}, on)).toBe(false);
   });
 
-  it("a native runner is a Codex agent only when the config names Codex", () => {
-    // Named Codex: enrolled with the Claude/Codex RH_MEMORY_* profile.
-    expect(agentMemoryProfileFor("paperclip_runner", { provider: "codex" })).toBe(AGENT_MEMORY_ADAPTER_PROFILES.codex_local);
-    expect(agentMemoryProfileFor("paperclip_runner", { provider: "acpx", acpxAgent: "codex" })).toBe(AGENT_MEMORY_ADAPTER_PROFILES.codex_local);
-    // The runner default (no provider) maps to the Codex harness but is not a choice, so it is not enrolled.
-    expect(agentMemoryProfileFor("paperclip_runner", {})).toBeNull();
-    expect(agentMemoryProfileFor("paperclip_runner", undefined)).toBeNull();
-    expect(agentMemoryProfileFor("paperclip_runner", { model: "gpt-5" })).toBeNull();
-    expect(agentMemoryProfileFor("paperclip_runner", { provider: null })).toBeNull();
-    expect(agentMemoryProfileFor("paperclip_runner", { provider: "Codex" })).toBeNull();
+  it("matches Codex agents by harness and nothing else", () => {
+    const codex = AGENT_MEMORY_ADAPTER_PROFILES.codex_local;
+    expect(agentMemoryProfileFor("codex_local", {})).toBe(codex);
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "codex" })).toBe(codex);
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "acpx", acpxAgent: "codex" })).toBe(codex);
+    // The runner default (no provider) is the Codex harness. Agent creation stores it as provider "codex".
+    expect(agentMemoryProfileFor("paperclip_runner", {})).toBe(codex);
+    expect(agentMemoryProfileFor("paperclip_runner", undefined)).toBe(codex);
     // Other runner providers and ACP agents stay out.
     for (const config of [
       { provider: "opencode" },
@@ -131,13 +129,22 @@ describe("agent memory config", () => {
       { provider: "acpx", acpxAgent: "grok" },
       { provider: "acpx", acpxAgent: "cursor" },
       { provider: "acpx", acpxAgent: "copilot" },
+      { provider: "acpx", acpxAgent: "unknown" },
+      { provider: "Codex" },
+      { provider: null },
     ]) {
       expect(agentMemoryProfileFor("paperclip_runner", config)).toBeNull();
     }
+    // A runner provider named after another harness does not borrow that harness's profile.
+    for (const provider of ["hermes_local", "claude_local", "codex_local", "toString"]) {
+      expect(agentMemoryProfileFor("paperclip_runner", { provider })).toBeNull();
+    }
     // Claude through the runner is unchanged, including the ACP default agent.
     expect(agentMemoryProfileFor("paperclip_runner", { provider: "acpx" })).toBe(AGENT_MEMORY_ADAPTER_PROFILES.claude_local);
-    expect(agentMemoryEligibleForNewAgent("paperclip_runner", {}, on)).toBe(false);
-    expect(agentMemoryEligibleForNewAgent("paperclip_runner", { provider: "codex" }, on)).toBe(true);
+    // Other adapter types stay out.
+    for (const type of ["hermes_gateway", "opencode_local", "cursor", "process", "http"]) {
+      expect(agentMemoryProfileFor(type, {})).toBeNull();
+    }
   });
 
   it("the adapter profile table maps each harness to its env keys", () => {
@@ -408,6 +415,47 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
     const env = ((await rowOf(agent.id)).adapterConfig as Record<string, any>).env;
     expect(Object.keys(env).sort()).toEqual(["RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
+  });
+
+  it("new Codex local agent: attaches the same RH_MEMORY_* keys as Claude", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const agent = await createAgent(companyId, ownerId, { adapterType: "codex_local", adapterConfig: { model: "some-model" }, runner: "legacy" });
+    expect((await rowOf(agent.id)).adapterType).toBe("codex_local");
+    expect(fetchMock.calls.mint.filter((call) => call.sub.startsWith("agent-memory-"))).toHaveLength(1);
+    expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
+    const [secret] = await secretsFor(companyId, agent.id);
+    const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+    expect(config.env).toEqual({
+      RH_MEMORY_TOKEN: expect.objectContaining({ type: "secret_ref", secretId: secret!.id, version: "latest" }),
+      RH_MEMORY_URL: { type: "plain", value: MEMORY_URL },
+      RH_MEMORY_PROXY: { type: "plain", value: MEMORY_PROXY },
+    });
+    expect(config.memoryProvider).toBeUndefined();
+    expect(config.runtimeMemory).toBeUndefined();
+    expect(JSON.stringify(config)).not.toContain(BOARD_TOKEN);
+    const resolved = await secretService(db).resolveAdapterConfigForRuntime(
+      companyId,
+      config,
+      { consumerType: "agent", consumerId: agent.id },
+      { adapterType: "codex_local" },
+    );
+    expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_TOKEN).toBe(BOARD_TOKEN);
+  });
+
+  it("a default native-runner agent is stored as provider codex and gets the Codex profile", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    vi.stubGlobal("fetch", downstreamFetch());
+    const agent = await createAgent(companyId, ownerId, { adapterType: "paperclip_runner", adapterConfig: {} });
+    const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+    expect(config.provider).toBe("codex");
+    expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
+    expect(Object.keys(config.env).sort()).toEqual(["RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
   });
 
   it("keeps an existing proxy key when none is configured", async () => {

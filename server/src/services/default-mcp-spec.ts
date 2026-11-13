@@ -419,7 +419,7 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
   },
   {
     // Per-agent memory (TECH-8409). Not an MCP connection: the hook mints `agent-memory-<agentId>`, stores it as a company
-    // secret and attaches the harness's memory settings (Hermes mem0 or Claude RH_MEMORY_*) to the agent's adapterConfig. `connectionName` names no real
+    // secret and attaches the harness's memory settings (Hermes mem0, or RH_MEMORY_* for Claude and Codex) to the agent's adapterConfig. `connectionName` names no real
     // connection (no template, no install). Inert unless PAPERCLIP_AGENT_MEMORY_ENABLED and PAPERCLIP_AGENT_MEMORY_URL are set.
     key: "agent-memory",
     displayName: "Agent Memory",
