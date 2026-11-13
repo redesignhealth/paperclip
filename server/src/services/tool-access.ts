@@ -12605,6 +12605,7 @@ export function toolAccessService(
     connection: typeof toolConnections.$inferSelect,
     grant: typeof connectionGrants.$inferSelect,
     forceRefresh: boolean,
+    baselineRefreshedAt?: string | null,
   ): Promise<{
     grant: typeof connectionGrants.$inferSelect;
     leaseId: string | null;
@@ -12625,12 +12626,24 @@ export function toolAccessService(
         });
       }
       const expiresAtMs = oauthGrantExpiresAtMs(latest, connection);
+      const latestOauth = oauthGrantConfig(latest);
+      const latestRefreshedAt = typeof latestOauth.refreshedAt === "string" ? latestOauth.refreshedAt : null;
+      const advancedPastBaseline =
+        baselineRefreshedAt !== undefined &&
+        latestRefreshedAt !== null &&
+        (baselineRefreshedAt === null || latestRefreshedAt > baselineRefreshedAt);
+
       if (
         (!forceRefresh &&
           (expiresAtMs === null || expiresAtMs > Date.now() + 60_000)) ||
         (forceRefresh &&
+          baselineRefreshedAt !== undefined &&
+          advancedPastBaseline &&
+          !asRecord(latestOauth.refreshLease).id) ||
+        (forceRefresh &&
+          baselineRefreshedAt === undefined &&
           latest.updatedAt.getTime() > initialUpdatedAt &&
-          !asRecord(oauthGrantConfig(latest).refreshLease).id)
+          !asRecord(latestOauth.refreshLease).id)
       ) {
         return { grant: latest, leaseId: null };
       }
@@ -19661,7 +19674,13 @@ export function toolAccessService(
     connectionId: string;
     subjectUserId: string;
     force?: boolean;
-  }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
+    observedRefreshedAt?: string | null;
+  }): Promise<{
+    accessToken: string;
+    expiresAt: string | null;
+    refreshedAt?: string | null;
+    rotated?: boolean;
+  } | null> {
     // companyId-prefixed: connectionId is already company-scoped on its own
     // (it's a UUID primary key), so the prefix isn't load-bearing for
     // uniqueness here. It's kept for the same reason every other
@@ -19675,17 +19694,20 @@ export function toolAccessService(
       const cooldownUntil = userGrantRefreshCooldownUntil.get(flightKey);
       if (cooldownUntil && cooldownUntil > Date.now()) return null;
 
-      const [grant] = await db
-        .select()
-        .from(connectionGrants)
-        .where(and(
-          eq(connectionGrants.companyId, input.companyId),
-          eq(connectionGrants.connectionId, input.connectionId),
-          eq(connectionGrants.kind, "user"),
-          eq(connectionGrants.subjectUserId, input.subjectUserId),
-          eq(connectionGrants.status, "active"),
-        ))
-        .limit(1);
+      const grant = await withCompanyScope(db, input.companyId, async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(connectionGrants)
+          .where(and(
+            eq(connectionGrants.companyId, input.companyId),
+            eq(connectionGrants.connectionId, input.connectionId),
+            eq(connectionGrants.kind, "user"),
+            eq(connectionGrants.subjectUserId, input.subjectUserId),
+            eq(connectionGrants.status, "active"),
+          ))
+          .limit(1);
+        return row ?? null;
+      });
       if (!grant) return null;
       const accessTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
       const refreshTokenRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
@@ -19698,13 +19720,28 @@ export function toolAccessService(
         return null;
       }
 
-      // If force is requested, check if another process just refreshed this grant recently (< 15s).
-      // If so, reuse the freshly rotated token rather than rotating again and risking stale refresh token races.
+      // Cloud strategy guard: cloud strategy refresh tokens must NOT be exchanged via direct refreshUserGrant
+      if (isPaperclipCloudConnectorStrategy(asRecord(asRecord(connection.config)?.oauth)?.strategy)) {
+        logger.info(
+          { connectionId: connection.id, companyId: input.companyId, subjectUserId: input.subjectUserId },
+          "[tool-access] refreshUserGrant skipped: cloud strategy tokens are managed by cloud connector",
+        );
+        return null;
+      }
+
+      // Server-observed generation check before acquiring lease:
+      // If force is requested and an observedRefreshedAt is provided:
+      // If DB grant's refreshedAt is already strictly newer than the token that received 401,
+      // another concurrent call already refreshed the grant after the rejected token was issued.
+      // Reuse the newer token directly.
       const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
-      const refreshedAtStr = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
-      const refreshedAtMs = refreshedAtStr ? Date.parse(refreshedAtStr) : Number.NaN;
-      const recentlyRefreshed = Number.isFinite(refreshedAtMs) && Date.now() - refreshedAtMs < 15_000;
-      if (input.force && recentlyRefreshed) {
+      const currentRefreshedAt = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
+      if (
+        input.force &&
+        input.observedRefreshedAt !== undefined &&
+        currentRefreshedAt !== null &&
+        (input.observedRefreshedAt === null || currentRefreshedAt > input.observedRefreshedAt)
+      ) {
         try {
           const { value: currentToken } = await resolveConnectionGrantSecret(db, connection, grant, accessTokenRef, {
             consumerType: "connection_grant",
@@ -19715,22 +19752,91 @@ export function toolAccessService(
           const currentExpiresAt = typeof accessTokenRef.expiresAt === "string"
             ? accessTokenRef.expiresAt
             : (typeof grantOauth?.accessTokenExpiresAt === "string" ? grantOauth.accessTokenExpiresAt : null);
-          return { accessToken: currentToken, expiresAt: currentExpiresAt };
+          return {
+            accessToken: currentToken,
+            expiresAt: currentExpiresAt,
+            refreshedAt: currentRefreshedAt,
+            rotated: false,
+          };
         } catch {
-          // Fall through to exchange if resolving fails
+          // Fall through to lease acquisition if secret read fails
         }
       }
 
+      // Cross-instance lease acquisition
+      let lease: { grant: typeof connectionGrants.$inferSelect; leaseId: string | null };
       try {
-        // consumerType/consumerId target this grant, not the connection --
-        // see the connection_grant comment on SECRET_BINDING_TARGET_TYPES
-        // and the matching fix in tool-gateway.ts's resolveUserGrantAuthHeader.
-        const { value: refreshTokenValue } = await resolveConnectionGrantSecret(db, connection, grant, refreshTokenRef, {
+        lease = await acquireOAuthGrantRefreshLease(
+          connection,
+          grant,
+          true,
+          input.observedRefreshedAt,
+        );
+      } catch (leaseErr) {
+        logger.warn(
+          {
+            connectionId: input.connectionId,
+            subjectUserId: input.subjectUserId,
+            error: sanitizeLoggedProviderError(leaseErr instanceof Error ? leaseErr.message : String(leaseErr)),
+          },
+          "[tool-access] acquireOAuthGrantRefreshLease failed in refreshUserGrant",
+        );
+        return null;
+      }
+
+      // If leaseId is null, another instance refreshed the grant while we waited
+      if (!lease.leaseId) {
+        const leasedOauth = asRecord(asRecord(lease.grant.providerTenant)?.oauth);
+        const leasedRefreshedAt = typeof leasedOauth?.refreshedAt === "string" ? leasedOauth.refreshedAt : null;
+        if (
+          input.observedRefreshedAt !== undefined &&
+          (leasedRefreshedAt === null || (input.observedRefreshedAt !== null && leasedRefreshedAt <= input.observedRefreshedAt))
+        ) {
+          userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
+          return null;
+        }
+
+        const leasedAccessRef = lease.grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+        if (!leasedAccessRef) return null;
+        try {
+          const { value: currentToken } = await resolveConnectionGrantSecret(db, connection, lease.grant, leasedAccessRef, {
+            consumerType: "connection_grant",
+            consumerId: lease.grant.id,
+            configPath: "oauth.access_token",
+            actorType: "system",
+          });
+          const leasedExpiresAt = typeof leasedAccessRef.expiresAt === "string"
+            ? leasedAccessRef.expiresAt
+            : (typeof leasedOauth?.accessTokenExpiresAt === "string" ? leasedOauth.accessTokenExpiresAt : null);
+          return {
+            accessToken: currentToken,
+            expiresAt: leasedExpiresAt,
+            refreshedAt: leasedRefreshedAt,
+            rotated: false,
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      // We own the lease! Resolve the refresh token value and latestVersion for CAS
+      let refreshTokenValue: string;
+      let refreshSecretLatestVersion: number | null = null;
+      try {
+        const resolvedSecret = await resolveConnectionGrantSecret(db, connection, grant, refreshTokenRef, {
           consumerType: "connection_grant",
           consumerId: grant.id,
           configPath: "oauth.refresh_token",
           actorType: "system",
         });
+        refreshTokenValue = resolvedSecret.value;
+        refreshSecretLatestVersion = typeof resolvedSecret.latestVersion === "number" ? resolvedSecret.latestVersion : null;
+      } catch {
+        return null;
+      }
+
+      try {
+        // HTTP discovery / client / token exchange strictly outside DB transactions
         const endpoints = await oauthEndpointsForConnection(connection, null);
         const client = await oauthClientForConnection(connection, endpoints.provider);
         if (!client.clientId) return null;
@@ -19742,49 +19848,70 @@ export function toolAccessService(
           refreshToken: refreshTokenValue,
         });
 
-        // Rotate the secrets first: if secret rotation fails, the grant's
-        // expiry in the DB is untouched (still expired), preventing a false
-        // "fresh" state where an expired token is treated as valid.
-        await secrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
-        if (token.refreshToken) {
-          await secrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
-        }
-
+        const newRefreshedAt = new Date().toISOString();
         const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
-        const updatedRefs = grant.credentialSecretRefs.map((ref) =>
-          ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
-        const currentOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
-        const updatedProviderTenant = {
-          ...(grant.providerTenant ?? {}),
-          oauth: {
-            ...currentOauth,
-            accessTokenExpiresAt: expiresAt ?? undefined,
-            refreshedAt: new Date().toISOString(),
-          },
-        };
-        const [updated] = await db
-          .update(connectionGrants)
-          .set({
-            providerTenant: updatedProviderTenant,
-            credentialSecretRefs: updatedRefs,
-            lastUsedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(and(
-            eq(connectionGrants.id, grant.id),
-            eq(connectionGrants.companyId, input.companyId),
-            eq(connectionGrants.status, "active"),
-          ))
-          .returning({ id: connectionGrants.id });
-        if (!updated) {
-          // Lost the race to a concurrent process that already marked this
-          // grant needs_reauthorization (or revoked it) between our SELECT
-          // and this UPDATE. Fall through to null.
-          return null;
-        }
+
+        const committed = await withCompanyScope(db, input.companyId, async (tx) => {
+          const [lockedGrant] = await tx
+            .select()
+            .from(connectionGrants)
+            .where(and(
+              eq(connectionGrants.id, grant.id),
+              eq(connectionGrants.companyId, input.companyId),
+              eq(connectionGrants.status, "active"),
+              sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
+            ))
+            .for("update")
+            .limit(1);
+
+          if (!lockedGrant) return false;
+
+          const txSecrets = secretService(tx);
+          await txSecrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
+          if (token.refreshToken) {
+            await txSecrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+          }
+
+          const updatedRefs = lockedGrant.credentialSecretRefs.map((ref) =>
+            ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
+          const currentOauth = asRecord(asRecord(lockedGrant.providerTenant)?.oauth);
+          const updatedProviderTenant = {
+            ...(lockedGrant.providerTenant ?? {}),
+            oauth: {
+              ...withoutOAuthGrantRefreshLease(currentOauth),
+              accessTokenExpiresAt: expiresAt ?? undefined,
+              refreshedAt: newRefreshedAt,
+            },
+          };
+
+          const [updated] = await tx
+            .update(connectionGrants)
+            .set({
+              providerTenant: updatedProviderTenant,
+              credentialSecretRefs: updatedRefs,
+              lastUsedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(connectionGrants.id, lockedGrant.id),
+              eq(connectionGrants.companyId, input.companyId),
+              eq(connectionGrants.status, "active"),
+              sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
+            ))
+            .returning({ id: connectionGrants.id });
+
+          return Boolean(updated);
+        });
+
+        if (!committed) return null;
 
         userGrantRefreshCooldownUntil.delete(flightKey);
-        return { accessToken: token.accessToken, expiresAt };
+        return {
+          accessToken: token.accessToken,
+          expiresAt,
+          refreshedAt: newRefreshedAt,
+          rotated: true,
+        };
       } catch (err) {
         // A refresh_token itself expiring/being revoked is expected over a
         // long enough time horizon, not a bug -- fail closed by marking the
@@ -19799,36 +19926,42 @@ export function toolAccessService(
         let markedNeedsReauthorization = false;
         if (errorCode === "oauth_reauthorization_required") {
           try {
-            const [reauthorized] = await db
-              .update(connectionGrants)
-              .set({ status: "needs_reauthorization", updatedAt: new Date() })
-              .where(and(
-                eq(connectionGrants.id, grant.id),
-                eq(connectionGrants.companyId, input.companyId),
-                eq(connectionGrants.status, "active"),
-              ))
-              .returning({ id: connectionGrants.id });
-            // Only claim the transition happened if a row actually came
-            // back -- a zero-row UPDATE (e.g. a concurrent call already
-            // moved this grant to "revoked" or "needs_reauthorization"
-            // between our SELECT and this UPDATE) still runs successfully
-            // but affects nothing, and without this check the flag below
-            // would be set as if we'd made the transition ourselves.
-            markedNeedsReauthorization = Boolean(reauthorized);
+            await withCompanyScope(db, input.companyId, async (tx) => {
+              const [currentSecret] = await tx
+                .select({ latestVersion: companySecrets.latestVersion })
+                .from(companySecrets)
+                .where(eq(companySecrets.id, refreshTokenRef.secretId))
+                .limit(1);
+
+              const secretVersionUnchanged =
+                refreshSecretLatestVersion === null ||
+                (currentSecret && currentSecret.latestVersion === refreshSecretLatestVersion);
+
+              if (secretVersionUnchanged) {
+                const [reauthorized] = await tx
+                  .update(connectionGrants)
+                  .set({
+                    status: "needs_reauthorization",
+                    providerTenant: {
+                      ...(grant.providerTenant ?? {}),
+                      oauth: withoutOAuthGrantRefreshLease(asRecord(asRecord(grant.providerTenant)?.oauth)),
+                    },
+                    updatedAt: new Date(),
+                  })
+                  .where(and(
+                    eq(connectionGrants.id, grant.id),
+                    eq(connectionGrants.companyId, input.companyId),
+                    eq(connectionGrants.status, "active"),
+                    sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
+                  ))
+                  .returning({ id: connectionGrants.id });
+                markedNeedsReauthorization = Boolean(reauthorized);
+              }
+            });
           } catch (updateErr) {
             // Same "never throws" contract as the rest of this function --
             // if the DB is degraded and this update fails, fall through to
-            // the cooldown below instead of propagating. Without a catch
-            // here, this exception would escape through oauthSingleFlight
-            // (which only has a `finally`, no `catch`) to every concurrent
-            // waiter, and no cooldown would get set -- every subsequent
-            // tool call would re-enter refreshUserGrant and hammer the
-            // OAuth provider again with no backoff while the DB recovers.
-            // Logged (unlike a bare swallow) because a failure here leaves
-            // the grant stuck marked "active" while its OAuth provider
-            // keeps getting retried on every cooldown expiry, with no other
-            // operator-visible signal that the reauthorization transition
-            // never landed.
+            // the cooldown below instead of propagating.
             logger.warn(
               {
                 connectionId: input.connectionId,
@@ -19842,15 +19975,6 @@ export function toolAccessService(
         if (!markedNeedsReauthorization) {
           userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
         }
-        // Best-effort, deliberately: refreshUserGrant's contract (see
-        // tool-gateway.ts's resolveUserGrantAuthHeader) is "never throws,
-        // returns null on any failure so the caller falls through to the
-        // connect-card/reauthorization prompt." A bare, awaited logActivity
-        // call here broke that contract silently -- a transient DB error
-        // while auditing the refresh failure would itself throw, propagate
-        // out of this catch block uncaught, and replace the structured
-        // user_authorization_required 403 with an opaque error, since
-        // nothing on the gateway side wraps this call either.
         try {
           await logActivity(db, {
             companyId: input.companyId,
@@ -19862,33 +19986,24 @@ export function toolAccessService(
             details: {
               subjectUserId: input.subjectUserId,
               errorCode: errorCode ?? null,
-              // This message can originate directly from the OAuth provider's
-              // own error_description field (see exchangeOAuthToken) -- an
-              // untrusted external string being persisted into a durable
-              // activity log. Capped and stripped of non-printable characters
-              // so a malicious or misconfigured authorization server can't use
-              // this as an unbounded storage sink or smuggle control
-              // characters into log output.
               error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
             },
           });
         } catch (logErr) {
-          // Swallow -- see comment above -- but not silently: without this,
-          // a transient DB failure here has no signal at all, unlike every
-          // sibling degradation branch in tool-gateway.ts's bestEffortAudit.
           logger.warn(
             {
               connectionId: input.connectionId,
               subjectUserId: input.subjectUserId,
-              // Same rationale as the sanitizeLoggedProviderError call above --
-              // this can be a raw DB/driver error message that echoes back
-              // query or parameter content.
               error: sanitizeLoggedProviderError(logErr instanceof Error ? logErr.message : String(logErr)),
             },
             "refreshUserGrant swallowed a logActivity failure",
           );
         }
         return null;
+      } finally {
+        if (lease.leaseId) {
+          await clearOAuthGrantRefreshLease(lease.grant, lease.leaseId).catch(() => undefined);
+        }
       }
     });
   }

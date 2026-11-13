@@ -1399,7 +1399,13 @@ export function createToolGatewayService(
         connectionId: string;
         subjectUserId: string;
         force?: boolean;
-      }) => Promise<{ accessToken: string; expiresAt: string | null } | null>)
+        observedRefreshedAt?: string | null;
+      }) => Promise<{
+        accessToken: string;
+        expiresAt: string | null;
+        refreshedAt?: string | null;
+        rotated?: boolean;
+      } | null>)
     | null = null;
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
@@ -4709,58 +4715,89 @@ export function createToolGatewayService(
   const MAX_PERSONAL_GRANT_EXPIRY_SKEW_MS = 5 * 60_000;
 
   function resolvePersonalGrantExpiry(
+    connection: typeof toolConnections.$inferSelect,
     grant: typeof connectionGrants.$inferSelect,
     accessTokenRef: ToolCredentialSecretRef,
     nowMs: number = Date.now(),
   ): {
     expiresAt: string | null;
     expirySource: "secret_ref" | "provider_tenant" | "none";
+    conflict: boolean;
     isExpired: boolean;
   } {
+    const isCloud = isPaperclipCloudConnectorStrategy(
+      asRecord(asRecord(connection.config)?.oauth)?.strategy,
+    );
     const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
-    const refExpiryStr = typeof accessTokenRef.expiresAt === "string" ? accessTokenRef.expiresAt : null;
-    const tenantExpiryStr = typeof grantOauth?.accessTokenExpiresAt === "string" ? grantOauth.accessTokenExpiresAt : null;
-
-    const refParsed = refExpiryStr ? Date.parse(refExpiryStr) : Number.NaN;
+    const tenantExpiryStr =
+      typeof grantOauth?.accessTokenExpiresAt === "string"
+        ? grantOauth.accessTokenExpiresAt
+        : null;
     const tenantParsed = tenantExpiryStr ? Date.parse(tenantExpiryStr) : Number.NaN;
+    const hasValidTenant = Number.isFinite(tenantParsed);
+
+    if (isCloud) {
+      if (hasValidTenant && tenantExpiryStr) {
+        const isExpired = tenantParsed <= nowMs;
+        return {
+          expiresAt: tenantExpiryStr,
+          expirySource: "provider_tenant",
+          conflict: false,
+          isExpired,
+        };
+      }
+      return {
+        expiresAt: null,
+        expirySource: "none",
+        conflict: false,
+        isExpired: false,
+      };
+    }
+
+    const refExpiryStr =
+      typeof accessTokenRef.expiresAt === "string" ? accessTokenRef.expiresAt : null;
+    const refParsed = refExpiryStr ? Date.parse(refExpiryStr) : Number.NaN;
+    const hasValidRef = Number.isFinite(refParsed);
+
+    const refreshedAtStr =
+      typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
+    const refreshedAtMs = refreshedAtStr ? Date.parse(refreshedAtStr) : Number.NaN;
+
+    // ref is demonstrably superseded if its expiry is at or before the last successful refresh timestamp
+    const refSuperseded =
+      hasValidRef && Number.isFinite(refreshedAtMs) && refParsed <= refreshedAtMs;
+
+    const conflict =
+      hasValidRef && hasValidTenant && Math.abs(refParsed - tenantParsed) > 60_000;
 
     let expiresMs: number | null = null;
     let expiresAt: string | null = null;
     let expirySource: "secret_ref" | "provider_tenant" | "none" = "none";
 
-    if (Number.isFinite(refParsed) && Number.isFinite(tenantParsed)) {
-      if (refParsed >= tenantParsed) {
-        expiresMs = refParsed;
-        expiresAt = refExpiryStr;
-        expirySource = "secret_ref";
-      } else {
-        expiresMs = tenantParsed;
-        expiresAt = tenantExpiryStr;
-        expirySource = "provider_tenant";
-      }
-    } else if (Number.isFinite(refParsed)) {
+    if (hasValidRef && !refSuperseded) {
       expiresMs = refParsed;
       expiresAt = refExpiryStr;
       expirySource = "secret_ref";
-    } else if (Number.isFinite(tenantParsed)) {
+    } else if (hasValidTenant) {
       expiresMs = tenantParsed;
       expiresAt = tenantExpiryStr;
       expirySource = "provider_tenant";
+    } else if (hasValidRef) {
+      expiresMs = refParsed;
+      expiresAt = refExpiryStr;
+      expirySource = "secret_ref";
     }
 
     if (expiresMs === null || expiresAt === null) {
-      return { expiresAt: null, expirySource: "none", isExpired: false };
+      return { expiresAt: null, expirySource: "none", conflict, isExpired: false };
     }
 
     if (expiresMs <= nowMs) {
-      return { expiresAt, expirySource, isExpired: true };
+      return { expiresAt, expirySource, conflict, isExpired: true };
     }
 
-    const refreshedAtParsed = typeof grantOauth?.refreshedAt === "string"
-      ? Date.parse(grantOauth.refreshedAt)
-      : Number.NaN;
-    const issuedAtMs = Number.isFinite(refreshedAtParsed)
-      ? refreshedAtParsed
+    const issuedAtMs = Number.isFinite(refreshedAtMs)
+      ? refreshedAtMs
       : grant.updatedAt ? new Date(grant.updatedAt).getTime() : null;
 
     let skewMs = MAX_PERSONAL_GRANT_EXPIRY_SKEW_MS;
@@ -4771,7 +4808,7 @@ export function createToolGatewayService(
     }
 
     const isExpired = expiresMs <= nowMs + skewMs;
-    return { expiresAt, expirySource, isExpired };
+    return { expiresAt, expirySource, conflict, isExpired };
   }
 
   // Never falls back to a workspace grant or the connection's own
@@ -4784,7 +4821,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     subjectUserId: string,
-  ): Promise<Record<string, string> | null> {
+  ): Promise<{ headers: Record<string, string>; observedRefreshedAt?: string | null } | null> {
     // Scoped explicitly (see withCredentialReadScope): a security-sensitive
     // "does this person have a grant" read.
     const [storedGrant] = await withCredentialReadScope(connection.companyId, (tx) => tx
@@ -4861,7 +4898,12 @@ export function createToolGatewayService(
       return null;
     }
     const nowMs = options.now?.() ?? Date.now();
-    const { expiresAt, expirySource, isExpired } = resolvePersonalGrantExpiry(grant, accessTokenRef, nowMs);
+    const { expiresAt, expirySource, conflict, isExpired } = resolvePersonalGrantExpiry(
+      connection,
+      grant,
+      accessTokenRef,
+      nowMs,
+    );
     if (isExpired) {
       if (!refreshUserGrantHook) {
         await bestEffortAudit({
@@ -4938,11 +4980,15 @@ export function createToolGatewayService(
           subjectUserId,
           expirySource,
           expiresPresent: Boolean(expiresAt),
+          conflict,
           refreshed: true,
         },
         "[tool-gateway] personal grant resolved",
       );
-      return { Authorization: `Bearer ${sanitized}` };
+      return {
+        headers: { Authorization: `Bearer ${sanitized}` },
+        observedRefreshedAt: refreshed.refreshedAt ?? new Date(nowMs).toISOString(),
+      };
     }
     try {
       // consumerType/consumerId target this specific grant, not the
@@ -4971,6 +5017,8 @@ export function createToolGatewayService(
         });
         return null;
       }
+      const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+      const storedRefreshedAt = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
       logger.info(
         {
           connectionId: connection.id,
@@ -4979,11 +5027,15 @@ export function createToolGatewayService(
           subjectUserId,
           expirySource,
           expiresPresent: Boolean(expiresAt),
+          conflict,
           refreshed: false,
         },
         "[tool-gateway] personal grant resolved",
       );
-      return { Authorization: `Bearer ${sanitized}` };
+      return {
+        headers: { Authorization: `Bearer ${sanitized}` },
+        observedRefreshedAt: storedRefreshedAt,
+      };
     } catch (err) {
       // Swallowed to the caller (falls through to the connect-card/
       // reauthorization flow, same as "no grant") -- but not silently: an
@@ -5005,7 +5057,7 @@ export function createToolGatewayService(
   async function resolvePersonalOrConnectionCredentialHeaders(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
-  ): Promise<Record<string, string>> {
+  ): Promise<{ headers: Record<string, string>; observedRefreshedAt?: string | null }> {
     await assertManagedInstallForSession(session, connection);
     if (!session.agentId) {
       await bestEffortAudit({
@@ -7136,13 +7188,16 @@ export function createToolGatewayService(
     let endpoint: string;
     let credentialHeaders: Record<string, string>;
     let personalUserId: string | null = null;
+    let personalObservedRefreshedAt: string | null = null;
     if (personalOnly) {
       endpoint = remoteEndpoint(connection.config ?? {});
       personalUserId = await resolveResponsibleUserId(session);
+      const personalCreds = await resolvePersonalOrConnectionCredentialHeaders(session, connection);
       credentialHeaders = {
         ...projectedConnectionHeaders(connection),
-        ...(await resolvePersonalOrConnectionCredentialHeaders(session, connection)),
+        ...personalCreds.headers,
       };
+      personalObservedRefreshedAt = personalCreds.observedRefreshedAt ?? null;
     } else {
       endpoint = workspaceTarget?.serverUrl ?? await resolvedRemoteEndpoint(session, connection, grant!);
       // Method-defined headers are trusted catalog configuration. Treat them as
@@ -7396,6 +7451,7 @@ export function createToolGatewayService(
             connectionId: connection.id,
             subjectUserId: personalUserId,
             force: true,
+            observedRefreshedAt: personalObservedRefreshedAt,
           });
         } catch (err) {
           logger.warn(
