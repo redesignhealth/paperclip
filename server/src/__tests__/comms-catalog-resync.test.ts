@@ -9,7 +9,8 @@ import { activityLog, agents, authUsers, companies, companyMemberships, companyS
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
-import { readDefaultMcpState } from "../services/default-mcp-spec.js";
+import { DEFAULT_MCP_TEMPLATE_UID, commsReviewedAllowlist, readDefaultMcpState } from "../services/default-mcp-spec.js";
+import { toolAccessService } from "../services/tool-access.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import {
   COMMS_CATALOG_RESYNC_CONFIRMATION,
@@ -230,6 +231,190 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
     const connectionId = await makeV1Clone(agent.id);
     return { companyId, ownerId, template, agent, connectionId };
   }
+
+
+  /** A minimal MCP streamable-HTTP server serving initialize / tools/list for whatever URL the connection uses. */
+  function mcpServer(descriptors: Array<Record<string, unknown>>) {
+    return async (_url: string, init: RequestInit) => {
+      if (init.method === "DELETE") return new Response(null, { status: 200 });
+      const body = JSON.parse(String(init.body)) as { id?: number; method: string };
+      if (body.method === "initialize") {
+        return new Response(
+          JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "board", version: "1" } } }),
+          { status: 200, headers: { "content-type": "application/json", "mcp-session-id": "session-board-test" } },
+        );
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: descriptors } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected MCP method ${body.method}`);
+    };
+  }
+  const liveTool = (name: string, extra: Record<string, unknown> = {}) => ({
+    name,
+    description: `Live description of ${name}`,
+    inputSchema: { type: "object", properties: { labels: { type: "array" } } },
+    annotations: { readOnlyHint: true },
+    ...extra,
+  });
+  const refreshWith = (connectionId: string, descriptors: Array<Record<string, unknown>>) =>
+    toolAccessService(db, {
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      remoteHttpRequest: mcpServer(descriptors),
+    } as never).refreshCatalog(connectionId, { actorType: "system", actorId: "test" });
+  const markManagedTemplate = (connectionId: string) =>
+    db.update(toolConnections).set({ uid: DEFAULT_MCP_TEMPLATE_UID, config: { url: TEMPLATE_URL, defaultMcpManaged: "template", quarantineNewEntries: true }, credentialRefs: [] }).where(eq(toolConnections.id, connectionId));
+  /** The mock board needs no credential; the refresh only has to reach tools/list. */
+  const dropCredentials = async (connectionId: string) => {
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    // Production clones carry the managed marker and quarantineNewEntries from the template; the seeded template is unmarked, so set both here.
+    await db.update(toolConnections).set({ config: { ...(row!.config as Record<string, unknown>), defaultMcpManaged: "dedicated", quarantineNewEntries: true }, credentialRefs: [] }).where(eq(toolConnections.id, connectionId));
+  };
+  const LIVE = () => [liveTool("comms_whoami"), liveTool("proposals_submit"), liveTool("proposals_get"), liveTool("comms_admin_register")];
+
+  describe("catalog refresh keeps the reviewed comms-board tools active", () => {
+    it("re-activates a reviewed tool a past refresh quarantined, on the template and on a clone, and leaves the rest alone", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      for (const connectionId of [template.id, cloneId]) {
+        await db
+          .update(toolCatalogEntries)
+          .set({ status: "quarantined", quarantineReason: "pending_review", quarantinedAt: new Date(), versionHash: "stale" })
+          .where(and(eq(toolCatalogEntries.connectionId, connectionId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+        const result = await refreshWith(connectionId, [...LIVE(), liveTool("brand_new_tool")]);
+        const statuses = await cloneStatus(connectionId);
+        expect(statuses.proposals_submit).toBe("active");
+        const [submit] = await db.select().from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, connectionId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+        expect(submit!.quarantineReason).toBeNull();
+        expect(submit!.quarantinedAt).toBeNull();
+        expect(statuses.proposals_get).toBe("active");
+        expect(statuses.comms_admin_register).toBe("disabled");
+        // A tool outside the reviewed list is still held for review.
+        expect(statuses.brand_new_tool).toBe("quarantined");
+        expect(result.quarantinedCount).toBe(1);
+      }
+    });
+
+    it("accepts descriptor drift of an active reviewed tool (new schema hash) without quarantining it", async () => {
+      const companyId = await seedCompany();
+      await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      await markManagedTemplate(template.id);
+      const result = await refreshWith(template.id, LIVE());
+      expect(result.quarantinedCount).toBe(0);
+      expect(await cloneStatus(template.id)).toMatchObject({ comms_whoami: "active", proposals_submit: "active", proposals_get: "active" });
+    });
+
+    it("fails closed: a reviewed tool that now classifies as destructive is quarantined", async () => {
+      const companyId = await seedCompany();
+      await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      await markManagedTemplate(template.id);
+      await refreshWith(template.id, [liveTool("comms_whoami"), liveTool("proposals_submit", { annotations: { destructiveHint: true } }), liveTool("proposals_get"), liveTool("comms_admin_register")]);
+      const statuses = await cloneStatus(template.id);
+      expect(statuses.proposals_submit).toBe("quarantined");
+      expect(statuses.proposals_get).toBe("active");
+    });
+
+    it("never re-enables a reviewed tool an operator disabled", async () => {
+      const companyId = await seedCompany();
+      await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      await markManagedTemplate(template.id);
+      await db.update(toolCatalogEntries).set({ status: "disabled" }).where(and(eq(toolCatalogEntries.connectionId, template.id), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(template.id, LIVE());
+      expect((await cloneStatus(template.id)).proposals_submit).toBe("disabled");
+    });
+
+    it("control: a connection without the managed markers keeps the generic behaviour (drift is quarantined)", async () => {
+      const companyId = await seedCompany();
+      await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      await db.update(toolConnections).set({ config: { url: TEMPLATE_URL, quarantineNewEntries: true }, credentialRefs: [] }).where(eq(toolConnections.id, template.id));
+      await refreshWith(template.id, LIVE());
+      expect((await cloneStatus(template.id)).proposals_submit).toBe("quarantined");
+    });
+
+    it("a clone repointed away from the template's endpoint loses the exemption: its drift is quarantined", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, cloneId));
+      const repointed = "https://9.9.9.9/mcp";
+      await db.update(toolConnections).set({ config: { ...(row!.config as Record<string, unknown>), url: repointed }, transportConfig: { url: repointed } }).where(eq(toolConnections.id, cloneId));
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
+    });
+
+    it.each([
+      ["the endpoint alias with url removed", (config: Record<string, unknown>) => { const { url: _url, ...rest } = config; return { ...rest, endpoint: "https://9.9.9.9/mcp" }; }],
+      ["the remoteUrl alias with url removed", (config: Record<string, unknown>) => { const { url: _url, ...rest } = config; return { ...rest, remoteUrl: "https://9.9.9.9/mcp" }; }],
+      ["an explicit default port (same endpoint) does NOT lose the exemption", (config: Record<string, unknown>) => ({ ...config, url: String(config.url).replace("8.8.8.8", "8.8.8.8:443") })],
+    ])("endpoint pin: %s", async (label, mutate) => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, cloneId));
+      await db.update(toolConnections).set({ config: mutate(row!.config as Record<string, unknown>) }).where(eq(toolConnections.id, cloneId));
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      const exempt = label.includes("does NOT lose");
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe(exempt ? "active" : "quarantined");
+    });
+
+    it("a clone loses the exemption when its company's managed template is archived", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, template.id));
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
+    });
+
+    it("a clone whose company has no managed template loses the exemption", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await dropCredentials(cloneId);
+      // The seeded template keeps its random uid (not DEFAULT_MCP_TEMPLATE_UID), so no managed template resolves.
+      expect(template.uid).not.toBe(DEFAULT_MCP_TEMPLATE_UID);
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
+    });
+
+    it("commsReviewedAllowlist only covers managed comms-board connections", () => {
+      const config = { defaultMcpManaged: "dedicated" };
+      expect(commsReviewedAllowlist({ name: "rh-comms-board:agent-1", config })?.has("proposals_submit")).toBe(true);
+      expect(commsReviewedAllowlist({ name: "rh-comms-board", config: { defaultMcpManaged: "template" } })?.has("proposals_get")).toBe(true);
+      expect(commsReviewedAllowlist({ name: "rh-comms-board", config: {} })).toBeNull();
+      expect(commsReviewedAllowlist({ name: "rh-comms-board", config: { defaultMcpManaged: "seed" } })).toBeNull();
+      expect(commsReviewedAllowlist({ name: "someone-elses-board", config })).toBeNull();
+      expect(commsReviewedAllowlist({ name: "rh-comms-boardx", config })).toBeNull();
+    });
+  });
 
   it("a census reports would_widen with the tool names and writes nothing", async () => {
     const { companyId, agent, connectionId } = await legacyAgent();

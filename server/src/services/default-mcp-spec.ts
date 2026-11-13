@@ -738,6 +738,22 @@ export function staticCatalogAllowlist(config: unknown): ReadonlySet<string> | n
   return entry?.reviewedTools ? new Set(entry.reviewedTools.allow) : null;
 }
 
+/**
+ * The reviewed comms-board tools a Paperclip-managed comms-board connection keeps ACTIVE across catalog refreshes, or
+ * null for any other connection. Covers the company template and its per-agent clones (the managed markers are
+ * server-owned, so a client cannot opt a connection in). The board's catalog drifts whenever a tool's descriptor
+ * changes upstream; without this a refresh re-quarantines a reviewed tool, the immutable template can never be
+ * re-reviewed, and the resync (which only widens clones from ACTIVE template rows) cannot repair it.
+ */
+export function commsReviewedAllowlist(connection: { name: string; config: unknown }): ReadonlySet<string> | null {
+  if (!isManagedTemplate(connection.config) && !isManagedDedicated(connection.config)) return null;
+  const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "comms-board");
+  if (!entry?.reviewedTools) return null;
+  const base = entry.connectionName;
+  if (connection.name !== base && !connection.name.startsWith(`${base}:`)) return null;
+  return new Set(entry.reviewedTools.allow);
+}
+
 /** The spec-declared timeout for one tool of a default-MCP connection, clamped to the ceiling; undefined = gateway default. */
 export function defaultToolTimeoutMs(
   connectionName: string,

@@ -50,6 +50,8 @@ import {
   isPersonalDefaultMcpInstance,
   isPersonalDefaultMcpTemplate,
   managedConnectionRole,
+  commsReviewedAllowlist,
+  DEFAULT_MCP_TEMPLATE_UID,
   staticCatalogAllowlist,
   stripDefaultMcpProtectedConfigKeys,
   grantHasPersonalOAuthAccessToken,
@@ -8883,6 +8885,31 @@ export function toolAccessService(
     // review trigger for a reviewed verb (the seeded placeholder descriptors always differ from the real ones), and
     // any other tool the server reports is never added.
     const staticAllowlist = staticCatalogAllowlist(connection.config);
+    // The managed comms-board template and its clones keep their reviewed tools active when the board's descriptor
+    // drifts (see `commsReviewedAllowlist`). Unlike the static catalog this does not filter what is discovered.
+    let commsReviewed = commsReviewedAllowlist(connection);
+    if (commsReviewed !== null && isManagedDedicated(connection.config)) {
+      // A clone's config can be edited by PATCH (the managed marker is kept, the URL is not pinned). Trust the reviewed
+      // list only while the clone still points at the endpoint of its company's immutable managed template.
+      const [template] = await db
+        .select({ config: toolConnections.config, status: toolConnections.status })
+        .from(toolConnections)
+        .where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.uid, DEFAULT_MCP_TEMPLATE_UID)))
+        .limit(1);
+      // Compare the endpoints the refresh itself resolves (`url`, then the `endpoint`/`remoteUrl` aliases), normalized.
+      // Any config that does not resolve to a valid endpoint, on either side, loses the exemption.
+      const endpointOf = (config: unknown): string | null => {
+        try {
+          return remoteEndpoint(asRecord(config));
+        } catch {
+          return null;
+        }
+      };
+      // An archived template is how an operator revokes the managed comms-board access: its clones lose the exemption too.
+      const templateEndpoint =
+        template && template.status !== "archived" && isManagedTemplate(template.config) ? endpointOf(template.config) : null;
+      if (templateEndpoint === null || endpointOf(connection.config) !== templateEndpoint) commsReviewed = null;
+    }
     const discoveredCount = descriptors.length;
     if (staticAllowlist) {
       descriptors = descriptors.filter((descriptor) => staticAllowlist.has(descriptor.name));
@@ -8982,9 +9009,12 @@ export function toolAccessService(
       // Reviewed static-catalog verbs are accepted on drift while they still classify as plain reads; one that no
       // longer does (write/destructive annotation) takes the normal quarantine path instead (fail closed).
       const staticReviewedRead = staticAllowlist !== null && riskLevel === "read";
+      // A reviewed comms-board tool is accepted on drift unless it now classifies as destructive (fail closed).
+      const commsReviewedTool = commsReviewed !== null && commsReviewed.has(descriptor.name) && riskLevel !== "destructive";
       const shouldQuarantine =
         quarantineOnRefresh &&
         !staticReviewedRead &&
+        !commsReviewedTool &&
         (!existing || changed) &&
         existing?.status !== "disabled" &&
         (!safeDefault || riskLevel !== "read" || nativeDaytona);
@@ -9020,7 +9050,7 @@ export function toolAccessService(
         quarantineReason = "pending_review";
         quarantinedAt = refreshedAt;
         quarantinedCount += 1;
-      } else if (quarantineOnRefresh && !staticReviewedRead && existing?.status === "quarantined") {
+      } else if (quarantineOnRefresh && !staticReviewedRead && !commsReviewedTool && existing?.status === "quarantined") {
         status = "quarantined";
         quarantineReason = existing.quarantineReason;
         quarantinedAt = existing.quarantinedAt;
