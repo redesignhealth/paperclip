@@ -37,6 +37,7 @@ any new fork patch; remove one when the patch is upstreamed.
 ## Claude Code memory hooks
 
 - `docker/claude/` managed settings and the memory hook baked into the image
+- `docker/codex/` managed Codex config that registers the same hook
 
 ## Hermes defaults and runtime
 

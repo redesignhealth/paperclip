@@ -264,9 +264,11 @@ These are set automatically by the server when invoking agents:
 | `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
 | `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
 
-## Claude Code Memory Hook (agent env)
+## Claude Code and Codex Memory Hook (agent env)
 
-The production image includes `/etc/claude-code/managed-settings.json` and `/usr/local/bin/rh-memory-hook`. The hook recalls memories from a mem0-compatible service before each prompt, and saves the last exchange after each turn. It runs only for `claude_local` agents whose `adapterConfig.env` sets the token and URL below. Set these variables per agent, not on the server.
+The production image includes `/etc/claude-code/managed-settings.json`, `/etc/codex/managed_config.toml` and `/usr/local/bin/rh-memory-hook`. The hook recalls memories from a mem0-compatible service before each prompt, and saves the last exchange after each turn. It runs only for `claude_local` and `codex_local` agents whose `adapterConfig.env` sets the token and URL below. Set these variables per agent, not on the server.
+
+Codex loads `/etc/codex/managed_config.toml` for every run, so the `CODEX_HOME` that the adapter seeds does not matter. Codex hooks need no feature flag. Runs in remote sandboxes do not see the image files, so they do not use the hook.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
