@@ -12,7 +12,7 @@ import { dotRunnerBroker } from "../services/dot-runner-broker.js";
 import { publicMcpConfig } from "../services/public-mcp/oauth.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
-import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT, OPERATOR_ONLY_ADAPTER_CONFIG_KEYS } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
@@ -2646,7 +2646,6 @@ export function agentRoutes(
   // Memory routing keys are operator-owned: an agent key must never select or disable its own
   // memory backend (TECH-8409). Mirrors the homeMode pattern: no set on create/hire/patch, and no
   // value change through replace, adapter change or rollback.
-  const OPERATOR_ONLY_MEMORY_ADAPTER_CONFIG_KEYS = ["memoryProvider"] as const;
 
   function assertNoAgentOperatorMemoryKeyChange(
     req: Request,
@@ -2654,7 +2653,7 @@ export function agentRoutes(
     existingAdapterConfig: Record<string, unknown>,
   ) {
     if (req.actor.type !== "agent") return;
-    if (OPERATOR_ONLY_MEMORY_ADAPTER_CONFIG_KEYS.some((key) => !isDeepStrictEqual(nextAdapterConfig[key], existingAdapterConfig[key]))) {
+    if (OPERATOR_ONLY_ADAPTER_CONFIG_KEYS.some((key) => !isDeepStrictEqual(nextAdapterConfig[key], existingAdapterConfig[key]))) {
       throw forbidden("Only an operator can configure agent memory routing.");
     }
   }
@@ -2668,7 +2667,7 @@ export function agentRoutes(
       throw forbidden("Only an operator can configure Runner homeMode.");
     if (req.actor.type === "agent" && ["dotAttachmentAccess", "dotWorkspaceAccess", "dotBindingId", "externalBindingId", "museBindingId", "museGeneration", "museConnection"].some(key => hasOwn(adapterConfig, key)))
       throw forbidden("Only an operator can configure external-agent pairing, attachment access, or workspace access.");
-    if (req.actor.type === "agent" && OPERATOR_ONLY_MEMORY_ADAPTER_CONFIG_KEYS.some((key) => hasOwn(adapterConfig, key)))
+    if (req.actor.type === "agent" && OPERATOR_ONLY_ADAPTER_CONFIG_KEYS.some((key) => hasOwn(adapterConfig, key)))
       throw forbidden("Only an operator can configure agent memory routing.");
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(

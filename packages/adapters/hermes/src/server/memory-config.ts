@@ -791,10 +791,6 @@ export function serializeMem0Json(
 }
 
 /**
- * Generates the separate Hermes config.yaml memory block.
- * Notice: host config inheritance must not widen ALLOWED_HOST_CONFIG_KEYS.
- */
-/**
  * Closed allowlist for `adapterConfig.memoryProvider`. Only providers that Hermes can configure
  * purely from `memory.provider` plus `MEM0_*`-style environment variables belong here.
  */
@@ -817,6 +813,10 @@ export function resolveHermesMemoryProvider(config: Record<string, unknown> | un
   throw new Error(`Invalid adapterConfig.memoryProvider: expected one of ${HERMES_MEMORY_PROVIDER_ALLOWLIST.join(", ")}`);
 }
 
+/**
+ * Generates the separate Hermes config.yaml memory block.
+ * Notice: host config inheritance must not widen ALLOWED_HOST_CONFIG_KEYS.
+ */
 export function generateHermesMemoryYaml(flags?: MemoryHardeningFlags): string {
   const hardening = flags ?? resolveMemoryHardeningFlags();
   if (hardening.hermesMemoryConfig) {

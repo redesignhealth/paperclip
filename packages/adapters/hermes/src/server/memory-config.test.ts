@@ -1193,7 +1193,14 @@ describe("memory-config", () => {
       for (const bad of ["honcho", "MEM0", "mem0;rm", 1, false, {}, []]) {
         expect(() => resolveHermesMemoryProvider({ memoryProvider: bad })).toThrow(/Invalid adapterConfig\.memoryProvider/);
       }
-      expect(() => resolveHermesMemoryProvider({ memoryProvider: "secret-looking-value" })).not.toThrow(/secret-looking-value/);
+      let message = "";
+      try {
+        resolveHermesMemoryProvider({ memoryProvider: "secret-looking-value" });
+      } catch (err) {
+        message = err instanceof Error ? err.message : "";
+      }
+      expect(message).toContain("Invalid adapterConfig.memoryProvider");
+      expect(message).not.toContain("secret-looking-value");
     });
   });
 

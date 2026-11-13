@@ -27,6 +27,11 @@ describe("execution workspace policy helpers", () => {
     expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { homeMode: "preconfigured", model: "task-model" } }))
       .toEqual({ adapterConfig: { model: "task-model" }, useProjectWorkspace: null });
   });
+  it("ignores operator-owned memory routing keys in stored task overrides", () => {
+    expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { memoryProvider: "mem0", model: "task-model" } }))
+      .toEqual({ adapterConfig: { model: "task-model" }, useProjectWorkspace: null });
+    expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { memoryProvider: "mem0" } })).toBeNull();
+  });
   it("defaults new issue settings from enabled project policy", () => {
     expect(
       defaultIssueExecutionWorkspaceSettingsForProject({

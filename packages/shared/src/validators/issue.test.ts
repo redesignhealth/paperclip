@@ -665,6 +665,13 @@ describe("issue validators", () => {
     expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
   });
 
+  it("rejects task-level memory routing keys on create and update", () => {
+    const overrides = { assigneeAdapterOverrides: { adapterConfig: { memoryProvider: "mem0" } } };
+    expect(createIssueSchema.safeParse({ title: "Task", ...overrides }).success).toBe(false);
+    expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
+    expect(createIssueSchema.safeParse({ title: "Task", assigneeAdapterOverrides: { adapterConfig: { model: "x" } } }).success).toBe(true);
+  });
+
   it("rejects retired model profiles in agent runtime config", () => {
     const parsed = createAgentSchema.safeParse({
       name: "Coder",

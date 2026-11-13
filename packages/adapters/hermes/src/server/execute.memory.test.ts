@@ -844,15 +844,17 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     it("does not isolate the home or touch memory config when memoryProvider is unset", async () => {
       const result = await execute(makeContext({}));
       expect(result.exitCode).toBe(0);
+      expect(interceptedOpts.mem0JsonExistedAtExecution).not.toBe(true);
       expect(interceptedOpts.configYamlContentAtExecution ?? "").not.toContain("provider: mem0");
-      expect(interceptedOpts.mem0JsonExistedAtExecution ?? false).toBe(false);
     });
 
     it("keeps the runtimeMemory route unchanged when both are present (mem0.json wins)", async () => {
-      const ctx = makeContext({ memoryConfig: createValidMemoryConfig(), memoryProvider: "mem0" });
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({ memoryConfig: createValidMemoryConfig(), memoryProvider: "mem0", onLogCollector: logs });
 
       const result = await execute(ctx);
       expect(result.exitCode).toBe(0);
+      expect(logs.map((l) => l.chunk).join("")).toContain("memoryProvider ignored");
       expect(interceptedOpts.mem0JsonExistedAtExecution).toBe(true);
       const yamlText = interceptedOpts.configYamlContentAtExecution ?? "";
       expect(yamlText.match(/provider: mem0/g)?.length).toBe(1);
@@ -864,6 +866,8 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       const ctx = makeContext({ memoryProvider: bad, onLogCollector: logs });
       await expect(execute(ctx)).rejects.toThrow("Invalid adapterConfig.memoryProvider");
       expect(runChildProcessCallCount).toBe(0);
+      expect(logs.map((l) => l.chunk).join("")).toContain("Invalid adapterConfig.memoryProvider");
+      expect(logs.map((l) => l.chunk).join("")).not.toContain(String(bad));
     });
 
     it.each(["", "  ", null])("treats blank memoryProvider %j as unset", async (blank) => {

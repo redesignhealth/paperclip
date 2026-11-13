@@ -1,3 +1,4 @@
+import { OPERATOR_ONLY_ADAPTER_CONFIG_KEYS } from "@paperclipai/shared";
 import type {
   ExecutionWorkspaceMode,
   ExecutionWorkspaceStrategy,
@@ -404,7 +405,7 @@ export function parseIssueAssigneeAdapterOverrides(
 ): ParsedIssueAssigneeAdapterOverrides | null {
   const parsed = parseObject(raw);
   const parsedAdapterConfig = Object.fromEntries(
-    Object.entries(parseObject(parsed.adapterConfig)).filter(([key]) => key !== "homeMode"),
+    Object.entries(parseObject(parsed.adapterConfig)).filter(([key]) => key !== "homeMode" && !OPERATOR_ONLY_ADAPTER_CONFIG_KEYS.includes(key as never)),
   );
   const adapterConfig =
     Object.keys(parsedAdapterConfig).length > 0 ? parsedAdapterConfig : null;

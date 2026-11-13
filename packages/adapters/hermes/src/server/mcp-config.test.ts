@@ -25,6 +25,7 @@ import {
   resolveHermesToolSearchSetting,
   HERMES_PROVIDER_ENV_ALLOWLIST,
 } from "./mcp-config.js";
+import { resolveMemoryHardeningFlags } from "@paperclipai/adapter-utils/server-utils";
 import { validateHermesMemoryConfig, MAX_CONFIG_STRING_LENGTH } from "./memory-config.js";
 import { resolveHermesHome, resolveHostHermesDir, resolveHostHermesSkillsDir, listHermesSkills } from "./skills.js";
 
@@ -1748,6 +1749,21 @@ print(json.dumps(data))
       const configYaml = await fs.readFile(prepared.configPath, "utf8");
       expect(configYaml).toContain("memory:\n  provider: mem0\n");
       expect(configYaml).not.toContain("mcp_servers:");
+    });
+
+    it.each([false, true])("memoryProvider honors the hermesMemoryConfig hardening flag (%s)", async (hermesMemoryConfig) => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-mem-"));
+      cleanupDirs.push(mockHost);
+      const prepared = await prepareHermesMcpHome({
+        servers: [],
+        memoryProvider: "mem0",
+        flags: { ...resolveMemoryHardeningFlags({}), hermesMemoryConfig },
+        config: { env: { HERMES_HOME: mockHost } },
+      });
+      cleanupDirs.push(prepared.homeDir);
+      const configYaml = await fs.readFile(prepared.configPath, "utf8");
+      expect(configYaml).toContain("memory:\n  provider: mem0\n");
+      expect(configYaml.includes("memory_enabled: false")).toBe(hermesMemoryConfig);
     });
 
     it("prepares isolated home with BOTH servers and memory", async () => {

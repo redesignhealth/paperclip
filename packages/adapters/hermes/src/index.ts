@@ -100,7 +100,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| memoryProvider | "mem0" | (unset) | Operator-only. Selects Hermes's built-in mem0 memory provider by writing \`memory.provider: mem0\` into the per-run Hermes \`config.yaml\`. Only \`"mem0"\` is accepted; any other value fails the run. No \`mem0.json\` is written, so Hermes reads its connection settings from the environment: \`MEM0_HOST\`, \`MEM0_API_KEY\` (use a secret reference), \`MEM0_USER_ID\` and, for a proxy-only route, \`MEM0_PROXY\` (set these in \`env\`). Ignored when Paperclip runtime memory is active for the run, which keeps its own \`mem0.json\` route. |
+| memoryProvider | "mem0" | (unset) | Operator-only. Selects Hermes's built-in mem0 memory provider by writing \`memory.provider: mem0\` into the per-run Hermes \`config.yaml\`. Only \`"mem0"\` is accepted; any other value fails the run. No \`mem0.json\` is written, so Hermes reads its connection settings from the environment: \`MEM0_HOST\`, \`MEM0_API_KEY\` (use a secret reference), \`MEM0_USER_ID\` and, for a proxy-only route, \`MEM0_PROXY\` (set these in \`env\`). Ignored when Paperclip runtime memory is active for the run, which keeps its own \`mem0.json\` route. A run with this key uses a fresh per-run Hermes home (no session resume). There is no preflight: if the memory service is unreachable or \`MEM0_*\` is incomplete, Hermes runs without memory instead of failing. |
 
 ## Session & Workspace
 
