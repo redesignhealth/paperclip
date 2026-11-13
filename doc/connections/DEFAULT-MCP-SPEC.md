@@ -715,7 +715,7 @@ Per-user and per-agent OAuth callback failures never mutate the shared connectio
 
 ## Agent memory entry (`agent-memory`, TECH-8409)
 
-Not an MCP connection: it has no template, no install and no tools. It gives a NEW `hermes_local` agent its own memory credential and Hermes settings, so recall and capture go through an external memory service instead of Paperclip's in-process runtime memory. Paperclip holds only generic config and the credential.
+Not an MCP connection: it has no template, no install and no tools. It gives a NEW `hermes_local` or `claude_local` agent (including a native-runner agent whose harness is Claude) its own memory credential and harness settings, so recall and capture go through an external memory service instead of Paperclip's in-process runtime memory. Paperclip holds only generic config and the credential.
 
 Enable it with `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and `PAPERCLIP_AGENT_MEMORY_URL` (plus optional `PAPERCLIP_AGENT_MEMORY_PROXY`), on top of `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` and the comms-board provisioner settings (the ownership registry mints the token). It is off by default and applies only to agents created while it is on: the entry has `newAgentsOnly`, so backfill, legacy enrollment and missing-entry enrollment never add it.
 

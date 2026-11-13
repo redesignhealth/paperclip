@@ -378,6 +378,16 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect(Object.keys(env).sort()).toEqual(["RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
   });
 
+  it("keeps an existing proxy key when none is configured", async () => {
+    enable({ proxy: false });
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    vi.stubGlobal("fetch", downstreamFetch());
+    const agent = await createAgent(companyId, ownerId, { adapterConfig: { env: { MEM0_PROXY: { type: "plain", value: "http://127.0.0.1:9999" } } } });
+    const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+    expect(config.env.MEM0_PROXY).toEqual({ type: "plain", value: "http://127.0.0.1:9999" });
+  });
+
   it("omits MEM0_PROXY when no proxy is configured", async () => {
     enable({ proxy: false });
     const companyId = await seedCompany();

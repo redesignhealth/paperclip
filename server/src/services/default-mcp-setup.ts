@@ -1448,7 +1448,9 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
 export const DEFAULT_MCP_SETUP_HOOKS: Partial<Record<DefaultMcpSetupHookKey, DefaultMcpSetupHook>> = {
   comms_board_identity: commsBoardIdentityHook,
   arcana_brain: arcanaBrainHook,
-  agent_memory: agentMemoryHook,
+  // Deferred: agent-memory imports the agent service, which (through agent-hiring) imports this module. Reading the
+  // binding eagerly here could hit it before initialization when agent-hiring loads first.
+  agent_memory: (input) => agentMemoryHook(input),
 };
 
 /** The wiring a READY comms entry depends on, checked against the real rows (local reads only). */

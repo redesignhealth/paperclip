@@ -163,8 +163,8 @@ export async function applyAgentMemoryAdapterConfig(
     [profile.urlEnvKey]: { type: "plain", value: input.config.url },
   };
   if (profile.userIdEnvKey) env[profile.userIdEnvKey] = { type: "plain", value: input.agentId };
+  // No configured proxy leaves whatever the agent already has: every other key is kept.
   if (input.config.proxy) env[profile.proxyEnvKey] = { type: "plain", value: input.config.proxy };
-  else delete env[profile.proxyEnvKey];
   const updated = await svc.update(
     input.agentId,
     { adapterConfig: { ...current, env, ...(profile.adapterConfig ?? {}) } },
