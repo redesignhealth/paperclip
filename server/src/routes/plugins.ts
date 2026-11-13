@@ -30,11 +30,21 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   companies,
+  companyMemberships,
   heartbeatRuns,
   pluginLogs,
   pluginWebhookDeliveries,
   projects,
 } from "@paperclipai/db";
+import {
+  pluginApiUpgrade,
+  proxyPluginApiWebSocket,
+  acquireWebSocketSlot,
+  type UpgradeRequest,
+  type PluginApiWsLifecycleOptions,
+} from "../realtime/plugin-api-ws.js";
+import { trustedBoardMutationOrigin } from "../middleware/board-mutation-guard.js";
+import { authorizationService } from "../services/authorization.js";
 import type {
   PluginApiRouteDeclaration,
   PluginStatus,
@@ -72,6 +82,7 @@ import {
   assertCompanyAccess,
   assertInstanceAdmin,
   getActorInfo,
+  hasCompanyAccess,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
 import {
@@ -441,6 +452,10 @@ export interface PluginRouteBridgeDeps {
   workerManager: PluginWorkerManager;
   /** Optional stream bus for SSE push from worker to UI. */
   streamBus?: PluginStreamBus;
+  // fork(TECH-8283 Finding 5): Safe lifecycle options for production proxy
+  wsOptions?: PluginApiWsLifecycleOptions;
+  // fork(TECH-8283 Finding 5): Optional injected proxy for test harness only
+  proxyWs?: typeof proxyPluginApiWebSocket;
 }
 
 export interface PluginRouteToolGatewayDeps {
@@ -466,6 +481,7 @@ interface PluginScopedApiRequest {
 }
 
 interface PluginScopedApiResponse {
+  websocket?: { url: string; headers?: Record<string, string> };
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;
@@ -625,6 +641,17 @@ export function pluginRoutes(
     if (resolution.from === "query") {
       const value = req.query[resolution.key ?? ""];
       return typeof value === "string" ? value : null;
+    }
+
+    if (resolution.from === "agent") {
+      const id = params[resolution.param];
+      if (!id) return null;
+      const [agent] = await db.select({ id: agents.id, companyId: agents.companyId }).from(agents).where(eq(agents.id, id)).limit(1);
+      if (!agent || !hasCompanyAccess(req, agent.companyId)) throw notFound("Agent not found");
+      assertCompanyAccess(req, agent.companyId);
+      const decision = await authorizationService(db).decide({ actor: req.actor, action: "agent:read", resource: { type: "agent", companyId: agent.companyId, agentId: agent.id } });
+      if (!decision.allowed) throw notFound("Agent not found");
+      return agent.companyId;
     }
 
     const issueId = params[resolution.param ?? ""];
@@ -1869,6 +1896,20 @@ export function pluginRoutes(
     }
 
     try {
+      const upgrade = (req as UpgradeRequest)[pluginApiUpgrade];
+      if (match.route.transport === "websocket") {
+        if (!upgrade || req.method !== "GET" || match.route.auth !== "board" || !plugin.manifestJson.capabilities.includes("http.outbound")) {
+          res.status(426).json({ error: "Browser WebSocket required" });
+          return;
+        }
+        if (!req.header("origin") || trustedBoardMutationOrigin(req) !== req.header("origin")?.toLowerCase()) {
+          res.status(403).json({ error: "Trusted browser origin required" });
+          return;
+        }
+      } else if (upgrade) {
+        res.status(400).json({ error: "Route does not accept WebSockets" });
+        return;
+      }
       assertScopedApiAuth(req, match.route);
       const companyId = await resolveScopedApiCompanyId(match.route, match.params, req);
       if (!companyId) {
@@ -1889,6 +1930,19 @@ export function pluginRoutes(
       }
 
       const actor = getActorInfo(req);
+
+      // fork(TECH-8283 F3): Concurrency cap per (actor, plugin) = 4, per company = 32. Reject 429 BEFORE worker dispatch.
+      let releaseSlot: (() => void) | null = null;
+      if (match.route.transport === "websocket") {
+        releaseSlot = acquireWebSocketSlot(companyId, actor.actorId, plugin.id);
+        if (!releaseSlot) {
+          res.status(429).json({ error: "Too many concurrent plugin WebSocket connections" });
+          return;
+        }
+        res.once("close", releaseSlot);
+        res.once("finish", releaseSlot);
+      }
+
       const input: PluginScopedApiRequest = {
         routeKey: match.route.routeKey,
         method: req.method,
@@ -1907,11 +1961,69 @@ export function pluginRoutes(
         headers: sanitizePluginRequestHeaders(req),
       };
 
-      const result = await bridgeDeps.workerManager.call(
-        plugin.id,
-        "handleApiRequest",
-        input,
-      ) as PluginScopedApiResponse;
+      // fork(TECH-8283 Finding B): Race workerManager.call against upgrade.signal
+      let result: PluginScopedApiResponse;
+      if (match.route.transport === "websocket" && upgrade) {
+        const callPromise = bridgeDeps.workerManager.call(plugin.id, "handleApiRequest", input) as Promise<PluginScopedApiResponse>;
+        callPromise.catch(() => {});
+        if (upgrade.signal.aborted) {
+          if (!res.headersSent && !upgrade.socket.destroyed) res.status(504).json({ error: "Plugin upgrade timed out" });
+          return;
+        }
+        const abortPromise = new Promise<never>((_, reject) => {
+          upgrade.signal.addEventListener("abort", () => reject(Object.assign(new Error("Plugin upgrade timed out"), { name: "AbortError" })), { once: true });
+        });
+        try {
+          result = await Promise.race([callPromise, abortPromise]);
+        } catch (err: unknown) {
+          if ((err as Error)?.name === "AbortError" || upgrade.signal.aborted) {
+            if (!res.headersSent && !upgrade.socket.destroyed) res.status(504).json({ error: "Plugin upgrade timed out" });
+            return;
+          }
+          throw err;
+        }
+      } else {
+        result = await bridgeDeps.workerManager.call(plugin.id, "handleApiRequest", input) as PluginScopedApiResponse;
+      }
+
+      if (match.route.transport === "websocket") {
+        if (result.websocket) {
+          // fork(TECH-8283 F2, Finding C): Re-check company access and plugin status on tick & 101
+          const checkAvailable = async (): Promise<boolean> => {
+            if (!bridgeDeps.workerManager.isRunning(plugin.id)) return false;
+            try {
+              const currentPlugin = await registry.getById(plugin.id);
+              if (!currentPlugin || currentPlugin.status !== "ready") return false;
+              if (req.actor.source !== "local_implicit") {
+                if (req.actor.type === "board" && req.actor.userId && typeof db.select === "function") {
+                  const [membership] = await db
+                    .select({ id: companyMemberships.id })
+                    .from(companyMemberships)
+                    .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, req.actor.userId), eq(companyMemberships.status, "active")))
+                    .limit(1);
+                  if (!membership) return false;
+                } else if (!hasCompanyAccess(req, companyId)) {
+                  return false;
+                }
+              }
+              return true;
+            } catch {
+              return false;
+            }
+          };
+          const proxyFn = bridgeDeps?.proxyWs ?? proxyPluginApiWebSocket;
+          await proxyFn(
+            req,
+            res,
+            result.websocket,
+            checkAvailable,
+            bridgeDeps?.wsOptions,
+          );
+        } else {
+          res.status(result.status && result.status >= 400 && result.status <= 599 ? result.status : 502).json({ error: "Plugin connection unavailable" });
+        }
+        return;
+      }
       const status = Number.isInteger(result.status) && Number(result.status) >= 200 && Number(result.status) <= 599
         ? Number(result.status)
         : 200;

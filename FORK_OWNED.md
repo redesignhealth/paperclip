@@ -120,3 +120,8 @@ any new fork patch; remove one when the patch is upstreamed.
 - `FORK_OWNED.md`
 - `tools/upstream-sync/`
 - `doc/UPSTREAM-SYNC.md`
+
+## Plugin WebSocket routes and egress guard (TECH-8283)
+
+- `server/src/realtime/plugin-api-ws.ts`
+- `server/src/services/plugin-egress-guard.ts`
