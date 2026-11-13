@@ -34,6 +34,7 @@ import { consumeSkillSourceReturn } from "@/lib/skill-source-connect-return";
 import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { accessApi } from "@/api/access";
+import { authApi } from "@/api/auth";
 import { buildCompanyUserProfileMap } from "@/lib/company-members";
 import { installStateFrom, isPersonalDefaultMcpInstance, managedDefaultMcpKind, type InstallState } from "@/lib/tool-installs";
 import { navigateTopLevel } from "@/lib/browserNavigation";
@@ -160,6 +161,11 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     queryKey: queryKeys.tools.connectionGrants(connectionId),
     queryFn: () => toolsApi.listConnectionGrants(connectionId),
     enabled: !!connectionId && !!activeTab,
+  });
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+    enabled: !!activeTab,
   });
 
   const connection = connectionQuery.data;
@@ -298,24 +304,50 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     () => installStateFrom(installsQuery.data?.installs ?? connection?.installs),
     [connection?.installs, installsQuery.data?.installs],
   );
+  const installsResolved =
+    installsQuery.isSuccess ||
+    installsQuery.data?.installs !== undefined ||
+    connection?.installs !== undefined;
+  const currentUserId = grantsQuery.data?.currentUserId ?? session?.user?.id ?? session?.session?.userId ?? null;
+  const isPersonal = isPersonalDefaultMcpInstance(connection?.config);
+  const isPersonalOwner = Boolean(
+    isPersonal
+    && connection?.createdByUserId
+    && currentUserId
+    && connection.createdByUserId === currentUserId,
+  );
   const access = useMemo(
-    () => accessForConnection(
-      accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install),
+    () => {
+      // Personal instance owners unconditionally use authoritative install agentIds without falling back
+      // to profile bindings, preventing stale binding installs from re-appearing when installs are empty.
+      if (isPersonalOwner) {
+        return { mode: "specific" as const, agentIds: new Set(install.agentIds) };
+      }
+      return accessForConnection(
+        accessFrom(connection?.connectionPurpose === "ai" ? undefined : profile, install),
+        install,
+        isPersonal,
+      );
+    },
+    [
+      connection?.connectionPurpose,
+      profile,
       install,
-      isPersonalDefaultMcpInstance(connection?.config),
-    ),
-    [connection?.connectionPurpose, connection?.config, profile, install],
+      isPersonalOwner,
+      isPersonal,
+    ],
   );
   const managesRemoteMcpAccess = isRemoteMcpConnectorMethod(connection?.config?.sourceTemplateKey, connection?.config?.connectionMethodKey);
   const agents = agentsQuery.data ?? [];
   // On an ordinary tool connection the agent picker IS the install: an agent only gets a connection's tools
   // with an explicit per-agent install row (a permission binding does not turn a default-MCP agent on), so
-  // choosing an agent installs it and clearing it uninstalls it. Personal default-MCP instances install through
-  // their own guarded setup path, and AI / remote-MCP connections manage installs elsewhere.
+  // choosing an agent installs it and clearing it uninstalls it. The owner of a personal default-MCP instance
+  // also manages installs directly through this picker, while non-owners, AI connections, and remote-MCP
+  // connections manage installs elsewhere.
   const pickerInstallsAgents =
     connection?.connectionPurpose !== "ai"
     && !managesRemoteMcpAccess
-    && !isPersonalDefaultMcpInstance(connection?.config)
+    && (!isPersonal || isPersonalOwner)
     && managedDefaultMcpKind(connection?.config) === null;
   const disconnectRemote = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
@@ -338,6 +370,11 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
       /** True only when this save changes who may use the connection (the agent picker), not for action toggles. */
       accessChanged?: boolean;
     }) => {
+      // Invariant (S2): finishApp performs profile binding updates, followed by putConnectionInstalls
+      // for pickerInstallsAgents. On the server, finishGalleryAppConnection wrapper performs owner installs
+      // BEFORE private finish/bindings when !preserveExistingAccess, so any peer 409 conflict is raised before
+      // binding writes, and the client's subsequent putConnectionInstalls is idempotent. If a subsequent call
+      // fails, onError refetches authoritative state to restore UI consistency.
       return connection?.connectionPurpose === "ai"
       ? toolsApi.putConnectionInstalls(connectionId, next.access.mode === "all" ? [{ targetType: "company", targetId: selectedCompanyId! }] : [...next.access.agentIds].map(targetId => ({ targetType: "agent" as const, targetId })))
       : (async () => {
@@ -352,7 +389,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
           if (wanted) {
             await toolsApi.putConnectionInstalls(connectionId, [
               // PUT replaces the whole list, so a company-wide install row must be sent back to survive.
-              ...(install.onAll ? [{ targetType: "company" as const, targetId: selectedCompanyId! }] : []),
+              ...(install.onAll && !isPersonal ? [{ targetType: "company" as const, targetId: selectedCompanyId! }] : []),
               ...wanted.map((targetId) => ({ targetType: "agent" as const, targetId })),
             ]);
           }
@@ -626,9 +663,14 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   const actionsContent = renderActions?.(connection) ?? (connection.connectionPurpose === "ai" ? <ManagedAiConnectionDetails connection={connection} /> : undefined);
   const actionCount = actionsContent !== undefined ? null : catalogQuery.data ? active.length : null;
   const reviewLoading = catalogQuery.isLoading || profilesQuery.isLoading || policiesQuery.isLoading;
-  const permissionsLoading = reviewLoading || installsQuery.isLoading || agentsQuery.isLoading;
+  const permissionsLoading =
+    reviewLoading ||
+    installsQuery.isLoading ||
+    agentsQuery.isLoading ||
+    (isPersonalOwner && !installsResolved) ||
+    (isPersonal && grantsQuery.isLoading);
   const reviewFailed = catalogQuery.isError || profilesQuery.isError || policiesQuery.isError;
-  const permissionsFailed = reviewFailed || installsQuery.isError || agentsQuery.isError;
+  const permissionsFailed = reviewFailed || installsQuery.isError || agentsQuery.isError || (isPersonal && grantsQuery.isError);
 
   return (
     <div className="max-w-4xl space-y-10 pb-12">
@@ -711,6 +753,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
               void policiesQuery.refetch();
               void installsQuery.refetch();
               void agentsQuery.refetch();
+              void grantsQuery.refetch();
             }} />
           : permissionsLoading
           ? <ToolsLoading />
@@ -797,7 +840,12 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
                     ? "Shell Git and gh use this account for the run and are not constrained by per-tool Ask-first controls."
                     : undefined
                 }
-                onSaveAccess={(next) => apply({ access: connection.connectionPurpose === "ai" || managesRemoteMcpAccess || pickerInstallsAgents ? next : accessIncludingInstalls(next, install) })}
+                // Invariant (S1): onSaveAccess receives the updated access directly from PermissionsPanel.
+                // When !pickerOwnsInstalls, PermissionsPanel (lines 189/193) already unions requiredAgentIds
+                // (from install.agentIds) and disables their checkboxes, ensuring installed agents cannot be
+                // dropped by non-owners/managed connections. When pickerOwnsInstalls is true, the user owns
+                // the selection and unticking an agent must not re-union previous installs.
+                onSaveAccess={(next) => apply({ access: next })}
                 onRefreshActions={() => refreshTools.mutate()}
                 onSetActionPermission={(ids, next) => apply(actionPermissionMutation(ids, next, enabledIds, askFirstIds))}
                 onReviewQuarantined={reviewQuarantined}
@@ -1057,16 +1105,6 @@ function accessFrom(
   return install.onAll
     ? { mode: "all", agentIds: new Set() }
     : { mode: "specific", agentIds: new Set(install.agentIds) };
-}
-
-function accessIncludingInstalls(next: AccessDraft, install: InstallState): AccessDraft {
-  if (install.onAll || next.mode === "all") {
-    return { mode: "all", agentIds: new Set() };
-  }
-  return {
-    mode: "specific",
-    agentIds: new Set([...next.agentIds, ...install.agentIds]),
-  };
 }
 
 function galleryEntryFor(

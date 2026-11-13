@@ -11,6 +11,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { ApiError } from "../api/client";
+import { queryKeys } from "../lib/queryKeys";
 
 const mockToolsApi = vi.hoisted(() => ({
   getEffectiveProfilesForAgent: vi.fn(),
@@ -24,6 +25,7 @@ const mockToolsApi = vi.hoisted(() => ({
 }));
 
 const mockAuthApi = vi.hoisted(() => ({ getSession: vi.fn() }));
+const mockHealthApi = vi.hoisted(() => ({ get: vi.fn() }));
 const mockAccessApi = vi.hoisted(() => ({ listUserDirectory: vi.fn() }));
 const mockPrepareOAuthNavigation = vi.hoisted(() => vi.fn());
 const mockNavigateTopLevel = vi.hoisted(() => vi.fn());
@@ -31,6 +33,7 @@ const pushToastMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/tools", () => ({ toolsApi: mockToolsApi }));
 vi.mock("../api/auth", () => ({ authApi: mockAuthApi }));
+vi.mock("@/api/health", () => ({ healthApi: mockHealthApi }));
 vi.mock("../api/access", () => ({ accessApi: mockAccessApi }));
 vi.mock("../lib/oauthHandoff", () => ({ prepareOAuthNavigation: mockPrepareOAuthNavigation }));
 vi.mock("../lib/browserNavigation", () => ({ navigateTopLevel: mockNavigateTopLevel }));
@@ -148,6 +151,8 @@ describe("AgentToolsTab", () => {
     mockToolsApi.startOAuth.mockResolvedValue({ authorizationUrl: "https://mcp.example.test/authorize?state=xyz" });
     mockAuthApi.getSession.mockReset();
     mockAuthApi.getSession.mockResolvedValue(null);
+    mockHealthApi.get.mockReset();
+    mockHealthApi.get.mockResolvedValue({ deploymentMode: "authenticated" });
     mockAccessApi.listUserDirectory.mockReset();
     mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
     mockPrepareOAuthNavigation.mockReset();
@@ -168,9 +173,9 @@ describe("AgentToolsTab", () => {
     vi.clearAllMocks();
   });
 
-  async function renderTab(agentOverrides: Record<string, unknown> = {}) {
+  async function renderTab(agentOverrides: Record<string, unknown> = {}, queryClient?: QueryClient) {
     const { AgentToolsTab } = await import("./AgentToolsTab");
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const client = queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const agent = { id: "agent-1", name: "Coder", ...agentOverrides } as never;
     await act(async () => {
       root = createRoot(container);
@@ -183,6 +188,7 @@ describe("AgentToolsTab", () => {
       );
     });
     await flushReact();
+    return { client };
   }
 
   it("preserves checkbox changes made after the last saved install state", async () => {
@@ -943,6 +949,306 @@ describe("AgentToolsTab", () => {
       ).toBeNull();
       // Bob's own Connect-your-account row legitimately reappears for the seed.
       expect(connectButton()).toBeTruthy();
+    });
+
+    it("TECH-8350: owner can toggle installing their own personal instance on an agent", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({ id: "pi-b", uid: "rh-google-mcp/default-mcp-personal/user-b", createdByUserId: "user-b", installs: [] }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+      const { client } = await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+      client.setQueryData(queryKeys.tools.connectionInstalls("pi-b"), []);
+
+      const ownRow = container.querySelector<HTMLElement>('[aria-label="Install RH Google MCP on Coder"]');
+      expect(ownRow).toBeTruthy();
+      expect(ownRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((ownRow as HTMLButtonElement).disabled).toBe(false);
+
+      await act(async () => {
+        ownRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("pi-b", [
+        { targetType: "agent", targetId: "agent-1" },
+      ]);
+      expect(client.getQueryState(queryKeys.tools.connectionInstalls("pi-b"))?.isInvalidated).toBe(true);
+    });
+
+    it("TECH-8350: disables own personal instance when another owner's personal instance for the same entry is installed (conflict check)", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-a",
+            uid: "rh-google-mcp/default-mcp-personal/user-a",
+            createdByUserId: "user-a",
+            name: "Alice Google MCP",
+            installs: [{ targetType: "agent", targetId: "agent-1" }],
+          }),
+          personalInstance({
+            id: "pi-b",
+            uid: "rh-google-mcp/default-mcp-personal/user-b",
+            createdByUserId: "user-b",
+            name: "Bob Google MCP",
+            installs: [],
+          }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [
+          { principalId: "user-a", status: "active", user: { name: "Alice Member" } },
+          { principalId: "user-b", status: "active", user: { name: "Bob Member" } },
+        ],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+
+      const aliceRow = container.querySelector<HTMLElement>('[aria-label="Install Alice Google MCP on Coder"]');
+      expect(aliceRow).toBeTruthy();
+      expect(aliceRow!.getAttribute("data-state")).toBe("checked");
+
+      const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
+      expect(bobRow).toBeTruthy();
+      expect(bobRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((bobRow as HTMLButtonElement).disabled).toBe(true);
+      expect(container.textContent).toContain("Another user's personal instance is already installed for this app on this agent.");
+    });
+
+    it("TECH-8350: failed owner personal-instance install restores state, refetches for peer conflict, and allows retry", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      let peerInstalled = false;
+      mockToolsApi.listConnections.mockImplementation(async () => ({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-a",
+            uid: "rh-google-mcp/default-mcp-personal/user-a",
+            createdByUserId: "user-a",
+            name: "Alice Google MCP",
+            installs: peerInstalled ? [{ targetType: "agent", targetId: "agent-1" }] : [],
+          }),
+          personalInstance({
+            id: "pi-b",
+            uid: "rh-google-mcp/default-mcp-personal/user-b",
+            createdByUserId: "user-b",
+            name: "Bob Google MCP",
+            installs: [],
+          }),
+        ],
+      }));
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [
+          { principalId: "user-a", status: "active", user: { name: "Alice Member" } },
+          { principalId: "user-b", status: "active", user: { name: "Bob Member" } },
+        ],
+      });
+
+      const { client } = await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+      client.setQueryData(queryKeys.tools.connectionInstalls("pi-b"), []);
+
+      const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
+      expect(bobRow).toBeTruthy();
+      expect(bobRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((bobRow as HTMLButtonElement).disabled).toBe(false);
+
+      // Bob attempts to install his personal instance, but a concurrent peer conflict occurs on the backend.
+      peerInstalled = true;
+      mockToolsApi.putConnectionInstalls.mockRejectedValueOnce(new Error("Another user's personal instance is already installed."));
+
+      await act(async () => {
+        bobRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      // The authoritative state is restored (unchecked), error toast is shown, and queries are refetched.
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Couldn't update the connection", tone: "error" }),
+      );
+      expect(bobRow!.getAttribute("data-state")).toBe("unchecked");
+      // Alice's concurrent install was loaded by the refetch, so Bob's row is now disabled by conflict.
+      expect((bobRow as HTMLButtonElement).disabled).toBe(true);
+      expect(container.textContent).toContain("Another user's personal instance is already installed for this app on this agent.");
+      expect(client.getQueryState(queryKeys.tools.connectionInstalls("pi-b"))?.isInvalidated).toBe(true);
+
+      // Alice's peer instance is removed, clearing the conflict.
+      peerInstalled = false;
+      const aliceRow = container.querySelector<HTMLElement>('[aria-label="Install Alice Google MCP on Coder"]');
+      expect(aliceRow).toBeTruthy();
+      mockToolsApi.putConnectionInstalls.mockResolvedValueOnce({ connectionId: "pi-a", installs: [] });
+      await act(async () => {
+        aliceRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      // Bob's row is re-enabled and retrying Bob's install is NOT suppressed.
+      expect((bobRow as HTMLButtonElement).disabled).toBe(false);
+      mockToolsApi.putConnectionInstalls.mockResolvedValueOnce({
+        connectionId: "pi-b",
+        installs: [{ targetType: "agent", targetId: "agent-1" }],
+      });
+      await act(async () => {
+        bobRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenLastCalledWith("pi-b", [
+        { targetType: "agent", targetId: "agent-1" },
+      ]);
+      expect(bobRow!.getAttribute("data-state")).toBe("checked");
+    });
+
+    it("TECH-8350: null-owner installed peer disables own row due to conflict", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-null",
+            uid: "rh-google-mcp/default-mcp-personal/null-user",
+            createdByUserId: null,
+            name: "Legacy Google MCP",
+            installs: [{ targetType: "agent", targetId: "agent-1" }],
+          }),
+          personalInstance({
+            id: "pi-b",
+            uid: "rh-google-mcp/default-mcp-personal/user-b",
+            createdByUserId: "user-b",
+            name: "Bob Google MCP",
+            installs: [],
+          }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [{ principalId: "user-b", status: "active", user: { name: "Bob Member" } }],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+
+      const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
+      expect(bobRow).toBeTruthy();
+      expect(bobRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((bobRow as HTMLButtonElement).disabled).toBe(true);
+      expect(container.textContent).toContain("Another user's personal instance is already installed for this app on this agent.");
+    });
+
+    it("TECH-8350: enables personal instance row for local-board owner in local_trusted mode when session is null", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [
+          seedConnection,
+          personalInstance({
+            id: "pi-local",
+            uid: "rh-google-mcp/default-mcp-personal/local-board",
+            createdByUserId: "local-board",
+            name: "Local Google MCP",
+            installs: [],
+          }),
+        ],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockHealthApi.get.mockResolvedValue({ deploymentMode: "local_trusted" });
+      mockAuthApi.getSession.mockResolvedValue(null);
+      mockAccessApi.listUserDirectory.mockResolvedValue({ users: [] });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-local") });
+
+      const localRow = container.querySelector<HTMLElement>('[aria-label="Install Local Google MCP on Coder"]');
+      expect(localRow).toBeTruthy();
+      expect(localRow!.getAttribute("data-state")).toBe("unchecked");
+      expect((localRow as HTMLButtonElement).disabled).toBe(false);
+
+      await act(async () => {
+        localRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenCalledWith("pi-local", [
+        { targetType: "agent", targetId: "agent-1" },
+      ]);
+    });
+
+    it("TECH-8350: autosave selects changed uninstalls before installs to avoid peer-uninstall race", async () => {
+      mockToolsApi.getEffectiveProfilesForAgent.mockResolvedValue(emptyEffective());
+      const aliceConn = personalInstance({
+        id: "pi-a",
+        uid: "rh-google-mcp/default-mcp-personal/user-a",
+        createdByUserId: "user-a",
+        name: "Alice Google MCP",
+        installs: [{ targetType: "agent", targetId: "agent-1" }],
+      });
+      const bobConn = personalInstance({
+        id: "pi-b",
+        uid: "rh-google-mcp/default-mcp-personal/user-b",
+        createdByUserId: "user-b",
+        name: "Bob Google MCP",
+        installs: [],
+      });
+      // Put pi-b first in connectionList to guarantee that order in connectionList doesn't dictate order
+      mockToolsApi.listConnections.mockResolvedValue({
+        connections: [bobConn, aliceConn],
+      });
+      mockToolsApi.listPolicies.mockResolvedValue({ policies: [] });
+      mockToolsApi.listCatalog.mockResolvedValue({ catalog: [] });
+      mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-b" } });
+      mockAccessApi.listUserDirectory.mockResolvedValue({
+        users: [
+          { principalId: "user-a", status: "active", user: { name: "Alice Member" } },
+          { principalId: "user-b", status: "active", user: { name: "Bob Member" } },
+        ],
+      });
+
+      mockToolsApi.putConnectionInstalls.mockResolvedValueOnce({
+        connectionId: "pi-a",
+        installs: [],
+      });
+
+      await renderTab({ companyId: "company-1", metadata: seedMetadata("pi-b") });
+
+      const aliceRow = container.querySelector<HTMLElement>('[aria-label="Install Alice Google MCP on Coder"]');
+      expect(aliceRow).toBeTruthy();
+      expect(aliceRow!.getAttribute("data-state")).toBe("checked");
+
+      // Alice's instance is currently installed. Bob clicks Alice to uninstall it:
+      await act(async () => {
+        aliceRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+
+      // And Bob clicks his own instance to install it:
+      const bobRow = container.querySelector<HTMLElement>('[aria-label="Install Bob Google MCP on Coder"]');
+      expect(bobRow).toBeTruthy();
+      await act(async () => {
+        bobRow!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+      });
+      await flushReact();
+
+      // The first call sent to putConnectionInstalls MUST be the uninstall (pi-a with []), NOT pi-b
+      expect(mockToolsApi.putConnectionInstalls).toHaveBeenNthCalledWith(1, "pi-a", []);
     });
   });
 });
