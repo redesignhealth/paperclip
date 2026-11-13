@@ -1398,6 +1398,7 @@ export function createToolGatewayService(
         companyId: string;
         connectionId: string;
         subjectUserId: string;
+        force?: boolean;
       }) => Promise<{ accessToken: string; expiresAt: string | null } | null>)
     | null = null;
 
@@ -4705,6 +4706,74 @@ export function createToolGatewayService(
     return null;
   }
 
+  const MAX_PERSONAL_GRANT_EXPIRY_SKEW_MS = 5 * 60_000;
+
+  function resolvePersonalGrantExpiry(
+    grant: typeof connectionGrants.$inferSelect,
+    accessTokenRef: ToolCredentialSecretRef,
+    nowMs: number = Date.now(),
+  ): {
+    expiresAt: string | null;
+    expirySource: "secret_ref" | "provider_tenant" | "none";
+    isExpired: boolean;
+  } {
+    const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+    const refExpiryStr = typeof accessTokenRef.expiresAt === "string" ? accessTokenRef.expiresAt : null;
+    const tenantExpiryStr = typeof grantOauth?.accessTokenExpiresAt === "string" ? grantOauth.accessTokenExpiresAt : null;
+
+    const refParsed = refExpiryStr ? Date.parse(refExpiryStr) : Number.NaN;
+    const tenantParsed = tenantExpiryStr ? Date.parse(tenantExpiryStr) : Number.NaN;
+
+    let expiresMs: number | null = null;
+    let expiresAt: string | null = null;
+    let expirySource: "secret_ref" | "provider_tenant" | "none" = "none";
+
+    if (Number.isFinite(refParsed) && Number.isFinite(tenantParsed)) {
+      if (refParsed >= tenantParsed) {
+        expiresMs = refParsed;
+        expiresAt = refExpiryStr;
+        expirySource = "secret_ref";
+      } else {
+        expiresMs = tenantParsed;
+        expiresAt = tenantExpiryStr;
+        expirySource = "provider_tenant";
+      }
+    } else if (Number.isFinite(refParsed)) {
+      expiresMs = refParsed;
+      expiresAt = refExpiryStr;
+      expirySource = "secret_ref";
+    } else if (Number.isFinite(tenantParsed)) {
+      expiresMs = tenantParsed;
+      expiresAt = tenantExpiryStr;
+      expirySource = "provider_tenant";
+    }
+
+    if (expiresMs === null || expiresAt === null) {
+      return { expiresAt: null, expirySource: "none", isExpired: false };
+    }
+
+    if (expiresMs <= nowMs) {
+      return { expiresAt, expirySource, isExpired: true };
+    }
+
+    const refreshedAtParsed = typeof grantOauth?.refreshedAt === "string"
+      ? Date.parse(grantOauth.refreshedAt)
+      : Number.NaN;
+    const issuedAtMs = Number.isFinite(refreshedAtParsed)
+      ? refreshedAtParsed
+      : grant.updatedAt ? new Date(grant.updatedAt).getTime() : null;
+
+    let skewMs = MAX_PERSONAL_GRANT_EXPIRY_SKEW_MS;
+    if (issuedAtMs !== null && expiresMs > issuedAtMs) {
+      const totalTtlMs = expiresMs - issuedAtMs;
+      // Cap skew to at most 20% of total TTL to prevent refresh loops on short TTL tokens
+      skewMs = Math.min(MAX_PERSONAL_GRANT_EXPIRY_SKEW_MS, Math.max(0, Math.floor(totalTtlMs * 0.2)));
+    }
+
+    const isExpired = expiresMs <= nowMs + skewMs;
+    return { expiresAt, expirySource, isExpired };
+  }
+
   // Never falls back to a workspace grant or the connection's own
   // credentialRefs -- for a personal_only connection there is no valid
   // fallback identity, only this specific person's or nothing. Refresh is
@@ -4791,11 +4860,8 @@ export function createToolGatewayService(
       });
       return null;
     }
-    const cloudOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
-    const expiresAt = isPaperclipCloudConnectorStrategy(asRecord(asRecord(connection.config)?.oauth)?.strategy)
-      ? (typeof cloudOauth?.accessTokenExpiresAt === "string" ? cloudOauth.accessTokenExpiresAt : null)
-      : accessTokenRef.expiresAt;
-    const isExpired = expiresAt && Date.parse(expiresAt) <= Date.now();
+    const nowMs = options.now?.() ?? Date.now();
+    const { expiresAt, expirySource, isExpired } = resolvePersonalGrantExpiry(grant, accessTokenRef, nowMs);
     if (isExpired) {
       if (!refreshUserGrantHook) {
         await bestEffortAudit({
@@ -4865,7 +4931,15 @@ export function createToolGatewayService(
         return null;
       }
       logger.info(
-        { connectionId: connection.id, grantId: grant.id, source: "refreshed", subjectUserId },
+        {
+          connectionId: connection.id,
+          grantId: grant.id,
+          source: "refreshed",
+          subjectUserId,
+          expirySource,
+          expiresPresent: Boolean(expiresAt),
+          refreshed: true,
+        },
         "[tool-gateway] personal grant resolved",
       );
       return { Authorization: `Bearer ${sanitized}` };
@@ -4898,7 +4972,15 @@ export function createToolGatewayService(
         return null;
       }
       logger.info(
-        { connectionId: connection.id, grantId: grant.id, source: "stored", subjectUserId },
+        {
+          connectionId: connection.id,
+          grantId: grant.id,
+          source: "stored",
+          subjectUserId,
+          expirySource,
+          expiresPresent: Boolean(expiresAt),
+          refreshed: false,
+        },
         "[tool-gateway] personal grant resolved",
       );
       return { Authorization: `Bearer ${sanitized}` };
@@ -7300,6 +7382,51 @@ export function createToolGatewayService(
         headers = builtHeaders.headers;
         headerSummary = builtHeaders.summary;
         await requireExplicitRetryAfterOAuthRefresh(response);
+      }
+      if (
+        response.status === 401 &&
+        personalOnly &&
+        personalUserId &&
+        refreshUserGrantHook
+      ) {
+        let refreshed: Awaited<ReturnType<NonNullable<typeof refreshUserGrantHook>>> = null;
+        try {
+          refreshed = await refreshUserGrantHook({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            subjectUserId: personalUserId,
+            force: true,
+          });
+        } catch (err) {
+          logger.warn(
+            {
+              connectionId: connection.id,
+              subjectUserId: personalUserId,
+              error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
+            },
+            "[tool-gateway] personal grant 401 refresh hook failed",
+          );
+        }
+        if (refreshed) {
+          logger.info(
+            {
+              connectionId: connection.id,
+              subjectUserId: personalUserId,
+              refreshed: true,
+            },
+            "[tool-gateway] personal grant refreshed after upstream 401",
+          );
+          await requireExplicitRetryAfterOAuthRefresh(response);
+        } else {
+          logger.warn(
+            {
+              connectionId: connection.id,
+              subjectUserId: personalUserId,
+              refreshed: false,
+            },
+            "[tool-gateway] personal grant refresh after upstream 401 returned null",
+          );
+        }
       }
       const sessionExpired = response.status === 404 && new Headers(requestHeaders).has("mcp-session-id");
       if (sessionExpired) {

@@ -18438,13 +18438,17 @@ export function toolAccessService(
           },
           txSecretContext,
         );
+        const accessRefWithExpiry = {
+          ...accessRef,
+          expiresAt: expiresAt ?? undefined,
+        };
         const nextCredentialSecretRefs = [
           ...subjectCredentialSecretRefs.filter(
             (ref) =>
               ref.configPath !== "oauth.access_token" &&
               ref.configPath !== "oauth.refresh_token",
           ),
-          accessRef,
+          accessRefWithExpiry,
         ];
         if (token.refreshToken) {
           nextCredentialSecretRefs.push(
@@ -19656,6 +19660,7 @@ export function toolAccessService(
     companyId: string;
     connectionId: string;
     subjectUserId: string;
+    force?: boolean;
   }): Promise<{ accessToken: string; expiresAt: string | null } | null> {
     // companyId-prefixed: connectionId is already company-scoped on its own
     // (it's a UUID primary key), so the prefix isn't load-bearing for
@@ -19693,6 +19698,29 @@ export function toolAccessService(
         return null;
       }
 
+      // If force is requested, check if another process just refreshed this grant recently (< 15s).
+      // If so, reuse the freshly rotated token rather than rotating again and risking stale refresh token races.
+      const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+      const refreshedAtStr = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
+      const refreshedAtMs = refreshedAtStr ? Date.parse(refreshedAtStr) : Number.NaN;
+      const recentlyRefreshed = Number.isFinite(refreshedAtMs) && Date.now() - refreshedAtMs < 15_000;
+      if (input.force && recentlyRefreshed) {
+        try {
+          const { value: currentToken } = await resolveConnectionGrantSecret(db, connection, grant, accessTokenRef, {
+            consumerType: "connection_grant",
+            consumerId: grant.id,
+            configPath: "oauth.access_token",
+            actorType: "system",
+          });
+          const currentExpiresAt = typeof accessTokenRef.expiresAt === "string"
+            ? accessTokenRef.expiresAt
+            : (typeof grantOauth?.accessTokenExpiresAt === "string" ? grantOauth.accessTokenExpiresAt : null);
+          return { accessToken: currentToken, expiresAt: currentExpiresAt };
+        } catch {
+          // Fall through to exchange if resolving fails
+        }
+      }
+
       try {
         // consumerType/consumerId target this grant, not the connection --
         // see the connection_grant comment on SECRET_BINDING_TARGET_TYPES
@@ -19725,9 +19753,23 @@ export function toolAccessService(
         const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
         const updatedRefs = grant.credentialSecretRefs.map((ref) =>
           ref.configPath === "oauth.access_token" ? { ...ref, expiresAt: expiresAt ?? undefined } : ref);
+        const currentOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+        const updatedProviderTenant = {
+          ...(grant.providerTenant ?? {}),
+          oauth: {
+            ...currentOauth,
+            accessTokenExpiresAt: expiresAt ?? undefined,
+            refreshedAt: new Date().toISOString(),
+          },
+        };
         const [updated] = await db
           .update(connectionGrants)
-          .set({ credentialSecretRefs: updatedRefs, lastUsedAt: new Date(), updatedAt: new Date() })
+          .set({
+            providerTenant: updatedProviderTenant,
+            credentialSecretRefs: updatedRefs,
+            lastUsedAt: new Date(),
+            updatedAt: new Date(),
+          })
           .where(and(
             eq(connectionGrants.id, grant.id),
             eq(connectionGrants.companyId, input.companyId),

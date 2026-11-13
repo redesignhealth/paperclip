@@ -22604,6 +22604,14 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(tokenRequest!.body.has("client_secret")).toBe(false);
     expect(tokenRequest!.body.get("code_verifier")).toBeTruthy();
     expect(requested.some((entry) => entry.includes("/oauth2/register"))).toBe(false);
+
+    // TECH-8431: completeOAuthCallback writes expiresAt to both credentialSecretRefs and providerTenant.oauth
+    const [initialGrant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const initialAccessRef = initialGrant!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+    expect(initialAccessRef?.expiresAt).toBeDefined();
+    const initialTenantOauth = (initialGrant!.providerTenant as Record<string, any>)?.oauth;
+    expect(initialTenantOauth?.accessTokenExpiresAt).toBe(initialAccessRef?.expiresAt);
+
     const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
     expect(connection.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(false);
     expect((connection.config.oauth as Record<string, unknown> | undefined)?.clientRegistrationSource).not.toBe("cimd");
@@ -22667,6 +22675,53 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(tokenRequest!.body.get("grant_type")).toBe("refresh_token");
     expect(tokenRequest!.body.get("client_id")).toBe("client_granola_fixture");
     expect(tokenRequest!.body.has("client_secret")).toBe(false);
+
+    // TECH-8431: Verify metadata was properly updated on grant refresh
+    const [refreshedGrant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.connectionId));
+    const refreshedAccessRef = refreshedGrant!.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+    expect(refreshedAccessRef?.expiresAt).toBe(refreshed!.expiresAt);
+    const refreshedTenantOauth = (refreshedGrant!.providerTenant as Record<string, any>)?.oauth;
+    expect(refreshedTenantOauth?.accessTokenExpiresAt).toBe(refreshed!.expiresAt);
+    expect(refreshedTenantOauth?.refreshedAt).toBeDefined();
+
+    // TECH-8431: Concurrent calls for the same user grant share in-flight exchange
+    tokenRequest = null;
+    const tokenCallsBefore = requested.filter((r) => r.includes("/oauth2/token")).length;
+    const [concurrent1, concurrent2] = await Promise.all([
+      service.refreshUserGrant({
+        companyId: company.id,
+        connectionId: connected.connectionId,
+        subjectUserId: userId,
+      }),
+      service.refreshUserGrant({
+        companyId: company.id,
+        connectionId: connected.connectionId,
+        subjectUserId: userId,
+      }),
+    ]);
+    expect(concurrent1).not.toBeNull();
+    expect(concurrent2).not.toBeNull();
+    expect(concurrent1!.accessToken).toBe(concurrent2!.accessToken);
+
+    // TECH-8431: Force refresh within 15s reuses recent fresh token without re-exchanging
+    const resRecentForce = await service.refreshUserGrant({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      subjectUserId: userId,
+      force: true,
+    });
+    expect(resRecentForce).toMatchObject({ accessToken: "granola-access-token" });
+    // Exactly 1 new token call was made by concurrent1+concurrent2, and 0 by resRecentForce
+    const tokenCallsAfter = requested.filter((r) => r.includes("/oauth2/token")).length;
+    expect(tokenCallsAfter).toBe(tokenCallsBefore + 1);
+
+    // TECH-8431: Tenant / user isolation: refresh for otherUser returns null without affecting grant
+    const otherResult = await service.refreshUserGrant({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      subjectUserId: otherUser,
+    });
+    expect(otherResult).toBeNull();
   });
 
   it("keeps each Granola user's grant isolated to its own subject", async () => {
