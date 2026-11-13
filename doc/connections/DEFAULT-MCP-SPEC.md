@@ -696,7 +696,7 @@ connection to rh-mcp named `rh-mcp-service`, so no agent depends on one person's
 - **Off by default.** Set `PAPERCLIP_SHARED_ORG_RH_MCP_ENABLED=true` (also needs the default-MCP spec flag, the rh-mcp URL in
   `PAPERCLIP_DEFAULT_MCP_RH_MCP_URL`, and the comms ownership API credentials). Rollout follows the company template scope.
 - **One token per org**, minted through the ownership API (`paperclip-rh-mcp-<companyId>`), never by Paperclip. Scopes are the
-  closed read set in `RH_MCP_SERVICE_TOOLS_BY_SCOPE`: Argus review, MDM read, Opik read, Coresignal, Definitive Healthcare, the
+  closed allowlist in `RH_MCP_SERVICE_TOOLS_BY_SCOPE` (read scopes, plus the async comps run scope): Argus review, MDM read, Opik read, Coresignal, Definitive Healthcare, the
   voice humanizer checklist and the async comps verbs (`comps:run`: `comps__start`/`comps__get`/`comps__cancel`, TECH-8433). Never `supabase:*` (Ashby views are readable under `supabase:read`), writes, secrets or impersonation.
 - **Offered tools equal the scopes.** The spec entry's reviewed allowlist is derived from the same map; identity-keyed tools
   (annotations, Granola status, voice guides) are left out because a service identity has no meaningful answer for them.
@@ -705,7 +705,9 @@ connection to rh-mcp named `rh-mcp-service`, so no agent depends on one person's
   (expiry kept in `config.rhMcpServiceTokenExpiresAt`).
 - **Scope changes do not reach existing orgs automatically.** The token's scopes are the keys of the map, and an issued token
   keeps its scopes until it is re-issued (60 days before expiry, or by hand with `POST /agents/{sub}/rotate` on the ownership
-  API). After adding a scope such as `comps:run`, rotate each org's token manually. Bump `RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION`
+  API). After adding a scope such as `comps:run`, rotate each org's token manually: `POST /agents/paperclip-rh-mcp-<companyId>/rotate` with a JSON body of
+  `{"scopes": <every key of RH_MCP_SERVICE_TOKEN_SCOPES>, "expires_in_days": <days>}`, then store the returned `token` as a new version of the
+  connection's vault secret (the API call alone does not update Paperclip; the old token keeps its old scopes until it expires). Bump `RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION`
   whenever a scope or tool is added. The Argus and comps verbs get a 30 s per-call timeout (api-main cold starts).
 - **Opt-out:** archive the `rh-mcp-service` connection; it is not re-created.
 

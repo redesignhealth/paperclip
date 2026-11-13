@@ -217,7 +217,8 @@ export const RH_MCP_SERVICE_TOOLS_BY_SCOPE = Object.freeze({
 
 /**
  * Version of `RH_MCP_SERVICE_REVIEWED_TOOLS`. Bump it whenever the tool or scope set changes (v2 = + `comps:run`, TECH-8433).
- * Changing the scope set also needs `RH_MCP_SERVICE_TOKEN_SCOPES_VERSION` bumped so existing org tokens are re-issued.
+ * Changing the scope set does not re-issue existing org tokens: nothing reads `RH_MCP_SERVICE_TOKEN_SCOPES_VERSION`, and
+ * the sweep only rotates a token near expiry. Rotate each org's token by hand (see DEFAULT-MCP-SPEC.md).
  */
 export const RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION = 2;
 export const RH_MCP_SERVICE_REVIEWED_TOOLS: readonly string[] = Object.freeze(
