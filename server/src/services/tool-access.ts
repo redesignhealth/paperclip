@@ -8892,7 +8892,7 @@ export function toolAccessService(
       // A clone's config can be edited by PATCH (the managed marker is kept, the URL is not pinned). Trust the reviewed
       // list only while the clone still points at the endpoint of its company's immutable managed template.
       const [template] = await db
-        .select({ config: toolConnections.config })
+        .select({ config: toolConnections.config, status: toolConnections.status })
         .from(toolConnections)
         .where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.uid, DEFAULT_MCP_TEMPLATE_UID)))
         .limit(1);
@@ -8905,7 +8905,9 @@ export function toolAccessService(
           return null;
         }
       };
-      const templateEndpoint = template ? endpointOf(template.config) : null;
+      // An archived template is how an operator revokes the managed comms-board access: its clones lose the exemption too.
+      const templateEndpoint =
+        template && template.status !== "archived" && isManagedTemplate(template.config) ? endpointOf(template.config) : null;
       if (templateEndpoint === null || endpointOf(connection.config) !== templateEndpoint) commsReviewed = null;
     }
     const discoveredCount = descriptors.length;

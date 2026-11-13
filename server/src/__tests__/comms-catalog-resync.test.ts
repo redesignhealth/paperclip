@@ -377,6 +377,20 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
       expect((await cloneStatus(cloneId)).proposals_submit).toBe(exempt ? "active" : "quarantined");
     });
 
+    it("a clone loses the exemption when its company's managed template is archived", async () => {
+      const companyId = await seedCompany();
+      const ownerId = await seedOwner(companyId);
+      const template = await seedCommsTemplate(companyId);
+      const agent = await readyAgent(companyId, ownerId);
+      const cloneId = (await entryOf(agent.id)).binding!.connectionId!;
+      await markManagedTemplate(template.id);
+      await dropCredentials(cloneId);
+      await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, template.id));
+      await db.update(toolCatalogEntries).set({ versionHash: "stale" }).where(and(eq(toolCatalogEntries.connectionId, cloneId), eq(toolCatalogEntries.toolName, "proposals_submit")));
+      await refreshWith(cloneId, LIVE());
+      expect((await cloneStatus(cloneId)).proposals_submit).toBe("quarantined");
+    });
+
     it("a clone whose company has no managed template loses the exemption", async () => {
       const companyId = await seedCompany();
       const ownerId = await seedOwner(companyId);
