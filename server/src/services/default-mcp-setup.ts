@@ -278,14 +278,14 @@ export async function snapshotDefaultMcpForNewAgent(
   const keptKeys = new Set<string>();
 
   for (const entry of spec) {
-    // A new-agents-only entry is never written for an existing agent or for an agent that is not eligible: no entry at all.
-    if (entry.newAgentsOnly && (input.newAgentCreation !== true || input.excludedSetupKeys?.has(entry.key))) continue;
     const prior = existingEntries[entry.key];
     if (prior && (prior.binding || prior.setup.registerAttemptedAt || prior.setup.mintAttemptedAt || !["pending", "not_required"].includes(prior.setup.state))) {
       entries[entry.key] = prior;
       keptKeys.add(entry.key);
       continue;
     }
+    // A new-agents-only entry is never written for an existing agent or for an agent that is not eligible: no entry at all.
+    if (entry.newAgentsOnly && (input.newAgentCreation !== true || input.excludedSetupKeys?.has(entry.key))) continue;
     const excluded = input.excludedSetupKeys?.has(entry.key) === true;
     // Scoped by company: a same-named connection in another tenant is never matched.
     const templates = excluded ? [] : await db

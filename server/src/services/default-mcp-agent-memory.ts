@@ -3,7 +3,8 @@ import { agents, companySecrets, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { isUnreachableTailnetPort } from "./remote-http-fetch.js";
 import { HERMES_ADAPTER_TYPE } from "./company-memory-constants.js";
-import { mintAgentMemoryCredential, resolveCommsBoardProvisionerConfig } from "./comms-board-provisioner-client.js";
+import { composeAgentMemorySub, mintAgentMemoryCredential, resolveCommsBoardProvisionerConfig } from "./comms-board-provisioner-client.js";
+import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { ownerEmailFor } from "./default-mcp-owner.js";
 import type { DefaultMcpSetupHook } from "./default-mcp-setup.js";
 import { secretService } from "./secrets.js";
@@ -97,8 +98,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /**
  * The local, idempotent stage: GET the agent's adapterConfig under a row lock, merge the memory settings into
- * `env` (every other key is kept), set `memoryProvider` and `runtimeMemory: false`, and write it back. Replaying it
- * writes the same values. Returns false when the agent is not a Hermes local agent (nothing is written).
+ * `env` (every other key is kept), set `memoryProvider` and `runtimeMemory: false`, write it back and sync the agent's
+ * secret bindings (the `MEM0_API_KEY` reference needs its binding row to resolve). Replaying it writes the same values. Returns false when the agent is not a Hermes local agent (nothing is written).
  */
 export async function applyAgentMemoryAdapterConfig(
   db: Db,
@@ -126,6 +127,14 @@ export async function applyAgentMemoryAdapterConfig(
       .update(agents)
       .set({ adapterConfig: next, updatedAt: sql`now()` })
       .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
+    // The secret reference only resolves at run time through its binding row, so write it in the same transaction,
+    // exactly as an agent config update does (replaces the agent's config-derived bindings from the merged config).
+    await syncAgentAdapterEnvBindings({
+      secretsSvc: secretService(tx as unknown as Db) as never,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      adapterConfig: next,
+    });
     return true;
   });
 }
@@ -206,7 +215,7 @@ export const agentMemoryHook: DefaultMcpSetupHook = async (input) => {
     }
     binding = {
       boardAgentId: null,
-      baseSub: `agent-memory-${agentId.toLowerCase()}`,
+      baseSub: composeAgentMemorySub(agentId) ?? `agent-memory-${agentId.toLowerCase()}`,
       agentKey: null,
       boardSub: null,
       secretId,

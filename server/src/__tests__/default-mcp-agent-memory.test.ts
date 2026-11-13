@@ -298,6 +298,19 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
       MEM0_USER_ID: { type: "plain", value: agent.id },
     });
     expect(JSON.stringify(config)).not.toContain(BOARD_TOKEN);
+
+    // The secret reference resolves at run time only through its binding row.
+    const bindings = await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, agent.id));
+    expect(bindings.map((row) => ({ path: row.configPath, secretId: row.secretId, target: row.targetType }))).toEqual([
+      { path: "env.MEM0_API_KEY", secretId: secret!.id, target: "agent" },
+    ]);
+    const resolved = await secretService(db).resolveAdapterConfigForRuntime(
+      companyId,
+      (await rowOf(agent.id)).adapterConfig as Record<string, unknown>,
+      { consumerType: "agent", consumerId: agent.id },
+      { adapterType: "hermes_local" },
+    );
+    expect((resolved.config.env as Record<string, unknown>).MEM0_API_KEY).toBe(BOARD_TOKEN);
   });
 
   it("omits MEM0_PROXY when no proxy is configured", async () => {
