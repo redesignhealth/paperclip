@@ -18,7 +18,6 @@ import {
 } from "@paperclipai/db";
 import { __resetDefaultMcpTemplateScopeForTests, captureDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { logger } from "../middleware/logger.js";
 import { agentService } from "../services/agents.js";
 import { readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
