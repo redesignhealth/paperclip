@@ -356,5 +356,106 @@ describe("plugin-api-ws unit & lifecycle tests (P2a unwired module)", () => {
         await closeServer(server);
       }
     });
+
+    it("fails closed promptly when authorization hangs at 101 upgrade", async () => {
+      const upstream = createServer();
+      const upstreamWs = new WebSocketServer({ noServer: true });
+      upstream.on("upgrade", (req, socket, head) => {
+        upstreamWs.handleUpgrade(req, socket, head, (ws) => upstreamWs.emit("connection", ws));
+      });
+      const upstreamBase = await listen(upstream);
+      const testProxy = createGuardedWebSocketProxyForTesting({ allowPrivateNetwork: true });
+
+      const server = createServer();
+      setupPluginApiWebSocketServer(server, (req, res) => {
+        void testProxy(
+          req as never, res as unknown as Response,
+          { url: upstreamBase.replace("http:", "wss:") + "/test" },
+          () => new Promise(() => {}), // hung auth
+          { upgradeDeadlineMs: 60 },
+        );
+      }, { upgradeDeadlineMs: 60 });
+      const serverBase = await listen(server);
+      const ws = new WebSocket(`${serverBase}/api/plugins/p1/api/test`);
+      try {
+        const result = await new Promise<{ status: number }>((resolve) => {
+          ws.on("unexpected-response", (_req, res) => { res.resume(); resolve({ status: res.statusCode! }); });
+          ws.on("error", () => resolve({ status: 504 }));
+        });
+        expect([502, 504]).toContain(result.status);
+      } finally {
+        ws.terminate();
+        upstreamWs.close();
+        await Promise.all([closeServer(server), closeServer(upstream)]);
+      }
+    });
+
+    it("does not open or forward data if upstream closes while awaiting authorization", async () => {
+      let upstreamSocket: Duplex | undefined;
+      const upstream = createServer();
+      const upstreamWs = new WebSocketServer({ noServer: true });
+      upstream.on("upgrade", (req, socket, head) => {
+        upstreamSocket = socket;
+        upstreamWs.handleUpgrade(req, socket, head, (ws) => upstreamWs.emit("connection", ws));
+      });
+      const upstreamBase = await listen(upstream);
+      const testProxy = createGuardedWebSocketProxyForTesting({ allowPrivateNetwork: true });
+
+      const server = createServer();
+      setupPluginApiWebSocketServer(server, (req, res) => {
+        void testProxy(
+          req as never, res as unknown as Response,
+          { url: upstreamBase.replace("http:", "wss:") + "/test" },
+          async () => {
+            upstreamSocket?.destroy();
+            await new Promise((r) => setTimeout(r, 20));
+            return true;
+          },
+        );
+      });
+      const serverBase = await listen(server);
+      const ws = new WebSocket(`${serverBase}/api/plugins/p1/api/test`);
+      try {
+        const result = await new Promise<{ status: number }>((resolve) => {
+          ws.on("unexpected-response", (_req, res) => { res.resume(); resolve({ status: res.statusCode! }); });
+          ws.on("error", () => resolve({ status: 502 }));
+        });
+        expect(result.status).toBe(502);
+      } finally {
+        ws.terminate();
+        upstreamWs.close();
+        await Promise.all([closeServer(server), closeServer(upstream)]);
+      }
+    });
+
+    it("never logs sensitive path-token or query-token on validation failure", async () => {
+      const { logger } = await import("../../middleware/logger.js");
+      const warnSpy = vi.spyOn(logger, "warn");
+      const testProxy = createGuardedWebSocketProxyForTesting({ allowPrivateNetwork: false });
+
+      const server = createServer();
+      setupPluginApiWebSocketServer(server, (req, res) => {
+        void testProxy(
+          req as never, res as unknown as Response,
+          { url: "wss://invalid_host:abc/secret_path_token?key=secret_query_token" },
+          () => Promise.resolve(true),
+        );
+      });
+      const serverBase = await listen(server);
+      const ws = new WebSocket(`${serverBase}/api/plugins/p1/api/test`);
+      try {
+        await new Promise<void>((resolve) => {
+          ws.on("unexpected-response", (_req, res) => { res.resume(); resolve(); });
+          ws.on("error", () => resolve());
+        });
+        const callsJson = JSON.stringify(warnSpy.mock.calls);
+        expect(callsJson).not.toContain("secret_path_token");
+        expect(callsJson).not.toContain("secret_query_token");
+      } finally {
+        ws.terminate();
+        warnSpy.mockRestore();
+        await closeServer(server);
+      }
+    });
   });
 });
