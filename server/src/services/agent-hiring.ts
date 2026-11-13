@@ -257,8 +257,8 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
       status: created.status,
       installDedicatedOnReady: true,
       newAgentCreation: true,
-      // Agent memory (TECH-8409) is offered only to new Hermes local agents while the server enables it.
-      ...(agentMemoryEligibleForNewAgent(created.adapterType) ? {} : { excludedSetupKeys: new Set([AGENT_MEMORY_ENTRY_KEY]) }),
+      // Agent memory (TECH-8409) is offered only to new agents of a profiled adapter (Hermes or Claude local) while the server enables it.
+      ...(agentMemoryEligibleForNewAgent(created.adapterType, created.adapterConfig) ? {} : { excludedSetupKeys: new Set([AGENT_MEMORY_ENTRY_KEY]) }),
     });
   }
   if (options?.aiConnectionInstall) {

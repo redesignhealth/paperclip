@@ -25,6 +25,7 @@ import { DEFAULT_MCP_SPEC, readDefaultMcpState } from "../services/default-mcp-s
 import { runDefaultMcpSetupForAgent, waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import {
   AGENT_MEMORY_ENABLED_ENV,
+  AGENT_MEMORY_ADAPTER_PROFILES,
   AGENT_MEMORY_PROXY_ENV,
   AGENT_MEMORY_URL_ENV,
   agentMemoryEligibleForNewAgent,
@@ -97,11 +98,30 @@ describe("agent memory config", () => {
     },
   );
 
-  it("only Hermes local agents are eligible, and only when configured", () => {
-    expect(agentMemoryEligibleForNewAgent("hermes_local", on)).toBe(true);
-    expect(agentMemoryEligibleForNewAgent("hermes_gateway", on)).toBe(false);
-    expect(agentMemoryEligibleForNewAgent("claude_local", on)).toBe(false);
-    expect(agentMemoryEligibleForNewAgent("hermes_local", {})).toBe(false);
+  it("only profiled local adapters are eligible, and only when configured", () => {
+    expect(agentMemoryEligibleForNewAgent("hermes_local", {}, on)).toBe(true);
+    expect(agentMemoryEligibleForNewAgent("claude_local", {}, on)).toBe(true);
+    expect(agentMemoryEligibleForNewAgent("paperclip_runner", { provider: "acpx", acpxAgent: "claude" }, on)).toBe(true);
+    expect(agentMemoryEligibleForNewAgent("paperclip_runner", { provider: "acpx", acpxAgent: "pi" }, on)).toBe(false);
+    expect(agentMemoryEligibleForNewAgent("hermes_gateway", {}, on)).toBe(false);
+    expect(agentMemoryEligibleForNewAgent("process", {}, on)).toBe(false);
+    expect(agentMemoryEligibleForNewAgent("hermes_local", {}, {})).toBe(false);
+    expect(agentMemoryEligibleForNewAgent("toString", {}, on)).toBe(false);
+  });
+
+  it("the adapter profile table maps each harness to its env keys", () => {
+    expect(AGENT_MEMORY_ADAPTER_PROFILES.hermes_local).toEqual({
+      tokenEnvKey: "MEM0_API_KEY",
+      urlEnvKey: "MEM0_HOST",
+      proxyEnvKey: "MEM0_PROXY",
+      userIdEnvKey: "MEM0_USER_ID",
+      adapterConfig: { memoryProvider: "mem0", runtimeMemory: false },
+    });
+    expect(AGENT_MEMORY_ADAPTER_PROFILES.claude_local).toEqual({
+      tokenEnvKey: "RH_MEMORY_TOKEN",
+      urlEnvKey: "RH_MEMORY_URL",
+      proxyEnvKey: "RH_MEMORY_PROXY",
+    });
   });
 
   it("the spec entry is a new-agents-only managed hook entry that is never installed or enabled by default", () => {
@@ -313,6 +333,51 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect((resolved.config.env as Record<string, unknown>).MEM0_API_KEY).toBe(BOARD_TOKEN);
   });
 
+  it("new Claude local agent: attaches RH_MEMORY_TOKEN, RH_MEMORY_URL and RH_MEMORY_PROXY only", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const agent = await createAgent(companyId, ownerId, { adapterType: "claude_local", adapterConfig: { model: "some-model" }, runner: "legacy" });
+    expect((await rowOf(agent.id)).adapterType).toBe("claude_local");
+
+    expect(fetchMock.calls.mint.filter((call) => call.sub.startsWith("agent-memory-"))).toHaveLength(1);
+    expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
+    const [secret] = await secretsFor(companyId, agent.id);
+    const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+    expect(config.env).toEqual({
+      RH_MEMORY_TOKEN: expect.objectContaining({ type: "secret_ref", secretId: secret!.id, version: "latest" }),
+      RH_MEMORY_URL: { type: "plain", value: MEMORY_URL },
+      RH_MEMORY_PROXY: { type: "plain", value: MEMORY_PROXY },
+    });
+    expect(config.memoryProvider).toBeUndefined();
+    expect(config.runtimeMemory).toBeUndefined();
+    const resolved = await secretService(db).resolveAdapterConfigForRuntime(
+      companyId,
+      config,
+      { consumerType: "agent", consumerId: agent.id },
+      { adapterType: "claude_local" },
+    );
+    expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_TOKEN).toBe(BOARD_TOKEN);
+  });
+
+  it("a native-runner agent whose harness is Claude gets the Claude profile", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    vi.stubGlobal("fetch", downstreamFetch());
+    const agent = await createAgent(companyId, ownerId, {
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "acpx", acpxAgent: "claude" },
+    });
+    expect((await rowOf(agent.id)).adapterType).toBe("paperclip_runner");
+    expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
+    const env = ((await rowOf(agent.id)).adapterConfig as Record<string, any>).env;
+    expect(Object.keys(env).sort()).toEqual(["RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
+  });
+
   it("omits MEM0_PROXY when no proxy is configured", async () => {
     enable({ proxy: false });
     const companyId = await seedCompany();
@@ -410,7 +475,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect(((await rowOf(agent.id)).adapterConfig as Record<string, unknown>).memoryProvider).toBeUndefined();
   });
 
-  it("non-Hermes agents get no entry and no mint", async () => {
+  it("agents of an unprofiled adapter get no entry and no mint", async () => {
     enable();
     const companyId = await seedCompany();
     const ownerId = await seedOwner(companyId);

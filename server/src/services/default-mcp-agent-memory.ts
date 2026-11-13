@@ -1,8 +1,8 @@
 import { and, eq } from "drizzle-orm";
+import { agentHarnessType } from "@paperclipai/shared";
 import { agents, companySecrets, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { isUnreachableTailnetPort } from "./remote-http-fetch.js";
-import { HERMES_ADAPTER_TYPE } from "./company-memory-constants.js";
 import { composeAgentMemorySub, mintAgentMemoryCredential, resolveCommsBoardProvisionerConfig } from "./comms-board-provisioner-client.js";
 import { agentService } from "./agents.js";
 import { ownerEmailFor } from "./default-mcp-owner.js";
@@ -10,18 +10,17 @@ import type { DefaultMcpSetupHook } from "./default-mcp-setup.js";
 import { secretService } from "./secrets.js";
 
 /**
- * Per-agent memory default for new Hermes agents (TECH-8409).
+ * Per-agent memory default for new Hermes and Claude local agents (TECH-8409).
  *
  * The memory service lives outside Paperclip. This hook only provisions generic config: it mints an
  * `agent-memory-<agentId>` token through the ownership registry (the same path the comms hook uses), stores it as a
- * company secret, and attaches the Hermes mem0 self-hosted settings to the agent's adapterConfig:
+ * company secret, and attaches the harness settings to the agent's adapterConfig. Which env keys and adapterConfig
+ * keys an adapter type gets is the small `AGENT_MEMORY_ADAPTER_PROFILES` table below (add a harness in one entry):
  *
- *   env.MEM0_API_KEY  secret reference to the stored token (never the value)
- *   env.MEM0_HOST     PAPERCLIP_AGENT_MEMORY_URL
- *   env.MEM0_PROXY    PAPERCLIP_AGENT_MEMORY_PROXY (optional)
- *   env.MEM0_USER_ID  the agent id
- *   memoryProvider    "mem0"
- *   runtimeMemory     false (no agent has both the in-process mem0 route and this one)
+ *   hermes_local  env.MEM0_API_KEY (secret reference, never the value), env.MEM0_HOST, env.MEM0_PROXY (optional),
+ *                 env.MEM0_USER_ID (the agent id), memoryProvider "mem0", runtimeMemory false (no agent has both the
+ *                 in-process mem0 route and this one)
+ *   claude_local  env.RH_MEMORY_TOKEN (secret reference), env.RH_MEMORY_URL, env.RH_MEMORY_PROXY (optional)
  *
  * Disabled unless `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and a valid `PAPERCLIP_AGENT_MEMORY_URL` is set.
  *
@@ -35,6 +34,47 @@ export const AGENT_MEMORY_ENTRY_KEY = "agent-memory";
 export const AGENT_MEMORY_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_ENABLED";
 export const AGENT_MEMORY_URL_ENV = "PAPERCLIP_AGENT_MEMORY_URL";
 export const AGENT_MEMORY_PROXY_ENV = "PAPERCLIP_AGENT_MEMORY_PROXY";
+
+/** The harness-specific part of the provisioning: which keys the agent's adapterConfig receives. */
+export interface AgentMemoryAdapterProfile {
+  /** env key holding the secret reference to the agent's memory token. */
+  tokenEnvKey: string;
+  /** env key for the memory service base URL. */
+  urlEnvKey: string;
+  /** env key for the optional proxy URL. */
+  proxyEnvKey: string;
+  /** env key for the agent id, when the harness wants one. */
+  userIdEnvKey?: string;
+  /** Extra top-level adapterConfig keys, merged as is. */
+  adapterConfig?: Readonly<Record<string, unknown>>;
+}
+
+/** Adapter type -> keys. Codex (same RH_MEMORY_* keys as Claude) is one more line here. */
+export const AGENT_MEMORY_ADAPTER_PROFILES: Readonly<Record<string, AgentMemoryAdapterProfile>> = Object.freeze({
+  hermes_local: {
+    tokenEnvKey: "MEM0_API_KEY",
+    urlEnvKey: "MEM0_HOST",
+    proxyEnvKey: "MEM0_PROXY",
+    userIdEnvKey: "MEM0_USER_ID",
+    adapterConfig: { memoryProvider: "mem0", runtimeMemory: false },
+  },
+  claude_local: {
+    tokenEnvKey: "RH_MEMORY_TOKEN",
+    urlEnvKey: "RH_MEMORY_URL",
+    proxyEnvKey: "RH_MEMORY_PROXY",
+  },
+});
+
+/**
+ * The profile of an agent, keyed by its HARNESS: `agentHarnessType` maps a native-runner agent (`paperclip_runner`) to
+ * the harness its config selects (for example provider `acpx` with agent `claude` is `claude_local`), and returns every
+ * other adapter type unchanged.
+ */
+export function agentMemoryProfileFor(adapterType: string | null | undefined, adapterConfig?: unknown): AgentMemoryAdapterProfile | null {
+  if (!adapterType) return null;
+  const harness = agentHarnessType(adapterType, asRecord(adapterConfig));
+  return Object.prototype.hasOwnProperty.call(AGENT_MEMORY_ADAPTER_PROFILES, harness) ? AGENT_MEMORY_ADAPTER_PROFILES[harness]! : null;
+}
 
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
@@ -87,9 +127,13 @@ export function resolveAgentMemoryConfig(env: NodeJS.ProcessEnv = process.env): 
   return { ok: true, config: { url: url.replace(/\/+$/, ""), proxy: proxy ? proxy.replace(/\/+$/, "") : null } };
 }
 
-/** Whether a NEW agent of this adapter type gets the memory entry at creation (enabled and valid config, Hermes local). */
-export function agentMemoryEligibleForNewAgent(adapterType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
-  return adapterType === HERMES_ADAPTER_TYPE && resolveAgentMemoryConfig(env).ok;
+/** Whether a NEW agent of this adapter type gets the memory entry at creation (enabled and valid config, profiled adapter). */
+export function agentMemoryEligibleForNewAgent(
+  adapterType: string | null | undefined,
+  adapterConfig: unknown = {},
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return agentMemoryProfileFor(adapterType, adapterConfig) !== null && resolveAgentMemoryConfig(env).ok;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -98,10 +142,10 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /**
  * The local, idempotent stage: read the agent's adapterConfig, merge the memory settings into `env` (every other key
- * is kept), set `memoryProvider` and `runtimeMemory: false`, and write it back through the agent lifecycle module's
- * configuration update (the only owner of adapterConfig writes). That update normalizes the env, records a config
- * revision and syncs the agent's secret bindings, which the `MEM0_API_KEY` reference needs to resolve at run time.
- * Replaying it writes the same values. Returns false when the agent is not a Hermes local agent (nothing is written).
+ * is kept) plus the adapter's extra keys, and write it back through the agent lifecycle module's configuration update
+ * (the only owner of adapterConfig writes). That update normalizes the env, records a config revision and syncs the
+ * agent's secret bindings, which the token reference needs to resolve at run time. Replaying it writes the same
+ * values. Returns false when the agent's adapter type has no profile (nothing is written).
  */
 export async function applyAgentMemoryAdapterConfig(
   db: Db,
@@ -109,19 +153,21 @@ export async function applyAgentMemoryAdapterConfig(
 ): Promise<boolean> {
   const svc = agentService(db);
   const row = await svc.getById(input.agentId);
-  if (!row || row.companyId !== input.companyId || row.adapterType !== HERMES_ADAPTER_TYPE) return false;
+  if (!row || row.companyId !== input.companyId) return false;
+  const profile = agentMemoryProfileFor(row.adapterType, row.adapterConfig);
+  if (!profile) return false;
   const current = asRecord(row.adapterConfig);
   const env: Record<string, unknown> = {
     ...asRecord(current.env),
-    MEM0_API_KEY: { type: "secret_ref", secretId: input.secretId, version: "latest" },
-    MEM0_HOST: { type: "plain", value: input.config.url },
-    MEM0_USER_ID: { type: "plain", value: input.agentId },
+    [profile.tokenEnvKey]: { type: "secret_ref", secretId: input.secretId, version: "latest" },
+    [profile.urlEnvKey]: { type: "plain", value: input.config.url },
   };
-  if (input.config.proxy) env.MEM0_PROXY = { type: "plain", value: input.config.proxy };
-  else delete env.MEM0_PROXY;
+  if (profile.userIdEnvKey) env[profile.userIdEnvKey] = { type: "plain", value: input.agentId };
+  if (input.config.proxy) env[profile.proxyEnvKey] = { type: "plain", value: input.config.proxy };
+  else delete env[profile.proxyEnvKey];
   const updated = await svc.update(
     input.agentId,
-    { adapterConfig: { ...current, env, memoryProvider: "mem0", runtimeMemory: false } },
+    { adapterConfig: { ...current, env, ...(profile.adapterConfig ?? {}) } },
     { recordRevision: { source: "default_mcp_agent_memory" } },
   );
   return updated !== null;
@@ -143,11 +189,11 @@ export const agentMemoryHook: DefaultMcpSetupHook = async (input) => {
   const memoryConfig = resolvedMemory.config;
 
   const [agentRow] = await db
-    .select({ adapterType: agents.adapterType })
+    .select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
     .from(agents)
     .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
     .limit(1);
-  if (!agentRow || agentRow.adapterType !== HERMES_ADAPTER_TYPE) return { kind: "error", reason: "adapter_unsupported" };
+  if (!agentRow || agentMemoryProfileFor(agentRow.adapterType, agentRow.adapterConfig) === null) return { kind: "error", reason: "adapter_unsupported" };
 
   if (!binding?.secretId) {
     const ownerEmail = current.ownerUserId ? await ownerEmailFor(db, companyId, current.ownerUserId) : null;

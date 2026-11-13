@@ -701,7 +701,7 @@ export type DefaultMcpSetupReason =
   // Unknown outcome of a non-idempotent POST: terminal, never retried or rotated blindly.
   | "board_unknown"
   | "mint_unknown"
-  // Agent memory (TECH-8409): the agent is not a Hermes local agent (anymore); nothing is provisioned.
+  // Agent memory (TECH-8409): the agent's adapter type has no memory profile (anymore); nothing is provisioned.
   | "adapter_unsupported"
   // Token lost after a successful mint, or its vault secret was deleted/disabled: terminal, never re-minted.
   | "secret_store_failed"
