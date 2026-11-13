@@ -34,7 +34,7 @@ any new fork patch; remove one when the patch is upstreamed.
 - `ui/src/lib/agent-setup-fields.ts`
 - `ui/src/pages/test-support/hermes-create-preflight.ts`
 
-## Claude Code memory hooks (TECH-8410)
+## Claude Code memory hooks
 
 - `docker/claude/` managed settings and the memory hook baked into the image
 

@@ -30,11 +30,15 @@ token is never logged.
 from __future__ import annotations
 
 import json
+import math
 import os
+import signal
 import sys
 from typing import Any
 
-MAX_QUERY_CHARS = 1000
+# Paperclip prompts put the wake/task text first and fixed template and memory
+# guidance last, so queries and captured prompts keep the head.
+MAX_QUERY_CHARS = 6000
 MAX_MESSAGE_CHARS = 4000
 MAX_CONTEXT_CHARS = 4000
 DEFAULT_TOP_K = 5
@@ -56,7 +60,7 @@ def _env_seconds(name: str, default: float, cap: float | None = None) -> float:
         value = float(os.environ.get(name, ""))
     except ValueError:
         value = default
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         value = default
     return min(value, cap) if cap is not None else value
 
@@ -132,7 +136,7 @@ def recall(event: dict[str, Any]) -> str | None:
         "/search",
         token,
         proxy,
-        {"query": prompt.strip()[-MAX_QUERY_CHARS:], "top_k": _env_top_k()},
+        {"query": prompt.strip()[:MAX_QUERY_CHARS], "top_k": _env_top_k()},
         _env_seconds("RH_MEMORY_RECALL_TIMEOUT", 3, RECALL_TIMEOUT_CAP),
     )
     context = format_context(results)
@@ -181,7 +185,7 @@ def last_exchange(transcript_path: str) -> list[dict[str, str]]:
     if not user or not assistant:
         return []
     return [
-        {"role": "user", "content": user[-MAX_MESSAGE_CHARS:]},
+        {"role": "user", "content": user[:MAX_MESSAGE_CHARS]},
         {"role": "assistant", "content": "\n".join(assistant)[-MAX_MESSAGE_CHARS:]},
     ]
 
@@ -222,12 +226,27 @@ def capture(event: dict[str, Any]) -> None:
         os._exit(0)
 
 
+class _Deadline(Exception):
+    pass
+
+
+def _raise_deadline(_signum: int, _frame: object) -> None:
+    raise _Deadline()
+
+
 def main(argv: list[str]) -> int:
     mode = argv[1] if len(argv) > 1 else ""
     try:
         event = _read_event()
         if mode == "recall":
-            output = recall(event)
+            # urllib's timeout is per socket operation (and excludes DNS), so
+            # bound the whole recall to stay under the 10 s hook timeout.
+            signal.signal(signal.SIGALRM, _raise_deadline)
+            signal.setitimer(signal.ITIMER_REAL, _env_seconds("RH_MEMORY_RECALL_TIMEOUT", 3, RECALL_TIMEOUT_CAP))
+            try:
+                output = recall(event)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
             if output:
                 sys.stdout.write(output)
         elif mode == "capture":

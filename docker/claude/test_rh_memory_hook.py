@@ -156,12 +156,51 @@ class HelpersTest(unittest.TestCase):
             hook.recall({"prompt": "what did we decide?"})
         self.assertEqual(post.call_args.args[5], hook.RECALL_TIMEOUT_CAP)
 
-    def test_long_prompt_keeps_the_end(self) -> None:
-        prompt = "context " * 400 + "FINAL QUESTION"
+    def test_long_prompt_keeps_the_task_head(self) -> None:
+        # Paperclip prompts: wake/task text first, fixed guidance boilerplate last.
+        prompt = "TASK: fix the deploy " + "boilerplate " * 1000
         with mock.patch.dict(os.environ, ENV, clear=True), \
                 mock.patch.object(hook, "_post", return_value={"results": []}) as post:
             hook.recall({"prompt": prompt})
-        self.assertTrue(post.call_args.args[4]["query"].endswith("FINAL QUESTION"))
+        query = post.call_args.args[4]["query"]
+        self.assertTrue(query.startswith("TASK: fix the deploy"))
+        self.assertLessEqual(len(query), hook.MAX_QUERY_CHARS)
+
+    def test_env_seconds(self) -> None:
+        cases = (("", 3.0), ("abc", 3.0), ("0", 3.0), ("-1", 3.0), ("nan", 3.0), ("inf", 3.0), ("5", 5.0), ("30", 8.0))
+        for raw, expected in cases:
+            with mock.patch.dict(os.environ, {"T": raw}, clear=True):
+                self.assertEqual(hook._env_seconds("T", 3, 8), expected, raw)
+        with mock.patch.dict(os.environ, {"T": "30"}, clear=True):
+            self.assertEqual(hook._env_seconds("T", 15), 30.0)
+
+    def test_recall_overall_deadline(self) -> None:
+        import time
+
+        def slow(*_args: object) -> None:
+            time.sleep(5)
+
+        stdin = io.StringIO(json.dumps({"prompt": "what did we decide?"}))
+        with mock.patch.dict(os.environ, {**ENV, "RH_MEMORY_RECALL_TIMEOUT": "0.2"}, clear=True), \
+                mock.patch.object(hook, "_post", side_effect=slow), \
+                mock.patch("sys.stdin", stdin), mock.patch("sys.stdout", io.StringIO()) as out, \
+                mock.patch("sys.stderr", io.StringIO()):
+            start = time.monotonic()
+            self.assertEqual(hook.main(["rh-memory-hook", "recall"]), 0)
+            self.assertLess(time.monotonic() - start, 2)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_detach_stdio_points_fds_at_devnull(self) -> None:
+        import subprocess
+        import sys
+
+        code = (
+            "import importlib.machinery as m, importlib.util as u, os, sys;"
+            f"l=m.SourceFileLoader('h', {str(_PATH)!r}); s=u.spec_from_loader('h', l); h=u.module_from_spec(s); l.exec_module(h);"
+            "h._detach_stdio(); print('leak'); sys.stderr.write('leak')"
+        )
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+        self.assertEqual((done.stdout, done.stderr), ("", ""))
 
     def test_main_capture_fails_open(self) -> None:
         stdin = io.StringIO(json.dumps({"transcript_path": "/x"}))
