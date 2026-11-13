@@ -44,7 +44,7 @@ const EXCLUDED_ENTRY_KEYS: ReadonlySet<string> = new Set(["arcana-brain"]);
 
 /** The spec entries this job may add: managed (hook) entries minus those owned by another job. */
 export function missingEntryEligibleSpec(): readonly DefaultMcpEntrySpec[] {
-  return DEFAULT_MCP_SPEC.filter((entry) => entry.setupHook && !EXCLUDED_ENTRY_KEYS.has(entry.key));
+  return DEFAULT_MCP_SPEC.filter((entry) => entry.setupHook && !entry.newAgentsOnly && !EXCLUDED_ENTRY_KEYS.has(entry.key));
 }
 
 export type MissingEntrySkipReason =

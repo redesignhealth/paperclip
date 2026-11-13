@@ -62,6 +62,13 @@ export const COMMS_BOARD_TOKEN_SCOPES = ["comms:read", "comms:write", "comms:pro
  * v1 = read + write; v2 = + `comms:proposals:write`.
  */
 export const COMMS_BOARD_TOKEN_SCOPES_VERSION = 2;
+/**
+ * Per-agent memory credential (TECH-8409): read + write on the external memory service only. Never `comms:*`,
+ * `ownership:*` or any admin scope. Minted through the same ownership registry as the comms credentials.
+ */
+export const AGENT_MEMORY_TOKEN_SCOPES = ["memory:read", "memory:write"] as const;
+/** Memory tokens are shorter-lived than comms tokens. Downstream ownership API accepts [1, 3650]. */
+export const AGENT_MEMORY_TOKEN_EXPIRES_IN_DAYS = 90;
 /** The company template credential (TECH-7271) is discovery-only: read, never write/admin/ownership. */
 export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
 /**
@@ -79,11 +86,19 @@ export const RH_MCP_SERVICE_TOKEN_SCOPES_VERSION = 1;
  * Closed, typed credential purpose. The scopes sent downstream are looked up from this table only; there
  * is no caller-supplied scope list, so no code path can request `comms:admin` or `ownership:*`.
  */
-export type CommsBoardCredentialPurpose = "bot" | "template" | "rh_mcp_service";
+export type CommsBoardCredentialPurpose = "bot" | "template" | "rh_mcp_service" | "memory";
 const CREDENTIAL_SCOPES_BY_PURPOSE: Readonly<Record<CommsBoardCredentialPurpose, readonly string[]>> = Object.freeze({
   bot: COMMS_BOARD_TOKEN_SCOPES,
   template: COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
   rh_mcp_service: RH_MCP_SERVICE_TOKEN_SCOPES,
+  memory: AGENT_MEMORY_TOKEN_SCOPES,
+});
+/** Per-purpose expiry for newly minted credentials. Comms purposes stay at 365 days; memory tokens are 90 days. */
+const CREDENTIAL_EXPIRES_IN_DAYS_BY_PURPOSE: Readonly<Record<CommsBoardCredentialPurpose, number>> = Object.freeze({
+  bot: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
+  template: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
+  rh_mcp_service: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
+  memory: AGENT_MEMORY_TOKEN_EXPIRES_IN_DAYS,
 });
 
 const BASE_SUB_PATTERN = /^[a-z0-9][a-z0-9-]{0,127}$/;
@@ -169,6 +184,16 @@ export function composeTemplateSub(companyId: string): string | null {
 export function composeRhMcpServiceSub(companyId: string): string | null {
   if (!UUID_PATTERN.test(companyId)) return null;
   const sub = `paperclip-rh-mcp-${companyId.toLowerCase()}`;
+  return BASE_SUB_PATTERN.test(sub) && !sub.includes("::") ? sub : null;
+}
+
+/**
+ * Token subject of an agent's memory credential (TECH-8409): `agent-memory-<lowercase agent UUID>` (49 chars, no
+ * "::"). Null for anything that is not a canonical UUID. One credential per agent, so the sub names the agent.
+ */
+export function composeAgentMemorySub(agentId: string): string | null {
+  if (!UUID_PATTERN.test(agentId)) return null;
+  const sub = `agent-memory-${agentId.toLowerCase()}`;
   return BASE_SUB_PATTERN.test(sub) && !sub.includes("::") ? sub : null;
 }
 
@@ -580,7 +605,7 @@ async function mintCredentialForPurpose(
         sub: request.baseSub,
         owner_email: request.ownerEmail,
         scopes: [...scopes],
-        expires_in_days: COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
+        expires_in_days: CREDENTIAL_EXPIRES_IN_DAYS_BY_PURPOSE[request.purpose],
       }),
       signal: AbortSignal.timeout(timeoutMs),
       redirect: "error",
@@ -661,6 +686,23 @@ export async function mintRhMcpServiceCredential(
   const baseSub = composeRhMcpServiceSub(request.companyId);
   if (!baseSub) return { ok: false, reason: "invalid_subject" };
   return mintCredentialForPurpose(config, { baseSub, ownerEmail: request.ownerEmail, purpose: "rh_mcp_service" }, fetchImpl, timeoutMs);
+}
+
+/**
+ * Per-agent memory credential (`AGENT_MEMORY_TOKEN_SCOPES` ONLY, 90-day expiry), minted through the same ownership
+ * API with the server's existing ownership token. `request.agentId` must be a canonical UUID; the subject is always
+ * `composeAgentMemorySub(agentId)`, never caller-supplied. Insert-only: a second mint for the same agent is
+ * `ownership_conflict`.
+ */
+export async function mintAgentMemoryCredential(
+  config: CommsBoardProvisionerConfig,
+  request: { agentId: string; ownerEmail: string },
+  fetchImpl: FetchLike = tailnetAwareFetch,
+  timeoutMs: number = COMMS_BOARD_REQUEST_TIMEOUT_MS,
+): Promise<PurposeMintOutcome> {
+  const baseSub = composeAgentMemorySub(request.agentId);
+  if (!baseSub) return { ok: false, reason: "invalid_subject" };
+  return mintCredentialForPurpose(config, { baseSub, ownerEmail: request.ownerEmail, purpose: "memory" }, fetchImpl, timeoutMs);
 }
 
 // ---------------------------------------------------------------------------

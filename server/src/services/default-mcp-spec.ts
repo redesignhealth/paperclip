@@ -17,7 +17,7 @@ import { badRequest } from "../errors.js";
 /** `managed_token`: Paperclip provisions + stores a per-agent token. `oauth`/`none`: no provisioning. */
 export type DefaultMcpAuthKind = "managed_token" | "oauth" | "none";
 
-export type DefaultMcpSetupHookKey = "comms_board_identity" | "arcana_brain";
+export type DefaultMcpSetupHookKey = "comms_board_identity" | "arcana_brain" | "agent_memory";
 
 export interface DefaultMcpEntrySpec {
   /** Stable MCP identifier. Persisted on the agent, never derived from a display name. */
@@ -42,6 +42,12 @@ export interface DefaultMcpEntrySpec {
   installByDefault?: boolean;
   /** Optional per-MCP setup run after the agent row commits. Only special auth needs one. */
   setupHook?: DefaultMcpSetupHookKey;
+  /**
+   * Entry is provisioned only for agents created while it is enabled (TECH-8409). Backfill, legacy enrollment and
+   * missing-entry enrollment never add it to an existing agent, and the new-agent snapshot records it as excluded
+   * unless the caller says it is a new-agent creation.
+   */
+  newAgentsOnly?: boolean;
   /**
    * When true, Paperclip itself provisions the company's read-only template connection (TECH-7271,
    * `default-mcp-template.ts`) instead of requiring an operator-authored one. Requires `reviewedTools`.
@@ -412,6 +418,18 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     reviewedTools: { version: ARCANA_BRAIN_REVIEWED_TOOLS_VERSION, allow: ARCANA_BRAIN_REVIEWED_TOOLS },
   },
   {
+    // Per-agent memory (TECH-8409). Not an MCP connection: the hook mints `agent-memory-<agentId>`, stores it as a company
+    // secret and attaches the harness's memory settings (Hermes mem0 or Claude RH_MEMORY_*) to the agent's adapterConfig. `connectionName` names no real
+    // connection (no template, no install). Inert unless PAPERCLIP_AGENT_MEMORY_ENABLED and PAPERCLIP_AGENT_MEMORY_URL are set.
+    key: "agent-memory",
+    displayName: "Agent Memory",
+    connectionName: "rh-agent-memory",
+    authKind: "managed_token",
+    defaultEnabled: false,
+    setupHook: "agent_memory",
+    newAgentsOnly: true,
+  },
+  {
     // Argus review service (TECH-7792). An ORDINARY (non-dedicated) entry: the company's operator-authored
     // `mcp_remote` + `api_key` connection is used as-is, so every agent that opts in shares the one rh-auth service
     // token (`sub=rh-mcp`-scoped `argus:review`) stored in the vault secret its header ref points at. Nothing is
@@ -683,6 +701,8 @@ export type DefaultMcpSetupReason =
   // Unknown outcome of a non-idempotent POST: terminal, never retried or rotated blindly.
   | "board_unknown"
   | "mint_unknown"
+  // Agent memory (TECH-8409): the agent's adapter type has no memory profile (anymore); nothing is provisioned.
+  | "adapter_unsupported"
   // Token lost after a successful mint, or its vault secret was deleted/disabled: terminal, never re-minted.
   | "secret_store_failed"
   | "secret_unavailable"
