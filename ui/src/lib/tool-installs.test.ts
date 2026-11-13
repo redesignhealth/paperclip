@@ -76,6 +76,14 @@ describe("default-MCP aware install state", () => {
     expect(defaultMcpPendingEntries(metadata, [])).toEqual(expected);
   });
 
+  it("never lists the connection-less agent-memory entry as an app being set up", () => {
+    const metadata = { defaultMcp: { version: 1, entries: {
+      memory: { key: "agent-memory", templateKey: "rh-agent-memory", connectionId: null, setup: { state: "ready", reason: null } },
+      pending: { key: "agent-memory", templateKey: "rh-agent-memory", connectionId: null, setup: { state: "pending", reason: "owner_required" } },
+    } } };
+    expect(defaultMcpPendingEntries(metadata)).toEqual([]);
+  });
+
   it("lists default entries without a connection as pending rows", () => {
     const metadata = { defaultMcp: { version: 1, entries: {
       comms: { key: "comms", templateKey: "rh-comms-board", dedicated: true, connectionId: null, setup: { state: "pending", reason: "owner_required" } },

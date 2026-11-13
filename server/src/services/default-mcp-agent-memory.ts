@@ -1,10 +1,10 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { agents, companySecrets, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { isUnreachableTailnetPort } from "./remote-http-fetch.js";
 import { HERMES_ADAPTER_TYPE } from "./company-memory-constants.js";
 import { composeAgentMemorySub, mintAgentMemoryCredential, resolveCommsBoardProvisionerConfig } from "./comms-board-provisioner-client.js";
-import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
+import { agentService } from "./agents.js";
 import { ownerEmailFor } from "./default-mcp-owner.js";
 import type { DefaultMcpSetupHook } from "./default-mcp-setup.js";
 import { secretService } from "./secrets.js";
@@ -97,46 +97,34 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 /**
- * The local, idempotent stage: GET the agent's adapterConfig under a row lock, merge the memory settings into
- * `env` (every other key is kept), set `memoryProvider` and `runtimeMemory: false`, write it back and sync the agent's
- * secret bindings (the `MEM0_API_KEY` reference needs its binding row to resolve). Replaying it writes the same values. Returns false when the agent is not a Hermes local agent (nothing is written).
+ * The local, idempotent stage: read the agent's adapterConfig, merge the memory settings into `env` (every other key
+ * is kept), set `memoryProvider` and `runtimeMemory: false`, and write it back through the agent lifecycle module's
+ * configuration update (the only owner of adapterConfig writes). That update normalizes the env, records a config
+ * revision and syncs the agent's secret bindings, which the `MEM0_API_KEY` reference needs to resolve at run time.
+ * Replaying it writes the same values. Returns false when the agent is not a Hermes local agent (nothing is written).
  */
 export async function applyAgentMemoryAdapterConfig(
   db: Db,
   input: { companyId: string; agentId: string; secretId: string; config: AgentMemoryConfig },
 ): Promise<boolean> {
-  return db.transaction(async (tx) => {
-    const [row] = await tx
-      .select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
-      .from(agents)
-      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
-      .for("update")
-      .limit(1);
-    if (!row || row.adapterType !== HERMES_ADAPTER_TYPE) return false;
-    const current = asRecord(row.adapterConfig);
-    const env: Record<string, unknown> = {
-      ...asRecord(current.env),
-      MEM0_API_KEY: { type: "secret_ref", secretId: input.secretId, version: "latest" },
-      MEM0_HOST: { type: "plain", value: input.config.url },
-      MEM0_USER_ID: { type: "plain", value: input.agentId },
-    };
-    if (input.config.proxy) env.MEM0_PROXY = { type: "plain", value: input.config.proxy };
-    else delete env.MEM0_PROXY;
-    const next = { ...current, env, memoryProvider: "mem0", runtimeMemory: false };
-    await tx
-      .update(agents)
-      .set({ adapterConfig: next, updatedAt: sql`now()` })
-      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)));
-    // The secret reference only resolves at run time through its binding row, so write it in the same transaction,
-    // exactly as an agent config update does (replaces the agent's config-derived bindings from the merged config).
-    await syncAgentAdapterEnvBindings({
-      secretsSvc: secretService(tx as unknown as Db) as never,
-      companyId: input.companyId,
-      agentId: input.agentId,
-      adapterConfig: next,
-    });
-    return true;
-  });
+  const svc = agentService(db);
+  const row = await svc.getById(input.agentId);
+  if (!row || row.companyId !== input.companyId || row.adapterType !== HERMES_ADAPTER_TYPE) return false;
+  const current = asRecord(row.adapterConfig);
+  const env: Record<string, unknown> = {
+    ...asRecord(current.env),
+    MEM0_API_KEY: { type: "secret_ref", secretId: input.secretId, version: "latest" },
+    MEM0_HOST: { type: "plain", value: input.config.url },
+    MEM0_USER_ID: { type: "plain", value: input.agentId },
+  };
+  if (input.config.proxy) env.MEM0_PROXY = { type: "plain", value: input.config.proxy };
+  else delete env.MEM0_PROXY;
+  const updated = await svc.update(
+    input.agentId,
+    { adapterConfig: { ...current, env, memoryProvider: "mem0", runtimeMemory: false } },
+    { recordRevision: { source: "default_mcp_agent_memory" } },
+  );
+  return updated !== null;
 }
 
 export const agentMemoryHook: DefaultMcpSetupHook = async (input) => {

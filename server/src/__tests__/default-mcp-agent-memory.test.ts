@@ -292,7 +292,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect(config.model).toBe("some-model");
     expect(config.env).toEqual({
       KEEP_ME: { type: "plain", value: "yes" },
-      MEM0_API_KEY: { type: "secret_ref", secretId: secret!.id, version: "latest" },
+      MEM0_API_KEY: expect.objectContaining({ type: "secret_ref", secretId: secret!.id, version: "latest" }),
       MEM0_HOST: { type: "plain", value: MEMORY_URL },
       MEM0_PROXY: { type: "plain", value: MEMORY_PROXY },
       MEM0_USER_ID: { type: "plain", value: agent.id },
