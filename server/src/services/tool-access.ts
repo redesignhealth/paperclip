@@ -20031,20 +20031,14 @@ export function toolAccessService(
 
               if (!currentGrant) return;
 
-              const [currentSecret] = await tx
-                .select({ latestVersion: companySecrets.latestVersion })
-                .from(companySecrets)
-                .where(eq(companySecrets.id, refreshTokenRef.secretId))
-                .limit(1);
-
               const currentLeaseId = asRecord(asRecord(asRecord(currentGrant.providerTenant).oauth).refreshLease).id;
               const matchesLease = currentLeaseId === lease.leaseId;
-              const secretVersionUnchanged = currentSecret?.latestVersion === refreshSecretLatestVersion;
               const isActive = currentGrant.status === "active";
 
-              if (isActive && matchesLease && secretVersionUnchanged) {
+              let reauthorized: { id: string } | undefined;
+              if (isActive && matchesLease) {
                 const currentOauth = asRecord(asRecord(currentGrant.providerTenant)?.oauth);
-                const [reauthorized] = await tx
+                [reauthorized] = await tx
                   .update(connectionGrants)
                   .set({
                     status: "needs_reauthorization",
@@ -20058,27 +20052,47 @@ export function toolAccessService(
                     eq(connectionGrants.id, currentGrant.id),
                     eq(connectionGrants.companyId, input.companyId),
                     eq(connectionGrants.status, "active"),
+                    sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
+                    sql`EXISTS (
+                      SELECT 1 FROM ${companySecrets}
+                      WHERE ${companySecrets.id} = ${refreshTokenRef.secretId}
+                        AND ${companySecrets.companyId} = ${input.companyId}
+                        AND ${companySecrets.latestVersion} = ${refreshSecretLatestVersion}
+                    )`,
                   ))
                   .returning({ id: connectionGrants.id });
-                markedNeedsReauthorization = Boolean(reauthorized);
+              }
+
+              if (reauthorized) {
+                markedNeedsReauthorization = true;
               } else {
                 casMissWithNewGeneration = true;
-                const currentGrantOauth = asRecord(asRecord(currentGrant.providerTenant)?.oauth);
-                const currentGen = typeof currentGrantOauth?.refreshedAt === "string" ? currentGrantOauth.refreshedAt : null;
-                if (isActive && currentGen && isStrictlyNewerGeneration(currentGen, input.observedRefreshedAt)) {
-                  const accessRef = currentGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+                const [freshGrant] = await tx
+                  .select()
+                  .from(connectionGrants)
+                  .where(and(
+                    eq(connectionGrants.id, lease.grant.id),
+                    eq(connectionGrants.companyId, input.companyId),
+                  ))
+                  .limit(1);
+
+                const candidateGrant = freshGrant ?? currentGrant;
+                const freshGrantOauth = asRecord(asRecord(candidateGrant.providerTenant)?.oauth);
+                const currentGen = typeof freshGrantOauth?.refreshedAt === "string" ? freshGrantOauth.refreshedAt : null;
+                if (candidateGrant.status === "active" && currentGen && isStrictlyNewerGeneration(currentGen, input.observedRefreshedAt)) {
+                  const accessRef = candidateGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
                   if (accessRef) {
                     try {
-                      const resolved = await resolveConnectionGrantSecret(tx, connection, currentGrant, accessRef, {
+                      const resolved = await resolveConnectionGrantSecret(tx, connection, candidateGrant, accessRef, {
                         consumerType: "connection_grant",
-                        consumerId: currentGrant.id,
+                        consumerId: candidateGrant.id,
                         configPath: "oauth.access_token",
                         actorType: "system",
                       });
                       if (resolved?.value) {
                         const exp = typeof accessRef.expiresAt === "string"
                           ? accessRef.expiresAt
-                          : (typeof currentGrantOauth?.accessTokenExpiresAt === "string" ? currentGrantOauth.accessTokenExpiresAt : null);
+                          : (typeof freshGrantOauth?.accessTokenExpiresAt === "string" ? freshGrantOauth.accessTokenExpiresAt : null);
                         freshCredentialFromMiss = {
                           accessToken: resolved.value,
                           expiresAt: exp,

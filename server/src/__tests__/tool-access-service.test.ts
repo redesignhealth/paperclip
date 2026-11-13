@@ -22884,7 +22884,7 @@ describeEmbeddedPostgres("tool access service", () => {
         });
       }
       if (href === "https://mcp-auth.granola.ai/oauth2/token") {
-        const bodyText = typeof init?.body === "string" ? init.body : "";
+        const bodyText = typeof init?.body === "string" ? init.body : (init?.body ? String(init.body) : "");
         const params = new URLSearchParams(bodyText);
         const grantType = params.get("grant_type");
         if (grantType === "authorization_code") {
@@ -22933,7 +22933,7 @@ describeEmbeddedPostgres("tool access service", () => {
       });
 
       const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id));
-      expect((asRecord(grant?.providerTenant)?.oauth as any)?.refreshedAt).toBeDefined();
+      expect(((grant?.providerTenant as Record<string, any>)?.oauth as any)?.refreshedAt).toBeDefined();
 
       const refreshRef = grant!.credentialSecretRefs.find((r) => r.configPath === "oauth.refresh_token")!;
 
