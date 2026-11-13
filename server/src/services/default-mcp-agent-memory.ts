@@ -21,6 +21,7 @@ import { secretService } from "./secrets.js";
  *                 env.MEM0_USER_ID (the agent id), memoryProvider "mem0", runtimeMemory false (no agent has both the
  *                 in-process mem0 route and this one)
  *   claude_local  env.RH_MEMORY_TOKEN (secret reference), env.RH_MEMORY_URL, env.RH_MEMORY_PROXY (optional)
+ *   codex_local   the same RH_MEMORY_* keys as claude_local (the image-baked Codex hook reads them)
  *
  * Disabled unless `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and a valid `PAPERCLIP_AGENT_MEMORY_URL` is set.
  *
@@ -54,7 +55,7 @@ export interface AgentMemoryAdapterProfile {
   adapterConfig?: Readonly<Record<string, unknown>>;
 }
 
-/** Adapter type -> keys. Codex (same RH_MEMORY_* keys as Claude) is one more line here. */
+/** Adapter type -> keys. Codex uses the same RH_MEMORY_* keys as Claude (TECH-8416). */
 export const AGENT_MEMORY_ADAPTER_PROFILES: Readonly<Record<string, AgentMemoryAdapterProfile>> = Object.freeze({
   hermes_local: {
     tokenEnvKey: "MEM0_API_KEY",
@@ -68,16 +69,34 @@ export const AGENT_MEMORY_ADAPTER_PROFILES: Readonly<Record<string, AgentMemoryA
     urlEnvKey: "RH_MEMORY_URL",
     proxyEnvKey: "RH_MEMORY_PROXY",
   },
+  codex_local: {
+    tokenEnvKey: "RH_MEMORY_TOKEN",
+    urlEnvKey: "RH_MEMORY_URL",
+    proxyEnvKey: "RH_MEMORY_PROXY",
+  },
 });
+
+/**
+ * A native-runner (`paperclip_runner`) config that names Codex explicitly: `provider: "codex"`, or `provider: "acpx"`
+ * with `acpxAgent: "codex"`. `agentHarnessType` also maps a native-runner config with NO provider to `codex_local`
+ * (the runner default), so one table line alone would enroll every such agent. Enrollment mints a token and writes
+ * config, so it needs the operator to have chosen Codex, not the default to have fallen through to it.
+ */
+function paperclipRunnerNamesCodex(config: Record<string, unknown>): boolean {
+  if (config.provider === "codex") return true;
+  return config.provider === "acpx" && config.acpxAgent === "codex";
+}
 
 /**
  * The profile of an agent, keyed by its HARNESS: `agentHarnessType` maps a native-runner agent (`paperclip_runner`) to
  * the harness its config selects (for example provider `acpx` with agent `claude` is `claude_local`), and returns every
- * other adapter type unchanged.
+ * other adapter type unchanged. Codex through the native runner must be named explicitly (see `paperclipRunnerNamesCodex`).
  */
 export function agentMemoryProfileFor(adapterType: string | null | undefined, adapterConfig?: unknown): AgentMemoryAdapterProfile | null {
   if (!adapterType) return null;
-  const harness = agentHarnessType(adapterType, asRecord(adapterConfig));
+  const config = asRecord(adapterConfig);
+  const harness = agentHarnessType(adapterType, config);
+  if (adapterType === "paperclip_runner" && harness === "codex_local" && !paperclipRunnerNamesCodex(config)) return null;
   return Object.prototype.hasOwnProperty.call(AGENT_MEMORY_ADAPTER_PROFILES, harness) ? AGENT_MEMORY_ADAPTER_PROFILES[harness]! : null;
 }
 

@@ -29,6 +29,7 @@ import {
   AGENT_MEMORY_PROXY_ENV,
   AGENT_MEMORY_URL_ENV,
   agentMemoryEligibleForNewAgent,
+  agentMemoryProfileFor,
   resolveAgentMemoryConfig,
 } from "../services/default-mcp-agent-memory.js";
 import {
@@ -103,10 +104,40 @@ describe("agent memory config", () => {
     expect(agentMemoryEligibleForNewAgent("claude_local", {}, on)).toBe(true);
     expect(agentMemoryEligibleForNewAgent("paperclip_runner", { provider: "acpx", acpxAgent: "claude" }, on)).toBe(true);
     expect(agentMemoryEligibleForNewAgent("paperclip_runner", { provider: "acpx", acpxAgent: "pi" }, on)).toBe(false);
+    expect(agentMemoryEligibleForNewAgent("codex_local", {}, on)).toBe(true);
     expect(agentMemoryEligibleForNewAgent("hermes_gateway", {}, on)).toBe(false);
     expect(agentMemoryEligibleForNewAgent("process", {}, on)).toBe(false);
     expect(agentMemoryEligibleForNewAgent("hermes_local", {}, {})).toBe(false);
     expect(agentMemoryEligibleForNewAgent("toString", {}, on)).toBe(false);
+  });
+
+  it("a native runner is a Codex agent only when the config names Codex", () => {
+    // Named Codex: enrolled with the Claude/Codex RH_MEMORY_* profile.
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "codex" })).toBe(AGENT_MEMORY_ADAPTER_PROFILES.codex_local);
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "acpx", acpxAgent: "codex" })).toBe(AGENT_MEMORY_ADAPTER_PROFILES.codex_local);
+    // The runner default (no provider) maps to the Codex harness but is not a choice, so it is not enrolled.
+    expect(agentMemoryProfileFor("paperclip_runner", {})).toBeNull();
+    expect(agentMemoryProfileFor("paperclip_runner", undefined)).toBeNull();
+    expect(agentMemoryProfileFor("paperclip_runner", { model: "gpt-5" })).toBeNull();
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: null })).toBeNull();
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "Codex" })).toBeNull();
+    // Other runner providers and ACP agents stay out.
+    for (const config of [
+      { provider: "opencode" },
+      { provider: "muse" },
+      { provider: "openai_dot" },
+      { provider: "grok_bot" },
+      { provider: "acpx", acpxAgent: "pi" },
+      { provider: "acpx", acpxAgent: "grok" },
+      { provider: "acpx", acpxAgent: "cursor" },
+      { provider: "acpx", acpxAgent: "copilot" },
+    ]) {
+      expect(agentMemoryProfileFor("paperclip_runner", config)).toBeNull();
+    }
+    // Claude through the runner is unchanged, including the ACP default agent.
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "acpx" })).toBe(AGENT_MEMORY_ADAPTER_PROFILES.claude_local);
+    expect(agentMemoryEligibleForNewAgent("paperclip_runner", {}, on)).toBe(false);
+    expect(agentMemoryEligibleForNewAgent("paperclip_runner", { provider: "codex" }, on)).toBe(true);
   });
 
   it("the adapter profile table maps each harness to its env keys", () => {
@@ -122,6 +153,7 @@ describe("agent memory config", () => {
       urlEnvKey: "RH_MEMORY_URL",
       proxyEnvKey: "RH_MEMORY_PROXY",
     });
+    expect(AGENT_MEMORY_ADAPTER_PROFILES.codex_local).toEqual(AGENT_MEMORY_ADAPTER_PROFILES.claude_local);
   });
 
   it("the spec entry is a new-agents-only managed hook entry that is never installed or enabled by default", () => {
