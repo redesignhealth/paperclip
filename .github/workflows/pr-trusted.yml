@@ -194,6 +194,10 @@ jobs:
       - name: Validate Hermes Mem0 auto-sync provider patch
         run: pnpm test:hermes-mem0-patch
 
+      - name: Validate Claude memory hook
+        # Fork-specific (TECH-8410): docker/claude/rh-memory-hook, baked into the image.
+        run: python3 -m unittest discover -s docker/claude -p 'test_*.py'
+
       - name: Validate Node version policy
         run: pnpm check:node-version
 

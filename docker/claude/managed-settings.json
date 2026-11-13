@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/usr/local/bin/rh-memory-hook recall", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/usr/local/bin/rh-memory-hook capture", "timeout": 10 }] }
+    ]
+  }
+}

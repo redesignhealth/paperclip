@@ -279,6 +279,14 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Claude Code memory hooks (TECH-8410): managed settings apply to every Claude
+# run in the image; the hook is a no-op unless the agent's env supplies
+# RH_MEMORY_TOKEN and RH_MEMORY_URL. See docker/claude/rh-memory-hook.
+COPY docker/claude/managed-settings.json /etc/claude-code/managed-settings.json
+COPY docker/claude/rh-memory-hook /usr/local/bin/rh-memory-hook
+RUN chmod 0644 /etc/claude-code/managed-settings.json \
+  && chmod 0755 /usr/local/bin/rh-memory-hook
+
 # TECH-7095: the server runs from a root-owned, exec-only (mode 0111) copy of node. The kernel marks a
 # process that exec'd a binary its user cannot read as non-dumpable, which makes its /proc/<pid>/environ,
 # fd and mem root-owned. Agent children run as the same uid as the server; without this they could read
