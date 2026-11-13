@@ -745,7 +745,7 @@ export async function runSweep(
         }
 
         // PREFLIGHT: compute the worst-case nanodollar cost ceiling for converting THIS
-        // source (up to 2 chat calls + up to 3 embedding calls, conservative UTF-8
+        // source (up to 2 chat calls + up to 6 embedding calls, conservative UTF-8
         // byte-based projection) and check the budget BEFORE resolving any API key or
         // making any paid call. If the worst case would exceed the remaining budget, abort
         // here with ZERO additional API calls.

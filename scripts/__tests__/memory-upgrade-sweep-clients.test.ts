@@ -518,7 +518,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(requests.length, 1);
     const expectedInputBytes = Buffer.byteLength(requests[0].body, "utf8");
     assert.equal(res.inputTokens, expectedInputBytes, "inputTokens must fall back to request body UTF8 bytes");
-    assert.equal(res.outputTokens, 600, "outputTokens must fall back to 600");
+    assert.equal(res.outputTokens, PREFLIGHT_MAX_COMPLETION_TOKENS, "outputTokens must fall back to PREFLIGHT_MAX_COMPLETION_TOKENS");
   });
 
   await t.test("choices: [] is treated as billed_unusable without retrying (exact usage passthrough variant)", async () => {
@@ -558,7 +558,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(res.outputTokens, 45, "Must pass through exact completion_tokens from usage");
   });
 
-  await t.test("choices: [] is treated as billed_unusable without retrying ((bodyBytes, 600) fallback variant)", async () => {
+  await t.test("choices: [] is treated as billed_unusable without retrying ((bodyBytes, fallback) variant)", async () => {
     let sleepCalls = 0;
     const sleeper = {
       sleep: async (ms: number) => {
@@ -587,7 +587,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(sleepCalls, 0, "Must not sleep or backoff on billed unusable response");
     const expectedInputBytes = Buffer.byteLength(requests[0].body, "utf8");
     assert.equal(res.inputTokens, expectedInputBytes, "Must fall back to request body bytes");
-    assert.equal(res.outputTokens, 600, "Must fall back to 600 output tokens");
+    assert.equal(res.outputTokens, PREFLIGHT_MAX_COMPLETION_TOKENS, "Must fall back to PREFLIGHT_MAX_COMPLETION_TOKENS output tokens");
   });
 
   await t.test("injected fetch error message embeds API key is scrubbed by redaction", async () => {
@@ -685,6 +685,9 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
         { data: "Second clean record data text.", type: "fact", subject: "s2", confidence: 0.9 },
         { data: "Third clean record data text.", type: "fact", subject: "s3", confidence: 0.9 },
         { data: "Fourth clean record data text.", type: "fact", subject: "s4", confidence: 0.9 },
+        { data: "Fifth clean record data text.", type: "fact", subject: "s5", confidence: 0.9 },
+        { data: "Sixth clean record data text.", type: "fact", subject: "s6", confidence: 0.9 },
+        { data: "Seventh clean record data text.", type: "fact", subject: "s7", confidence: 0.9 },
       ],
     };
 
@@ -751,7 +754,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(callCount, 1, "Must never retry a billed 200 response with unreadable body");
     assert.equal(sleepCalls, 0, "Must not sleep or backoff on billed unusable response");
     assert.equal(res.inputTokens, Buffer.byteLength(requests[0].body, "utf8"));
-    assert.equal(res.outputTokens, 600);
+    assert.equal(res.outputTokens, PREFLIGHT_MAX_COMPLETION_TOKENS);
   });
 
   await t.test("repair-turn case: call 1 schema-invalid triggers repair, call 2 json() rejects -> quarantined/llm_unavailable", async () => {
@@ -816,7 +819,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     assert.equal(sleepCalls, 0, "No backoff sleep on billed unusable response");
     const expectedCall2BodyBytes = Buffer.byteLength(requests[1].body, "utf8");
     assert.equal(res.inputTokens, 150 + expectedCall2BodyBytes);
-    assert.equal(res.outputTokens, 40 + 600);
+    assert.equal(res.outputTokens, 40 + PREFLIGHT_MAX_COMPLETION_TOKENS);
   });
 
   await t.test("quote-heavy/control/multibyte schema-invalid call 1: oversize repair request is intercepted and never sent; first-call usage counted", async () => {
@@ -829,7 +832,7 @@ test("LLM conversion client retry, repair, and error handling", async (t) => {
     const model = "gpt-5.4-mini";
 
     // Call 1 returns schema-invalid JSON packed with control characters that escape to \u00XX (6 bytes each),
-    // genuinely exceeding the escape-aware preflight projection (600 * 24 bytes).
+    // genuinely exceeding the escape-aware preflight projection (PREFLIGHT_MAX_COMPLETION_TOKENS * 24 bytes).
     const oversizeSchemaInvalidContent = JSON.stringify({
       invalid: "\u0000".repeat(4000),
     });

@@ -41,7 +41,7 @@ test("converter contract invariants and pins", async (t) => {
     );
     assert.equal(
       CONVERTER_CONTRACT_SHA256,
-      "9fe03e311eeb765d3dd59ab5a21b32c4cf707a2b924484246afbb33287c70d50",
+      "d27300ce3e11473d517a4a4e80b411fa44632ab25c904b6e44cfbf3ad7ce88c9",
       "Frozen contract pin must match historical sha256",
     );
   });
@@ -61,7 +61,7 @@ test("converter contract invariants and pins", async (t) => {
 });
 
 test("validateConversionOutput happy path and drop decisions", async (t) => {
-  await t.test("valid convert decision with 1..3 records", () => {
+  await t.test("valid convert decision with 1..6 records", () => {
     const validRaw = {
       decision: "convert",
       records: [
@@ -87,6 +87,32 @@ test("validateConversionOutput happy path and drop decisions", async (t) => {
     // Accepts JSON string
     const stringRes = validateConversionOutput(JSON.stringify(validRaw));
     assert.equal(stringRes.ok, true);
+  });
+
+  await t.test("valid convert decision with exactly 6 records accepted and produces 6 validated records", () => {
+    const validRaw = {
+      decision: "convert",
+      records: [
+        { data: "First valid atomic fact recorded here.", type: "fact", subject: "subject one", confidence: 0.9 },
+        { data: "Second valid atomic fact recorded here.", type: "fact", subject: "subject two", confidence: 0.9 },
+        { data: "Third valid atomic fact recorded here.", type: "fact", subject: "subject three", confidence: 0.9 },
+        { data: "Fourth valid atomic fact recorded here.", type: "fact", subject: "subject four", confidence: 0.9 },
+        { data: "Fifth valid atomic fact recorded here.", type: "fact", subject: "subject five", confidence: 0.9 },
+        { data: "Sixth valid atomic fact recorded here.", type: "fact", subject: "subject six", confidence: 0.9 },
+      ],
+    };
+
+    const res = validateConversionOutput(validRaw);
+    assert.equal(res.ok, true);
+    if (res.ok && res.decision === "convert") {
+      assert.equal(res.records.length, 6);
+      for (let i = 0; i < 6; i++) {
+        assert.equal(res.records[i].data, validRaw.records[i].data);
+        assert.equal(res.records[i].type, validRaw.records[i].type);
+        assert.equal(res.records[i].subject, validRaw.records[i].subject);
+        assert.equal(res.records[i].confidence, validRaw.records[i].confidence);
+      }
+    }
   });
 
   await t.test("valid drop_noise and drop_sensitive decisions with empty records", () => {
@@ -171,7 +197,7 @@ test("validateConversionOutput reject codes table", async (t) => {
       expectedCode: "empty_records",
     },
     {
-      name: "too_many_records (>3 records)",
+      name: "too_many_records (>6 records)",
       raw: {
         decision: "convert",
         records: [
@@ -179,6 +205,9 @@ test("validateConversionOutput reject codes table", async (t) => {
           { data: "Second valid atomic fact.", type: "fact", subject: "second", confidence: 0.9 },
           { data: "Third valid atomic fact.", type: "fact", subject: "third", confidence: 0.9 },
           { data: "Fourth valid atomic fact.", type: "fact", subject: "fourth", confidence: 0.9 },
+          { data: "Fifth valid atomic fact.", type: "fact", subject: "fifth", confidence: 0.9 },
+          { data: "Sixth valid atomic fact.", type: "fact", subject: "sixth", confidence: 0.9 },
+          { data: "Seventh valid atomic fact.", type: "fact", subject: "seventh", confidence: 0.9 },
         ],
       },
       expectedCode: "too_many_records",
