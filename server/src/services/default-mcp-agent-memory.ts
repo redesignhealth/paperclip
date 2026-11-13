@@ -34,6 +34,11 @@ export const AGENT_MEMORY_ENTRY_KEY = "agent-memory";
 export const AGENT_MEMORY_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_ENABLED";
 export const AGENT_MEMORY_URL_ENV = "PAPERCLIP_AGENT_MEMORY_URL";
 export const AGENT_MEMORY_PROXY_ENV = "PAPERCLIP_AGENT_MEMORY_PROXY";
+/**
+ * Extra opt-in for EXISTING agents: when `true` (and the memory settings are valid), the operator-run missing-entry
+ * enrollment may add the agent-memory entry to agents that already hold a default-MCP state. New agents never need it.
+ */
+export const AGENT_MEMORY_BACKFILL_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_BACKFILL_ENABLED";
 
 /** The harness-specific part of the provisioning: which keys the agent's adapterConfig receives. */
 export interface AgentMemoryAdapterProfile {
@@ -125,6 +130,11 @@ export function resolveAgentMemoryConfig(env: NodeJS.ProcessEnv = process.env): 
   const proxy = env[AGENT_MEMORY_PROXY_ENV]?.trim() || null;
   if (proxy && !validProxyUrl(proxy)) return { ok: false, reason: "provisioner_config_invalid" };
   return { ok: true, config: { url: url.replace(/\/+$/, ""), proxy: proxy ? proxy.replace(/\/+$/, "") : null } };
+}
+
+/** Backfill of existing agents is on only with its own flag AND a valid memory configuration. */
+export function agentMemoryBackfillEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[AGENT_MEMORY_BACKFILL_ENABLED_ENV]?.trim().toLowerCase() === "true" && resolveAgentMemoryConfig(env).ok;
 }
 
 /** Whether a NEW agent of this adapter type gets the memory entry at creation (enabled and valid config, profiled adapter). */
