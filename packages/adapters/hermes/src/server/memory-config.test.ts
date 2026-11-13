@@ -5,6 +5,7 @@ import {
   serializeMem0Json,
   buildCanonicalMem0Object,
   generateHermesMemoryYaml,
+  resolveHermesMemoryProvider,
   extractMemorySensitiveValues,
   assertStrictPlainObject,
   createChunkAwareStreamingRedactor,
@@ -1172,6 +1173,34 @@ describe("memory-config", () => {
         mem0AutoSyncOff: true,
       });
       expect(canonical.auto_sync).toBe(false);
+    });
+  });
+
+  describe("resolveHermesMemoryProvider", () => {
+    it("accepts only the closed allowlist", () => {
+      expect(resolveHermesMemoryProvider({ memoryProvider: "mem0" })).toBe("mem0");
+      expect(resolveHermesMemoryProvider({ memoryProvider: " mem0 " })).toBe("mem0");
+    });
+
+    it("treats absent, null and blank as unset", () => {
+      expect(resolveHermesMemoryProvider(undefined)).toBeUndefined();
+      expect(resolveHermesMemoryProvider({})).toBeUndefined();
+      expect(resolveHermesMemoryProvider({ memoryProvider: null })).toBeUndefined();
+      expect(resolveHermesMemoryProvider({ memoryProvider: "  " })).toBeUndefined();
+    });
+
+    it("rejects everything else without echoing the value", () => {
+      for (const bad of ["honcho", "MEM0", "mem0;rm", 1, false, {}, []]) {
+        expect(() => resolveHermesMemoryProvider({ memoryProvider: bad })).toThrow(/Invalid adapterConfig\.memoryProvider/);
+      }
+      let message = "";
+      try {
+        resolveHermesMemoryProvider({ memoryProvider: "secret-looking-value" });
+      } catch (err) {
+        message = err instanceof Error ? err.message : "";
+      }
+      expect(message).toContain("Invalid adapterConfig.memoryProvider");
+      expect(message).not.toContain("secret-looking-value");
     });
   });
 

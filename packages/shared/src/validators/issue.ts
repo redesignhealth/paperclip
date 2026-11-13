@@ -1,7 +1,7 @@
 import { CHAT_PROVIDERS } from "../types/chat-channels.js";
 import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
 import { z } from "zod";
-import { ISSUE_SUMMARIES_MAX_IDS } from "../constants.js";
+import { ISSUE_SUMMARIES_MAX_IDS, OPERATOR_ONLY_ADAPTER_CONFIG_KEYS } from "../constants.js";
 
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -308,6 +308,10 @@ export const issueAssigneeAdapterOverridesSchema = z
   .object({
     adapterConfig: z.record(z.string(), z.unknown())
       .refine(config => !Object.prototype.hasOwnProperty.call(config, "homeMode"), "homeMode must be set by an operator on the agent, not on a task")
+      .refine(
+        config => !OPERATOR_ONLY_ADAPTER_CONFIG_KEYS.some(key => Object.prototype.hasOwnProperty.call(config, key)),
+        "memory routing keys must be set by an operator on the agent, not on a task",
+      )
       .optional(),
     useProjectWorkspace: z.boolean().optional(),
   })

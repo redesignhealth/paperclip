@@ -83,6 +83,8 @@ import {
   canSafelyRedactSecret,
   MAX_CONFIG_STRING_LENGTH,
   type ValidatedHermesMemoryConfig,
+  resolveHermesMemoryProvider,
+  type HermesMemoryProvider,
 } from "./memory-config.js";
 import { applyCommandScanPolicy, getHermesCommandScanMode } from "./command-scan-policy.js";
 import {
@@ -1538,12 +1540,28 @@ export async function execute(
     }
   }
 
+  // Optional per-agent provider selection for env-configured memory (for example an external
+  // mem0-compatible server through MEM0_HOST). Runtime memory, when present, owns the run.
+  let memoryProvider: HermesMemoryProvider | undefined;
+  try {
+    memoryProvider = resolveHermesMemoryProvider(config);
+  } catch (err) {
+    await ctx.onLog("stderr", `[hermes] ${err instanceof Error ? err.message : "Invalid adapterConfig.memoryProvider"}\n`);
+    throw err;
+  }
+  if (memoryConfig != null) {
+    if (memoryProvider) {
+      await ctx.onLog("stdout", "[hermes] adapterConfig.memoryProvider ignored: Paperclip runtime memory is active for this run.\n");
+    }
+    memoryProvider = undefined;
+  }
+
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
   // TECH-7102: in a hosted deployment a Hermes run never touches the server host's ~/.hermes; it
   // gets a fresh per-run home and only an explicit provider credential from its own adapter env.
   const hostIsolated = hermesHostIsolationEnabled();
   // Final value is decided after provider resolution: every Ramp Router run also uses a fresh home.
-  const needsIsolatedHomeForRuntime = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null;
+  const needsIsolatedHomeForRuntime = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null || memoryProvider != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -2122,6 +2140,7 @@ export async function execute(
       const preparedHome = await prepareHermesMcpHome({
         servers: runtimeMcpServers,
         memory: memoryConfig ?? undefined,
+        ...(memoryProvider ? { memoryProvider } : {}),
         config,
         flags: hardeningFlags,
         onWarning: onCleanupWarning,
@@ -2195,6 +2214,13 @@ export async function execute(
           await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
           throw err;
         }
+      }
+      if (memoryProvider) {
+        const hasMem0Host = Boolean(cfgEnvString((userEnv as Record<string, unknown> | undefined)?.MEM0_HOST));
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Memory provider ${memoryProvider} selected through adapterConfig (settings come from env${hasMem0Host ? "" : "; MEM0_HOST is not set, so the provider may be unavailable"}).\n`,
+        );
       }
       if (runtimeMcpServers.length > 0 && memoryConfig != null) {
         await ctx.onLog(

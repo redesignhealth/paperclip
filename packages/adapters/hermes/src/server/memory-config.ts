@@ -791,6 +791,29 @@ export function serializeMem0Json(
 }
 
 /**
+ * Closed allowlist for `adapterConfig.memoryProvider`. Only providers that Hermes can configure
+ * purely from `memory.provider` plus `MEM0_*`-style environment variables belong here.
+ */
+export const HERMES_MEMORY_PROVIDER_ALLOWLIST = ["mem0"] as const;
+export type HermesMemoryProvider = (typeof HERMES_MEMORY_PROVIDER_ALLOWLIST)[number];
+
+/**
+ * Resolves and validates `adapterConfig.memoryProvider`. Absent, null or blank means "not set".
+ * Any other value outside the closed allowlist fails closed; the error never echoes the value.
+ */
+export function resolveHermesMemoryProvider(config: Record<string, unknown> | undefined): HermesMemoryProvider | undefined {
+  const raw = config?.memoryProvider;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") {
+    throw new Error(`Invalid adapterConfig.memoryProvider: expected one of ${HERMES_MEMORY_PROVIDER_ALLOWLIST.join(", ")}`);
+  }
+  const value = raw.trim();
+  if (value === "") return undefined;
+  if ((HERMES_MEMORY_PROVIDER_ALLOWLIST as readonly string[]).includes(value)) return value as HermesMemoryProvider;
+  throw new Error(`Invalid adapterConfig.memoryProvider: expected one of ${HERMES_MEMORY_PROVIDER_ALLOWLIST.join(", ")}`);
+}
+
+/**
  * Generates the separate Hermes config.yaml memory block.
  * Notice: host config inheritance must not widen ALLOWED_HOST_CONFIG_KEYS.
  */

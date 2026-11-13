@@ -1781,3 +1781,9 @@ export const PLUGIN_BRIDGE_ERROR_CODES = [
   "UNKNOWN",
 ] as const;
 export type PluginBridgeErrorCode = (typeof PLUGIN_BRIDGE_ERROR_CODES)[number];
+
+/**
+ * Agent adapterConfig keys that route an agent's memory. An operator sets them on the agent; an agent key
+ * and a task-level assignee override can never set or change them (TECH-8409).
+ */
+export const OPERATOR_ONLY_ADAPTER_CONFIG_KEYS = ["memoryProvider"] as const;

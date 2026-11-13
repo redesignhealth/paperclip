@@ -14,6 +14,7 @@ import {
   type ValidatedHermesMemoryConfig,
   serializeMem0Json,
   generateHermesMemoryYaml,
+  type HermesMemoryProvider,
   MAX_CONFIG_STRING_LENGTH,
 } from "./memory-config.js";
 
@@ -50,6 +51,12 @@ export interface PrepareHermesMcpHomeOptions {
    */
   canonicalRouterEndpoint?: boolean;
   flags?: MemoryHardeningFlags;
+  /**
+   * Validated `adapterConfig.memoryProvider`. Emits `memory.provider` into config.yaml only; no
+   * `mem0.json` is written, so Hermes reads its connection settings (`MEM0_*`) from the
+   * environment. Ignored when runtime memory (`memory`) is present for the run.
+   */
+  memoryProvider?: HermesMemoryProvider;
   onWarning?: (msg: string) => void;
 }
 
@@ -809,7 +816,7 @@ export async function prepareHermesMcpHome(
   const isolatedFromHost = options.isolatedFromHost === true;
   // A Ramp Router run always gets its own profile, even with no MCP servers or memory.
   const routerProfile = options.canonicalRouterEndpoint === true;
-  if (servers.length === 0 && !memory && !isolatedFromHost && !routerProfile) {
+  if (servers.length === 0 && !memory && !options.memoryProvider && !isolatedFromHost && !routerProfile) {
     throw new Error("Cannot prepare Hermes isolated home: no servers or memory provided");
   }
   if (routerProfile && !options.tempDirPrefix) {
@@ -944,7 +951,7 @@ export async function prepareHermesMcpHome(
     }
 
     const yamlContent = serializeHermesMcpYaml(
-      mcpServers, inheritedHostYaml, Boolean(memory), hardeningFlags, options.anthropicRequestTimeoutSec,
+      mcpServers, inheritedHostYaml, Boolean(memory) || options.memoryProvider === "mem0", hardeningFlags, options.anthropicRequestTimeoutSec,
     );
     await fs.writeFile(configPath, yamlContent, { mode: 0o600 });
     // Explicit hard fail on configPath chmod; failures abort and trigger cleanup in catch
