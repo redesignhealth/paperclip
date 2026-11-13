@@ -166,6 +166,7 @@ import {
   reissueCommsBoardIdentity,
 } from "../services/comms-identity-reissue.js";
 import { COMMS_RESCOPE_BATCH_LIMIT, CommsRescopeConfirmationError, CommsRescopeInProgressError, rescopeCommsCredentials } from "../services/comms-credential-rescope.js";
+import { DEFAULT_MCP_SPEC } from "../services/default-mcp-spec.js";
 import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
 import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
@@ -4482,9 +4483,15 @@ export function agentRoutes(
       (await access.hasPermission(companyId, "user", actor.actorId, "tools:manage_connections"));
     if (!manager) throw forbidden("Only a connection manager can add missing default MCP entries");
 
-    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown };
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown; limit?: unknown; afterId?: unknown; keys?: unknown };
     if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
     if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    if (
+      body.keys !== undefined &&
+      (!Array.isArray(body.keys) || body.keys.length === 0 || body.keys.some((key) => typeof key !== "string" || !DEFAULT_MCP_SPEC.some((entry) => entry.key === key)))
+    ) {
+      throw badRequest("keys must be a non-empty array of default MCP spec keys");
+    }
     if (
       body.limit !== undefined &&
       (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > MISSING_ENTRY_BATCH_LIMIT)
@@ -4502,6 +4509,7 @@ export function agentRoutes(
         confirm: typeof body.confirm === "string" ? body.confirm : undefined,
         limit: typeof body.limit === "number" ? body.limit : undefined,
         afterId: typeof body.afterId === "string" ? body.afterId : undefined,
+        keys: Array.isArray(body.keys) ? (body.keys as string[]) : undefined,
       });
       res.json(report);
     } catch (err) {

@@ -727,3 +727,18 @@ Setup hook `agent_memory`, per new agent:
 4. Writes the agent's `adapterConfig` through the agent lifecycle update (which records a revision and syncs secret bindings), merging the keys of the adapter's profile in `AGENT_MEMORY_ADAPTER_PROFILES` (`default-mcp-agent-memory.ts`). `hermes_local`: `env.MEM0_API_KEY` (secret reference), `env.MEM0_HOST`, `env.MEM0_PROXY` (when configured), `env.MEM0_USER_ID` (the agent id), `memoryProvider: "mem0"` and `runtimeMemory: false`. `claude_local`: `env.RH_MEMORY_TOKEN` (secret reference), `env.RH_MEMORY_URL`, `env.RH_MEMORY_PROXY` (when configured). Other `env` keys are kept. Another harness (for example Codex with the same `RH_MEMORY_*` keys) is one more table entry. A failure here is a bounded retry; nothing external is repeated.
 
 The token is never logged and is not stored anywhere except the secret. The 90-day token is not rotated automatically yet.
+
+### Backfill for existing agents (agent memory)
+
+Existing agents are enrolled by the operator-run missing-entry job (`POST /api/companies/:companyId/default-mcp/missing-entry-enrollment`), which reuses the same hook, so one mechanism serves new and existing agents. It adds `agent-memory` only while `PAPERCLIP_AGENT_MEMORY_BACKFILL_ENABLED=true` with a valid memory configuration, only for agents of a profiled adapter, and only for agents that already hold a default-MCP state (legacy agents with none are enrolled by legacy enrollment first). Pass `"keys": ["agent-memory"]` to restrict the run to this entry; without it the job also adds any other missing managed entry, as before.
+
+Run it per company, batch by batch:
+
+1. Dry run (the default): `{ "keys": ["agent-memory"] }`. The report lists `would_add` agents and the reasons for skips (`owner_required` when the agent has no resolvable human owner). Nothing is written or minted.
+2. Real run: `{ "keys": ["agent-memory"], "dryRun": false, "confirm": "add-missing-default-mcp-entries", "limit": 25 }`. Each added agent is set up by the normal hook (mint, secret, config). Pass the returned `nextCursor` as `afterId` to resume; a repeat run skips agents that already have the entry (`nothing_missing`).
+
+The registry is insert-only per sub. An agent whose memory token was minted by hand (`agent-memory-<id>` already registered) ends at `ownership_conflict`; configure those agents manually, as before. Setup output never contains a token.
+
+### Rotation
+
+Memory tokens last 90 days and the registry never revokes. The 60-second setup sweep rotates every ready `agent-memory` entry whose `binding.tokenExpiresAt` is within 14 days (`agent-memory-rotation.ts`), when agent memory is configured: one registry rotate per agent (`POST {ownership API}/agents/agent-memory-<id>/rotate`, memory scopes, 90 days), then a new version of the agent's secret (the env reference is `version: "latest"`, so runs pick it up), then the new expiry is recorded. A failure after the token was issued leaves `binding.rotation = { state: "failed", ... }` (codes only) and the old token keeps working; the next pass retries. A disabled or deleted secret is never rotated or revived. Each rotation writes an `agent.agent_memory.rotated` activity row with no secret data.

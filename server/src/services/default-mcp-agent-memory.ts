@@ -34,6 +34,11 @@ export const AGENT_MEMORY_ENTRY_KEY = "agent-memory";
 export const AGENT_MEMORY_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_ENABLED";
 export const AGENT_MEMORY_URL_ENV = "PAPERCLIP_AGENT_MEMORY_URL";
 export const AGENT_MEMORY_PROXY_ENV = "PAPERCLIP_AGENT_MEMORY_PROXY";
+/**
+ * Extra opt-in for EXISTING agents: when `true` (and the memory settings are valid), the operator-run missing-entry
+ * enrollment may add the agent-memory entry to agents that already hold a default-MCP state. New agents never need it.
+ */
+export const AGENT_MEMORY_BACKFILL_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_BACKFILL_ENABLED";
 
 /** The harness-specific part of the provisioning: which keys the agent's adapterConfig receives. */
 export interface AgentMemoryAdapterProfile {
@@ -127,6 +132,11 @@ export function resolveAgentMemoryConfig(env: NodeJS.ProcessEnv = process.env): 
   return { ok: true, config: { url: url.replace(/\/+$/, ""), proxy: proxy ? proxy.replace(/\/+$/, "") : null } };
 }
 
+/** Backfill of existing agents is on only with its own flag AND a valid memory configuration. */
+export function agentMemoryBackfillEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[AGENT_MEMORY_BACKFILL_ENABLED_ENV]?.trim().toLowerCase() === "true" && resolveAgentMemoryConfig(env).ok;
+}
+
 /** Whether a NEW agent of this adapter type gets the memory entry at creation (enabled and valid config, profiled adapter). */
 export function agentMemoryEligibleForNewAgent(
   adapterType: string | null | undefined,
@@ -134,6 +144,13 @@ export function agentMemoryEligibleForNewAgent(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return agentMemoryProfileFor(adapterType, adapterConfig) !== null && resolveAgentMemoryConfig(env).ok;
+}
+
+/** `2027-03-01T00:00:00+00:00` and friends to one canonical UTC form; null when absent or unparseable. */
+export function normalizeIso(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -256,7 +273,8 @@ export const agentMemoryHook: DefaultMcpSetupHook = async (input) => {
       secretVersion: "latest",
       connectionId: null,
       grantId: null,
-      tokenExpiresAt: minted.tokenExpiresAt,
+      // Normalized so the rotation sweep can compare expiry times as text.
+      tokenExpiresAt: normalizeIso(minted.tokenExpiresAt),
     };
     await input.checkpoint({ binding });
   }
