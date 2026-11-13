@@ -1,5 +1,5 @@
 import { createAgentLifecycle } from "./agent-lifecycle.js";
-import { agentAppearanceSchema, agentHarnessType, agentRunner, type AgentRunnerChoice } from "@paperclipai/shared";
+import { agentAppearanceSchema, agentHarnessType, agentRunner, OPERATOR_ONLY_ADAPTER_CONFIG_KEYS, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "./agent-runner-selection.js";
 import { AGENT_PROFILE_ROUTINE_ORIGIN_KIND } from "./default-agent-profile-routine.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -3689,6 +3689,10 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     delete nextAdapterConfig.instructionsBundleMode;
     delete nextAdapterConfig.instructionsRootPath;
     delete nextAdapterConfig.instructionsEntryFile;
+    // An agent-driven import must not carry operator-only memory routing keys (memoryProvider, runtimeMemory).
+    if (mode === "agent_safe") {
+      for (const key of OPERATOR_ONLY_ADAPTER_CONFIG_KEYS) delete nextAdapterConfig[key];
+    }
     const normalizedAdapterConfig = await secrets.normalizeAdapterConfigForPersistence(
       companyId,
       nextAdapterConfig,

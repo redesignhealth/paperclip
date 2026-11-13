@@ -22,6 +22,18 @@ export {
 };
 
 /**
+ * `adapterConfig.runtimeMemory === false` is the only opt-out value. Anything else (absent, null,
+ * true, strings such as "false") keeps the company-level behavior.
+ */
+export function isRuntimeMemoryDisabledForAgent(adapterConfig: unknown): boolean {
+  return (
+    typeof adapterConfig === "object" &&
+    adapterConfig !== null &&
+    (adapterConfig as Record<string, unknown>).runtimeMemory === false
+  );
+}
+
+/**
  * Resolve the isolated company memory database for a run and wrap it in the
  * adapter-facing runtime memory accessor. The password is registered with the
  * run secret redaction registry before it is handed to the adapter so that it
@@ -33,13 +45,23 @@ export {
  */
 export async function resolveHeartbeatRuntimeMemory(input: {
   db: any;
-  agent: { id: string; adapterType: string | null | undefined; companyId: string };
+  agent: {
+    id: string;
+    adapterType: string | null | undefined;
+    companyId: string;
+    adapterConfig?: unknown;
+  };
   runId: string;
   flags?: MemoryHardeningFlags;
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
 }): Promise<AdapterRuntimeMemoryAccess | undefined> {
   const { db, agent, runId } = input;
   if (!adapterSupportsRuntimeMemory(agent.adapterType)) {
+    return undefined;
+  }
+  if (isRuntimeMemoryDisabledForAgent(agent.adapterConfig)) {
+    // Per-agent opt-out (`adapterConfig.runtimeMemory === false`): this agent uses another memory
+    // route, so no company memory database is resolved, no secret is registered, and no config is built.
     return undefined;
   }
   const memorySvc = companyMemoryDatabaseService(db);

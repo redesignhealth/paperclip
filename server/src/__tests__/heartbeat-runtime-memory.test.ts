@@ -139,6 +139,73 @@ describe("heartbeat runtime memory integration (W5-c / Argus 14, 33)", () => {
     ]);
   });
 
+  describe("per-agent runtimeMemory opt-out (TECH-8409)", () => {
+    function spyMemoryService() {
+      const resolveRuntimeConfig = vi.fn(async () => mockDescriptor);
+      vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({
+        companyScope: "all",
+        isSupported: () => true,
+        resolveRuntimeConfig,
+        ensureProvisioned: vi.fn(),
+        rotateCredential: vi.fn(),
+        archiveCompanyMemory: vi.fn(),
+        unarchiveCompanyMemory: vi.fn(),
+        deleteCompanyMemory: vi.fn(),
+        reconcileStaleLeases: vi.fn(async () => 0),
+        isEligibleCompany: vi.fn(() => true),
+      } as any);
+      return resolveRuntimeConfig;
+    }
+
+    it("adapterConfig.runtimeMemory === false returns undefined, resolves nothing and registers no secret", async () => {
+      const resolveRuntimeConfig = spyMemoryService();
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId, adapterConfig: { runtimeMemory: false } },
+        runId,
+      });
+      expect(runtimeMemory).toBeUndefined();
+      expect(resolveRuntimeConfig).not.toHaveBeenCalled();
+      expect(registeredSecrets).toEqual([]);
+    });
+
+    it.each([undefined, null, true, "false", 0, {}])("keeps runtime memory when runtimeMemory is %j", async (value) => {
+      const resolveRuntimeConfig = spyMemoryService();
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: {
+          id: agentId,
+          adapterType: "hermes_local",
+          companyId,
+          adapterConfig: value === undefined ? {} : { runtimeMemory: value },
+        },
+        runId,
+      });
+      expect(runtimeMemory).toBeDefined();
+      expect(resolveRuntimeConfig).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps runtime memory when the agent has no adapterConfig", async () => {
+      spyMemoryService();
+      const runtimeMemory = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: agentId, adapterType: "hermes_local", companyId, adapterConfig: null },
+        runId,
+      });
+      expect(runtimeMemory).toBeDefined();
+    });
+
+    it("the opt-out applies to one agent only", async () => {
+      spyMemoryService();
+      const other = await resolveHeartbeatRuntimeMemory({
+        db: mockDb,
+        agent: { id: "bbbb2222-bbbb-4bbb-8bbb-bbbbbbbbbbbb", adapterType: "hermes_local", companyId, adapterConfig: {} },
+        runId,
+      });
+      expect(other).toBeDefined();
+    });
+  });
+
   it("hermes_gateway omits runtimeMemory and skips resolveRuntimeConfig", async () => {
     const resolveSpy = vi.fn();
     vi.spyOn(memoryModule, "companyMemoryDatabaseService").mockReturnValue({

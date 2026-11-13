@@ -666,9 +666,11 @@ describe("issue validators", () => {
   });
 
   it("rejects task-level memory routing keys on create and update", () => {
-    const overrides = { assigneeAdapterOverrides: { adapterConfig: { memoryProvider: "mem0" } } };
-    expect(createIssueSchema.safeParse({ title: "Task", ...overrides }).success).toBe(false);
-    expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
+    for (const adapterConfig of [{ memoryProvider: "mem0" }, { runtimeMemory: true }]) {
+      const overrides = { assigneeAdapterOverrides: { adapterConfig } };
+      expect(createIssueSchema.safeParse({ title: "Task", ...overrides }).success).toBe(false);
+      expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
+    }
     expect(createIssueSchema.safeParse({ title: "Task", assigneeAdapterOverrides: { adapterConfig: { model: "x" } } }).success).toBe(true);
   });
 

@@ -31,6 +31,8 @@ describe("execution workspace policy helpers", () => {
     expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { memoryProvider: "mem0", model: "task-model" } }))
       .toEqual({ adapterConfig: { model: "task-model" }, useProjectWorkspace: null });
     expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { memoryProvider: "mem0" } })).toBeNull();
+    expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { runtimeMemory: true, model: "task-model" } }))
+      .toEqual({ adapterConfig: { model: "task-model" }, useProjectWorkspace: null });
   });
   it("defaults new issue settings from enabled project policy", () => {
     expect(

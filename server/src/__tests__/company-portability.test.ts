@@ -3609,6 +3609,46 @@ describe("company portability", () => {
     expect(createdRuntimeConfig?.debug).not.toHaveProperty("providerTrace");
   });
 
+  it.each([
+    ["agent_safe", false],
+    ["board_full", true],
+  ] as const)("operator-only memory routing keys on imported agents (%s mode, kept=%s)", async (mode, kept) => {
+    const portability = companyPortabilityService({} as any);
+    companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
+      id: `agent-${String(input.name).toLowerCase()}`,
+      name: input.name,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    }));
+    const sourceAgents = (await agentSvc.list()) as Array<Record<string, unknown>>;
+    agentSvc.list.mockResolvedValue(sourceAgents.map((agent) => ({
+      ...agent,
+      adapterConfig: { ...((agent.adapterConfig ?? {}) as Record<string, unknown>), memoryProvider: "mem0", runtimeMemory: true },
+    })));
+    agentSvc.list.mockClear();
+    const exported = await exportCompanyAndAgents(portability);
+    agentSvc.list.mockResolvedValue([]);
+
+    await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+      agents: "all",
+      collisionStrategy: "rename",
+    }, "user-1", mode === "agent_safe" ? { mode: "agent_safe", sourceCompanyId: "company-1" } : undefined);
+
+    const created = agentSvc.create.mock.calls.find(([, input]) => input.name === "ClaudeCoder");
+    const config = (created?.[1].adapterConfig ?? {}) as Record<string, unknown>;
+    expect(created).toBeDefined();
+    if (kept) {
+      expect(config).toMatchObject({ memoryProvider: "mem0" });
+    } else {
+      expect(config).not.toHaveProperty("memoryProvider");
+      expect(config).not.toHaveProperty("runtimeMemory");
+    }
+  });
+
   it("imports only selected files and leaves unchecked company metadata alone", async () => {
     const portability = companyPortabilityService({} as any);
 
