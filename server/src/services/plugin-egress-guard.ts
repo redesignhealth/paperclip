@@ -23,7 +23,12 @@ export function isPrivateIP(ip: string): boolean {
 
   // Unwrap IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) and re-check as IPv4
   const v4MappedMatch = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (v4MappedMatch && v4MappedMatch[1]) return isPrivateIP(v4MappedMatch[1]);
+  if (v4MappedMatch && v4MappedMatch[1]) {
+    const ipv4 = v4MappedMatch[1];
+    // fork(TECH-8283 Finding 7): Strict IPv4 octet validation; reject invalid octets like 999
+    if (isIP(ipv4) !== 4) return true;
+    return isPrivateIP(ipv4);
+  }
 
   // IPv4 patterns
   if (ip.startsWith("10.")) return true;
@@ -52,31 +57,42 @@ export function isFetchPrivateIP(ip: string): boolean {
   return isPrivateIP(ip);
 }
 
-// fork(TECH-8283 Finding A): Canonical in-repo guard classifier for WebSocket egress
+// fork(TECH-8283 Finding A, Finding 7): Canonical in-repo guard classifier for WebSocket egress
 /**
  * Strict canonical classifier for WebSocket egress (TECH-8283 Finding A).
- * Rejects link-local always (even with allowPrivateNetwork), rejects private/reserved
- * IPs (including CGNAT 100.64.0.0/10), and fails closed on unparseable input.
+ * Rejects link-local always (even with allowPrivateNetwork), rejects AWS IPv6 metadata
+ * (fd00:ec2::254) always, rejects private/reserved IPs (including CGNAT 100.64.0.0/10),
+ * and fails closed on unparseable/invalid IP input.
  */
 export function isPrivateOrDeniedWsIP(ip: string, options?: { allowPrivateNetwork?: boolean }): boolean {
-  if (isAlwaysDeniedLinkLocalIp(ip)) return true;
+  const normalized = ip.trim().toLowerCase().replace(/^\[|\]$/g, "");
+
+  // fork(TECH-8283 Finding 7): AWS IPv6 metadata service (fd00:ec2::254) is denied in all modes
+  if (normalized === "fd00:ec2::254") return true;
+
+  // Link-local is denied in every mode, even when allowPrivateNetwork is true
+  if (isAlwaysDeniedLinkLocalIp(normalized)) return true;
+
+  // Strict check on IPv4-mapped IPv6 (e.g. ::ffff:999.999.999.999 -> unparseable -> deny)
+  const mappedIpv4 = normalized.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (mappedIpv4 && mappedIpv4[1]) {
+    if (isIP(mappedIpv4[1]) !== 4) return true;
+  }
+
   // Fail-closed on unparseable/invalid IP addresses regardless of allowPrivateNetwork
-  if (isIP(ip) === 0 && !/^::ffff:\d{1,3}(?:\.\d{1,3}){3}$/i.test(ip)) return true;
-  if (!options?.allowPrivateNetwork && isPrivateOrReservedIp(ip)) return true;
+  if (isIP(normalized) === 0 && !mappedIpv4) return true;
+
+  if (!options?.allowPrivateNetwork && isPrivateOrReservedIp(normalized)) return true;
   return false;
 }
 
-// fork(TECH-8283 F1, Finding A, Finding B): Options for guarded egress and test seam
+// fork(TECH-8283 F1, Finding A, Finding B): Options for guarded egress
 export interface GuardedRemoteHttpFetchOptions {
   allowPrivateNetwork?: boolean;
   allowedProtocols?: Set<string>;
   lookup?: typeof dnsLookup;
   isPrivate?: IpAddressClassifier;
   dnsTimeoutMs?: number;
-  upgradeDeadlineMs?: number;
-  handshakeDeadlineMs?: number;
-  watchIntervalMs?: number;
-  lifetimeMs?: number;
 }
 
 /**
@@ -121,35 +137,48 @@ export async function validateAndResolveFetchUrl(
     );
   }
 
-  // Resolve the hostname to an IP and check for private ranges.
-  // We pin the resolved IP into the URL to eliminate the TOCTOU window
-  // between DNS resolution here and the second resolution fetch() would do.
   const originalHostname = parsed.hostname.replace(/^\[|\]$/g, ""); // strip IPv6 brackets
   const hostHeader = parsed.host; // includes port if non-default
+  const isPrivateFn = options?.isPrivate ?? ((ip: string) => isPrivateIP(ip));
+  const useTls = parsed.protocol === "https:" || parsed.protocol === "wss:";
+
+  // fork(TECH-8283 Finding 7): Classify IP literals directly without DNS lookup
+  if (isIP(originalHostname) !== 0) {
+    if (isPrivateFn(originalHostname, { allowPrivateNetwork: options?.allowPrivateNetwork })) {
+      throw new Error(`All resolved IPs for ${originalHostname} are in private/reserved ranges`);
+    }
+    return {
+      parsedUrl: parsed,
+      resolvedAddress: originalHostname,
+      hostHeader,
+      tlsServername: undefined,
+      useTls,
+    };
+  }
 
   // Race the DNS lookup against a timeout to prevent indefinite hangs
-  // when DNS is misconfigured or unresponsive.
   const lookupFn = options?.lookup ?? dnsLookup;
   const dnsTimeoutMs = options?.dnsTimeoutMs ?? DNS_LOOKUP_TIMEOUT_MS;
   const dnsPromise = lookupFn(originalHostname, { all: true });
+
+  let dnsTimer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(
+    dnsTimer = setTimeout(
       () => reject(new Error(`DNS lookup timed out after ${dnsTimeoutMs}ms for ${originalHostname}`)),
       dnsTimeoutMs,
     );
+    dnsTimer.unref?.();
   });
 
   try {
     const results = await Promise.race([dnsPromise, timeoutPromise]);
+    // fork(TECH-8283 Finding 7): Clear DNS timeout timer on success
+    if (dnsTimer) clearTimeout(dnsTimer);
+
     if (results.length === 0) {
       throw new Error(`DNS resolution returned no results for ${originalHostname}`);
     }
 
-    // Filter to only non-private IPs instead of rejecting the entire request
-    // when some IPs are private. This handles multi-homed hosts that resolve
-    // to both private and public addresses.
-    // fork(TECH-8283 Finding A): Use provided classifier or default fetch isPrivateIP
-    const isPrivateFn = options?.isPrivate ?? ((ip: string) => isPrivateIP(ip));
     const safeResults = results.filter((entry) => !isPrivateFn(entry.address, { allowPrivateNetwork: options?.allowPrivateNetwork }));
     if (safeResults.length === 0) {
       throw new Error(
@@ -158,7 +187,6 @@ export async function validateAndResolveFetchUrl(
     }
 
     const resolved = safeResults[0]!;
-    const useTls = parsed.protocol === "https:" || parsed.protocol === "wss:";
     return {
       parsedUrl: parsed,
       resolvedAddress: resolved.address,
@@ -169,7 +197,7 @@ export async function validateAndResolveFetchUrl(
       useTls,
     };
   } catch (err) {
-    // Re-throw our own errors; wrap DNS failures
+    if (dnsTimer) clearTimeout(dnsTimer);
     if (err instanceof Error && (
       err.message.startsWith("All resolved IPs") ||
       err.message.startsWith("DNS resolution returned") ||
