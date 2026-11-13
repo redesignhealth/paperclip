@@ -14,7 +14,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-/** True when an env entry holds a token: a non-empty string, or a plain or secret-reference binding. Never reads the value out. */
+/** True when an env entry holds a token: a non-empty string, or a plain or secret-reference binding. The value is never returned or logged. */
 function envEntryPresent(entry: unknown): boolean {
   if (typeof entry === "string") return entry.trim() !== "";
   if (!isRecord(entry)) return false;
@@ -26,7 +26,7 @@ function envEntryPresent(entry: unknown): boolean {
 /**
  * Whether the agent uses the external memory service, which is separate from Paperclip runtime memory (TECH-8409).
  * Hermes selects it with `adapterConfig.memoryProvider: "mem0"`. Claude and Codex agents carry `RH_MEMORY_TOKEN`.
- * Presence only: the token is never read.
+ * Presence only: the token value is never returned or logged.
  */
 export function agentUsesExternalMemory(
   adapterType: string | null | undefined,
@@ -67,7 +67,8 @@ export function computeMemoryAgentCapabilities(
     mcpState?.entries[BRAIN_BINDING_ARCANA_ENTRY_KEY]?.setup?.state === "ready";
   const isHermes = input.adapterType === HERMES_ADAPTER_TYPE;
   const hasRuntimeMemory = Boolean(input.runtimeMemory);
-  const externalMemory = agentUsesExternalMemory(input.adapterType, input.adapterConfig);
+  // The Hermes adapter drops `memoryProvider` while runtime memory is active, so runtime memory wins.
+  const externalMemory = !hasRuntimeMemory && agentUsesExternalMemory(input.adapterType, input.adapterConfig);
   const mem0Available = hasRuntimeMemory || externalMemory;
 
   return {
