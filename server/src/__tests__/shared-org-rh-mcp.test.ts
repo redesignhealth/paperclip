@@ -15,7 +15,6 @@ import {
   COMMS_BOARD_OWNERSHIP_API_TOKEN_ENV,
   COMMS_BOARD_OWNERSHIP_API_URL_ENV,
   RH_MCP_SERVICE_TOKEN_SCOPES,
-  RH_MCP_SERVICE_TOKEN_SCOPES_VERSION,
   composeRhMcpServiceSub,
 } from "../services/comms-board-provisioner-client.js";
 import {
@@ -29,7 +28,6 @@ import {
   SHARED_ORG_RH_MCP_ENABLED_ENV,
   SHARED_ORG_RH_MCP_EXPIRY_CONFIG_KEY,
   SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS,
-  SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY,
   SHARED_ORG_RH_MCP_URL_ENV,
   ensureSharedOrgRhMcp,
   startSharedOrgRhMcpSweep,
@@ -557,33 +555,6 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     expect(await secretService(db).resolveSecretValue(companyId, secretId, "latest")).toBe(ROTATED_TOKEN);
     const [secret] = await db.select({ latestVersion: companySecrets.latestVersion }).from(companySecrets).where(eq(companySecrets.id, secretId));
     expect(secret!.latestVersion).toBe(2);
-  });
-
-  it("records the scope-set version at provision and re-issues a token minted with an older scope set (TECH-8433)", async () => {
-    const companyId = await seedCompany();
-    await seedOwner(companyId);
-    const fetchMock = makeFetch();
-    const now = new Date("2026-10-30T00:00:00Z");
-    await ensureSharedOrgRhMcp(ctxFor(fetchMock, { now: () => now }), companyId);
-    const [connection] = await connectionsOf(companyId);
-    expect((connection!.config as Record<string, unknown>)[SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY]).toBe(RH_MCP_SERVICE_TOKEN_SCOPES_VERSION);
-    // Current version and far from expiry: nothing to do.
-    expect(await ensureSharedOrgRhMcp(ctxFor(fetchMock, { now: () => now }), companyId)).toEqual({ kind: "ready", installed: 0 });
-    expect(fetchMock.calls.rotates).toHaveLength(0);
-
-    // Simulate a connection provisioned before the scope version existed (key absent = v1).
-    await db
-      .update(toolConnections)
-      .set({ config: sql`${toolConnections.config} - ${SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY}` })
-      .where(eq(toolConnections.id, connection!.id));
-    expect(await ensureSharedOrgRhMcp(ctxFor(fetchMock, { now: () => now }), companyId)).toEqual({ kind: "rotated", installed: 0 });
-    expect(fetchMock.calls.rotates).toHaveLength(1);
-    expect(fetchMock.calls.rotates[0]!.scopes).toContain("comps:run");
-    const [after] = await connectionsOf(companyId);
-    expect((after!.config as Record<string, unknown>)[SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY]).toBe(RH_MCP_SERVICE_TOKEN_SCOPES_VERSION);
-    // Idempotent: the next tick finds the current version.
-    expect(await ensureSharedOrgRhMcp(ctxFor(fetchMock, { now: () => now }), companyId)).toEqual({ kind: "ready", installed: 0 });
-    expect(fetchMock.calls.rotates).toHaveLength(1);
   });
 
   // ---- sweep --------------------------------------------------------------------------------

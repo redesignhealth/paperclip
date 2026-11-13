@@ -703,10 +703,10 @@ connection to rh-mcp named `rh-mcp-service`, so no agent depends on one person's
 - **Lifecycle.** A periodic sweep (startup, then every 5 minutes) mints, connects, enables exactly the reviewed tools and installs
   live agents. New agents get it from `defaultEnabled`. The token is re-issued into a new vault version 60 days before expiry
   (expiry kept in `config.rhMcpServiceTokenExpiresAt`).
-- **Scope changes reach existing orgs.** The token's scopes are the keys of the map. The stored token's scope-set version is
-  kept in `config.rhMcpServiceTokenScopesVersion` (absent = 1); the sweep re-issues any token below
-  `RH_MCP_SERVICE_TOKEN_SCOPES_VERSION`. Bump it (and `RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION`) whenever a scope or tool is added.
-  The Argus and comps verbs get a 30 s per-call timeout (api-main cold starts).
+- **Scope changes do not reach existing orgs automatically.** The token's scopes are the keys of the map, and an issued token
+  keeps its scopes until it is re-issued (60 days before expiry, or by hand with `POST /agents/{sub}/rotate` on the ownership
+  API). After adding a scope such as `comps:run`, rotate each org's token manually. Bump `RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION`
+  whenever a scope or tool is added. The Argus and comps verbs get a 30 s per-call timeout (api-main cold starts).
 - **Opt-out:** archive the `rh-mcp-service` connection; it is not re-created.
 
 ## Credential health and OAuth callback failures
