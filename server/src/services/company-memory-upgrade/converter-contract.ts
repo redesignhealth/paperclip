@@ -14,6 +14,14 @@ import { detectSensitiveFamilies, type SensitiveFamilyName } from "./sensitive-p
 export const CONVERTER_ID = "paperclip.memory-upgrade.atomic-converter";
 export const CONVERTER_VERSION = 1;
 
+/**
+ * Maximum number of atomic records a single source memory can be converted into.
+ * Dev evidence showed sources requiring more than 3 records were the dominant
+ * reason for quarantine under the initial cap. Raising the cap to 6 accommodates
+ * richer source memories without sacrificing atomicity.
+ */
+export const MAX_CONVERTED_RECORDS_PER_SOURCE = 6;
+
 export const MODEL_CLASSIFIED_NOISE_REASON_CODE = "model_classified_noise";
 export const MODEL_CLASSIFIED_SENSITIVE_REASON_CODE = "model_classified";
 
@@ -37,7 +45,7 @@ export const CONVERSION_DECISIONS = [
 export type ConversionDecision = (typeof CONVERSION_DECISIONS)[number];
 
 export const CONVERSION_SYSTEM_PROMPT = `You are a precision memory upgrade converter for Paperclip.
-Convert legacy unstructured company memories into 1 to 3 standalone, atomic, durable memory records.
+Convert legacy unstructured company memories into 1 to 6 standalone, atomic, durable memory records.
 
 RULES:
 1. ATOMICITY: Each record must be exactly one atomic sentence expressing one single durable fact, decision, preference, lesson, or procedure.
@@ -49,7 +57,7 @@ RULES:
 7. CONFIDENCE: A number between 0.0 and 1.0 reflecting certainty directly supported by the source text.
 8. DECISION drop_sensitive: If the source contains credentials, API keys, bearer tokens, passwords, credit card numbers, SSNs, private keys, or personal authentication data, set decision to "drop_sensitive" and return empty records.
 9. DECISION drop_noise: If the source is an acknowledgment, greeting, test string, placeholder, or devoid of durable substance, set decision to "drop_noise" and return empty records.
-10. DECISION convert: If the source contains substantive knowledge, set decision to "convert" and return between 1 and 3 records.`;
+10. DECISION convert: If the source contains substantive knowledge, set decision to "convert" and return between 1 and 6 records.`;
 
 /**
  * Strict JSON schema for Structured Outputs.
@@ -87,7 +95,10 @@ export const CANONICAL_CONVERSION_PARAMS = Object.freeze({
   temperature: 0,
   top_p: 1,
   seed: 8191,
-  max_completion_tokens: 600,
+  // 6 records x the 400-character record ceiling plus JSON structure needs
+  // roughly 750-900 tokens, so 1000 removes truncation risk (truncated JSON
+  // would quarantine as not_json, defeating the purpose of the change).
+  max_completion_tokens: 1000,
 });
 
 export function computeConverterContractSha256(): string {
@@ -101,7 +112,7 @@ export function computeConverterContractSha256(): string {
     .digest("hex");
 }
 
-export const CONVERTER_CONTRACT_SHA256 = "9fe03e311eeb765d3dd59ab5a21b32c4cf707a2b924484246afbb33287c70d50";
+export const CONVERTER_CONTRACT_SHA256 = "d27300ce3e11473d517a4a4e80b411fa44632ab25c904b6e44cfbf3ad7ce88c9";
 
 export const CONVERSION_REJECT_CODES = [
   "not_json",
@@ -249,7 +260,7 @@ export function validateConversionOutput(raw: unknown): ConversionValidationResu
   if (records.length === 0) {
     return { ok: false, rejectCode: "empty_records" };
   }
-  if (records.length > 3) {
+  if (records.length > MAX_CONVERTED_RECORDS_PER_SOURCE) {
     return { ok: false, rejectCode: "too_many_records" };
   }
 

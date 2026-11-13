@@ -23,6 +23,7 @@ import {
   PREFLIGHT_REPAIR_ECHO_BYTES_PER_OUTPUT_TOKEN,
   projectWorstCaseRepairRequestBodyBytes,
 } from "./llm-converter.js";
+import { MAX_CONVERTED_RECORDS_PER_SOURCE } from "./converter-contract.js";
 import { CompanyMemoryUpgradeError } from "./types.js";
 
 /** 1 USD === 1_000_000_000 nanodollars. */
@@ -171,12 +172,12 @@ export function utf8ByteLength(text: string | null | undefined): number {
 
 // --- Preflight worst-case per-source cost ceiling -----------------------------------------
 
-/** Converter contract caps max_completion_tokens at 600 for both the initial and repair chat calls. */
+/** Converter contract caps max_completion_tokens at 1000 for both the initial and repair chat calls. */
 export const PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL = PREFLIGHT_MAX_COMPLETION_TOKENS;
 /** At most one initial chat call plus exactly one repair retry. */
 export const PREFLIGHT_MAX_CHAT_CALLS = 2;
-/** The converter contract allows between 1 and 3 converted records per source, each re-embedded once. */
-export const PREFLIGHT_MAX_EMBEDDING_CALLS = 3;
+/** The converter contract allows between 1 and 6 converted records per source, each re-embedded once. */
+export const PREFLIGHT_MAX_EMBEDDING_CALLS = MAX_CONVERTED_RECORDS_PER_SOURCE;
 /** Converter contract hard caps each converted record's `data` field at 400 characters (data_too_long). */
 export const PREFLIGHT_MAX_RECORD_DATA_CHARS = 400;
 /** Max UTF-8 encoding width of a single Unicode code point. */
@@ -200,11 +201,11 @@ export interface PreflightCostEstimate {
 /**
  * Computes the worst-case nanodollar cost ceiling for converting ONE source row, covering:
  *   - up to PREFLIGHT_MAX_CHAT_CALLS (2) chat completions calls (initial + one repair retry),
- *     each capped at PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL (600) output tokens, with input
+ *     each capped at PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL (1000) output tokens, with input
  *     tokens projected conservatively from the ACTUAL serialized initial request body byte length
  *     plus the projected worst-case repair body (base payload with schema/prompt/wrapper overhead
  *     plus an analytical allowance for the echoed prior turn);
- *   - up to PREFLIGHT_MAX_EMBEDDING_CALLS (3) embedding calls, each projected conservatively
+ *   - up to PREFLIGHT_MAX_EMBEDDING_CALLS (6) embedding calls, each projected conservatively
  *     from the maximum possible converted record size (PREFLIGHT_MAX_RECORD_DATA_CHARS Unicode
  *     characters at UTF8_MAX_BYTES_PER_CHAR bytes/char), NOT a fixed-token ASCII heuristic.
  *

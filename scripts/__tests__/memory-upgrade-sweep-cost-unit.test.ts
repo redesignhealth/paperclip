@@ -29,7 +29,10 @@ import {
   estimateWorstCaseSourceCostNanodollars,
   estimateWorstCaseSourceCostNanodollarsForText,
   MAX_USD_CAP,
+  PREFLIGHT_MAX_CHAT_CALLS,
   PREFLIGHT_MAX_EMBEDDING_CALLS,
+  PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL,
+  PREFLIGHT_MAX_RECORD_DATA_CHARS,
   priceUsdPerMillionToNanodollars,
   projectWorstCaseConversionRequestBytes,
   usdToNanodollars,
@@ -158,7 +161,10 @@ test("estimateWorstCaseSourceCostNanodollarsForText: embedding projection is con
     estimate.projectedEmbeddingTokens > flawedAsciiHeuristicTokens,
     `projected embedding tokens (${estimate.projectedEmbeddingTokens}) must exceed the flawed 100-token ASCII heuristic (${flawedAsciiHeuristicTokens})`,
   );
-  assert.equal(estimate.projectedEmbeddingTokens, 400 * UTF8_MAX_BYTES_PER_CHAR * PREFLIGHT_MAX_EMBEDDING_CALLS);
+  assert.equal(
+    estimate.projectedEmbeddingTokens,
+    PREFLIGHT_MAX_RECORD_DATA_CHARS * UTF8_MAX_BYTES_PER_CHAR * PREFLIGHT_MAX_EMBEDDING_CALLS,
+  );
 
   // Preflight must be computed BEFORE any key resolution or paid call; it is purely a
   // function of (sourceText, model, rates) -- call it twice and confirm determinism.
@@ -198,15 +204,20 @@ test("estimateWorstCaseSourceCostNanodollars direct calculation", () => {
     rates,
   });
 
-  assert.equal(estimate.projectedChatInputTokens, 3000);
-  assert.equal(estimate.projectedChatOutputTokens, 1200); // 600 * 2
-  assert.equal(estimate.projectedEmbeddingTokens, 4800); // 400 * 4 * 3
+  const expectedInputTokens = 1000 + 2000;
+  const expectedOutputTokens = PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL * PREFLIGHT_MAX_CHAT_CALLS;
+  const expectedEmbeddingTokens =
+    PREFLIGHT_MAX_RECORD_DATA_CHARS * UTF8_MAX_BYTES_PER_CHAR * PREFLIGHT_MAX_EMBEDDING_CALLS;
 
-  // chatInputCost: ceilTokenCostNanodollars(3000, 150_000_000) = 3000 * 150 = 450,000 nanodollars
-  // chatOutputCost: ceilTokenCostNanodollars(1200, 600_000_000) = 1200 * 600 = 720,000 nanodollars
-  // embeddingCost: ceilTokenCostNanodollars(4800, 20_000_000) = 4800 * 20 = 96,000 nanodollars
-  // worstCaseNanodollars: 450,000 + 720,000 + 96,000 = 1,266,000n
-  assert.equal(estimate.worstCaseNanodollars, 1_266_000n);
+  const expectedChatInputCost = ceilTokenCostNanodollars(expectedInputTokens, rates.chatInputNanoPerMillion);
+  const expectedChatOutputCost = ceilTokenCostNanodollars(expectedOutputTokens, rates.chatOutputNanoPerMillion);
+  const expectedEmbeddingCost = ceilTokenCostNanodollars(expectedEmbeddingTokens, rates.embeddingNanoPerMillion);
+  const expectedWorstCase = expectedChatInputCost + expectedChatOutputCost + expectedEmbeddingCost;
+
+  assert.equal(estimate.projectedChatInputTokens, expectedInputTokens);
+  assert.equal(estimate.projectedChatOutputTokens, expectedOutputTokens);
+  assert.equal(estimate.projectedEmbeddingTokens, expectedEmbeddingTokens);
+  assert.equal(estimate.worstCaseNanodollars, expectedWorstCase);
 });
 
 test("projectWorstCaseConversionRequestBytes sizes the repair body using the LONGEST CONVERSION_REJECT_CODE, not a hardcoded 15-char placeholder", () => {
@@ -613,14 +624,14 @@ test("regression guard: actual within-bound repair with unreadable call 2 report
 
   const call2BodyBytes = Buffer.byteLength(requests[1].body, "utf8");
   assert.equal(res.inputTokens, 110 + call2BodyBytes);
-  assert.equal(res.outputTokens, 35 + 600);
+  assert.equal(res.outputTokens, 35 + PREFLIGHT_MAX_COMPLETION_TOKENS);
 
   assert.ok(
     res.inputTokens <= worstCaseInputCap,
     `totalInputTokens (${res.inputTokens}) must not exceed preflight projection (${worstCaseInputCap})`,
   );
   assert.ok(
-    res.outputTokens <= 1200,
-    `totalOutputTokens (${res.outputTokens}) must not exceed 2 * 600 = 1200`,
+    res.outputTokens <= PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL * PREFLIGHT_MAX_CHAT_CALLS,
+    `totalOutputTokens (${res.outputTokens}) must not exceed ${PREFLIGHT_MAX_CHAT_CALLS} * ${PREFLIGHT_MAX_OUTPUT_TOKENS_PER_CHAT_CALL}`,
   );
 });
