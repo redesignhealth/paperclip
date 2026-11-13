@@ -717,7 +717,7 @@ Per-user and per-agent OAuth callback failures never mutate the shared connectio
 
 Not an MCP connection: it has no template, no install and no tools. It gives a NEW `hermes_local` or `claude_local` agent (including a native-runner agent whose harness is Claude) its own memory credential and harness settings, so recall and capture go through an external memory service instead of Paperclip's in-process runtime memory. Paperclip holds only generic config and the credential.
 
-Enable it with `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and `PAPERCLIP_AGENT_MEMORY_URL` (plus optional `PAPERCLIP_AGENT_MEMORY_PROXY`), on top of `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` and the comms-board provisioner settings (the ownership registry mints the token). It is off by default and applies only to agents created while it is on: the entry has `newAgentsOnly`, so backfill, legacy enrollment and missing-entry enrollment never add it.
+Enable it with `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and `PAPERCLIP_AGENT_MEMORY_URL` (plus optional `PAPERCLIP_AGENT_MEMORY_PROXY`), on top of `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` and the comms-board provisioner settings (the ownership registry mints the token). It is off by default and applies only to agents created while it is on: the entry has `newAgentsOnly`, so legacy enrollment never adds it and missing-entry enrollment adds it only under the explicit backfill flag below.
 
 Setup hook `agent_memory`, per new agent:
 
@@ -727,6 +727,17 @@ Setup hook `agent_memory`, per new agent:
 4. Writes the agent's `adapterConfig` through the agent lifecycle update (which records a revision and syncs secret bindings), merging the keys of the adapter's profile in `AGENT_MEMORY_ADAPTER_PROFILES` (`default-mcp-agent-memory.ts`). `hermes_local`: `env.MEM0_API_KEY` (secret reference), `env.MEM0_HOST`, `env.MEM0_PROXY` (when configured), `env.MEM0_USER_ID` (the agent id), `memoryProvider: "mem0"` and `runtimeMemory: false`. `claude_local`: `env.RH_MEMORY_TOKEN` (secret reference), `env.RH_MEMORY_URL`, `env.RH_MEMORY_PROXY` (when configured). Other `env` keys are kept. Another harness (for example Codex with the same `RH_MEMORY_*` keys) is one more table entry. A failure here is a bounded retry; nothing external is repeated.
 
 The token is never logged and is not stored anywhere except the secret.
+
+### Backfill for existing agents (agent memory)
+
+Existing agents are enrolled by the operator-run missing-entry job (`POST /api/companies/:companyId/default-mcp/missing-entry-enrollment`), which reuses the same hook, so one mechanism serves new and existing agents. It adds `agent-memory` only while `PAPERCLIP_AGENT_MEMORY_BACKFILL_ENABLED=true` with a valid memory configuration, only for agents of a profiled adapter, and only for agents that already hold a default-MCP state (legacy agents with none are enrolled by legacy enrollment first). With the flag off, `keys: ["agent-memory"]` reports every agent as `nothing_missing`. Pass `"keys": ["agent-memory"]` to restrict the run to this entry; without it the job also adds any other missing managed entry, as before.
+
+Run it per company, batch by batch:
+
+1. Dry run (the default): `{ "keys": ["agent-memory"] }`. The report lists `would_add` agents and the reasons for skips (`owner_required` when the agent has no resolvable human owner). Nothing is written or minted.
+2. Real run: `{ "keys": ["agent-memory"], "dryRun": false, "confirm": "add-missing-default-mcp-entries", "limit": 25 }`. Each added agent is set up by the normal hook (mint, secret, config). Pass the returned `nextCursor` as `afterId` to resume; a repeat run skips agents that already have the entry (`nothing_missing`).
+
+The registry is insert-only per sub. An agent whose memory token was minted by hand (`agent-memory-<id>` already registered) ends at `ownership_conflict`; configure those agents manually, as before. Setup output never contains a token.
 
 ### Rotation
 

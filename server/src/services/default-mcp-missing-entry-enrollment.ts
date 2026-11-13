@@ -34,6 +34,7 @@ import {
   type DefaultMcpEntryState,
 } from "./default-mcp-spec.js";
 import { scheduleDefaultMcpSetup, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
+import { AGENT_MEMORY_ENTRY_KEY, agentMemoryBackfillEnabled, agentMemoryProfileFor } from "./default-mcp-agent-memory.js";
 import { assessLegacyOrdinaryAccess, resolveLegacyResponsibleUser } from "./default-mcp-legacy-enrollment.js";
 
 export const MISSING_ENTRY_BATCH_LIMIT = 25;
@@ -45,6 +46,23 @@ const EXCLUDED_ENTRY_KEYS: ReadonlySet<string> = new Set(["arcana-brain"]);
 /** The spec entries this job may add: managed (hook) entries minus those owned by another job. */
 export function missingEntryEligibleSpec(): readonly DefaultMcpEntrySpec[] {
   return DEFAULT_MCP_SPEC.filter((entry) => entry.setupHook && !entry.newAgentsOnly && !EXCLUDED_ENTRY_KEYS.has(entry.key));
+}
+
+/** The keys this job can ever enroll: the eligible managed entries plus agent memory (still gated per agent by its flag). */
+export function missingEntryEnrollableKeys(): readonly string[] {
+  return [...missingEntryEligibleSpec().map((entry) => entry.key), AGENT_MEMORY_ENTRY_KEY];
+}
+
+/**
+ * The agent-memory entry (TECH-8409) is `newAgentsOnly`, so it joins the missing set only for an agent of a profiled
+ * adapter, and only while the explicit backfill flag is on with a valid memory configuration.
+ */
+function agentMemoryBackfillSpec(
+  env: NodeJS.ProcessEnv,
+  agent: { adapterType: string | null; adapterConfig: unknown },
+): readonly DefaultMcpEntrySpec[] {
+  if (!agentMemoryBackfillEnabled(env) || agentMemoryProfileFor(agent.adapterType, agent.adapterConfig) === null) return [];
+  return DEFAULT_MCP_SPEC.filter((entry) => entry.key === AGENT_MEMORY_ENTRY_KEY);
 }
 
 export type MissingEntrySkipReason =
@@ -89,6 +107,8 @@ export interface MissingEntryOptions {
   dryRun?: boolean;
   /** Required (exactly `MISSING_ENTRY_CONFIRMATION`) when `dryRun` is false. */
   confirm?: string;
+  /** Restrict the run to these spec keys (for example only `agent-memory`). Default: every eligible key. */
+  keys?: readonly string[];
   env?: NodeJS.ProcessEnv;
   fetchImpl?: FetchLike;
   now?: () => Date;
@@ -113,9 +133,16 @@ function classifyMetadata(metadata: unknown): "absent" | "corrupted" | "present"
 }
 
 /** The spec entries this agent lacks. Judged on the raw key so even a malformed existing entry is never replaced. */
-function missingSpecFor(metadata: unknown): DefaultMcpEntrySpec[] {
+function missingSpecFor(
+  metadata: unknown,
+  agent: { adapterType: string | null; adapterConfig: unknown },
+  env: NodeJS.ProcessEnv,
+  keys?: readonly string[],
+): DefaultMcpEntrySpec[] {
   const raw = (metadata as { [DEFAULT_MCP_METADATA_KEY]?: { entries?: Record<string, unknown> } }).defaultMcp?.entries ?? {};
-  return missingEntryEligibleSpec().filter((entry) => !(entry.key in raw));
+  return [...missingEntryEligibleSpec(), ...agentMemoryBackfillSpec(env, agent)]
+    .filter((entry) => !(entry.key in raw))
+    .filter((entry) => !keys || keys.includes(entry.key));
 }
 
 export async function addMissingDefaultMcpEntries(db: Db, options: MissingEntryOptions): Promise<MissingEntryReport> {
@@ -146,7 +173,15 @@ async function scan(db: Db, options: MissingEntryOptions, dryRun: boolean, env: 
   const limit = Math.max(1, Math.min(options.limit ?? MISSING_ENTRY_BATCH_LIMIT, MISSING_ENTRY_BATCH_LIMIT));
   const scope = readDefaultMcpTemplateScope();
   const rows = await db
-    .select({ id: agents.id, companyId: agents.companyId, metadata: agents.metadata, status: agents.status, companyStatus: companies.status })
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      metadata: agents.metadata,
+      status: agents.status,
+      adapterType: agents.adapterType,
+      adapterConfig: agents.adapterConfig,
+      companyStatus: companies.status,
+    })
     .from(agents)
     .innerJoin(companies, eq(companies.id, agents.companyId))
     .where(and(eq(agents.companyId, options.companyId), options.afterId ? gt(agents.id, options.afterId) : undefined))
@@ -164,7 +199,7 @@ async function scan(db: Db, options: MissingEntryOptions, dryRun: boolean, env: 
     const classification = classifyMetadata(row.metadata);
     if (classification === "corrupted") { skip(row, "corrupted_existing_state"); continue; }
     if (classification === "absent") { skip(row, "no_default_mcp_state"); continue; } // legacy enrollment's job
-    const missing = missingSpecFor(row.metadata);
+    const missing = missingSpecFor(row.metadata, row, env, options.keys);
     if (missing.length === 0) { skip(row, "nothing_missing"); continue; }
     try {
       // Resolved before the dry-run short-circuit so a census and a real run agree.
@@ -176,7 +211,7 @@ async function scan(db: Db, options: MissingEntryOptions, dryRun: boolean, env: 
         outcomes.push({ agentId: row.id, companyId: row.companyId, result: "would_add", keys });
         continue;
       }
-      const written = await addEntries(db, row, missing, owner.userId, options.now?.() ?? new Date());
+      const written = await addEntries(db, row, missing, owner.userId, options.now?.() ?? new Date(), env, options.keys);
       if (written === "lost_race") { skip(row, "lost_race"); continue; }
       if (written === "terminated") { skip(row, "agent_terminated"); continue; }
       // After the write commits; setup makes the external calls and the durable sweep is the backstop. Restricted to
@@ -192,7 +227,7 @@ async function scan(db: Db, options: MissingEntryOptions, dryRun: boolean, env: 
         // Non-secret facts only.
         details: { keys: written.map((entry) => entry.key), ownerUserId: owner.userId },
       });
-      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "added", keys });
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "added", keys: written.map((entry) => entry.key) });
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "missing default MCP entry enrollment failed");
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "failed", reason: "enrollment_error" });
@@ -214,10 +249,12 @@ async function addEntries(
   missing: DefaultMcpEntrySpec[],
   ownerUserId: string,
   now: Date,
+  env: NodeJS.ProcessEnv,
+  keys?: readonly string[],
 ): Promise<DefaultMcpEntrySpec[] | "lost_race" | "terminated"> {
   return db.transaction(async (tx) => {
     const [locked] = await tx
-      .select({ metadata: agents.metadata, status: agents.status })
+      .select({ metadata: agents.metadata, status: agents.status, adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
       .from(agents)
       .where(and(eq(agents.id, row.id), eq(agents.companyId, row.companyId)))
       .limit(1)
@@ -225,7 +262,7 @@ async function addEntries(
     if (!locked || classifyMetadata(locked.metadata) !== "present") return "lost_race" as const;
     if (locked.status === "terminated") return "terminated" as const;
     // Re-judged under the lock: only keys still absent are written.
-    const stillMissing = missing.filter((entry) => missingSpecFor(locked.metadata).some((m) => m.key === entry.key));
+    const stillMissing = missing.filter((entry) => missingSpecFor(locked.metadata, locked, env, keys).some((m) => m.key === entry.key));
     if (stillMissing.length === 0) return "lost_race" as const;
     const noWrite = { set: () => ({ where: async () => [] }) };
     const probe = {
@@ -240,6 +277,8 @@ async function addEntries(
       ownerUserId,
       status: locked.status,
       spec: stillMissing,
+      // Lets a newAgentsOnly entry (agent memory) be built; no other entry reads it.
+      newAgentCreation: true,
       now,
     });
     for (const entry of stillMissing) {
