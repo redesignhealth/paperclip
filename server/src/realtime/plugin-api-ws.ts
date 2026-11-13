@@ -1,3 +1,13 @@
+/**
+ * Plugin API WebSocket Server
+ *
+ * Listener Registration Order (fork(TECH-8283 Finding 11)):
+ * setupPluginApiWebSocketServer must be registered BEFORE any catch-all or fallback
+ * upgrade listeners (such as live-events-ws or createPaperclipHttpServer terminal fallback).
+ * It claims matching upgrade requests synchronously (setting request.paperclipWebSocketHandled = true)
+ * before any asynchronous dispatch so downstream listeners do not destroy in-flight upgrades.
+ */
+
 import { ServerResponse, type IncomingMessage, type RequestListener, type Server } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Socket } from "node:net";
@@ -8,12 +18,15 @@ import {
   validateAndResolveFetchUrl,
   isPrivateOrDeniedWsIP,
   type ValidatedFetchTarget,
-  type GuardedRemoteHttpFetchOptions,
 } from "../services/plugin-egress-guard.js";
+import { logger } from "../middleware/logger.js";
 
 export const PLUGIN_WS_UPGRADE_DEADLINE_MS = 20_000;
 
 export const pluginApiUpgrade = Symbol("pluginApiUpgrade");
+
+// fork(TECH-8283 Finding 9): Claim routes consistently with/without trailing slash and query strings
+export const PLUGIN_API_WS_ROUTE_REGEX = /^\/api\/plugins\/[^/]+\/api(?:\/|\?|$)/;
 
 export interface PluginApiUpgradeState {
   socket: Socket;
@@ -65,26 +78,89 @@ export function resetWebSocketSlotsForTest() {
   activePerCompany.clear();
 }
 
-// fork(TECH-8283 F4): Replace worker->upstream header deny-regex with strict allowlist
+// fork(TECH-8283 Finding 6): Header allowlist with explicit denylist of routing/proxy headers
+const DENIED_X_HEADER_PREFIXES = [
+  "x-forwarded-",
+];
+const DENIED_X_HEADERS = new Set([
+  "x-real-ip",
+  "x-original-url",
+  "x-rewrite-url",
+  "x-http-method-override",
+  "x-http-method",
+  "x-method-override",
+]);
+
 export function isAllowedWorkerUpstreamHeader(name: string): boolean {
-  const lower = name.toLowerCase();
+  const lower = name.toLowerCase().trim();
   if (lower === "authorization" || lower === "user-agent") return true;
-  if (lower.startsWith("x-") && !lower.startsWith("x-forwarded-")) return true;
-  return false;
+  if (!lower.startsWith("x-")) return false;
+  if (DENIED_X_HEADERS.has(lower)) return false;
+  if (DENIED_X_HEADER_PREFIXES.some((prefix) => lower.startsWith(prefix))) return false;
+  return true;
+}
+
+// fork(TECH-8283 Finding 5): Lifecycle options for route-level callers
+export interface PluginApiWsLifecycleOptions {
+  upgradeDeadlineMs?: number;
+  watchIntervalMs?: number;
+  lifetimeMs?: number;
+}
+
+// fork(TECH-8283 Finding 1): Strip path, query, credentials, and fragment for logging
+export function safeUrlForLog(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return "<invalid-url>";
+  }
+}
+
+// fork(TECH-8283 Finding 3): Test seam separated from production API
+export interface PluginApiWsTestSeam {
+  allowPrivateNetwork?: boolean;
+  lookup?: typeof import("node:dns/promises").lookup;
+  handshakeDeadlineMs?: number;
+}
+
+function isTestRuntimeEnvironment(): boolean {
+  return process.env.NODE_ENV === "test" || Boolean(process.env.VITEST);
+}
+
+/**
+ * Explicit test factory with runtime test-environment guard.
+ * fork(TECH-8283 Finding 3): Throws outside test runtime; prevents production bypass.
+ */
+export function createGuardedWebSocketProxyForTesting(
+  testSeam: PluginApiWsTestSeam,
+): (
+  req: Request,
+  res: Response,
+  target: { url: string; headers?: Record<string, string> },
+  available: () => Promise<boolean>,
+  options?: PluginApiWsLifecycleOptions,
+) => Promise<void> {
+  if (!isTestRuntimeEnvironment()) {
+    throw new Error("createGuardedWebSocketProxyForTesting is only permitted in test environments");
+  }
+  return (req, res, target, available, options) =>
+    internalProxyPluginApiWebSocket(req, res, target, available, options, testSeam);
 }
 
 /** Reuse the full HTTP authentication/company pipeline for plugin upgrades. */
 export function setupPluginApiWebSocketServer(
   server: Server,
   handler: RequestListener,
-  wsOptions?: GuardedRemoteHttpFetchOptions,
+  lifecycleOptions?: PluginApiWsLifecycleOptions,
 ) {
   server.on("upgrade", (request: UpgradeRequest, socket: Socket, head: Buffer) => {
-    if (request.paperclipWebSocketHandled || !/^\/api\/plugins\/[^/]+\/api\//.test(request.url ?? "")) return;
+    // fork(TECH-8283 Finding 9, Finding 11): Synchronous path claim before downstream listeners
+    if (request.paperclipWebSocketHandled || !PLUGIN_API_WS_ROUTE_REGEX.test(request.url ?? "")) return;
     request.paperclipWebSocketHandled = true;
 
     // fork(TECH-8283 Finding B): One absolute deadline armed at browser upgrade acceptance
-    const deadlineMs = wsOptions?.upgradeDeadlineMs ?? PLUGIN_WS_UPGRADE_DEADLINE_MS;
+    const deadlineMs = lifecycleOptions?.upgradeDeadlineMs ?? PLUGIN_WS_UPGRADE_DEADLINE_MS;
     const deadlineAt = Date.now() + deadlineMs;
     const abortController = new AbortController();
 
@@ -103,10 +179,12 @@ export function setupPluginApiWebSocketServer(
     response.assignSocket(socket);
     response.setHeader("Connection", "close");
 
+    // fork(TECH-8283 Finding 3): Deadline timer checks headersSent/writableEnded and clears on response finish/close
     const deadlineTimer = setTimeout(() => {
       if (settle("timeout")) {
+        logger.warn("Plugin WebSocket upgrade deadline exceeded");
         if (!socket.destroyed) {
-          if (!response.headersSent) {
+          if (!response.headersSent && !response.writableEnded) {
             response.writeHead(504, { "Content-Type": "application/json", Connection: "close" });
             response.end(JSON.stringify({ error: "Plugin upgrade timed out" }));
           } else {
@@ -116,6 +194,12 @@ export function setupPluginApiWebSocketServer(
       }
     }, deadlineMs);
     deadlineTimer.unref();
+
+    const clearDeadline = () => {
+      clearTimeout(deadlineTimer);
+    };
+    response.once("finish", clearDeadline);
+    response.once("close", clearDeadline);
 
     socket.on("error", () => {
       settle("error");
@@ -147,82 +231,126 @@ export function setupPluginApiWebSocketServer(
   });
 }
 
-/** Only worker-selected WSS targets and credentials reach the upstream. */
+/**
+ * Production exported proxy wrapper.
+ * fork(TECH-8283 Finding 3): Accepts ONLY safe lifecycle options; no test seam bypass parameters.
+ */
 export async function proxyPluginApiWebSocket(
   req: Request,
   res: Response,
   target: { url: string; headers?: Record<string, string> },
   available: () => Promise<boolean>,
-  options?: GuardedRemoteHttpFetchOptions,
-) {
+  options?: PluginApiWsLifecycleOptions,
+): Promise<void> {
+  return internalProxyPluginApiWebSocket(req, res, target, available, options, undefined);
+}
+
+/** Internal implementation: only worker-selected WSS targets and credentials reach upstream. */
+async function internalProxyPluginApiWebSocket(
+  req: Request,
+  res: Response,
+  target: { url: string; headers?: Record<string, string> },
+  available: () => Promise<boolean>,
+  options?: PluginApiWsLifecycleOptions,
+  testSeam?: PluginApiWsTestSeam,
+): Promise<void> {
   const upgrade = (req as UpgradeRequest)[pluginApiUpgrade];
   if (!upgrade || upgrade.socket.destroyed) return;
   const { socket, head } = upgrade;
 
-  // fork(TECH-8283 Finding B): Check remaining deadline time
   const remainingMs = Math.max(0, upgrade.deadlineAt - Date.now());
   if (remainingMs <= 0 || upgrade.signal.aborted) {
     if (upgrade.settle("timeout")) {
-      if (!socket.destroyed && !res.headersSent) {
-        res.status(504).json({ error: "Plugin upgrade timed out" });
-      } else {
-        socket.destroy();
+      logger.warn({ reason: "deadline_exceeded_before_dial" }, "Plugin WebSocket upgrade timed out before dial");
+      if (!socket.destroyed && !res.headersSent && !res.writableEnded) {
+        res.writeHead(504, { "Content-Type": "application/json", Connection: "close" });
+        res.end(JSON.stringify({ error: "Plugin upgrade timed out" }));
       }
+      socket.destroy();
     }
     return;
   }
 
-  let url: URL;
   let resolvedTarget: ValidatedFetchTarget;
   try {
-    url = new URL(target.url);
-    if (url.protocol !== "wss:" || url.username || url.password || url.hash) throw new Error();
+    const url = new URL(target.url);
+    if (url.protocol !== "wss:" || url.username || url.password || url.hash) {
+      throw new Error("Invalid WSS target URL");
+    }
     for (const [name, value] of Object.entries(target.headers ?? {})) {
       validateHeaderName(name);
       validateHeaderValue(name, value);
-      // fork(TECH-8283 F4): Reject any header not in the strict allowlist
-      if (!isAllowedWorkerUpstreamHeader(name)) throw new Error(`Disallowed upstream header: ${name}`);
+      // fork(TECH-8283 Finding 6): Reject any header not in the strict allowlist
+      if (!isAllowedWorkerUpstreamHeader(name)) {
+        logger.warn({ header: name }, "Worker returned prohibited upstream header");
+        throw new Error(`Disallowed upstream header: ${name}`);
+      }
     }
-    // fork(TECH-8283 F1, Finding A): Strict canonical IP classification for WebSocket egress
+    // fork(TECH-8283 Finding 5): Pass explicit parameters only; do NOT spread caller options
     resolvedTarget = await validateAndResolveFetchUrl(target.url, {
-      ...options,
       allowedProtocols: new Set(["wss:"]),
       isPrivate: isPrivateOrDeniedWsIP,
+      allowPrivateNetwork: testSeam?.allowPrivateNetwork,
+      lookup: testSeam?.lookup,
       dnsTimeoutMs: Math.min(5_000, remainingMs),
     });
-  } catch {
+  } catch (err) {
     const isTimeout = upgrade.signal.aborted || Date.now() >= upgrade.deadlineAt;
     const settleReason = isTimeout ? "timeout" : "error";
     if (upgrade.settle(settleReason)) {
-      if (!socket.destroyed && !res.headersSent) {
-        res.status(isTimeout ? 504 : 502).json({
-          error: isTimeout ? "Plugin upgrade timed out" : "Plugin connection unavailable",
-        });
-      } else {
-        socket.destroy();
+      logger.warn({ reason: (err as Error)?.message, target: safeUrlForLog(target.url) }, "Plugin WebSocket target validation failed");
+      const status = isTimeout ? 504 : 502;
+      if (!socket.destroyed && !res.headersSent && !res.writableEnded) {
+        res.writeHead(status, { "Content-Type": "application/json", Connection: "close" });
+        res.end(JSON.stringify({ error: isTimeout ? "Plugin upgrade timed out" : "Plugin connection unavailable" }));
       }
+      socket.destroy();
     }
     return;
   }
 
+  // fork(TECH-8283 Finding 8): Forward array-valued sec-websocket headers correctly
   const headers: Record<string, string | string[]> = { ...target.headers, Connection: "Upgrade", Upgrade: "websocket" };
   for (const name of ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions"]) {
-    if (req.headers[name]) headers[name] = req.headers[name]!;
+    const val = req.headers[name];
+    if (val !== undefined) {
+      headers[name] = Array.isArray(val) ? val.join(", ") : val;
+    }
   }
 
   let connected = false;
   let upstream: Duplex | undefined;
+  // fork(TECH-8283 Finding 2): Declare connection before cleanup to avoid TDZ/ReferenceError on sync throw
+  let connection: ReturnType<typeof httpsRequest> | undefined;
+  let cleanedUp = false;
+  let lifetimeTimer: NodeJS.Timeout | undefined;
+  let watchTimer: NodeJS.Timeout | undefined;
+  let handshakeTimer: NodeJS.Timeout | undefined;
 
-  const fail = (status = 502) => {
+  // fork(TECH-8283 Finding 1, Finding 2): Unified cleanup for all terminal paths; safe if connection undefined
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    if (lifetimeTimer) clearTimeout(lifetimeTimer);
+    if (watchTimer) clearInterval(watchTimer);
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+    connection?.destroy();
+    if (upstream && !upstream.destroyed) upstream.destroy();
+    if (!socket.destroyed) socket.destroy();
+  };
+  socket.once("close", cleanup);
+
+  const fail = (status = 502, reason = "connection_failed") => {
     if (upgrade.settle("error")) {
-      if (!connected && !socket.destroyed && !res.headersSent) {
-        res.status(status).json({ error: "Plugin connection unavailable" });
-      } else {
-        socket.destroy();
+      logger.warn({ status, reason, target: safeUrlForLog(target.url) }, "Plugin WebSocket connection failed");
+      if (!connected && !socket.destroyed) {
+        if (!res.headersSent && !res.writableEnded) {
+          res.writeHead(status, { "Content-Type": "application/json", Connection: "close" });
+          res.end(JSON.stringify({ error: status === 504 ? "Plugin upgrade timed out" : "Plugin connection unavailable" }));
+        }
       }
-    } else if (!connected && !socket.destroyed) {
-      socket.destroy();
     }
+    cleanup();
   };
 
   const port = resolvedTarget.parsedUrl.port ? Number(resolvedTarget.parsedUrl.port) : 443;
@@ -242,54 +370,34 @@ export async function proxyPluginApiWebSocket(
     timeout: connectTimeoutMs,
   };
 
-  let connection: ReturnType<typeof httpsRequest>;
   try {
     connection = httpsRequest(requestOptions);
-  } catch {
-    fail();
+  } catch (err) {
+    // fork(TECH-8283 Finding 2): Synchronous throw in httpsRequest safely invokes fail/cleanup without ReferenceError
+    fail(502, "https_request_threw");
     return;
   }
 
-  // fork(TECH-8283 F6, Finding B): Handshake deadline clamped to remaining absolute deadline
-  const handshakeDeadlineMs = Math.min(options?.handshakeDeadlineMs ?? 20_000, remainingMs);
-  const handshakeTimer = setTimeout(() => {
+  // fork(TECH-8283 Finding 4): Handshake deadline sub-cap clamped to remaining absolute deadline
+  const handshakeDeadlineMs = testSeam?.handshakeDeadlineMs
+    ? Math.min(testSeam.handshakeDeadlineMs, remainingMs)
+    : remainingMs;
+  handshakeTimer = setTimeout(() => {
     if (!connected) {
-      fail();
+      fail(502, "handshake_timeout");
     }
   }, handshakeDeadlineMs);
   handshakeTimer.unref();
 
-  // fork(TECH-8283 F2): Shorten hard lifetime from 5 min to 90 s, re-check on tick
-  const lifetimeMs = options?.lifetimeMs ?? 90_000;
-  const watchIntervalMs = options?.watchIntervalMs ?? 5_000;
-  const lifetime = setTimeout(() => socket.destroy(), lifetimeMs);
-  const watch = setInterval(async () => {
-    try {
-      if (!(await available())) socket.destroy();
-    } catch {
-      socket.destroy();
-    }
-  }, watchIntervalMs);
-  lifetime.unref();
-  watch.unref();
-
-  const cleanup = () => {
-    clearInterval(watch);
-    clearTimeout(lifetime);
-    clearTimeout(handshakeTimer);
-    connection.destroy();
-    upstream?.destroy();
-  };
-  socket.once("close", cleanup);
-
   connection.on("timeout", () => {
-    connection.destroy();
-    fail();
+    fail(504, "upstream_connect_timeout");
   });
-  connection.on("error", () => fail());
+  connection.on("error", (err) => {
+    fail(502, `upstream_connection_error: ${(err as Error)?.message}`);
+  });
   connection.on("response", (response) => {
     response.destroy();
-    fail();
+    fail(502, `unexpected_http_response: ${response.statusCode}`);
   });
 
   // fork(TECH-8283 Finding C): Rewritten upgrade handler ordering
@@ -298,58 +406,87 @@ export async function proxyPluginApiWebSocket(
   // 3. Verify status 101
   // 4. Await available() authorization
   // 5. Settle single-winner
-  // 6. Detach, write 101 to client, pipe, and resume
+  // 6. Start lifetime and watchdog timers only after tunnel established
+  // 7. Detach, write 101 to client, pipe, and resume
   connection.on("upgrade", async (response, remote, remoteHead) => {
     upstream = remote;
     remote.once("error", () => {
-      remote.destroy();
-      fail();
+      fail(502, "remote_stream_error");
     });
     remote.pause();
 
     if (socket.destroyed || upgrade.signal.aborted || response.statusCode !== 101) {
-      remote.destroy();
-      fail();
+      fail(502, `upgrade_status_not_101: ${response.statusCode}`);
       return;
     }
 
     let isAvail = false;
     try {
       isAvail = await available();
-    } catch {
+    } catch (err) {
+      logger.warn({ error: (err as Error)?.message }, "101 authorization check threw");
       isAvail = false;
     }
 
     if (!isAvail || socket.destroyed || upgrade.signal.aborted) {
-      remote.destroy();
-      fail();
+      fail(502, "authorization_denied_at_101");
       return;
     }
 
     if (!upgrade.settle("success")) {
-      remote.destroy();
-      fail();
+      fail(502, "upgrade_settle_failed");
       return;
     }
 
     connected = true;
-    clearTimeout(handshakeTimer);
+    if (handshakeTimer) clearTimeout(handshakeTimer);
     connection.setTimeout(0);
     socket.setTimeout(0);
     res.detachSocket(socket);
     socket.once("close", () => res.emit("close"));
 
+    // fork(TECH-8283 Finding 1): Start lifetime and watchdog ONLY after tunnel is established
+    const lifetimeMs = options?.lifetimeMs ?? 90_000;
+    const watchIntervalMs = options?.watchIntervalMs ?? 5_000;
+    lifetimeTimer = setTimeout(() => cleanup(), lifetimeMs);
+    lifetimeTimer.unref();
+
+    // fork(TECH-8283 Finding 2): Watchdog in-flight guard prevents overlapping available() calls
+    let watchInFlight = false;
+    watchTimer = setInterval(async () => {
+      if (watchInFlight || socket.destroyed || (upstream && upstream.destroyed)) return;
+      watchInFlight = true;
+      try {
+        const stillAvailable = await available();
+        if (!stillAvailable) {
+          logger.warn({ reason: "watchdog_revocation" }, "Plugin WebSocket revoked on watchdog tick");
+          cleanup();
+        }
+      } catch (err) {
+        logger.warn({ reason: "watchdog_check_error" }, "Plugin WebSocket watchdog check threw");
+        cleanup();
+      } finally {
+        watchInFlight = false;
+      }
+    }, watchIntervalMs);
+    watchTimer.unref();
+
     let handshake = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n";
+    // fork(TECH-8283 Finding 8): Forward array or string values for websocket response headers
     for (const name of ["sec-websocket-accept", "sec-websocket-protocol", "sec-websocket-extensions"]) {
       const value = response.headers[name];
-      if (typeof value === "string") handshake += `${name}: ${value}\r\n`;
+      if (typeof value === "string") {
+        handshake += `${name}: ${value}\r\n`;
+      } else if (Array.isArray(value)) {
+        handshake += `${name}: ${value.join(", ")}\r\n`;
+      }
     }
     socket.write(handshake + "\r\n");
     if (remoteHead.length) socket.write(remoteHead);
     if (head.length) remote.write(head);
 
-    remote.on("error", () => socket.destroy());
-    remote.once("close", () => socket.destroy());
+    remote.on("error", () => cleanup());
+    remote.once("close", () => cleanup());
     socket.pipe(remote).pipe(socket);
     remote.resume();
   });
