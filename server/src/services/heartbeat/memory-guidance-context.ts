@@ -7,9 +7,49 @@ import { readDefaultMcpState } from "../default-mcp-spec.js";
 import { BRAIN_BINDING_ARCANA_ENTRY_KEY } from "../arcana-brain-binding.js";
 import { HERMES_ADAPTER_TYPE } from "./run-state.js";
 
+/** Env key that holds the per-agent memory token for Claude and Codex agents (see default-mcp-agent-memory). */
+const EXTERNAL_MEMORY_TOKEN_ENV_KEY = "RH_MEMORY_TOKEN";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** True when an env entry holds a token: a non-empty string, or a plain or secret-reference binding. The value is never returned or logged. */
+function envEntryPresent(entry: unknown): boolean {
+  if (typeof entry === "string") return entry.trim() !== "";
+  if (!isRecord(entry)) return false;
+  if (entry.type === "secret_ref") return typeof entry.secretId === "string" && entry.secretId !== "";
+  if (entry.type === "plain") return typeof entry.value === "string" && entry.value.trim() !== "";
+  return false;
+}
+
+/**
+ * Whether the agent uses the external memory service, which is separate from Paperclip runtime memory (TECH-8409).
+ * Hermes selects it with `adapterConfig.memoryProvider: "mem0"`. Claude and Codex agents carry `RH_MEMORY_TOKEN`.
+ * Presence only: the token value is never returned or logged.
+ */
+export function agentUsesExternalMemory(
+  adapterType: string | null | undefined,
+  adapterConfig: unknown,
+): boolean {
+  if (!isRecord(adapterConfig)) return false;
+  if (adapterType === HERMES_ADAPTER_TYPE) {
+    return typeof adapterConfig.memoryProvider === "string" && adapterConfig.memoryProvider.trim() === "mem0";
+  }
+  if (adapterType === "claude_local" || adapterType === "codex_local") {
+    return isRecord(adapterConfig.env) && envEntryPresent(adapterConfig.env[EXTERNAL_MEMORY_TOKEN_ENV_KEY]);
+  }
+  return false;
+}
+
 export interface ComputeMemoryAgentCapabilitiesInput {
   agentMetadata: unknown;
   runtimeMemory: unknown;
+  /**
+   * The agent's adapterConfig, used to detect the external memory service. An agent that opted out of
+   * `runtimeMemory` but uses the external service still has mem0 available. Absent means no external memory.
+   */
+  adapterConfig?: unknown;
   flags: Pick<MemoryHardeningFlags, "hermesMemoryConfig">;
   /**
    * Adapter type for the executing agent. When specified, hermesBuiltInStores
@@ -27,12 +67,16 @@ export function computeMemoryAgentCapabilities(
     mcpState?.entries[BRAIN_BINDING_ARCANA_ENTRY_KEY]?.setup?.state === "ready";
   const isHermes = input.adapterType === HERMES_ADAPTER_TYPE;
   const hasRuntimeMemory = Boolean(input.runtimeMemory);
+  // The Hermes adapter drops `memoryProvider` while runtime memory is active, so runtime memory wins.
+  const externalMemory = !hasRuntimeMemory && agentUsesExternalMemory(input.adapterType, input.adapterConfig);
+  const mem0Available = hasRuntimeMemory || externalMemory;
 
   return {
-    mem0: hasRuntimeMemory,
+    mem0: mem0Available,
+    ...(externalMemory ? { externalMemory: true } : {}),
     arcana: arcanaReady,
     hermesBuiltInStores: Boolean(
-      isHermes && !hasRuntimeMemory && !input.flags.hermesMemoryConfig,
+      isHermes && !mem0Available && !input.flags.hermesMemoryConfig,
     ),
   };
 }
@@ -40,6 +84,7 @@ export function computeMemoryAgentCapabilities(
 export function buildHeartbeatMemoryGuidanceContext(input: {
   agentMetadata: unknown;
   runtimeMemory: unknown;
+  adapterConfig?: unknown;
   flags: MemoryHardeningFlags;
   adapterType: string | null | undefined;
 }): MemoryAgentGuidanceContext | undefined {

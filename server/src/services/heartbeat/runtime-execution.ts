@@ -844,6 +844,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           buildHeartbeatMemoryGuidanceContext({
             agentMetadata: agent.metadata,
             runtimeMemory,
+            adapterConfig: agent.adapterConfig,
             flags: hardeningFlags,
             adapterType: agent.adapterType,
           });
@@ -854,6 +855,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             agentId: agent.id,
             adapterType: agent.adapterType,
             mem0: memoryGuidanceContext?.capabilities.mem0,
+            externalMemory: memoryGuidanceContext?.capabilities.externalMemory === true,
             arcana: memoryGuidanceContext?.capabilities.arcana,
             hermesBuiltInStores: memoryGuidanceContext?.capabilities.hermesBuiltInStores,
           },
