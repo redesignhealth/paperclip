@@ -78,6 +78,23 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     const patchBytes2 = readFileSync(patchFilePath2);
     const actualSha2 = createHash("sha256").update(patchBytes2).digest("hex");
     expect(actualSha2).toBe(patchesLock.patch_sha256_2);
+
+    // Optional third patch validation (TECH-8409)
+    expect(patchesLock.patch_file_3).toBe("patches/0003-mem0-self-hosted-proxy.patch");
+    expect(patchesLock.postpatch_marker_3).toBe("TECH-8409-MEM0-PROXY");
+    expect(patchesLock.extension_version_3).toBe("0.21.3+tech8409.1");
+
+    const patchFile3 = patchesLock.patch_file_3;
+    expect(patchFile3.startsWith("patches/")).toBe(true);
+    expect(patchFile3.includes("..")).toBe(false);
+    expect(path.isAbsolute(patchFile3)).toBe(false);
+
+    const patchFilePath3 = path.join(hermesDockerDir, patchFile3);
+    expect(existsSync(patchFilePath3), "patch file 3 must exist").toBe(true);
+
+    const patchBytes3 = readFileSync(patchFilePath3);
+    const actualSha3 = createHash("sha256").update(patchBytes3).digest("hex");
+    expect(actualSha3).toBe(patchesLock.patch_sha256_3);
   });
 
   it("verifies Dockerfile pins multi-arch Tirith releases for both amd64 and arm64", () => {
@@ -132,6 +149,30 @@ describe("Hermes command-scan patch & package build verification (TECH-7355)", (
     expect(patchContent).toContain("MEM0_AUTO_SYNC_PATCH_MARKER");
     expect(patchContent).toContain("_coerce_bool");
     expect(patchContent).toContain("Mem0 sync_turn skipped (auto_sync disabled)");
+  });
+
+  it("verifies Dockerfile validates and applies optional third patch (TECH-8409)", () => {
+    const dockerfilePath = path.join(repoRoot, "Dockerfile");
+    const dockerfile = readFileSync(dockerfilePath, "utf8");
+
+    expect(dockerfile).toContain("PATCH_FILE_3=");
+    expect(dockerfile).toContain("PATCH_SHA_3=");
+    expect(dockerfile).toContain("POSTPATCH_MARKER_3=");
+    expect(dockerfile).toContain('case "$PATCH_FILE_3" in patches/0003-*.patch)');
+    expect(dockerfile).toContain('echo "$PATCH_SHA_3  /tmp/hermes/$PATCH_FILE_3" | sha256sum -c -');
+    expect(dockerfile).toContain('git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE_3"');
+    expect(dockerfile).toContain('git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE_3"');
+    expect(dockerfile).toContain('grep -q "$POSTPATCH_MARKER_3" /opt/hermes-src/plugins/memory/mem0/_backend.py');
+  });
+
+  it("verifies patch 3 contains the marker and the opt-in MEM0_PROXY wiring", () => {
+    const patchesLockPath = path.join(hermesDockerDir, "patches.lock");
+    const lock = parseLockfile(readFileSync(patchesLockPath, "utf8"));
+    const patchContent = readFileSync(path.join(hermesDockerDir, lock.patch_file_3), "utf8");
+
+    expect(patchContent).toContain(lock.postpatch_marker_3);
+    expect(patchContent).toContain('os.environ.get("MEM0_PROXY") or None');
+    expect(patchContent).toContain("httpx.HTTPTransport(retries=2, proxy=");
   });
 
   it("executes independent locked-source Python regression harness in CI", () => {

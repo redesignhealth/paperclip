@@ -238,6 +238,20 @@ RUN /usr/bin/python3 -m venv /opt/hermes \
        && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE_2" \
        && grep -q "$POSTPATCH_MARKER_2" /opt/hermes-src/plugins/memory/mem0/__init__.py; \
      fi \
+  && PATCH_FILE_3="$(sed -n 's/^patch_file_3=//p' /tmp/hermes/patches.lock)" \
+  && if [ -n "$PATCH_FILE_3" ]; then \
+       case "$PATCH_FILE_3" in *..* | /*) echo "ERROR: unsafe patch_file_3 path" >&2; exit 1 ;; esac \
+       && case "$PATCH_FILE_3" in patches/0003-*.patch) ;; *) echo "ERROR: patch file 3 must be patches/0003-*.patch" >&2; exit 1 ;; esac \
+       && if [ ! -f "/tmp/hermes/$PATCH_FILE_3" ]; then echo "ERROR: patch file 3 not found" >&2; exit 1; fi \
+       && PATCH_SHA_3="$(sed -n 's/^patch_sha256_3=//p' /tmp/hermes/patches.lock)" \
+       && if ! echo "$PATCH_SHA_3" | grep -Eq '^[a-f0-9]{64}$'; then echo "ERROR: invalid patch 3 sha format" >&2; exit 1; fi \
+       && POSTPATCH_MARKER_3="$(sed -n 's/^postpatch_marker_3=//p' /tmp/hermes/patches.lock)" \
+       && if [ -z "$POSTPATCH_MARKER_3" ]; then echo "ERROR: missing postpatch marker 3" >&2; exit 1; fi \
+       && echo "$PATCH_SHA_3  /tmp/hermes/$PATCH_FILE_3" | sha256sum -c - \
+       && git -C /opt/hermes-src apply --check "/tmp/hermes/$PATCH_FILE_3" \
+       && git -C /opt/hermes-src apply "/tmp/hermes/$PATCH_FILE_3" \
+       && grep -q "$POSTPATCH_MARKER_3" /opt/hermes-src/plugins/memory/mem0/_backend.py; \
+     fi \
   && /opt/hermes/bin/pip install --no-cache-dir --no-deps --no-build-isolation --no-index -e /opt/hermes-src \
   && /opt/hermes/bin/pip check \
   && cp /tmp/hermes/requirements.digest /opt/hermes/.hermes-production-closure \
