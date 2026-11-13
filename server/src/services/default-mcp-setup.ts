@@ -39,6 +39,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { agentMemoryHook } from "./default-mcp-agent-memory.js";
+import { sweepAgentMemoryRotation } from "./agent-memory-rotation.js";
 import { ownerEmailFor } from "./default-mcp-owner.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
@@ -826,6 +827,9 @@ export function startDefaultMcpSetupSweep(db: Db, ctx: Omit<DefaultMcpSetupConte
       // After setup and binding, so an agent that just became ready gets its daily one-pager routine (TECH-7713).
       .then(() => sweepAgentProfileRoutines(db, { env: ctx.env }))
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "agent profile routine sweep failed"))
+      // Memory tokens expire after 90 days: rotate those inside the window (no-op unless agent memory is configured).
+      .then(() => sweepAgentMemoryRotation(db, { env: ctx.env, fetchImpl: ctx.fetchImpl, now: ctx.now }))
+      .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "agent memory rotation sweep failed"))
       .finally(() => {
         running = false;
       });
