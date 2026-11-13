@@ -8,7 +8,7 @@ import { buildForkOwnedMatcher, parseForkOwned, touchesMigrations } from "../lib
 import { extractPr, extractRevertSha, gitInput, listCommitsAfter, parseLog, parseNameList } from "../lib/upstreamGit.mjs";
 import { createBudget } from "../lib/budget.mjs";
 import { escapeMarkdownCell, renderOutboxText } from "../lib/alerts.mjs";
-import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
+import { buildPrompt, heuristicClassify, isBreaking, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
 import { escapeSlack, formatRowAlert, neutralizeMentions, renderAlert } from "../lib/alerts.mjs";
 import { loadConfig, resolveWorkerRefs } from "../lib/config.mjs";
 
@@ -205,6 +205,108 @@ test("heuristic classifier", () => {
   assert.equal(f("fix: retained-source containment (#7)"), "fix"); // "source" must not match rce
 });
 
+test("security heuristic: no false positive on tests-only PRs (#21173)", () => {
+  const pr = {
+    title: "test(restart-chaos): add restart chaos harness (#21173)",
+    body: "Known secret values are redacted from the logs.",
+    files: ["tests/restart-chaos/a.ts", "tests/restart-chaos/b.ts", "tests/restart-chaos/README.md"],
+  };
+  assert.equal(heuristicClassify(pr).category, "infra");
+  // bare "redact" in a non-test PR is not a security signal either
+  assert.equal(heuristicClassify({ title: "feat: redact tokens in logs (#2)", body: "", files: ["server/src/log.ts"] }).category, "feature");
+  // body keyword on a docs/CI-only PR does not yield security
+  assert.equal(heuristicClassify({ title: "docs: security notes (#3)", body: "vulnerability overview", files: ["docs/a.md"] }).category, "infra");
+});
+
+test("security heuristic: real signals still yield security", () => {
+  const h = (title, body = "", files = ["server/src/x.ts"]) => heuristicClassify({ title, body, files }).category;
+  assert.equal(h("fix(security): validate redirect (#4)"), "security");
+  assert.equal(h("security: harden auth (#5)"), "security");
+  assert.equal(h("fix: bump dep", "Fixes GHSA-abcd-1234-wxyz"), "security");
+  assert.equal(h("fix: bump dep", "Fixes CVE-2026-12345", ["package.json"]), "security");
+  assert.equal(h("fix: close auth bypass (#6)"), "security");
+  const strong = commit({ title: "fix(security): validate redirect (#4)" });
+  assert.equal(mergeClassification(strong, { category: "infra", summary: "x" }, "m").category, "security");
+});
+
+// Excerpts of the real PR bodies (paperclipai/paperclip #21013, #21096) that raised false
+// `[upstream-sync BREAKING]` alerts: the PR template's `**Breaking changes**` heading
+// followed by "None.". Only the sections around the heading are kept.
+const PR_21013 = {
+  title: "perf(docker): take the orphan-reaping pull and pack chmod off the image path (#21013)",
+  body: [
+    "## Linked Issues or Issue Description",
+    "",
+    "**Proposed behavior**",
+    "Run the PID 1 probe in each build leg, on its own architecture, against the digest that leg pushed.",
+    "",
+    "**Reason and benefit**",
+    "The probe pull leaves the post-gate path.",
+    "",
+    "**Breaking changes**",
+    "None. Tags, digests, attestation subject, and signer identity are unchanged.",
+    "",
+    "**Additional context**",
+    "The concurrency proposal and the build-in-PR plan are below, in \"Risks\".",
+  ].join("\n"),
+  files: [".github/workflows/docker.yml", "Dockerfile", "scripts/standard-image-contract.mjs"],
+};
+const PR_21096 = {
+  title: "feat(docker): build the image in the merge queue and promote it on master (#21096)",
+  body: [
+    "## Linked Issues or Issue Description",
+    "",
+    "Refs #21013 (it measured the image path and proposed this plan).",
+    "",
+    "**Reason and benefit**",
+    "The build moves before the merge.",
+    "",
+    "**Breaking changes**",
+    "None. Without `merge_group` events, `find` returns no run and the leg builds as before.",
+    "",
+    "**Additional context**",
+    "This PR does not touch the exact-source gate jobs.",
+  ].join("\n"),
+  files: [".github/workflows/docker.yml", ".github/workflows/docker-merge-group.yml", "scripts/merge-group-image.mjs"],
+};
+
+test("a `Breaking changes` heading followed by None is not BREAKING (#21013, #21096)", () => {
+  for (const pr of [PR_21013, PR_21096]) {
+    assert.equal(isBreaking(pr), false, pr.title);
+    assert.notEqual(heuristicClassify(pr).category, "breaking", pr.title);
+  }
+  assert.equal(heuristicClassify(PR_21096).category, "feature");
+  // The pin still applies to non-breaking rows: the model's category is used.
+  assert.equal(mergeClassification(PR_21013, { category: "perf", summary: "faster" }, "m").category, "perf");
+});
+
+test("heading variants and prose mentioning breaking changes are not BREAKING", () => {
+  for (const body of [
+    "**Breaking changes**\nN/A",
+    "**Breaking changes**\nNo",
+    "## Breaking changes\n\nNo breaking changes.",
+    "This is not a breaking change.",
+    "Breaking change: none expected",
+    "breaking change: renames the flag", // lower case is prose, not a footer
+    "Mentions BREAKING CHANGE: inline, not at line start",
+  ]) {
+    assert.equal(isBreaking({ title: "feat: add y (#1)", body }), false, body);
+  }
+});
+
+test("real breaking signals are BREAKING", () => {
+  assert.equal(isBreaking({ title: "feat!: drop v1 api (#4)", body: "" }), true);
+  assert.equal(isBreaking({ title: "refactor(api)!: rename route (#5)", body: "" }), true);
+  assert.equal(isBreaking({ title: "feat: new auth (#6)", body: "Details.\n\nBREAKING CHANGE: tokens are now opaque" }), true);
+  assert.equal(isBreaking({ title: "feat: new auth (#6)", body: "Details.\n\nBREAKING-CHANGE: tokens are now opaque" }), true);
+  assert.equal(isBreaking({ title: "feat: new auth (#6)", body: "BREAKING CHANGE: none\nBREAKING CHANGE: drops the v1 flag" }), true);
+  assert.equal(heuristicClassify({ title: "feat: x (#7)", body: "BREAKING CHANGE: env var renamed", files: [] }).category, "breaking");
+  // Negated footer values are skipped.
+  for (const v of ["None", "none.", "N/A", "No", "no breaking changes"]) {
+    assert.equal(isBreaking({ title: "feat: x (#8)", body: `BREAKING CHANGE: ${v}` }), false, v);
+  }
+});
+
 test("classifier regexes stay linear on adversarial input", () => {
   // A long, pathological title/body: nested-looking parens, repeated prefixes,
   // huge whitespace runs, and many near-miss markers. A backtracking regex would
@@ -278,7 +380,7 @@ test("prompt fence differs per call", () => {
 });
 
 test("heuristic security/breaking cannot be downgraded by the model", () => {
-  const sec = commit({ title: "fix: patch XSS in comments (#5)" });
+  const sec = commit({ title: "fix: patch XSS in comments (CVE-2026-1234) (#5)" });
   const downgraded = { category: "infra", summary: "chore" };
   const r = mergeClassification(sec, downgraded, "m");
   assert.equal(r.category, "security");
@@ -287,6 +389,11 @@ test("heuristic security/breaking cannot be downgraded by the model", () => {
 
   const brk = commit({ title: "feat!: drop v1 api (#6)" });
   assert.equal(mergeClassification(brk, { category: "feature", summary: "x" }, "m").category, "breaking");
+
+  // A weak (prose-keyword) security verdict is only a hint: the model can correct it.
+  const weak = commit({ title: "fix: patch XSS in comments (#5)" });
+  assert.equal(heuristicClassify(weak).category, "security");
+  assert.equal(mergeClassification(weak, { category: "fix", summary: "x" }, "m").category, "fix");
 
   // Otherwise the model still wins.
   const plain = commit({ title: "feat: add y (#7)" });
