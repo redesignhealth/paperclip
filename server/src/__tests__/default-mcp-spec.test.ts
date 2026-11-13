@@ -18,6 +18,8 @@ import {
 } from "../services/comms-board-provisioner-client.js";
 import {
   ARGUS_REVIEW_TOOL_TIMEOUT_MS,
+  RH_MCP_SERVICE_TOOLS_BY_SCOPE,
+  COMPS_TOOL_TIMEOUT_MS,
   MAX_TOOL_TIMEOUT_MS,
   defaultToolTimeoutMs,
   ARGUS_REVIEW_REVIEWED_TOOLS,
@@ -548,6 +550,20 @@ describe("per-tool timeout (argus-review)", () => {
     }
   });
 
+  it("resolves the three comps verbs to 30 s on the rh-mcp-service connection only (TECH-8433)", () => {
+    expect(COMPS_TOOL_TIMEOUT_MS).toBe(ARGUS_REVIEW_TOOL_TIMEOUT_MS);
+    for (const tool of ["comps__start", "comps__get", "comps__cancel"]) {
+      expect(defaultToolTimeoutMs("rh-mcp-service", tool)).toBe(30_000);
+      expect(defaultToolTimeoutMs("rh-mcp", tool)).toBeUndefined();
+    }
+    for (const tool of ["argus_start_review", "argus_get_review", "argus_cancel_review"]) {
+      expect(defaultToolTimeoutMs("rh-mcp-service", tool)).toBe(30_000);
+    }
+    // The blocking one-call tool and unrelated tools keep the gateway default.
+    expect(defaultToolTimeoutMs("rh-mcp-service", "comps__run_business_area_comps")).toBeUndefined();
+    expect(defaultToolTimeoutMs("rh-mcp-service", "mdm_get_person")).toBeUndefined();
+  });
+
   it("leaves every other tool and connection on the gateway default (undefined)", () => {
     expect(defaultToolTimeoutMs("rh-mcp-argus-review", "argus_get_proxy_token")).toBeUndefined();
     expect(defaultToolTimeoutMs("rh-mcp-argus-review", "toString")).toBeUndefined();
@@ -564,6 +580,16 @@ describe("per-tool timeout (argus-review)", () => {
     expect(defaultToolTimeoutMs("c", "big", spec)).toBe(60_000);
     expect(defaultToolTimeoutMs("c", "ok", spec)).toBe(5_000);
     expect(defaultToolTimeoutMs("c", "nan", spec)).toBeUndefined();
+  });
+});
+
+describe("rh-mcp-service reviewed tools: comps:run (TECH-8433)", () => {
+  it("offers exactly the async comps verbs under the comps:run scope at reviewed-tools version 2", () => {
+    const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp-service")!;
+    expect(entry.reviewedTools!.version).toBe(2);
+    expect(RH_MCP_SERVICE_TOOLS_BY_SCOPE["comps:run"]).toEqual(["comps__start", "comps__get", "comps__cancel"]);
+    for (const tool of ["comps__start", "comps__get", "comps__cancel"]) expect(entry.reviewedTools!.allow).toContain(tool);
+    expect(entry.reviewedTools!.allow).not.toContain("comps__run_business_area_comps");
   });
 });
 

@@ -32,6 +32,7 @@ import {
   mintRhMcpServiceCredential,
   resolveCommsBoardProvisionerConfig,
   rotateRhMcpServiceCredential,
+  RH_MCP_SERVICE_TOKEN_SCOPES_VERSION,
   type FetchLike,
 } from "./comms-board-provisioner-client.js";
 import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
@@ -51,6 +52,8 @@ export const SHARED_ORG_RH_MCP_SWEEP_PAGE_SIZE = 50;
 export const SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
 /** Non-secret expiry of the stored token, on the connection's `config`. */
 export const SHARED_ORG_RH_MCP_EXPIRY_CONFIG_KEY = "rhMcpServiceTokenExpiresAt";
+/** Non-secret `RH_MCP_SERVICE_TOKEN_SCOPES_VERSION` the stored token was minted or rotated with (absent = 1). */
+export const SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY = "rhMcpServiceTokenScopesVersion";
 
 const ACTOR = { actorType: "system", actorId: "shared-org-rh-mcp" } as const;
 /** `connectGalleryApp`'s credential slot for a pasted-URL connection with `authMode: "bearer"`. */
@@ -104,11 +107,19 @@ function parseExpiry(config: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+/** Scope-set version the connection's stored token was issued with. Tokens minted before versioning carry v1. */
+function parseScopesVersion(config: unknown): number {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return 1;
+  const raw = (config as Record<string, unknown>)[SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY];
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : 1;
+}
+
+/** Records the token's expiry and the scope-set version it was issued with (both non-secret). */
 async function recordExpiry(db: Db, connectionId: string, expiresAt: string): Promise<void> {
   await db
     .update(toolConnections)
     .set({
-      config: sql`jsonb_set(coalesce(${toolConnections.config}, '{}'::jsonb), ARRAY[${SHARED_ORG_RH_MCP_EXPIRY_CONFIG_KEY}::text], to_jsonb(${expiresAt}::text), true)`,
+      config: sql`jsonb_set(jsonb_set(coalesce(${toolConnections.config}, '{}'::jsonb), ARRAY[${SHARED_ORG_RH_MCP_EXPIRY_CONFIG_KEY}::text], to_jsonb(${expiresAt}::text), true), ARRAY[${SHARED_ORG_RH_MCP_SCOPES_VERSION_CONFIG_KEY}::text], to_jsonb(${RH_MCP_SERVICE_TOKEN_SCOPES_VERSION}::int), true)`,
     })
     .where(eq(toolConnections.id, connectionId));
 }
@@ -289,10 +300,14 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
     connection = await reloadConnection(ctx.db, connection.id);
     if (kind === "ready") kind = "provisioned";
   } else if (kind === "ready") {
-    // Healthy and finished: keep the token valid. An unknown expiry (not minted here) is left alone.
+    // Healthy and finished: keep the token valid and on the current scope set. An unknown expiry (not minted here) is
+    // left alone, but a token issued with an older scope set is re-issued now (a new scope such as `comps:run` would
+    // otherwise only reach an existing org when its token next expires).
     const expiresAt = parseExpiry(connection.config);
     const now = ctx.now?.() ?? new Date();
-    if (expiresAt && expiresAt.getTime() - now.getTime() < SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS) {
+    const expiringSoon = expiresAt !== null && expiresAt.getTime() - now.getTime() < SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS;
+    const scopesStale = parseScopesVersion(connection.config) < RH_MCP_SERVICE_TOKEN_SCOPES_VERSION;
+    if (expiringSoon || scopesStale) {
       const rotated = await rotateRhMcpServiceCredential(provisioner.config, { companyId }, ctx.fetchImpl ?? tailnetAwareFetch);
       if (!rotated.ok) return { kind: "error", reason: "rotate_failed" };
       const secretId = connection.credentialSecretRefs?.[0]?.secretId;

@@ -79,8 +79,12 @@ export const COMMS_BOARD_TEMPLATE_TOKEN_SCOPES = ["comms:read"] as const;
  * no identity gate), and so is every `:write` scope, `argus:secrets` and `auth:impersonate`.
  */
 export const RH_MCP_SERVICE_TOKEN_SCOPES: readonly string[] = Object.freeze(Object.keys(RH_MCP_SERVICE_TOOLS_BY_SCOPE));
-/** Bump whenever `RH_MCP_SERVICE_TOKEN_SCOPES` changes so existing tokens can be rotated onto the new set. */
-export const RH_MCP_SERVICE_TOKEN_SCOPES_VERSION = 1;
+/**
+ * Bump whenever `RH_MCP_SERVICE_TOKEN_SCOPES` changes so existing tokens can be rotated onto the new set: the sweep in
+ * shared-org-rh-mcp.ts re-issues any org token whose recorded version (`config.rhMcpServiceTokenScopesVersion`, absent =
+ * 1) is below this. v1 = argus/mdm/opik/coresignal/definitive_healthcare/voice; v2 = + `comps:run` (TECH-8433).
+ */
+export const RH_MCP_SERVICE_TOKEN_SCOPES_VERSION = 2;
 
 /**
  * Closed, typed credential purpose. The scopes sent downstream are looked up from this table only; there
