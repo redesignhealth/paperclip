@@ -712,3 +712,18 @@ Failed OAuth callbacks record connection health (`error` status and message) on 
 - Strict personal default MCP instance where the consenting subject is the instance owner (`subjectUserId === createdByUserId`).
 
 Per-user and per-agent OAuth callback failures never mutate the shared connection row. This ensures that an individual user's consent denial or upstream authorization error does not poison or disrupt the shared connection health for other users and agents across the organization.
+
+## Agent memory entry (`agent-memory`, TECH-8409)
+
+Not an MCP connection: it has no template, no install and no tools. It gives a NEW `hermes_local` agent its own memory credential and Hermes settings, so recall and capture go through an external memory service instead of Paperclip's in-process runtime memory. Paperclip holds only generic config and the credential.
+
+Enable it with `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and `PAPERCLIP_AGENT_MEMORY_URL` (plus optional `PAPERCLIP_AGENT_MEMORY_PROXY`), on top of `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` and the comms-board provisioner settings (the ownership registry mints the token). It is off by default and applies only to agents created while it is on: the entry has `newAgentsOnly`, so backfill, legacy enrollment and missing-entry enrollment never add it.
+
+Setup hook `agent_memory`, per new agent:
+
+1. Waits (no external call) while the memory settings, the registry settings or the frozen owner are missing.
+2. Writes a mint checkpoint, then mints `agent-memory-<agentId>` through the ownership registry: scopes `memory:read` and `memory:write` only, expiry 90 days (comms credentials stay at 365 days).
+3. Stores the token as the company secret `agent_memory.<agentId>`. A checkpoint without a stored secret is an unknown outcome (`mint_unknown`): terminal, never re-minted. A disabled or deleted secret is never revived (`secret_unavailable`).
+4. In one local, idempotent transaction, merges into the agent's `adapterConfig`: `env.MEM0_API_KEY` (secret reference), `env.MEM0_HOST`, `env.MEM0_PROXY` (when configured), `env.MEM0_USER_ID` (the agent id), `memoryProvider: "mem0"` and `runtimeMemory: false`. Other `env` keys are kept. A failure here is a bounded retry; nothing external is repeated.
+
+The token is never logged and is not stored anywhere except the secret. The 90-day token is not rotated automatically yet.

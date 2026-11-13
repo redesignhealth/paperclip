@@ -38,6 +38,8 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { agentMemoryHook } from "./default-mcp-agent-memory.js";
+import { ownerEmailFor } from "./default-mcp-owner.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
 import { logActivity } from "./activity-log.js";
 import { sweepBrainBindings } from "./arcana-brain-binding.js";
@@ -252,6 +254,11 @@ export async function snapshotDefaultMcpForNewAgent(
      * connection when setup creates it (`installOnReady`). Backfill and legacy enrollment never pass this.
      */
     installDedicatedOnReady?: boolean;
+    /**
+     * New-agent creation only: entries marked `newAgentsOnly` (agent memory) are offered. Every other caller
+     * (backfill, legacy and missing-entry enrollment) leaves them excluded, so an existing agent is never provisioned.
+     */
+    newAgentCreation?: boolean;
   },
 ): Promise<DefaultMcpAgentState> {
   const spec = input.spec ?? DEFAULT_MCP_SPEC;
@@ -271,6 +278,8 @@ export async function snapshotDefaultMcpForNewAgent(
   const keptKeys = new Set<string>();
 
   for (const entry of spec) {
+    // A new-agents-only entry is never written for an existing agent or for an agent that is not eligible: no entry at all.
+    if (entry.newAgentsOnly && (input.newAgentCreation !== true || input.excludedSetupKeys?.has(entry.key))) continue;
     const prior = existingEntries[entry.key];
     if (prior && (prior.binding || prior.setup.registerAttemptedAt || prior.setup.mintAttemptedAt || !["pending", "not_required"].includes(prior.setup.state))) {
       entries[entry.key] = prior;
@@ -833,25 +842,6 @@ export function startDefaultMcpSetupSweep(db: Db, ctx: Omit<DefaultMcpSetupConte
 // ---------------------------------------------------------------------------
 // Hook: comms_board_identity
 // ---------------------------------------------------------------------------
-
-async function ownerEmailFor(db: Db, companyId: string, userId: string): Promise<string | null> {
-  // The owner must be an active member of THIS company, checked on every attempt.
-  const [membership] = await db
-    .select({ id: companyMemberships.id })
-    .from(companyMemberships)
-    .where(
-      and(
-        eq(companyMemberships.companyId, companyId),
-        eq(companyMemberships.principalType, "user"),
-        eq(companyMemberships.principalId, userId),
-        eq(companyMemberships.status, "active"),
-      ),
-    )
-    .limit(1);
-  if (!membership) return null;
-  const [user] = await db.select({ email: authUsers.email }).from(authUsers).where(eq(authUsers.id, userId)).limit(1);
-  return user?.email ?? null;
-}
 
 /**
  * Owner for an agent that another AGENT creates (no human actor exists on that request). The new agent inherits the
@@ -1458,6 +1448,7 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
 export const DEFAULT_MCP_SETUP_HOOKS: Partial<Record<DefaultMcpSetupHookKey, DefaultMcpSetupHook>> = {
   comms_board_identity: commsBoardIdentityHook,
   arcana_brain: arcanaBrainHook,
+  agent_memory: agentMemoryHook,
 };
 
 /** The wiring a READY comms entry depends on, checked against the real rows (local reads only). */
