@@ -48,6 +48,11 @@ export function missingEntryEligibleSpec(): readonly DefaultMcpEntrySpec[] {
   return DEFAULT_MCP_SPEC.filter((entry) => entry.setupHook && !entry.newAgentsOnly && !EXCLUDED_ENTRY_KEYS.has(entry.key));
 }
 
+/** The keys this job can ever enroll: the eligible managed entries plus agent memory (still gated per agent by its flag). */
+export function missingEntryEnrollableKeys(): readonly string[] {
+  return [...missingEntryEligibleSpec().map((entry) => entry.key), AGENT_MEMORY_ENTRY_KEY];
+}
+
 /**
  * The agent-memory entry (TECH-8409) is `newAgentsOnly`, so it joins the missing set only for an agent of a profiled
  * adapter, and only while the explicit backfill flag is on with a valid memory configuration.
@@ -222,7 +227,7 @@ async function scan(db: Db, options: MissingEntryOptions, dryRun: boolean, env: 
         // Non-secret facts only.
         details: { keys: written.map((entry) => entry.key), ownerUserId: owner.userId },
       });
-      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "added", keys });
+      outcomes.push({ agentId: row.id, companyId: row.companyId, result: "added", keys: written.map((entry) => entry.key) });
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "missing default MCP entry enrollment failed");
       outcomes.push({ agentId: row.id, companyId: row.companyId, result: "failed", reason: "enrollment_error" });

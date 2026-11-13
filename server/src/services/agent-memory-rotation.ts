@@ -28,14 +28,16 @@ import { secretService } from "./secrets.js";
  *     agent's env references it with `version: "latest"`, so nothing else changes);
  *  4. only then records the new expiry, guarded on the old one, and clears any failure marker.
  *
- * If 3 or 4 fails after a token was issued, a visible `binding.rotation` failure marker (ids and codes only) is
- * recorded, the old token keeps working, and the next pass rotates again. A concurrent rotation on another instance
+ * Any failure leaves a visible `binding.rotation` marker (codes and a timestamp only); the old token keeps working and the
+ * agent is retried only after `AGENT_MEMORY_ROTATION_RETRY_AFTER_MS`. A concurrent rotation on another instance
  * loses at step 3 (version guard) or step 4 (expiry guard), which is harmless. Nothing here logs, returns or persists
  * a token or secret value. The registry credential comes from the boot-captured snapshot.
  */
 
 export const AGENT_MEMORY_ROTATION_WINDOW_DAYS = 14;
 export const AGENT_MEMORY_ROTATION_BATCH_LIMIT = 25;
+/** An agent whose last rotation attempt failed is not tried again for this long, so a stuck agent cannot starve the batch or mint a token every pass. */
+export const AGENT_MEMORY_ROTATION_RETRY_AFTER_MS = 3_600_000;
 
 export type AgentMemoryRotationResult =
   | "rotated"
@@ -88,6 +90,7 @@ export async function rotateAgentMemoryCredentials(db: Db, options: AgentMemoryR
 
   const now = options.now?.() ?? new Date();
   const limit = Math.max(1, Math.min(options.limit ?? AGENT_MEMORY_ROTATION_BATCH_LIMIT, AGENT_MEMORY_ROTATION_BATCH_LIMIT));
+  const retryBefore = new Date(now.getTime() - AGENT_MEMORY_ROTATION_RETRY_AFTER_MS).toISOString();
   const cutoff = new Date(now.getTime() + (options.windowDays ?? AGENT_MEMORY_ROTATION_WINDOW_DAYS) * 86_400_000).toISOString();
   // Server-written canonical ISO strings compare correctly as text (see `normalizeIso`).
   const rows = await db
@@ -103,6 +106,8 @@ export async function rotateAgentMemoryCredentials(db: Db, options: AgentMemoryR
         sql`${agents.metadata} #>> ${entryPath("setup", "state")} = 'ready'`,
         sql`coalesce(${agents.metadata} #>> ${entryPath("binding", "tokenExpiresAt")}, '') <> ''`,
         sql`(${agents.metadata} #>> ${entryPath("binding", "tokenExpiresAt")}) COLLATE "C" <= ${cutoff}::text COLLATE "C"`,
+        // Not retried before the back-off after a failed attempt (the marker is cleared by a successful rotation).
+        sql`coalesce(${agents.metadata} #>> ${entryPath("binding", "rotation", "at")}, '') COLLATE "C" <= ${retryBefore}::text COLLATE "C"`,
       ),
     )
     .orderBy(asc(agents.id))
@@ -120,6 +125,7 @@ export async function rotateAgentMemoryCredentials(db: Db, options: AgentMemoryR
     }
     outcomes.push({ agentId: row.id, companyId: row.companyId, result });
     if (result === "rotated") {
+      // The rotation is already committed: an audit-log failure must not abort the rest of the batch.
       await logActivity(db, {
         companyId: row.companyId,
         actorType: "system",
@@ -129,7 +135,9 @@ export async function rotateAgentMemoryCredentials(db: Db, options: AgentMemoryR
         entityId: row.id,
         // Non-secret facts only.
         details: { key: AGENT_MEMORY_ENTRY_KEY },
-      });
+      }).catch((err) => logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "agent memory rotation activity log failed"));
+    } else {
+      logger.info({ agentId: row.id, companyId: row.companyId, result }, "agent memory rotation not completed");
     }
   }
   return { blocked: null, scanned: rows.length, outcomes, nextCursor: rows.length === limit ? rows[rows.length - 1]!.id : null };
@@ -149,15 +157,26 @@ async function rotateOne(
 
   const secrets = secretService(db);
   const secret = await secrets.getById(entry.binding.secretId);
-  if (!secret || secret.companyId !== row.companyId || secret.status !== "active" || secret.deletedAt) return "skipped_secret_unavailable";
+  if (!secret || secret.companyId !== row.companyId || secret.status !== "active" || secret.deletedAt) {
+    await markFailure(db, row.id, oldExpiry, "skipped_secret_unavailable", false, now);
+    return "skipped_secret_unavailable";
+  }
 
   const rotated = await rotateAgentMemoryCredential(provisioner, { agentId: row.id }, fetchImpl);
   if (!rotated.ok) {
-    return rotated.reason === "rotate_unknown_sub" || rotated.reason === "rotate_deactivated" || rotated.reason === "rotate_rejected"
-      ? rotated.reason
-      : "rotate_failed";
+    const result: AgentMemoryRotationResult =
+      rotated.reason === "rotate_unknown_sub" || rotated.reason === "rotate_deactivated" || rotated.reason === "rotate_rejected"
+        ? rotated.reason
+        : "rotate_failed";
+    await markFailure(db, row.id, oldExpiry, result, false, now);
+    return result;
   }
+  // A reply without a usable expiry is refused before anything is stored: the old token keeps working.
   const newExpiry = normalizeIso(rotated.tokenExpiresAt);
+  if (!newExpiry) {
+    await markFailure(db, row.id, oldExpiry, "rotate_failed", true, now);
+    return "rotate_failed";
+  }
 
   try {
     await secrets.rotate(
@@ -167,7 +186,7 @@ async function rotateOne(
     );
   } catch (err) {
     logger.warn({ agentId: row.id, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "agent memory token storage failed");
-    await markFailure(db, row.id, oldExpiry, "secret_write_failed", now);
+    await markFailure(db, row.id, oldExpiry, "secret_write_failed", true, now);
     return "secret_write_failed";
   }
 
@@ -179,13 +198,16 @@ async function rotateOne(
     })
     .where(and(eq(agents.id, row.id), sql`${agents.metadata} #>> ${entryPath("binding", "tokenExpiresAt")} = ${oldExpiry}`))
     .returning({ id: agents.id });
-  if (rows.length !== 1) return "marker_write_failed";
+  if (rows.length !== 1) {
+    await markFailure(db, row.id, oldExpiry, "marker_write_failed", true, now);
+    return "marker_write_failed";
+  }
   return "rotated";
 }
 
-/** A visible, secret-free failure marker (codes and a timestamp only). The old token keeps working; the next pass retries. */
-async function markFailure(db: Db, agentId: string, expectedExpiry: string, reason: string, now: Date) {
-  const marker = JSON.stringify({ state: "failed", reason, tokenMinted: true, at: now.toISOString() });
+/** A visible, secret-free failure marker (codes and a timestamp only). The old token keeps working; the agent is retried after the back-off. */
+async function markFailure(db: Db, agentId: string, expectedExpiry: string, reason: string, tokenMinted: boolean, now: Date) {
+  const marker = JSON.stringify({ state: "failed", reason, tokenMinted, at: now.toISOString() });
   await db
     .update(agents)
     .set({ metadata: sql`jsonb_set(${agents.metadata}, ${entryPath("binding", "rotation")}, ${marker}::jsonb, true)` })

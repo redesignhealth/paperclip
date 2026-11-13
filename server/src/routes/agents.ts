@@ -166,8 +166,7 @@ import {
   reissueCommsBoardIdentity,
 } from "../services/comms-identity-reissue.js";
 import { COMMS_RESCOPE_BATCH_LIMIT, CommsRescopeConfirmationError, CommsRescopeInProgressError, rescopeCommsCredentials } from "../services/comms-credential-rescope.js";
-import { DEFAULT_MCP_SPEC } from "../services/default-mcp-spec.js";
-import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
+import { MISSING_ENTRY_BATCH_LIMIT, MissingEntryConfirmationError, addMissingDefaultMcpEntries, missingEntryEnrollableKeys } from "../services/default-mcp-missing-entry-enrollment.js";
 import { createDefaultKbIngestRoutineForNewAgent } from "../services/default-kb-ingest-routine.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -4488,9 +4487,9 @@ export function agentRoutes(
     if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
     if (
       body.keys !== undefined &&
-      (!Array.isArray(body.keys) || body.keys.length === 0 || body.keys.some((key) => typeof key !== "string" || !DEFAULT_MCP_SPEC.some((entry) => entry.key === key)))
+      (!Array.isArray(body.keys) || body.keys.length === 0 || body.keys.length > 20 || body.keys.some((key) => typeof key !== "string" || !missingEntryEnrollableKeys().includes(key)))
     ) {
-      throw badRequest("keys must be a non-empty array of default MCP spec keys");
+      throw badRequest("keys must be a non-empty array (at most 20) of enrollable default MCP spec keys");
     }
     if (
       body.limit !== undefined &&

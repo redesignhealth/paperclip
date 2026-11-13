@@ -21,10 +21,10 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { logger } from "../middleware/logger.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
-import { DEFAULT_MCP_SPEC, readDefaultMcpState } from "../services/default-mcp-spec.js";
+import { readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import { MISSING_ENTRY_CONFIRMATION, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
-import { AGENT_MEMORY_ROTATION_WINDOW_DAYS, rotateAgentMemoryCredentials, sweepAgentMemoryRotation } from "../services/agent-memory-rotation.js";
+import { AGENT_MEMORY_ROTATION_RETRY_AFTER_MS, AGENT_MEMORY_ROTATION_WINDOW_DAYS, rotateAgentMemoryCredentials, sweepAgentMemoryRotation } from "../services/agent-memory-rotation.js";
 import {
   AGENT_MEMORY_BACKFILL_ENABLED_ENV,
   AGENT_MEMORY_ENABLED_ENV,
@@ -48,9 +48,6 @@ import {
   installBootProvisionerSnapshot,
 } from "./helpers/comms-board-downstream.js";
 
-
-
-
 const FEATURE_ENV = "PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED";
 const MEMORY_URL = "https://rh-memory.example.test";
 const MEMORY_PROXY = "http://127.0.0.1:1055";
@@ -58,15 +55,13 @@ const MEMORY_PROXY = "http://127.0.0.1:1055";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-const FEATURE_ENV_ = FEATURE_ENV;
-
 describeEmbeddedPostgres("agent memory backfill and rotation", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-agent-memory-ops-${randomUUID()}`);
   const envKeys = [
-    FEATURE_ENV_,
+    FEATURE_ENV,
     AGENT_MEMORY_ENABLED_ENV,
     AGENT_MEMORY_BACKFILL_ENABLED_ENV,
     AGENT_MEMORY_URL_ENV,
@@ -146,7 +141,7 @@ describeEmbeddedPostgres("agent memory backfill and rotation", () => {
   }
 
   function enableMemory(opts: { backfill?: boolean } = {}) {
-    process.env[FEATURE_ENV_] = "true";
+    process.env[FEATURE_ENV] = "true";
     process.env[AGENT_MEMORY_ENABLED_ENV] = "true";
     process.env[AGENT_MEMORY_URL_ENV] = MEMORY_URL;
     process.env[AGENT_MEMORY_PROXY_ENV] = MEMORY_PROXY;
@@ -216,7 +211,7 @@ describeEmbeddedPostgres("agent memory backfill and rotation", () => {
 
   async function existingAgentWithoutMemory(companyId: string, ownerId: string, extra: Record<string, unknown> = {}) {
     // Created while agent memory was off: it holds a default-MCP state but no agent-memory entry.
-    process.env[FEATURE_ENV_] = "true";
+    process.env[FEATURE_ENV] = "true";
     vi.stubGlobal("fetch", downstreamFetch());
     const agent = await createAgent(companyId, ownerId, extra);
     expect(await memoryEntryOf(agent.id)).toBeUndefined();
@@ -317,8 +312,35 @@ describeEmbeddedPostgres("agent memory backfill and rotation", () => {
     expect((await secretFor(companyId, agent.id))!.latestVersion).toBe(1);
     expect((await memoryEntryOf(agent.id))!.binding!.tokenExpiresAt).toBe(expiry);
 
+    expect(((await memoryEntryOf(agent.id))!.binding as Record<string, any>).rotation).toMatchObject({ state: "failed", reason: "rotate_failed", tokenMinted: false });
+
+    // Inside the back-off the agent is not tried again.
+    const early = rotateFetch();
+    expect((await rotateAgentMemoryCredentials(db, { fetchImpl: early, now: () => new Date(now.getTime() + 60_000) })).outcomes).toEqual([]);
+    expect(early).not.toHaveBeenCalled();
+
+    // After it, the next pass rotates and clears the marker.
     const ok = rotateFetch();
-    expect((await rotateAgentMemoryCredentials(db, { fetchImpl: ok, now: () => now })).outcomes[0]).toMatchObject({ result: "rotated" });
+    const later = new Date(now.getTime() + AGENT_MEMORY_ROTATION_RETRY_AFTER_MS + 1000);
+    expect((await rotateAgentMemoryCredentials(db, { fetchImpl: ok, now: () => later })).outcomes[0]).toMatchObject({ result: "rotated" });
+    expect(((await memoryEntryOf(agent.id))!.binding as Record<string, any>).rotation).toBeNull();
+  });
+
+  it.each([{ token_expires_at: undefined }, { token_expires_at: "not a date" }])("a registry reply without a usable expiry stores nothing and keeps the metadata intact (%j)", async (over) => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const agent = await readyAgent(companyId, ownerId);
+    const now = new Date("2027-01-01T00:00:00.000Z");
+    const expiry = new Date(now.getTime() + 86_400_000).toISOString();
+    await setExpiry(agent.id, expiry);
+    const metadataBefore = (await rowOf(agent.id)).metadata as Record<string, any>;
+    const report = await rotateAgentMemoryCredentials(db, { fetchImpl: rotateFetch((sub) => rotateResponse(sub, over)), now: () => now });
+    expect(report.outcomes[0]).toMatchObject({ result: "rotate_failed" });
+    const metadataAfter = (await rowOf(agent.id)).metadata as Record<string, any>;
+    expect(metadataAfter).not.toBeNull();
+    expect(Object.keys(metadataAfter.defaultMcp.entries)).toEqual(Object.keys(metadataBefore.defaultMcp.entries));
+    expect(metadataAfter.defaultMcp.entries["agent-memory"].binding.tokenExpiresAt).toBe(expiry);
+    expect((await secretFor(companyId, agent.id))!.latestVersion).toBe(1);
   });
 
   it.each([
@@ -356,7 +378,7 @@ describeEmbeddedPostgres("agent memory backfill and rotation", () => {
     expect(binding.rotation).toMatchObject({ state: "failed", reason: "secret_write_failed", tokenMinted: true });
     expect(JSON.stringify(binding)).not.toContain(ROTATED_TOKEN);
 
-    const retry = await rotateAgentMemoryCredentials(db, { fetchImpl: rotateFetch(), now: () => now });
+    const retry = await rotateAgentMemoryCredentials(db, { fetchImpl: rotateFetch(), now: () => new Date(now.getTime() + AGENT_MEMORY_ROTATION_RETRY_AFTER_MS + 1000) });
     expect(retry.outcomes[0]).toMatchObject({ result: "rotated" });
     expect(((await memoryEntryOf(agent.id))!.binding as Record<string, any>).rotation).toBeNull();
   });
@@ -387,7 +409,7 @@ describeEmbeddedPostgres("agent memory backfill and rotation", () => {
     process.env[AGENT_MEMORY_ENABLED_ENV] = "true";
     clearBootProvisionerSnapshot();
     expect(await rotateAgentMemoryCredentials(db, { fetchImpl: stub })).toMatchObject({ blocked: "provisioner_not_configured", outcomes: [] });
-    delete process.env[FEATURE_ENV_];
+    delete process.env[FEATURE_ENV];
     configureProvisioner();
     expect(await rotateAgentMemoryCredentials(db, { fetchImpl: stub })).toMatchObject({ blocked: "feature_flag_off", outcomes: [] });
     expect(stub).not.toHaveBeenCalled();
