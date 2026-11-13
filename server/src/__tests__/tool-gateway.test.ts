@@ -4514,6 +4514,159 @@ rl.on("line", (line) => {
         await fake.close();
       }
     });
+
+    it("bounds persistent 401s: rotates once on initial 401, skips unbounded rotation on immediate repeat, and recovers on future expiry", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      let mockTime = Date.now();
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 401,
+        body: { error: "invalid_token" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-bound401",
+          connectionName: "Personal Google (bound 401 test)",
+          toolName: "list_threads",
+          riskLevel: "read",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, "token-v1", remoteTool.connection.id);
+
+        const gen1 = new Date(mockTime - 10_000).toISOString();
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              refreshedAt: gen1,
+              accessTokenExpiresAt: new Date(mockTime + 3600_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(mockTime + 3600_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        let refreshHookCalls = 0;
+        let tokenVersion = 1;
+        const gateway = createTestToolGatewayService(db, { now: () => mockTime });
+        gateway.configureGrantRefresh(async () => {
+          refreshHookCalls++;
+          tokenVersion++;
+          const newGen = new Date(mockTime).toISOString();
+          const newToken = `token-v${tokenVersion}`;
+          await secretService(db).rotateCurrentUserSecretValue(company.id, responsibleUserId, secret.id, { value: newToken });
+          await db.update(connectionGrants).set({
+            providerTenant: {
+              oauth: {
+                refreshedAt: newGen,
+                accessTokenExpiresAt: new Date(mockTime + 3600_000).toISOString(),
+              },
+            },
+          }).where(eq(connectionGrants.id, grant!.id));
+          return {
+            accessToken: newToken,
+            expiresAt: new Date(mockTime + 3600_000).toISOString(),
+            refreshedAt: newGen,
+            rotated: true,
+          };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        // 1. Initial 401 rotates token once and throws explicit 409
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+        expect(refreshHookCalls).toBe(1);
+
+        // 2. Caller immediately retries; upstream returns 401 again on the freshly minted token.
+        // It must NOT rotate again unbounded: skips rotation and throws 502 mcp_remote_status!
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            callId: `retry-call-${randomUUID()}`,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 502,
+          reasonCode: "mcp_remote_status",
+        });
+        // Hook was NOT called a second time
+        expect(refreshHookCalls).toBe(1);
+
+        // 3. Time advances past the 5-minute freshness window (e.g. 10 minutes later when token expires)
+        mockTime += 10 * 60_000;
+
+        // Upstream 401 now triggers rotation again (future expiry recovers!)
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            callId: `future-call-${randomUUID()}`,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+        expect(refreshHookCalls).toBe(2);
+      } finally {
+        await fake.close();
+      }
+    });
   });
 
   it("creates a personal authorization card and resumes after the user grant exists", async () => {

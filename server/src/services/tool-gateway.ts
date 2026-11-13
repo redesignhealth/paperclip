@@ -4713,6 +4713,13 @@ export function createToolGatewayService(
   }
 
   const MAX_PERSONAL_GRANT_EXPIRY_SKEW_MS = 5 * 60_000;
+  interface Reactive401RotationRecord {
+    generation: string;
+    mintedAtMs: number;
+  }
+  const recentReactive401Rotations = new Map<string, Reactive401RotationRecord>();
+  const MAX_REACTIVE_401_ENTRIES = 1000;
+  const REACTIVE_401_FRESHNESS_WINDOW_MS = 5 * 60_000;
 
   function resolvePersonalGrantExpiry(
     connection: typeof toolConnections.$inferSelect,
@@ -4924,12 +4931,16 @@ export function createToolGatewayService(
       // regress that contract. Same reasoning as bestEffortAudit: a thrown
       // error here must not replace the structured connect-card/403 flow
       // below with an opaque exception.
+      const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
+      const observedRefreshedAt = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
       let refreshed: Awaited<ReturnType<NonNullable<typeof refreshUserGrantHook>>>;
       try {
         refreshed = await refreshUserGrantHook({
           companyId: connection.companyId,
           connectionId: connection.id,
           subjectUserId,
+          force: true,
+          observedRefreshedAt,
         });
       } catch (err) {
         await bestEffortAudit({
@@ -7444,44 +7455,75 @@ export function createToolGatewayService(
         personalUserId &&
         refreshUserGrantHook
       ) {
-        let refreshed: Awaited<ReturnType<NonNullable<typeof refreshUserGrantHook>>> = null;
-        try {
-          refreshed = await refreshUserGrantHook({
-            companyId: connection.companyId,
-            connectionId: connection.id,
-            subjectUserId: personalUserId,
-            force: true,
-            observedRefreshedAt: personalObservedRefreshedAt,
-          });
-        } catch (err) {
+        const grantKey = `${connection.companyId}:${connection.id}:${personalUserId}`;
+        const recentRotation = recentReactive401Rotations.get(grantKey);
+        const nowMs = options.now?.() ?? Date.now();
+        const isFreshlyMintedRejection =
+          recentRotation !== undefined &&
+          personalObservedRefreshedAt !== undefined &&
+          personalObservedRefreshedAt !== null &&
+          recentRotation.generation === personalObservedRefreshedAt &&
+          nowMs - recentRotation.mintedAtMs < REACTIVE_401_FRESHNESS_WINDOW_MS;
+
+        if (isFreshlyMintedRejection) {
           logger.warn(
             {
               connectionId: connection.id,
               subjectUserId: personalUserId,
-              error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
+              observedRefreshedAt: personalObservedRefreshedAt,
             },
-            "[tool-gateway] personal grant 401 refresh hook failed",
+            "[tool-gateway] personal grant 401 repeated for freshly minted generation; skipping rotation",
           );
-        }
-        if (refreshed) {
-          logger.info(
-            {
-              connectionId: connection.id,
-              subjectUserId: personalUserId,
-              refreshed: true,
-            },
-            "[tool-gateway] personal grant refreshed after upstream 401",
-          );
-          await requireExplicitRetryAfterOAuthRefresh(response);
         } else {
-          logger.warn(
-            {
+          let refreshed: Awaited<ReturnType<NonNullable<typeof refreshUserGrantHook>>> = null;
+          try {
+            refreshed = await refreshUserGrantHook({
+              companyId: connection.companyId,
               connectionId: connection.id,
               subjectUserId: personalUserId,
-              refreshed: false,
-            },
-            "[tool-gateway] personal grant refresh after upstream 401 returned null",
-          );
+              force: true,
+              observedRefreshedAt: personalObservedRefreshedAt,
+            });
+          } catch (err) {
+            logger.warn(
+              {
+                connectionId: connection.id,
+                subjectUserId: personalUserId,
+                error: sanitizeLoggedProviderError(err instanceof Error ? err.message : String(err)),
+              },
+              "[tool-gateway] personal grant 401 refresh hook failed",
+            );
+          }
+          if (refreshed) {
+            if (typeof refreshed.refreshedAt === "string") {
+              if (recentReactive401Rotations.size >= MAX_REACTIVE_401_ENTRIES) {
+                const oldestKey = recentReactive401Rotations.keys().next().value;
+                if (oldestKey) recentReactive401Rotations.delete(oldestKey);
+              }
+              recentReactive401Rotations.set(grantKey, {
+                generation: refreshed.refreshedAt,
+                mintedAtMs: nowMs,
+              });
+            }
+            logger.info(
+              {
+                connectionId: connection.id,
+                subjectUserId: personalUserId,
+                refreshed: true,
+              },
+              "[tool-gateway] personal grant refreshed after upstream 401",
+            );
+            await requireExplicitRetryAfterOAuthRefresh(response);
+          } else {
+            logger.warn(
+              {
+                connectionId: connection.id,
+                subjectUserId: personalUserId,
+                refreshed: false,
+              },
+              "[tool-gateway] personal grant refresh after upstream 401 returned null",
+            );
+          }
         }
       }
       const sessionExpired = response.status === 404 && new Headers(requestHeaders).has("mcp-session-id");

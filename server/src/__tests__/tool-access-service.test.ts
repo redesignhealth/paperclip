@@ -22763,10 +22763,15 @@ describeEmbeddedPostgres("tool access service", () => {
           scopes_supported: ["mcp"],
         });
       }
+      let tokenExchangeStarted!: () => void;
+      let tokenExchangeCanFinish!: () => void;
+      const exchangeStartedPromise = new Promise<void>((r) => { tokenExchangeStarted = r; });
+      const exchangeFinishPromise = new Promise<void>((r) => { tokenExchangeCanFinish = r; });
+
       if (href === "https://mcp-auth.granola.ai/oauth2/token") {
         tokenCalls++;
-        // Small delay to simulate network latency while lease is held
-        await new Promise((r) => setTimeout(r, 40));
+        tokenExchangeStarted();
+        await exchangeFinishPromise;
         return mcpHttpResponse({
           access_token: `token-multi-${tokenCalls}`,
           refresh_token: `refresh-multi-${tokenCalls}`,
@@ -22775,9 +22780,11 @@ describeEmbeddedPostgres("tool access service", () => {
         });
       }
       if (href === "https://mcp.granola.ai/mcp") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string | number; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id ?? "1", result: { tools: [] } });
         return mcpHttpResponse({
           jsonrpc: "2.0",
-          id: "init",
+          id: payload.id ?? "init",
           result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
         });
       }
@@ -22804,21 +22811,29 @@ describeEmbeddedPostgres("tool access service", () => {
 
       const callsBefore = tokenCalls;
 
-      // Two separate service instances (separate in-memory singleFlight maps!) attempt refresh at the same time:
-      const [res1, res2] = await Promise.all([
-        service1.refreshUserGrant({
-          companyId: company.id,
-          connectionId: raw.id,
-          subjectUserId: userId,
-          force: true,
-        }),
-        service2.refreshUserGrant({
-          companyId: company.id,
-          connectionId: raw.id,
-          subjectUserId: userId,
-          force: true,
-        }),
-      ]);
+      // Two separate service instances (separate in-memory singleFlight maps!) attempt refresh concurrently:
+      // Service 1 claims the lease and enters token exchange barrier
+      const p1 = service1.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+      });
+
+      await exchangeStartedPromise;
+
+      // Service 2 attempts refresh while Service 1 holds the lease
+      const p2 = service2.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+      });
+
+      // Release exchange barrier for Service 1 to complete and commit
+      tokenExchangeCanFinish();
+
+      const [res1, res2] = await Promise.all([p1, p2]);
 
       expect(res1).not.toBeNull();
       expect(res2).not.toBeNull();
@@ -22846,7 +22861,12 @@ describeEmbeddedPostgres("tool access service", () => {
     const actor = { actorType: "user" as const, actorId: userId };
     const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
 
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+    let refreshExchangeStarted!: () => void;
+    let refreshExchangeCanFinish!: () => void;
+    const exchangeStartedPromise = new Promise<void>((r) => { refreshExchangeStarted = r; });
+    const exchangeFinishPromise = new Promise<void>((r) => { refreshExchangeCanFinish = r; });
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
       if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
         return mcpHttpResponse({
@@ -22864,15 +22884,32 @@ describeEmbeddedPostgres("tool access service", () => {
         });
       }
       if (href === "https://mcp-auth.granola.ai/oauth2/token") {
-        return mcpHttpResponse({
-          error: "invalid_grant",
-          error_description: "refresh token revoked",
-        }, 400);
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        const params = new URLSearchParams(bodyText);
+        const grantType = params.get("grant_type");
+        if (grantType === "authorization_code") {
+          return mcpHttpResponse({
+            access_token: "init-token",
+            refresh_token: "init-refresh",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+        if (grantType === "refresh_token") {
+          refreshExchangeStarted();
+          await exchangeFinishPromise;
+          return mcpHttpResponse({
+            error: "invalid_grant",
+            error_description: "refresh token revoked",
+          }, 400);
+        }
       }
       if (href === "https://mcp.granola.ai/mcp") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string | number; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id ?? "1", result: { tools: [] } });
         return mcpHttpResponse({
           jsonrpc: "2.0",
-          id: "init",
+          id: payload.id ?? "init",
           result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
         });
       }
@@ -22886,16 +22923,6 @@ describeEmbeddedPostgres("tool access service", () => {
         config: { url: "https://mcp.granola.ai/mcp", oauth: { provider: "granola" } },
       }, actor);
 
-      // Temporarily succeed setup
-      fetchMock.mockImplementationOnce(async () => {
-        return mcpHttpResponse({
-          access_token: "init-token",
-          refresh_token: "init-refresh",
-          expires_in: 3600,
-          token_type: "Bearer",
-        });
-      });
-
       const started = await service.startOAuth(company.id, raw.id, { redirectUri, actor });
       const authorization = new URL(started.authorizationUrl);
       await service.completeOAuthCallback({
@@ -22906,21 +22933,30 @@ describeEmbeddedPostgres("tool access service", () => {
       });
 
       const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id));
+      expect((asRecord(grant?.providerTenant)?.oauth as any)?.refreshedAt).toBeDefined();
+
       const refreshRef = grant!.credentialSecretRefs.find((r) => r.configPath === "oauth.refresh_token")!;
 
-      // Simulate that a winner rotated the refresh secret to a newer version in the vault
-      await secretService(db).rotate(refreshRef.secretId, { value: "winner-new-refresh-token" });
-
-      // Now service attempts refreshUserGrant, which fails with invalid_grant (oauth_reauthorization_required)
-      const result = await service.refreshUserGrant({
+      // Start refreshUserGrant; it will pause inside exchangeOAuthToken at our barrier
+      const refreshPromise = service.refreshUserGrant({
         companyId: company.id,
         connectionId: raw.id,
         subjectUserId: userId,
         force: true,
       });
+
+      await exchangeStartedPromise;
+
+      // Simulate that a winner rotated the refresh secret to a newer version in the vault DURING the exchange
+      await secretService(db).rotate(refreshRef.secretId, { value: "winner-new-refresh-token" });
+
+      // Release exchange to return 400 invalid_grant
+      refreshExchangeCanFinish();
+
+      const result = await refreshPromise;
       expect(result).toBeNull();
 
-      // Because secret version changed (winner rotated it), grant was NOT marked needs_reauthorization!
+      // Because secret version changed (winner rotated it during exchange), grant was NOT marked needs_reauthorization!
       const [grantAfter] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
       expect(grantAfter?.status).toBe("active");
     } finally {
@@ -23176,15 +23212,23 @@ describeEmbeddedPostgres("tool access service", () => {
       });
       expect(result).toBeNull();
 
-      // Verify that secret rotation was rolled back atomically:
-      const secretVal = await secretService(db).resolveUserSecretValue(company.id, {
+      // Verify that secret rotation was rolled back atomically for BOTH access and refresh secrets:
+      const accessVal = await secretService(db).resolveUserSecretValue(company.id, {
         definitionId: (await db.select().from(companySecrets).where(eq(companySecrets.id, accessRef.secretId)))[0]!.userSecretDefinitionId!,
         responsibleUserId: userId,
         version: "latest",
         required: true,
       }, { consumerType: "tool_connection", consumerId: raw.id, configPath: "oauth.access_token", responsibleUserId: userId });
+      expect(accessVal?.value).toBe("original-access-token");
 
-      expect(secretVal?.value).toBe("original-access-token");
+      const refreshRef = grant!.credentialSecretRefs.find((r) => r.configPath === "oauth.refresh_token")!;
+      const refreshVal = await secretService(db).resolveUserSecretValue(company.id, {
+        definitionId: (await db.select().from(companySecrets).where(eq(companySecrets.id, refreshRef.secretId)))[0]!.userSecretDefinitionId!,
+        responsibleUserId: userId,
+        version: "latest",
+        required: true,
+      }, { consumerType: "tool_connection", consumerId: raw.id, configPath: "oauth.refresh_token", responsibleUserId: userId });
+      expect(refreshVal?.value).toBe("original-refresh-token");
     } finally {
       fetchMock.mockRestore();
     }
@@ -23281,6 +23325,420 @@ describeEmbeddedPostgres("tool access service", () => {
       const [finalGrant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id));
       const leaseInDb = (finalGrant?.providerTenant as Record<string, any>)?.oauth?.refreshLease;
       expect(leaseInDb?.id).toBeUndefined();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("concurrent legacy grant waiter with null baseline returns winner token with rotated false and no cooldown", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const userId = `legacy-waiter-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "member");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+
+    let tokenCalls = 0;
+    let tokenExchangeStarted!: () => void;
+    let tokenExchangeCanFinish!: () => void;
+    const exchangeStartedPromise = new Promise<void>((r) => { tokenExchangeStarted = r; });
+    const exchangeFinishPromise = new Promise<void>((r) => { tokenExchangeCanFinish = r; });
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
+        return mcpHttpResponse({
+          resource: "https://mcp.granola.ai/mcp",
+          authorization_servers: ["https://mcp-auth.granola.ai"],
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href.startsWith("https://mcp-auth.granola.ai/.well-known/")) {
+        return mcpHttpResponse({
+          issuer: "https://mcp-auth.granola.ai",
+          authorization_endpoint: "https://mcp-auth.granola.ai/oauth2/authorize",
+          token_endpoint: "https://mcp-auth.granola.ai/oauth2/token",
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href === "https://mcp-auth.granola.ai/oauth2/token") {
+        tokenCalls++;
+        const bodyText = typeof init?.body === "string" ? init.body : (init?.body ? String(init.body) : "");
+        const params = new URLSearchParams(bodyText);
+        const grantType = params.get("grant_type");
+        if (grantType === "authorization_code") {
+          return mcpHttpResponse({
+            access_token: "init-access-token",
+            refresh_token: "init-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+        if (grantType === "refresh_token") {
+          tokenExchangeStarted();
+          await exchangeFinishPromise;
+          return mcpHttpResponse({
+            access_token: "winner-new-access-token",
+            refresh_token: "winner-new-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+      }
+      if (href === "https://mcp.granola.ai/mcp") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string | number; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id ?? "1", result: { tools: [] } });
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id ?? "init",
+          result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    try {
+      const service1 = createTestToolAccessService(db);
+      const service2 = createTestToolAccessService(db);
+
+      const raw = await service1.createConnection(company.id, {
+        name: "Granola Legacy Baseline", transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user",
+        config: { url: "https://mcp.granola.ai/mcp", oauth: { provider: "granola" } },
+      }, actor);
+
+      const started = await service1.startOAuth(company.id, raw.id, { redirectUri, actor });
+      const authorization = new URL(started.authorizationUrl);
+      await service1.completeOAuthCallback({
+        state: authorization.searchParams.get("state")!,
+        code: "legacy-code",
+        redirectUri,
+        actor,
+      });
+
+      // Clear refreshedAt from grant so it simulates a legacy grant with null/absent baseline
+      const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id));
+      await db.update(connectionGrants).set({
+        providerTenant: {
+          ...(grant!.providerTenant ?? {}),
+          oauth: {
+            ...((grant!.providerTenant as Record<string, any>)?.oauth ?? {}),
+            refreshedAt: null,
+          },
+        },
+      }).where(eq(connectionGrants.id, grant!.id));
+
+      // Service 1 starts refresh with observedRefreshedAt: null (known-absent legacy baseline)
+      const p1 = service1.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+        observedRefreshedAt: null,
+      });
+
+      await exchangeStartedPromise;
+
+      // Service 2 waits on the lease with observedRefreshedAt: null
+      const p2 = service2.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+        observedRefreshedAt: null,
+      });
+
+      // Release exchange for Service 1 to commit
+      tokenExchangeCanFinish();
+
+      const [res1, res2] = await Promise.all([p1, p2]);
+
+      expect(res1).not.toBeNull();
+      expect(res1!.rotated).toBe(true);
+      expect(res1!.accessToken).toBe("winner-new-access-token");
+
+      // Service 2 waiter must accept the new generation from null baseline:
+      expect(res2).not.toBeNull();
+      expect(res2!.rotated).toBe(false);
+      expect(res2!.accessToken).toBe("winner-new-access-token");
+
+      // Verify no cooldown: a subsequent call succeeds and reuses the token rather than returning null
+      const immediateNext = await service2.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+        observedRefreshedAt: null,
+      });
+      expect(immediateNext).not.toBeNull();
+      expect(immediateNext!.accessToken).toBe("winner-new-access-token");
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("reconnect during in-flight refresh token exchange wins both tokens and clears lease", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const userId = `reconnect-race-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "member");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+
+    let refreshExchangeStarted!: () => void;
+    let refreshExchangeCanFinish!: () => void;
+    const exchangeStartedPromise = new Promise<void>((r) => { refreshExchangeStarted = r; });
+    const exchangeFinishPromise = new Promise<void>((r) => { refreshExchangeCanFinish = r; });
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
+        return mcpHttpResponse({
+          resource: "https://mcp.granola.ai/mcp",
+          authorization_servers: ["https://mcp-auth.granola.ai"],
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href.startsWith("https://mcp-auth.granola.ai/.well-known/")) {
+        return mcpHttpResponse({
+          issuer: "https://mcp-auth.granola.ai",
+          authorization_endpoint: "https://mcp-auth.granola.ai/oauth2/authorize",
+          token_endpoint: "https://mcp-auth.granola.ai/oauth2/token",
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href === "https://mcp-auth.granola.ai/oauth2/token") {
+        const bodyText = typeof init?.body === "string" ? init.body : (init?.body ? String(init.body) : "");
+        const params = new URLSearchParams(bodyText);
+        const grantType = params.get("grant_type");
+        const code = params.get("code");
+        if (grantType === "authorization_code") {
+          if (code === "reconnect-code") {
+            return mcpHttpResponse({
+              access_token: "reconnect-winner-access-token",
+              refresh_token: "reconnect-winner-refresh-token",
+              expires_in: 3600,
+              token_type: "Bearer",
+            });
+          }
+          return mcpHttpResponse({
+            access_token: "initial-access-token",
+            refresh_token: "initial-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+        if (grantType === "refresh_token") {
+          refreshExchangeStarted();
+          await exchangeFinishPromise;
+          return mcpHttpResponse({
+            access_token: "loser-refresh-access-token",
+            refresh_token: "loser-refresh-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+      }
+      if (href === "https://mcp.granola.ai/mcp") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string | number; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id ?? "1", result: { tools: [] } });
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id ?? "init",
+          result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    try {
+      const service = createTestToolAccessService(db);
+
+      const raw = await service.createConnection(company.id, {
+        name: "Granola Reconnect Race", transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user",
+        config: { url: "https://mcp.granola.ai/mcp", oauth: { provider: "granola" } },
+      }, actor);
+
+      const started = await service.startOAuth(company.id, raw.id, { redirectUri, actor });
+      const authorization = new URL(started.authorizationUrl);
+      await service.completeOAuthCallback({
+        state: authorization.searchParams.get("state")!,
+        code: "initial-code",
+        redirectUri,
+        actor,
+      });
+
+      // Start refreshUserGrant in background; it claims lease and waits at exchange barrier
+      const refreshPromise = service.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+      });
+
+      await exchangeStartedPromise;
+
+      // DURING exchange: user performs reconnect via completeOAuthCallback!
+      const reconnectStarted = await service.startOAuth(company.id, raw.id, { redirectUri, actor });
+      const reconnectAuth = new URL(reconnectStarted.authorizationUrl);
+      await service.completeOAuthCallback({
+        state: reconnectAuth.searchParams.get("state")!,
+        code: "reconnect-code",
+        redirectUri,
+        actor,
+      });
+
+      // Release exchange: in-flight refresh tries to commit, but lease CAS fails because reconnect stripped refreshLease
+      refreshExchangeCanFinish();
+
+      const refreshResult = await refreshPromise;
+      expect(refreshResult).toBeNull();
+
+      // Verify the grant in DB has reconnect tokens and NO refresh lease:
+      const [finalGrant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id));
+      expect(finalGrant?.status).toBe("active");
+      const finalLease = (finalGrant?.providerTenant as Record<string, any>)?.oauth?.refreshLease;
+      expect(finalLease?.id).toBeUndefined();
+
+      const accessRef = finalGrant!.credentialSecretRefs.find((r) => r.configPath === "oauth.access_token")!;
+      const refreshRef = finalGrant!.credentialSecretRefs.find((r) => r.configPath === "oauth.refresh_token")!;
+
+      const accessVal = await secretService(db).resolveUserSecretValue(company.id, {
+        definitionId: (await db.select().from(companySecrets).where(eq(companySecrets.id, accessRef.secretId)))[0]!.userSecretDefinitionId!,
+        responsibleUserId: userId,
+        version: "latest",
+        required: true,
+      }, { consumerType: "tool_connection", consumerId: raw.id, configPath: "oauth.access_token", responsibleUserId: userId });
+      expect(accessVal?.value).toBe("reconnect-winner-access-token");
+
+      const refreshVal = await secretService(db).resolveUserSecretValue(company.id, {
+        definitionId: (await db.select().from(companySecrets).where(eq(companySecrets.id, refreshRef.secretId)))[0]!.userSecretDefinitionId!,
+        responsibleUserId: userId,
+        version: "latest",
+        required: true,
+      }, { consumerType: "tool_connection", consumerId: raw.id, configPath: "oauth.refresh_token", responsibleUserId: userId });
+      expect(refreshVal?.value).toBe("reconnect-winner-refresh-token");
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("reconnect clears stale expired lease and enables subsequent refresh", async () => {
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_ID", "client_granola_fixture");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GRANOLA_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const userId = `stale-reconnect-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "member");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href.startsWith("https://mcp.granola.ai/.well-known/oauth-protected-resource")) {
+        return mcpHttpResponse({
+          resource: "https://mcp.granola.ai/mcp",
+          authorization_servers: ["https://mcp-auth.granola.ai"],
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href.startsWith("https://mcp-auth.granola.ai/.well-known/")) {
+        return mcpHttpResponse({
+          issuer: "https://mcp-auth.granola.ai",
+          authorization_endpoint: "https://mcp-auth.granola.ai/oauth2/authorize",
+          token_endpoint: "https://mcp-auth.granola.ai/oauth2/token",
+          scopes_supported: ["mcp"],
+        });
+      }
+      if (href === "https://mcp-auth.granola.ai/oauth2/token") {
+        const bodyText = typeof init?.body === "string" ? init.body : (init?.body ? String(init.body) : "");
+        const params = new URLSearchParams(bodyText);
+        const grantType = params.get("grant_type");
+        if (grantType === "authorization_code") {
+          return mcpHttpResponse({
+            access_token: "reconnected-access-token",
+            refresh_token: "reconnected-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+        if (grantType === "refresh_token") {
+          return mcpHttpResponse({
+            access_token: "usable-fresh-access-token",
+            refresh_token: "usable-fresh-refresh-token",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+      }
+      if (href === "https://mcp.granola.ai/mcp") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string | number; method?: string };
+        if (payload.method === "tools/list") return mcpHttpResponse({ jsonrpc: "2.0", id: payload.id ?? "1", result: { tools: [] } });
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id ?? "init",
+          result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "Granola", version: "1" } },
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    try {
+      const service = createTestToolAccessService(db);
+
+      const raw = await service.createConnection(company.id, {
+        name: "Granola Stale Lease Reconnect", transport: "mcp_remote", authKind: "oauth", credentialPolicy: "per_user",
+        config: { url: "https://mcp.granola.ai/mcp", oauth: { provider: "granola" } },
+      }, actor);
+
+      const started = await service.startOAuth(company.id, raw.id, { redirectUri, actor });
+      const authorization = new URL(started.authorizationUrl);
+      await service.completeOAuthCallback({
+        state: authorization.searchParams.get("state")!,
+        code: "initial-code",
+        redirectUri,
+        actor,
+      });
+
+      // Inject an expired stale lease into the grant
+      const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, raw.id));
+      await db.update(connectionGrants).set({
+        providerTenant: {
+          ...(grant!.providerTenant ?? {}),
+          oauth: {
+            ...((grant!.providerTenant as Record<string, any>)?.oauth ?? {}),
+            refreshLease: { id: "old-crashed-lease", expiresAt: new Date(Date.now() - 100_000).toISOString() },
+          },
+        },
+      }).where(eq(connectionGrants.id, grant!.id));
+
+      // Reconnect via completeOAuthCallback
+      const reconnectStarted = await service.startOAuth(company.id, raw.id, { redirectUri, actor });
+      const reconnectAuth = new URL(reconnectStarted.authorizationUrl);
+      await service.completeOAuthCallback({
+        state: reconnectAuth.searchParams.get("state")!,
+        code: "reconnect-code",
+        redirectUri,
+        actor,
+      });
+
+      // Assert lease is completely cleared from DB:
+      const [grantAfterReconnect] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant!.id));
+      const leaseAfterReconnect = (grantAfterReconnect?.providerTenant as Record<string, any>)?.oauth?.refreshLease;
+      expect(leaseAfterReconnect?.id).toBeUndefined();
+
+      // Now refreshUserGrant can successfully claim a fresh lease and refresh!
+      const refreshResult = await service.refreshUserGrant({
+        companyId: company.id,
+        connectionId: raw.id,
+        subjectUserId: userId,
+        force: true,
+      });
+
+      expect(refreshResult).toMatchObject({
+        accessToken: "usable-fresh-access-token",
+        rotated: true,
+      });
     } finally {
       fetchMock.mockRestore();
     }
