@@ -814,6 +814,25 @@ describe("agent routes adapter validation", () => {
     expect(response.status, JSON.stringify(response.body)).toBe(403);
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
+  it.each([false, true])("refuses an agent setting its own runtimeMemory=%s", async (value) => {
+    const app = await createApp({ type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_jwt" });
+    const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ adapterConfig: { runtimeMemory: value } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+  it("refuses an agent re-enabling runtime memory by replacing an operator-set runtimeMemory=false", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterConfig: { runtimeMemory: false } });
+    const app = await createApp({ type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_jwt" });
+    const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ replaceAdapterConfig: true, adapterConfig: { model: "x" } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+  it("allows an operator to set runtimeMemory=false", async () => {
+    const app = await createApp();
+    const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ adapterConfig: { runtimeMemory: false } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ adapterConfig: expect.objectContaining({ runtimeMemory: false }) }), expect.anything());
+  });
   it("refuses an agent selecting its own memoryProvider", async () => {
     const app = await createApp({ type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_jwt" });
     const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ adapterConfig: { memoryProvider: "mem0" } }));
