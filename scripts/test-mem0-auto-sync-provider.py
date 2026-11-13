@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent test harness for Mem0 auto_sync control patch (TECH-8191).
+"""Independent test harness for the Mem0 patches: auto_sync control (TECH-8191) and MEM0_PROXY (TECH-8409).
 
 Verifies:
 1. Pinned upstream source tarball checksum matches source.lock.
@@ -164,6 +164,9 @@ class TestMem0AutoSyncControl(unittest.TestCase):
         assert patches_lock["patch_file_2"] == "patches/0002-mem0-auto-sync.patch"
         assert patches_lock["postpatch_marker_2"] == "TECH-8191-MEM0-AUTO-SYNC"
         assert patches_lock["extension_version_2"] == "0.21.3+tech8191.1"
+        assert patches_lock["patch_file_3"] == "patches/0003-mem0-self-hosted-proxy.patch"
+        assert patches_lock["postpatch_marker_3"] == "TECH-8409-MEM0-PROXY"
+        assert patches_lock["extension_version_3"] == "0.21.3+tech8409.1"
 
         patch1_path = HERMES_DOCKER_DIR / patches_lock["patch_file"]
         assert sha256_file(patch1_path) == patches_lock["patch_sha256"], "Patch 1 sha mismatch"
@@ -222,11 +225,27 @@ class TestMem0AutoSyncControl(unittest.TestCase):
         mem0_init_py = cls.source_tree / "plugins" / "memory" / "mem0" / "__init__.py"
         assert patches_lock["postpatch_marker_2"] in mem0_init_py.read_text(encoding="utf-8")
 
-        # 6. Import patched mem0 module
+        # 6. Apply Patch 3 (opt-in MEM0_PROXY for the self-hosted backend)
+        patch3_path = HERMES_DOCKER_DIR / patches_lock["patch_file_3"]
+        assert sha256_file(patch3_path) == patches_lock["patch_sha256_3"], "Patch 3 sha mismatch"
+        subprocess.run(
+            ["git", "-C", str(cls.source_tree), "apply", "--check", str(patch3_path)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(cls.source_tree), "apply", str(patch3_path)],
+            check=True,
+        )
+        backend_py = cls.source_tree / "plugins" / "memory" / "mem0" / "_backend.py"
+        assert patches_lock["postpatch_marker_3"] in backend_py.read_text(encoding="utf-8")
+
+        # 7. Import patched mem0 module
         sys.path.insert(0, str(cls.source_tree))
         import plugins.memory.mem0 as mem0_mod
+        import plugins.memory.mem0._backend as backend_mod
 
         cls.mem0_mod = mem0_mod
+        cls.backend_mod = backend_mod
 
     @classmethod
     def tearDownClass(cls):
@@ -422,6 +441,44 @@ class TestMem0AutoSyncControl(unittest.TestCase):
             provider._sync_thread.join(timeout=2.0)
 
         self.assertEqual(mock_backend.add.call_count, 1)
+
+    # --- Patch 0003: opt-in MEM0_PROXY for SelfHostedBackend (mem0 traffic only) ---
+
+    def _pool_class(self, backend) -> str:
+        return type(backend._client._transport._pool).__name__
+
+    def _make_backend(self, env: dict, **kwargs):
+        base = {k: v for k, v in os.environ.items() if k not in ("MEM0_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")}
+        with unittest.mock.patch.dict(os.environ, {**base, **env}, clear=True):
+            return self.backend_mod.SelfHostedBackend("k", "https://mem.example.ts.net", **kwargs)
+
+    def test_proxy_marker_present(self):
+        self.assertEqual(self.backend_mod.MEM0_PROXY_PATCH_MARKER, "TECH-8409-MEM0-PROXY")
+
+    def test_no_proxy_by_default(self):
+        self.assertEqual(self._pool_class(self._make_backend({})), "ConnectionPool")
+
+    def test_empty_mem0_proxy_is_ignored(self):
+        self.assertEqual(self._pool_class(self._make_backend({"MEM0_PROXY": ""})), "ConnectionPool")
+
+    def test_mem0_proxy_routes_through_proxy(self):
+        backend = self._make_backend({"MEM0_PROXY": "http://127.0.0.1:1055"})
+        pool = backend._client._transport._pool
+        self.assertEqual(type(pool).__name__, "HTTPProxy")
+        self.assertEqual(pool._proxy_url.host, b"127.0.0.1")
+        self.assertEqual(pool._proxy_url.port, 1055)
+
+    def test_generic_proxy_env_is_not_adopted(self):
+        # The explicit transport disables generic proxy env; only MEM0_PROXY opts in.
+        backend = self._make_backend({"HTTPS_PROXY": "http://127.0.0.1:9", "ALL_PROXY": "http://127.0.0.1:9"})
+        self.assertEqual(self._pool_class(backend), "ConnectionPool")
+
+    def test_injected_transport_still_wins(self):
+        import httpx
+
+        sentinel = httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+        backend = self._make_backend({"MEM0_PROXY": "http://127.0.0.1:1055"}, transport=sentinel)
+        self.assertIs(backend._client._transport, sentinel)
 
 
 if __name__ == "__main__":

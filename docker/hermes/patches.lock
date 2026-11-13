@@ -10,3 +10,7 @@ patch_file_2=patches/0002-mem0-auto-sync.patch
 patch_sha256_2=674b9d614b6077d0535583832453e9791ddcbc9f7e104346605df9a5669115d7
 postpatch_marker_2=TECH-8191-MEM0-AUTO-SYNC
 extension_version_2=0.21.3+tech8191.1
+patch_file_3=patches/0003-mem0-self-hosted-proxy.patch
+patch_sha256_3=a0c0c58a7625e930b7ae06502ffb7c0406686f1085d4c30c0a7b9afcc73ea62a
+postpatch_marker_3=TECH-8409-MEM0-PROXY
+extension_version_3=0.21.3+tech8409.1

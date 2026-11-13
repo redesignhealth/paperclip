@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dan Costanza <dan.costanza@redesignhealth.com>
+Date: Fri, 13 Nov 2026 12:00:00 -0500
+Subject: [PATCH] feat(memory): add opt-in MEM0_PROXY for the self-hosted Mem0
+ backend (TECH-8409)
+
+---
+ plugins/memory/mem0/README.md   | 2 ++
+ plugins/memory/mem0/_backend.py | 7 ++++++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/memory/mem0/README.md b/plugins/memory/mem0/README.md
+index 4523d656..43ff2a63 100644
+--- a/plugins/memory/mem0/README.md
++++ b/plugins/memory/mem0/README.md
+@@ -66,6 +66,8 @@ Connect the plugin to a standalone Mem0 server you run yourself — the Docker-s
+ 
+ The plugin authenticates with `X-API-Key` and uses the server's `/search` and `/memories` routes. `api_key` is optional — omit it only for servers running with `AUTH_DISABLED`.
+ 
++Set `MEM0_PROXY` (for example `http://127.0.0.1:1055`) to send self-hosted server traffic through an HTTP, HTTPS or SOCKS proxy. It is read only by this backend and is unset by default; it does not change proxy behavior for any other Hermes component.
++
+ > Setting `host` routes to the self-hosted server automatically. Don't set `mode: oss` — OSS takes precedence and ignores `host`.
+ 
+ ## OSS (Self-Hosted) Mode
+diff --git a/plugins/memory/mem0/_backend.py b/plugins/memory/mem0/_backend.py
+index c1abd892..e41e89b3 100644
+--- a/plugins/memory/mem0/_backend.py
++++ b/plugins/memory/mem0/_backend.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from abc import ABC, abstractmethod
+ from contextlib import closing, suppress
+ from typing import Any
+@@ -61,6 +62,9 @@ class PlatformBackend(Mem0Backend):
+         self._client.delete(memory_id=memory_id)
+ 
+ 
++MEM0_PROXY_PATCH_MARKER: str = "TECH-8409-MEM0-PROXY"
++
++
+ class SelfHostedBackend(Mem0Backend):
+     """Direct HTTP backend for a self-hosted Mem0 server (the FastAPI ``server/``).
+     mem0.MemoryClient is hardwired to the cloud API (``Authorization: Token``, ``GET /v1/ping/`` in ``__init__``),
+@@ -70,7 +74,8 @@ class SelfHostedBackend(Mem0Backend):
+         import httpx
+         headers = {"Content-Type": "application/json", **({"X-API-Key": api_key} if api_key else {})}  # key omitted only for AUTH_DISABLED servers
+         # Connect-level retries keep one dropped SYN from counting toward the breaker. ``transport`` is injectable for tests.
+-        self._client = httpx.Client(base_url=host.rstrip("/"), headers=headers, timeout=30.0, transport=transport or httpx.HTTPTransport(retries=2))
++        # An explicit transport ignores HTTP(S)_PROXY, so the opt-in MEM0_PROXY (mem0 traffic only) is passed to it directly.
++        self._client = httpx.Client(base_url=host.rstrip("/"), headers=headers, timeout=30.0, transport=transport or httpx.HTTPTransport(retries=2, proxy=os.environ.get("MEM0_PROXY") or None))
+ 
+     def _json(self, method: str, path: str, **kwargs) -> Any:
+         resp = self._client.request(method, path, **kwargs)
+-- 
+2.54.0
+
