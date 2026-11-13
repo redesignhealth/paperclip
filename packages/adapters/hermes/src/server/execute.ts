@@ -83,6 +83,8 @@ import {
   canSafelyRedactSecret,
   MAX_CONFIG_STRING_LENGTH,
   type ValidatedHermesMemoryConfig,
+  resolveHermesMemoryProvider,
+  type HermesMemoryProvider,
 } from "./memory-config.js";
 import { applyCommandScanPolicy, getHermesCommandScanMode } from "./command-scan-policy.js";
 import {
@@ -1538,12 +1540,23 @@ export async function execute(
     }
   }
 
+  // Optional per-agent provider selection for env-configured memory (for example an external
+  // mem0-compatible server through MEM0_HOST). Runtime memory, when present, owns the run.
+  let memoryProvider: HermesMemoryProvider | undefined;
+  try {
+    memoryProvider = resolveHermesMemoryProvider(config);
+  } catch (err) {
+    await ctx.onLog("stderr", `[hermes] ${err instanceof Error ? err.message : "Invalid adapterConfig.memoryProvider"}\n`);
+    throw err;
+  }
+  if (memoryConfig != null) memoryProvider = undefined;
+
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
   // TECH-7102: in a hosted deployment a Hermes run never touches the server host's ~/.hermes; it
   // gets a fresh per-run home and only an explicit provider credential from its own adapter env.
   const hostIsolated = hermesHostIsolationEnabled();
   // Final value is decided after provider resolution: every Ramp Router run also uses a fresh home.
-  const needsIsolatedHomeForRuntime = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null;
+  const needsIsolatedHomeForRuntime = hostIsolated || runtimeMcpServers.length > 0 || memoryConfig != null || memoryProvider != null;
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -2122,6 +2135,7 @@ export async function execute(
       const preparedHome = await prepareHermesMcpHome({
         servers: runtimeMcpServers,
         memory: memoryConfig ?? undefined,
+        ...(memoryProvider ? { memoryProvider } : {}),
         config,
         flags: hardeningFlags,
         onWarning: onCleanupWarning,

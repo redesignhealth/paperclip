@@ -1732,6 +1732,24 @@ print(json.dumps(data))
       expect(envStat.mode & 0o777).toBe(0o600);
     });
 
+    it("emits memory.provider only (no mem0.json) for memoryProvider without runtime memory", async () => {
+      const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-mem-"));
+      cleanupDirs.push(mockHost);
+
+      const prepared = await prepareHermesMcpHome({
+        servers: [],
+        memoryProvider: "mem0",
+        config: { env: { HERMES_HOME: mockHost } },
+      });
+      cleanupDirs.push(prepared.homeDir);
+
+      expect(prepared.mem0JsonPath).toBeUndefined();
+      await expect(fs.access(path.join(prepared.homeDir, "mem0.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      const configYaml = await fs.readFile(prepared.configPath, "utf8");
+      expect(configYaml).toContain("memory:\n  provider: mem0\n");
+      expect(configYaml).not.toContain("mcp_servers:");
+    });
+
     it("prepares isolated home with BOTH servers and memory", async () => {
       const mockHost = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-mem-"));
       cleanupDirs.push(mockHost);

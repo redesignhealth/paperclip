@@ -44,6 +44,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
@@ -2642,6 +2643,22 @@ export function agentRoutes(
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
 
+  // Memory routing keys are operator-owned: an agent key must never select or disable its own
+  // memory backend (TECH-8409). Mirrors the homeMode pattern: no set on create/hire/patch, and no
+  // value change through replace, adapter change or rollback.
+  const OPERATOR_ONLY_MEMORY_ADAPTER_CONFIG_KEYS = ["memoryProvider"] as const;
+
+  function assertNoAgentOperatorMemoryKeyChange(
+    req: Request,
+    nextAdapterConfig: Record<string, unknown>,
+    existingAdapterConfig: Record<string, unknown>,
+  ) {
+    if (req.actor.type !== "agent") return;
+    if (OPERATOR_ONLY_MEMORY_ADAPTER_CONFIG_KEYS.some((key) => !isDeepStrictEqual(nextAdapterConfig[key], existingAdapterConfig[key]))) {
+      throw forbidden("Only an operator can configure agent memory routing.");
+    }
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
@@ -2651,6 +2668,8 @@ export function agentRoutes(
       throw forbidden("Only an operator can configure Runner homeMode.");
     if (req.actor.type === "agent" && ["dotAttachmentAccess", "dotWorkspaceAccess", "dotBindingId", "externalBindingId", "museBindingId", "museGeneration", "museConnection"].some(key => hasOwn(adapterConfig, key)))
       throw forbidden("Only an operator can configure external-agent pairing, attachment access, or workspace access.");
+    if (req.actor.type === "agent" && OPERATOR_ONLY_MEMORY_ADAPTER_CONFIG_KEYS.some((key) => hasOwn(adapterConfig, key)))
+      throw forbidden("Only an operator can configure agent memory routing.");
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
@@ -4808,6 +4827,7 @@ export function agentRoutes(
     assertNoAgentAdapterConfigMutation(req, rollbackAdapterConfig);
     if (req.actor.type === "agent" && rollbackAdapterConfig.homeMode !== asRecord(existing.adapterConfig)?.homeMode)
       throw forbidden("Only an operator can configure Runner homeMode.");
+    assertNoAgentOperatorMemoryKeyChange(req, rollbackAdapterConfig, asRecord(existing.adapterConfig) ?? {});
     assertNoAgentLocalAdapterHostCommandMutation(req, rollbackAdapterType, rollbackAdapterConfig);
     assertNoAgentProcessAdapterMutation(
       req,
@@ -6114,6 +6134,7 @@ export function agentRoutes(
       }
       if (req.actor.type === "agent" && rawEffectiveAdapterConfig.homeMode !== existingAdapterConfig.homeMode)
         throw forbidden("Only an operator can configure Runner homeMode.");
+      assertNoAgentOperatorMemoryKeyChange(req, rawEffectiveAdapterConfig, existingAdapterConfig);
       if (changingAdapterType || requestedAdapterConfig) {
         assertNoAgentLocalAdapterHostCommandMutation(
           req,

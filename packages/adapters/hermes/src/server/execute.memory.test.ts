@@ -252,6 +252,7 @@ function makeContext(options: {
   command?: string;
   onLogCollector?: Array<{ stream: string; chunk: string }>;
   onMeta?: (meta: any) => Promise<void>;
+  memoryProvider?: unknown;
 }): AdapterExecutionContext {
   const logs = options.onLogCollector ?? [];
   const memoryAccess: AdapterRuntimeMemoryAccess | undefined =
@@ -282,6 +283,7 @@ function makeContext(options: {
       timeoutSec: 30,
       graceSec: 2,
       persistSession: options.persistSession ?? true,
+      ...(options.memoryProvider !== undefined ? { memoryProvider: options.memoryProvider } : {}),
       extraArgs: options.extraArgs,
       env: {
         HERMES_HOME: testHermesHome,
@@ -819,6 +821,56 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
     await expect(execute(ctx)).rejects.toThrow("Failed to resolve runtime memory configuration");
     expect(logs.some((l) => l.stream === "stderr" && l.chunk.includes("Failed to resolve runtime memory configuration"))).toBe(true);
     expect(runChildProcessCallCount).toBe(0);
+  });
+
+  describe("adapterConfig.memoryProvider (env-configured mem0)", () => {
+    it("emits memory.provider: mem0, writes no mem0.json, and leaves MEM0_* env to the child", async () => {
+      const ctx = makeContext({
+        memoryProvider: "mem0",
+        extraEnv: { MEM0_HOST: "https://memory.example.test", MEM0_API_KEY: "mk-test-key-123456", MEM0_USER_ID: "agent-1" },
+      });
+
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(0);
+
+      expect(interceptedOpts.tempHomeAtExecution).toBeTruthy();
+      expect(interceptedOpts.mem0JsonExistedAtExecution).toBe(false);
+      expect(interceptedOpts.configYamlContentAtExecution).toContain("memory:\n  provider: mem0\n");
+      const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+      expect(childEnv.MEM0_HOST).toBe("https://memory.example.test");
+      expect(childEnv.HERMES_HOME).toBe(interceptedOpts.tempHomeAtExecution);
+    });
+
+    it("does not isolate the home or touch memory config when memoryProvider is unset", async () => {
+      const result = await execute(makeContext({}));
+      expect(result.exitCode).toBe(0);
+      expect(interceptedOpts.configYamlContentAtExecution ?? "").not.toContain("provider: mem0");
+      expect(interceptedOpts.mem0JsonExistedAtExecution ?? false).toBe(false);
+    });
+
+    it("keeps the runtimeMemory route unchanged when both are present (mem0.json wins)", async () => {
+      const ctx = makeContext({ memoryConfig: createValidMemoryConfig(), memoryProvider: "mem0" });
+
+      const result = await execute(ctx);
+      expect(result.exitCode).toBe(0);
+      expect(interceptedOpts.mem0JsonExistedAtExecution).toBe(true);
+      const yamlText = interceptedOpts.configYamlContentAtExecution ?? "";
+      expect(yamlText.match(/provider: mem0/g)?.length).toBe(1);
+      expect(JSON.parse(interceptedOpts.mem0JsonContentAtExecution ?? "{}").mode).toBe("oss");
+    });
+
+    it.each(["honcho", "MEM0", 5, true, {}])("fails closed before spawn for invalid memoryProvider %j", async (bad) => {
+      const logs: Array<{ stream: string; chunk: string }> = [];
+      const ctx = makeContext({ memoryProvider: bad, onLogCollector: logs });
+      await expect(execute(ctx)).rejects.toThrow("Invalid adapterConfig.memoryProvider");
+      expect(runChildProcessCallCount).toBe(0);
+    });
+
+    it.each(["", "  ", null])("treats blank memoryProvider %j as unset", async (blank) => {
+      const result = await execute(makeContext({ memoryProvider: blank }));
+      expect(result.exitCode).toBe(0);
+      expect(interceptedOpts.configYamlContentAtExecution ?? "").not.toContain("provider: mem0");
+    });
   });
 
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {
