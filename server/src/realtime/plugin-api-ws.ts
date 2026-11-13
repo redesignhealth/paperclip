@@ -117,6 +117,51 @@ export function safeUrlForLog(rawUrl: string): string {
   }
 }
 
+// fork(TECH-8283 Finding 1): Stable sanitized reason codes without raw error strings
+function classifyValidationErrorCode(err: unknown): string {
+  if (err instanceof Error) {
+    if (err.message.includes("Invalid WSS target URL") || err.message.startsWith("Invalid URL")) {
+      return "invalid_target_url";
+    }
+    if (err.message.startsWith("Disallowed upstream header")) {
+      return "disallowed_upstream_header";
+    }
+    if (err.message.startsWith("Disallowed protocol")) {
+      return "disallowed_protocol";
+    }
+    if (err.message.includes("private/reserved ranges")) {
+      return "private_ip_denied";
+    }
+    if (err.message.startsWith("DNS lookup timed out")) {
+      return "dns_timeout";
+    }
+    if (err.message.startsWith("DNS resolution")) {
+      return "dns_resolution_failed";
+    }
+  }
+  return "target_validation_failed";
+}
+
+const AVAILABLE_TIMEOUT_MS = 5_000;
+
+async function checkAvailableWithTimeout(
+  available: () => Promise<boolean>,
+  timeoutMs = AVAILABLE_TIMEOUT_MS,
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      available(),
+      new Promise<boolean>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("available() timed out")), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // fork(TECH-8283 Finding 3): Test seam separated from production API
 export interface PluginApiWsTestSeam {
   allowPrivateNetwork?: boolean;
@@ -282,7 +327,7 @@ async function internalProxyPluginApiWebSocket(
       validateHeaderValue(name, value);
       // fork(TECH-8283 Finding 6): Reject any header not in the strict allowlist
       if (!isAllowedWorkerUpstreamHeader(name)) {
-        logger.warn({ header: name }, "Worker returned prohibited upstream header");
+        logger.warn({ code: "disallowed_upstream_header" }, "Worker returned prohibited upstream header");
         throw new Error(`Disallowed upstream header: ${name}`);
       }
     }
@@ -298,7 +343,9 @@ async function internalProxyPluginApiWebSocket(
     const isTimeout = upgrade.signal.aborted || Date.now() >= upgrade.deadlineAt;
     const settleReason = isTimeout ? "timeout" : "error";
     if (upgrade.settle(settleReason)) {
-      logger.warn({ reason: (err as Error)?.message, target: safeUrlForLog(target.url) }, "Plugin WebSocket target validation failed");
+      // fork(TECH-8283 Finding 1): Log only stable sanitized code and safe origin/host
+      const code = isTimeout ? "upgrade_deadline_timeout" : classifyValidationErrorCode(err);
+      logger.warn({ code, target: safeUrlForLog(target.url) }, "Plugin WebSocket target validation failed");
       const status = isTimeout ? 504 : 502;
       if (!socket.destroyed && !res.headersSent && !res.writableEnded) {
         res.writeHead(status, { "Content-Type": "application/json", Connection: "close" });
@@ -400,36 +447,34 @@ async function internalProxyPluginApiWebSocket(
     fail(502, `unexpected_http_response: ${response.statusCode}`);
   });
 
-  // fork(TECH-8283 Finding C): Rewritten upgrade handler ordering
-  // 1. Attach provisional error listener
-  // 2. Pause remote stream
-  // 3. Verify status 101
-  // 4. Await available() authorization
-  // 5. Settle single-winner
-  // 6. Start lifetime and watchdog timers only after tunnel established
-  // 7. Detach, write 101 to client, pipe, and resume
+  // fork(TECH-8283 Finding C, Finding 2): Rewritten upgrade handler ordering with bounded auth
   connection.on("upgrade", async (response, remote, remoteHead) => {
     upstream = remote;
     remote.once("error", () => {
       fail(502, "remote_stream_error");
     });
+    // fork(TECH-8283 Finding 2): Cleanup runs when upstream destroyed
+    remote.once("close", cleanup);
     remote.pause();
 
-    if (socket.destroyed || upgrade.signal.aborted || response.statusCode !== 101) {
+    if (socket.destroyed || remote.destroyed || upgrade.signal.aborted || response.statusCode !== 101) {
       fail(502, `upgrade_status_not_101: ${response.statusCode}`);
       return;
     }
 
     let isAvail = false;
     try {
-      isAvail = await available();
+      // fork(TECH-8283 Finding 2): Bounded authorization check fails closed promptly on hang
+      const authTimeoutMs = Math.min(AVAILABLE_TIMEOUT_MS, Math.max(1, upgrade.deadlineAt - Date.now()));
+      isAvail = await checkAvailableWithTimeout(available, authTimeoutMs);
     } catch (err) {
-      logger.warn({ error: (err as Error)?.message }, "101 authorization check threw");
+      logger.warn({ code: "authz_check_failed" }, "101 authorization check failed or timed out");
       isAvail = false;
     }
 
-    if (!isAvail || socket.destroyed || upgrade.signal.aborted) {
-      fail(502, "authorization_denied_at_101");
+    // fork(TECH-8283 Finding 2): Re-check remote.destroyed and socket.destroyed after auth
+    if (!isAvail || socket.destroyed || remote.destroyed || upgrade.signal.aborted) {
+      fail(502, "authorization_denied_or_stream_destroyed_at_101");
       return;
     }
 
@@ -451,19 +496,19 @@ async function internalProxyPluginApiWebSocket(
     lifetimeTimer = setTimeout(() => cleanup(), lifetimeMs);
     lifetimeTimer.unref();
 
-    // fork(TECH-8283 Finding 2): Watchdog in-flight guard prevents overlapping available() calls
+    // fork(TECH-8283 Finding 2): Watchdog with in-flight guard and timeout
     let watchInFlight = false;
     watchTimer = setInterval(async () => {
       if (watchInFlight || socket.destroyed || (upstream && upstream.destroyed)) return;
       watchInFlight = true;
       try {
-        const stillAvailable = await available();
+        const stillAvailable = await checkAvailableWithTimeout(available, Math.min(AVAILABLE_TIMEOUT_MS, watchIntervalMs));
         if (!stillAvailable) {
-          logger.warn({ reason: "watchdog_revocation" }, "Plugin WebSocket revoked on watchdog tick");
+          logger.warn({ code: "watchdog_revocation" }, "Plugin WebSocket revoked on watchdog tick");
           cleanup();
         }
       } catch (err) {
-        logger.warn({ reason: "watchdog_check_error" }, "Plugin WebSocket watchdog check threw");
+        logger.warn({ code: "watchdog_timeout_or_error" }, "Plugin WebSocket watchdog check timed out or threw");
         cleanup();
       } finally {
         watchInFlight = false;
