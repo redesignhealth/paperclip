@@ -3428,6 +3428,16 @@ async function lockProfileEntryReferences(client: ToolAccessMutationDb, companyI
     .where(and(eq(toolCatalogEntries.companyId, companyId), inArray(toolCatalogEntries.id, catalogIds))).orderBy(toolCatalogEntries.id).for("key share");
 }
 
+function isStrictlyNewerGeneration(
+  current: string | null | undefined,
+  observed: string | null | undefined,
+): boolean {
+  if (typeof current !== "string" || typeof observed !== "string") return false;
+  const currentMs = Date.parse(current);
+  const observedMs = Date.parse(observed);
+  return Number.isFinite(currentMs) && Number.isFinite(observedMs) && currentMs > observedMs;
+}
+
 export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
@@ -6755,7 +6765,9 @@ export function toolAccessService(
     const where = companyId
       ? and(identifier, eq(toolConnections.companyId, companyId))
       : identifier;
-    const [row] = await db.select().from(toolConnections).where(where);
+    const [row] = companyId
+      ? await withCompanyScope(db, companyId, async (tx) => tx.select().from(toolConnections).where(where))
+      : await db.select().from(toolConnections).where(where);
     if (!row) throw notFound("Tool connection not found");
     return row;
   }
@@ -12532,17 +12544,19 @@ export function toolAccessService(
     connectionId: string;
     grantId: string;
   }) {
-    const [grant] = await db
-      .select()
-      .from(connectionGrants)
-      .where(
-        and(
-          eq(connectionGrants.id, input.grantId),
-          eq(connectionGrants.companyId, input.companyId),
-          eq(connectionGrants.connectionId, input.connectionId),
-        ),
-      )
-      .limit(1);
+    const [grant] = await withCompanyScope(db, input.companyId, async (tx) =>
+      tx
+        .select()
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.id, input.grantId),
+            eq(connectionGrants.companyId, input.companyId),
+            eq(connectionGrants.connectionId, input.connectionId),
+          ),
+        )
+        .limit(1),
+    );
     if (!grant) throw notFound("Connection authorization not found");
     return grant;
   }
@@ -12566,39 +12580,41 @@ export function toolAccessService(
     grant: typeof connectionGrants.$inferSelect,
     leaseId: string,
   ) {
-    const latest = await getOAuthGrantRow({
-      companyId: grant.companyId,
-      connectionId: grant.connectionId,
-      grantId: grant.id,
-    });
-    const oauth = oauthGrantConfig(latest);
-    if (asRecord(oauth.refreshLease).id !== leaseId) return latest;
-    const providerTenant = {
-      ...(latest.providerTenant ?? {}),
-      oauth: withoutOAuthGrantRefreshLease(oauth),
-    };
-    const [updated] = await db
-      .update(connectionGrants)
-      .set({
-        providerTenant,
-        updatedAt: now(),
-      })
-      .where(
-        and(
-          eq(connectionGrants.id, latest.id),
-          eq(connectionGrants.companyId, latest.companyId),
-          sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${leaseId}`,
-        ),
-      )
-      .returning();
-    return (
-      updated ??
-      getOAuthGrantRow({
+    return withCompanyScope(db, grant.companyId, async (tx) => {
+      const latest = await getOAuthGrantRow({
         companyId: grant.companyId,
         connectionId: grant.connectionId,
         grantId: grant.id,
-      })
-    );
+      });
+      const oauth = oauthGrantConfig(latest);
+      if (asRecord(oauth.refreshLease).id !== leaseId) return latest;
+      const providerTenant = {
+        ...(latest.providerTenant ?? {}),
+        oauth: withoutOAuthGrantRefreshLease(oauth),
+      };
+      const [updated] = await tx
+        .update(connectionGrants)
+        .set({
+          providerTenant,
+          updatedAt: now(),
+        })
+        .where(
+          and(
+            eq(connectionGrants.id, latest.id),
+            eq(connectionGrants.companyId, latest.companyId),
+            sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${leaseId}`,
+          ),
+        )
+        .returning();
+      return (
+        updated ??
+        getOAuthGrantRow({
+          companyId: grant.companyId,
+          connectionId: grant.connectionId,
+          grantId: grant.id,
+        })
+      );
+    });
   }
 
   async function acquireOAuthGrantRefreshLease(
@@ -12676,21 +12692,23 @@ export function toolAccessService(
             },
           },
         };
-        const [claimed] = await db
-          .update(connectionGrants)
-          .set({
-            providerTenant,
-            updatedAt: now(),
-          })
-          .where(
-            and(
-              eq(connectionGrants.id, latest.id),
-              eq(connectionGrants.companyId, latest.companyId),
-              eq(connectionGrants.status, "active"),
-              sql`${connectionGrants.providerTenant} #>> '{oauth,refreshLease,id}' is null`,
-            ),
-          )
-          .returning();
+        const [claimed] = await withCompanyScope(db, connection.companyId, async (tx) =>
+          tx
+            .update(connectionGrants)
+            .set({
+              providerTenant,
+              updatedAt: now(),
+            })
+            .where(
+              and(
+                eq(connectionGrants.id, latest.id),
+                eq(connectionGrants.companyId, latest.companyId),
+                eq(connectionGrants.status, "active"),
+                sql`${connectionGrants.providerTenant} #>> '{oauth,refreshLease,id}' is null`,
+              ),
+            )
+            .returning(),
+        );
         if (claimed) return { grant: claimed, leaseId };
       }
       if (currentLeaseId && !leaseIsActive) {
@@ -19739,25 +19757,28 @@ export function toolAccessService(
       if (
         input.force &&
         input.observedRefreshedAt !== undefined &&
-        currentRefreshedAt !== null &&
-        (input.observedRefreshedAt === null || currentRefreshedAt > input.observedRefreshedAt)
+        isStrictlyNewerGeneration(currentRefreshedAt, input.observedRefreshedAt)
       ) {
         try {
-          const { value: currentToken } = await resolveConnectionGrantSecret(db, connection, grant, accessTokenRef, {
-            consumerType: "connection_grant",
-            consumerId: grant.id,
-            configPath: "oauth.access_token",
-            actorType: "system",
-          });
-          const currentExpiresAt = typeof accessTokenRef.expiresAt === "string"
-            ? accessTokenRef.expiresAt
-            : (typeof grantOauth?.accessTokenExpiresAt === "string" ? grantOauth.accessTokenExpiresAt : null);
-          return {
-            accessToken: currentToken,
-            expiresAt: currentExpiresAt,
-            refreshedAt: currentRefreshedAt,
-            rotated: false,
-          };
+          const resolvedCurrent = await withCompanyScope(db, input.companyId, async (tx) =>
+            resolveConnectionGrantSecret(tx, connection, grant, accessTokenRef, {
+              consumerType: "connection_grant",
+              consumerId: grant.id,
+              configPath: "oauth.access_token",
+              actorType: "system",
+            }),
+          );
+          if (resolvedCurrent?.value) {
+            const currentExpiresAt = typeof accessTokenRef.expiresAt === "string"
+              ? accessTokenRef.expiresAt
+              : (typeof grantOauth?.accessTokenExpiresAt === "string" ? grantOauth.accessTokenExpiresAt : null);
+            return {
+              accessToken: resolvedCurrent.value,
+              expiresAt: currentExpiresAt,
+              refreshedAt: currentRefreshedAt,
+              rotated: false,
+            };
+          }
         } catch {
           // Fall through to lease acquisition if secret read fails
         }
@@ -19790,8 +19811,9 @@ export function toolAccessService(
         const leasedRefreshedAt = typeof leasedOauth?.refreshedAt === "string" ? leasedOauth.refreshedAt : null;
         if (
           input.observedRefreshedAt !== undefined &&
-          (leasedRefreshedAt === null || (input.observedRefreshedAt !== null && leasedRefreshedAt <= input.observedRefreshedAt))
+          !isStrictlyNewerGeneration(leasedRefreshedAt, input.observedRefreshedAt)
         ) {
+          // Generation did not advance past what was rejected
           userGrantRefreshCooldownUntil.set(flightKey, Date.now() + USER_GRANT_REFRESH_COOLDOWN_MS);
           return null;
         }
@@ -19799,17 +19821,20 @@ export function toolAccessService(
         const leasedAccessRef = lease.grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
         if (!leasedAccessRef) return null;
         try {
-          const { value: currentToken } = await resolveConnectionGrantSecret(db, connection, lease.grant, leasedAccessRef, {
-            consumerType: "connection_grant",
-            consumerId: lease.grant.id,
-            configPath: "oauth.access_token",
-            actorType: "system",
-          });
+          const resolvedLeased = await withCompanyScope(db, input.companyId, async (tx) =>
+            resolveConnectionGrantSecret(tx, connection, lease.grant, leasedAccessRef, {
+              consumerType: "connection_grant",
+              consumerId: lease.grant.id,
+              configPath: "oauth.access_token",
+              actorType: "system",
+            }),
+          );
+          if (!resolvedLeased?.value) return null;
           const leasedExpiresAt = typeof leasedAccessRef.expiresAt === "string"
             ? leasedAccessRef.expiresAt
             : (typeof leasedOauth?.accessTokenExpiresAt === "string" ? leasedOauth.accessTokenExpiresAt : null);
           return {
-            accessToken: currentToken,
+            accessToken: resolvedLeased.value,
             expiresAt: leasedExpiresAt,
             refreshedAt: leasedRefreshedAt,
             rotated: false,
@@ -19819,23 +19844,25 @@ export function toolAccessService(
         }
       }
 
-      // We own the lease! Resolve the refresh token value and latestVersion for CAS
-      let refreshTokenValue: string;
+      // We own the lease! Move all work including secret resolution under try ... finally to guarantee lease cleanup
       let refreshSecretLatestVersion: number | null = null;
       try {
-        const resolvedSecret = await resolveConnectionGrantSecret(db, connection, grant, refreshTokenRef, {
-          consumerType: "connection_grant",
-          consumerId: grant.id,
-          configPath: "oauth.refresh_token",
-          actorType: "system",
-        });
-        refreshTokenValue = resolvedSecret.value;
-        refreshSecretLatestVersion = typeof resolvedSecret.latestVersion === "number" ? resolvedSecret.latestVersion : null;
-      } catch {
-        return null;
-      }
+        let refreshTokenValue: string;
+        try {
+          const resolvedSecret = await withCompanyScope(db, input.companyId, async (tx) =>
+            resolveConnectionGrantSecret(tx, connection, lease.grant, refreshTokenRef, {
+              consumerType: "connection_grant",
+              consumerId: lease.grant.id,
+              configPath: "oauth.refresh_token",
+              actorType: "system",
+            }),
+          );
+          refreshTokenValue = resolvedSecret.value;
+          refreshSecretLatestVersion = typeof resolvedSecret.latestVersion === "number" ? resolvedSecret.latestVersion : null;
+        } catch {
+          return null; // Hits finally and clears lease
+        }
 
-      try {
         // HTTP discovery / client / token exchange strictly outside DB transactions
         const endpoints = await oauthEndpointsForConnection(connection, null);
         const client = await oauthClientForConnection(connection, endpoints.provider);
@@ -19852,11 +19879,14 @@ export function toolAccessService(
         const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
 
         const committed = await withCompanyScope(db, input.companyId, async (tx) => {
+          await tx.execute(sql`set local statement_timeout = '5000ms'`);
+          await tx.execute(sql`set local lock_timeout = '2000ms'`);
+
           const [lockedGrant] = await tx
             .select()
             .from(connectionGrants)
             .where(and(
-              eq(connectionGrants.id, grant.id),
+              eq(connectionGrants.id, lease.grant.id),
               eq(connectionGrants.companyId, input.companyId),
               eq(connectionGrants.status, "active"),
               sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
@@ -19864,12 +19894,20 @@ export function toolAccessService(
             .for("update")
             .limit(1);
 
-          if (!lockedGrant) return false;
+          if (!lockedGrant) {
+            throw new Error("Grant row lock or lease CAS failed");
+          }
+
+          const currentAccessRef = lockedGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+          const currentRefreshRef = lockedGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
+          if (!currentAccessRef || !currentRefreshRef) {
+            throw new Error("Missing secret references on locked grant");
+          }
 
           const txSecrets = secretService(tx);
-          await txSecrets.rotate(accessTokenRef.secretId, { value: token.accessToken }, {});
+          await txSecrets.rotate(currentAccessRef.secretId, { value: token.accessToken }, {});
           if (token.refreshToken) {
-            await txSecrets.rotate(refreshTokenRef.secretId, { value: token.refreshToken }, {});
+            await txSecrets.rotate(currentRefreshRef.secretId, { value: token.refreshToken }, {});
           }
 
           const updatedRefs = lockedGrant.credentialSecretRefs.map((ref) =>
@@ -19900,7 +19938,21 @@ export function toolAccessService(
             ))
             .returning({ id: connectionGrants.id });
 
-          return Boolean(updated);
+          if (!updated) {
+            throw new Error("Grant update failed under lease CAS; rolling back secret rotation");
+          }
+
+          return true;
+        }).catch((commitErr) => {
+          logger.warn(
+            {
+              connectionId: input.connectionId,
+              subjectUserId: input.subjectUserId,
+              error: sanitizeLoggedProviderError(commitErr instanceof Error ? commitErr.message : String(commitErr)),
+            },
+            "[tool-access] commit failed in refreshUserGrant",
+          );
+          return false;
         });
 
         if (!committed) return null;
@@ -19924,39 +19976,32 @@ export function toolAccessService(
           ? (err.details as { code?: unknown }).code
           : null;
         let markedNeedsReauthorization = false;
-        if (errorCode === "oauth_reauthorization_required") {
+        if (errorCode === "oauth_reauthorization_required" && refreshSecretLatestVersion !== null) {
           try {
             await withCompanyScope(db, input.companyId, async (tx) => {
-              const [currentSecret] = await tx
-                .select({ latestVersion: companySecrets.latestVersion })
-                .from(companySecrets)
-                .where(eq(companySecrets.id, refreshTokenRef.secretId))
-                .limit(1);
-
-              const secretVersionUnchanged =
-                refreshSecretLatestVersion === null ||
-                (currentSecret && currentSecret.latestVersion === refreshSecretLatestVersion);
-
-              if (secretVersionUnchanged) {
-                const [reauthorized] = await tx
-                  .update(connectionGrants)
-                  .set({
-                    status: "needs_reauthorization",
-                    providerTenant: {
-                      ...(grant.providerTenant ?? {}),
-                      oauth: withoutOAuthGrantRefreshLease(asRecord(asRecord(grant.providerTenant)?.oauth)),
-                    },
-                    updatedAt: new Date(),
-                  })
-                  .where(and(
-                    eq(connectionGrants.id, grant.id),
-                    eq(connectionGrants.companyId, input.companyId),
-                    eq(connectionGrants.status, "active"),
-                    sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
-                  ))
-                  .returning({ id: connectionGrants.id });
-                markedNeedsReauthorization = Boolean(reauthorized);
-              }
+              const [reauthorized] = await tx
+                .update(connectionGrants)
+                .set({
+                  status: "needs_reauthorization",
+                  providerTenant: {
+                    ...(lease.grant.providerTenant ?? {}),
+                    oauth: withoutOAuthGrantRefreshLease(asRecord(asRecord(lease.grant.providerTenant)?.oauth)),
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(and(
+                  eq(connectionGrants.id, lease.grant.id),
+                  eq(connectionGrants.companyId, input.companyId),
+                  eq(connectionGrants.status, "active"),
+                  sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${lease.leaseId}`,
+                  sql`EXISTS (
+                    SELECT 1 FROM ${companySecrets}
+                    WHERE ${companySecrets.id} = ${refreshTokenRef.secretId}
+                      AND ${companySecrets.latestVersion} = ${refreshSecretLatestVersion}
+                  )`,
+                ))
+                .returning({ id: connectionGrants.id });
+              markedNeedsReauthorization = Boolean(reauthorized);
             });
           } catch (updateErr) {
             // Same "never throws" contract as the rest of this function --

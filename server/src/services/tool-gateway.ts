@@ -4987,7 +4987,7 @@ export function createToolGatewayService(
       );
       return {
         headers: { Authorization: `Bearer ${sanitized}` },
-        observedRefreshedAt: refreshed.refreshedAt ?? new Date(nowMs).toISOString(),
+        observedRefreshedAt: typeof refreshed.refreshedAt === "string" ? refreshed.refreshedAt : null,
       };
     }
     try {
