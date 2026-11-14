@@ -26,6 +26,9 @@ Environment:
     RH_MEMORY_RECALL_TIMEOUT   optional seconds, default 3, capped at 8 (the
                                UserPromptSubmit hook itself times out at 10)
     RH_MEMORY_CAPTURE_TIMEOUT  optional seconds, default 15 (runs detached)
+    RH_MEMORY_CAPTURE          optional switch, default unset (capture on). Set
+                               to off, false, 0, or no to disable end-of-turn
+                               capture (recall remains enabled).
 
 Fails open: any error exits 0 with no stdout (one line naming the error type
 goes to stderr), so memory problems never block or fail an agent run. The
@@ -265,6 +268,9 @@ def _detach_stdio() -> None:
 
 
 def capture(event: dict[str, Any], fmt: str = "claude") -> None:
+    capture_switch = os.environ.get("RH_MEMORY_CAPTURE", "").strip().lower()
+    if capture_switch in {"off", "false", "0", "no"}:
+        return
     config = _config()
     transcript_path = event.get("transcript_path")
     if config is None or not isinstance(transcript_path, str) or not transcript_path:

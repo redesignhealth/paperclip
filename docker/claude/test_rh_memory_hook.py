@@ -72,6 +72,14 @@ class RecallTest(unittest.TestCase):
             self.assertIsNone(hook.recall({"prompt": "ok"}))
         post.assert_not_called()
 
+    def test_recall_unaffected_when_capture_is_off(self) -> None:
+        results = {"results": [{"memory": "Dan prefers short answers", "score": 0.9}]}
+        with mock.patch.dict(os.environ, {**ENV, "RH_MEMORY_CAPTURE": "off"}, clear=True), \
+                mock.patch.object(hook, "_post", return_value=results) as post:
+            out = json.loads(hook.recall({"prompt": "how should I answer?"}) or "{}")
+        self.assertIn("- Dan prefers short answers", out["hookSpecificOutput"]["additionalContext"])
+        post.assert_called_once()
+
     def test_main_fails_open(self) -> None:
         stdin = io.StringIO(json.dumps({"prompt": "what did we decide?"}))
         stdout = io.StringIO()
@@ -112,6 +120,44 @@ class CaptureTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(hook.os, "fork") as fork:
             hook.capture({"transcript_path": "/nonexistent"})
         fork.assert_not_called()
+
+    def test_disabled_by_rh_memory_capture_env(self) -> None:
+        path = _transcript([
+            {"message": {"role": "user", "content": "remember this"}},
+            {"message": {"role": "assistant", "content": "ok"}},
+        ])
+        for val in ("off", "false", "0", "no", "OFF", " off "):
+            with mock.patch.dict(os.environ, {**ENV, "RH_MEMORY_CAPTURE": val}, clear=True), \
+                    mock.patch.object(hook.os, "fork") as fork, \
+                    mock.patch.object(hook, "_post") as post:
+                hook.capture({"transcript_path": path})
+                fork.assert_not_called()
+                post.assert_not_called()
+
+    def test_disabled_by_rh_memory_capture_env_codex_format(self) -> None:
+        event = {"transcript_path": _codex_rollout(), "turn_id": "t1"}
+        with mock.patch.dict(os.environ, {**ENV, "RH_MEMORY_CAPTURE": "off"}, clear=True), \
+                mock.patch.object(hook.os, "fork") as fork, \
+                mock.patch.object(hook, "_post") as post:
+            hook.capture(event, "codex")
+            fork.assert_not_called()
+            post.assert_not_called()
+
+    def test_capture_enabled_when_unset_or_other_values(self) -> None:
+        path = _transcript([
+            {"message": {"role": "user", "content": "remember this"}},
+            {"message": {"role": "assistant", "content": "ok"}},
+        ])
+        for val in (None, "on", "1", "true", "garbage", "ON", " yes "):
+            env = dict(ENV)
+            if val is not None:
+                env["RH_MEMORY_CAPTURE"] = val
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(hook.os, "fork", return_value=1234) as fork, \
+                    mock.patch.object(hook, "_post") as post:
+                hook.capture({"transcript_path": path})
+                fork.assert_called_once()
+                post.assert_not_called()  # Parent returns immediately after fork
 
     def test_parent_returns_after_fork(self) -> None:
         with mock.patch.dict(os.environ, ENV, clear=True), \
