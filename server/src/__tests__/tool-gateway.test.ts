@@ -4667,6 +4667,101 @@ rl.on("line", (line) => {
         await fake.close();
       }
     });
+
+    it("preserves undefined observedRefreshedAt for unknown baseline on 401 refresh", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 401,
+        body: { error: "invalid_token" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-undefined-gen",
+          connectionName: "Personal Google (undefined gen test)",
+          toolName: "list_threads",
+          riskLevel: "read",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, "token-unknown-gen", remoteTool.connection.id);
+
+        // Grant has NO providerTenant.oauth (so personalCreds.observedRefreshedAt is undefined)
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {},
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        let receivedObservedRefreshedAt: string | null | undefined = "sentinel";
+        const gateway = createTestToolGatewayService(db);
+        gateway.configureGrantRefresh(async (input) => {
+          receivedObservedRefreshedAt = input.observedRefreshedAt;
+          return {
+            accessToken: "token-v2",
+            expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            refreshedAt: new Date().toISOString(),
+            rotated: true,
+          };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            callId: `call-${randomUUID()}`,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+
+        // Must preserve undefined, NOT convert to null:
+        expect(receivedObservedRefreshedAt).toBeUndefined();
+      } finally {
+        await fake.close();
+      }
+    });
   });
 
   it("creates a personal authorization card and resumes after the user grant exists", async () => {

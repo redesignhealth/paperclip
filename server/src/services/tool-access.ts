@@ -12582,11 +12582,19 @@ export function toolAccessService(
     leaseId: string,
   ) {
     return withCompanyScope(db, grant.companyId, async (tx) => {
-      const latest = await getOAuthGrantRow({
-        companyId: grant.companyId,
-        connectionId: grant.connectionId,
-        grantId: grant.id,
-      });
+      const [latest] = await tx
+        .select()
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.id, grant.id),
+            eq(connectionGrants.companyId, grant.companyId),
+            eq(connectionGrants.connectionId, grant.connectionId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!latest) throw notFound("Connection authorization not found");
       const oauth = oauthGrantConfig(latest);
       if (asRecord(oauth.refreshLease).id !== leaseId) return latest;
       const providerTenant = {
@@ -12603,18 +12611,25 @@ export function toolAccessService(
           and(
             eq(connectionGrants.id, latest.id),
             eq(connectionGrants.companyId, latest.companyId),
+            eq(connectionGrants.connectionId, latest.connectionId),
             sql`${connectionGrants.providerTenant} -> 'oauth' -> 'refreshLease' ->> 'id' = ${leaseId}`,
           ),
         )
         .returning();
-      return (
-        updated ??
-        getOAuthGrantRow({
-          companyId: grant.companyId,
-          connectionId: grant.connectionId,
-          grantId: grant.id,
-        })
-      );
+      if (updated) return updated;
+      const [fallback] = await tx
+        .select()
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.id, grant.id),
+            eq(connectionGrants.companyId, grant.companyId),
+            eq(connectionGrants.connectionId, grant.connectionId),
+          ),
+        )
+        .limit(1);
+      if (!fallback) throw notFound("Connection authorization not found");
+      return fallback;
     });
   }
 
@@ -20066,7 +20081,6 @@ export function toolAccessService(
               if (reauthorized) {
                 markedNeedsReauthorization = true;
               } else {
-                casMissWithNewGeneration = true;
                 const [freshGrant] = await tx
                   .select()
                   .from(connectionGrants)
@@ -20079,7 +20093,13 @@ export function toolAccessService(
                 const candidateGrant = freshGrant ?? currentGrant;
                 const freshGrantOauth = asRecord(asRecord(candidateGrant.providerTenant)?.oauth);
                 const currentGen = typeof freshGrantOauth?.refreshedAt === "string" ? freshGrantOauth.refreshedAt : null;
-                if (candidateGrant.status === "active" && currentGen && isStrictlyNewerGeneration(currentGen, input.observedRefreshedAt)) {
+                const generationAdvanced =
+                  candidateGrant.status === "active" &&
+                  Boolean(currentGen) &&
+                  isStrictlyNewerGeneration(currentGen, input.observedRefreshedAt);
+
+                if (generationAdvanced) {
+                  casMissWithNewGeneration = true;
                   const accessRef = candidateGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
                   if (accessRef) {
                     try {

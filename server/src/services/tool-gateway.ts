@@ -4932,7 +4932,9 @@ export function createToolGatewayService(
       // error here must not replace the structured connect-card/403 flow
       // below with an opaque exception.
       const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
-      const observedRefreshedAt = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
+      const observedRefreshedAt = typeof grantOauth?.refreshedAt === "string"
+        ? grantOauth.refreshedAt
+        : (grantOauth?.refreshedAt === null ? null : undefined);
       let refreshed: Awaited<ReturnType<NonNullable<typeof refreshUserGrantHook>>>;
       try {
         refreshed = await refreshUserGrantHook({
@@ -4998,7 +5000,9 @@ export function createToolGatewayService(
       );
       return {
         headers: { Authorization: `Bearer ${sanitized}` },
-        observedRefreshedAt: typeof refreshed.refreshedAt === "string" ? refreshed.refreshedAt : null,
+        observedRefreshedAt: typeof refreshed.refreshedAt === "string"
+          ? refreshed.refreshedAt
+          : (refreshed.refreshedAt === null ? null : undefined),
       };
     }
     try {
@@ -5029,7 +5033,9 @@ export function createToolGatewayService(
         return null;
       }
       const grantOauth = asRecord(asRecord(grant.providerTenant)?.oauth);
-      const storedRefreshedAt = typeof grantOauth?.refreshedAt === "string" ? grantOauth.refreshedAt : null;
+      const storedRefreshedAt = typeof grantOauth?.refreshedAt === "string"
+        ? grantOauth.refreshedAt
+        : (grantOauth?.refreshedAt === null ? null : undefined);
       logger.info(
         {
           connectionId: connection.id,
@@ -7199,7 +7205,7 @@ export function createToolGatewayService(
     let endpoint: string;
     let credentialHeaders: Record<string, string>;
     let personalUserId: string | null = null;
-    let personalObservedRefreshedAt: string | null = null;
+    let personalObservedRefreshedAt: string | null | undefined = undefined;
     if (personalOnly) {
       endpoint = remoteEndpoint(connection.config ?? {});
       personalUserId = await resolveResponsibleUserId(session);
@@ -7208,7 +7214,7 @@ export function createToolGatewayService(
         ...projectedConnectionHeaders(connection),
         ...personalCreds.headers,
       };
-      personalObservedRefreshedAt = personalCreds.observedRefreshedAt ?? null;
+      personalObservedRefreshedAt = personalCreds.observedRefreshedAt;
     } else {
       endpoint = workspaceTarget?.serverUrl ?? await resolvedRemoteEndpoint(session, connection, grant!);
       // Method-defined headers are trusted catalog configuration. Treat them as
