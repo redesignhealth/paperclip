@@ -875,6 +875,107 @@ node -e "process.stdout.write(JSON.stringify({ pghost: process.env.PGHOST, pgpas
       expect(result.exitCode).toBe(0);
       expect(interceptedOpts.configYamlContentAtExecution ?? "").not.toContain("provider: mem0");
     });
+
+    describe("mem0AutoSyncOff flag handling (TECH-8574)", () => {
+      it("projects MEM0_AUTO_SYNC=false when flag is on, memoryProvider='mem0', and no runtime memory", async () => {
+        const ctx = makeContext({
+          memoryProvider: "mem0",
+          extraEnv: {
+            PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off",
+            MEM0_HOST: "https://memory.example.test",
+          },
+        });
+
+        const result = await execute(ctx);
+        expect(result.exitCode).toBe(0);
+        const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+        expect(childEnv.MEM0_AUTO_SYNC).toBe("false");
+      });
+
+      it("does not project MEM0_AUTO_SYNC when mem0AutoSyncOff flag is off", async () => {
+        const ctx = makeContext({
+          memoryProvider: "mem0",
+          extraEnv: {
+            MEM0_HOST: "https://memory.example.test",
+          },
+        });
+
+        const result = await execute(ctx);
+        expect(result.exitCode).toBe(0);
+        const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+        expect(childEnv.MEM0_AUTO_SYNC).toBeUndefined();
+      });
+
+      it("does not project MEM0_AUTO_SYNC when runtime memory is active (mem0.json path used instead)", async () => {
+        const ctx = makeContext({
+          memoryConfig: createValidMemoryConfig(),
+          extraEnv: {
+            PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off",
+          },
+        });
+
+        const result = await execute(ctx);
+        expect(result.exitCode).toBe(0);
+        const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+        // Runtime memory writes auto_sync: false to mem0.json; MEM0_AUTO_SYNC is not added to child env
+        expect(childEnv.MEM0_AUTO_SYNC).toBeUndefined();
+        expect(interceptedOpts.mem0JsonExistedAtExecution).toBe(true);
+        expect(JSON.parse(interceptedOpts.mem0JsonContentAtExecution ?? "{}").auto_sync).toBe(false);
+      });
+
+      it("prevents agent-provided MEM0_AUTO_SYNC=true from overriding the off flag", async () => {
+        const ctx = makeContext({
+          memoryProvider: "mem0",
+          extraEnv: {
+            PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off",
+            MEM0_HOST: "https://memory.example.test",
+            MEM0_AUTO_SYNC: "true",
+          },
+        });
+
+        const result = await execute(ctx);
+        expect(result.exitCode).toBe(0);
+        const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+        expect(childEnv.MEM0_AUTO_SYNC).toBe("false");
+      });
+
+      it("leaves unrelated agents without memoryProvider unaffected", async () => {
+        const ctx = makeContext({
+          extraEnv: {
+            PAPERCLIP_MEMORY_HARDENING: "mem0-auto-sync-off",
+          },
+        });
+
+        const result = await execute(ctx);
+        expect(result.exitCode).toBe(0);
+        const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+        expect(childEnv.MEM0_AUTO_SYNC).toBeUndefined();
+      });
+
+      it("honours server-level PAPERCLIP_MEMORY_HARDENING=mem0-auto-sync-off additively", async () => {
+        const originalServerHardening = process.env.PAPERCLIP_MEMORY_HARDENING;
+        try {
+          process.env.PAPERCLIP_MEMORY_HARDENING = "mem0-auto-sync-off";
+          const ctx = makeContext({
+            memoryProvider: "mem0",
+            extraEnv: {
+              MEM0_HOST: "https://memory.example.test",
+            },
+          });
+
+          const result = await execute(ctx);
+          expect(result.exitCode).toBe(0);
+          const childEnv = interceptedOpts.opts?.env as Record<string, string>;
+          expect(childEnv.MEM0_AUTO_SYNC).toBe("false");
+        } finally {
+          if (originalServerHardening !== undefined) {
+            process.env.PAPERCLIP_MEMORY_HARDENING = originalServerHardening;
+          } else {
+            delete process.env.PAPERCLIP_MEMORY_HARDENING;
+          }
+        }
+      });
+    });
   });
 
   it("fails closed before spawn with generic error if runtime memory config is malformed or invalid", async () => {

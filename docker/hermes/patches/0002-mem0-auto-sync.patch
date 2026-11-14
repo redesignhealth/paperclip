@@ -1,13 +1,13 @@
-From cdec0aa5830376f5911f86ee8e6c65c99b688f65 Mon Sep 17 00:00:00 2001
+From 33dd982628103f7a5f2217b0fc34ac96fe40fbd5 Mon Sep 17 00:00:00 2001
 From: Dan Costanza <dan.costanza@redesignhealth.com>
-Date: Thu, 12 Nov 2026 13:58:10 -0500
+Date: Fri, 13 Nov 2026 19:06:46 -0500
 Subject: [PATCH] feat(memory): add auto_sync control for Mem0 provider
  (TECH-8191)
 
 ---
  plugins/memory/mem0/README.md   |  1 +
- plugins/memory/mem0/__init__.py | 20 +++++++++++++++++++-
- 2 files changed, 20 insertions(+), 1 deletion(-)
+ plugins/memory/mem0/__init__.py | 22 +++++++++++++++++++++-
+ 2 files changed, 22 insertions(+), 1 deletion(-)
 
 diff --git a/plugins/memory/mem0/README.md b/plugins/memory/mem0/README.md
 index d97efd9..4523d65 100644
@@ -22,7 +22,7 @@ index d97efd9..4523d65 100644
  The plugin has three connection modes:
  
 diff --git a/plugins/memory/mem0/__init__.py b/plugins/memory/mem0/__init__.py
-index 77f6164..b060d40 100644
+index 77f6164..e4a5beb 100644
 --- a/plugins/memory/mem0/__init__.py
 +++ b/plugins/memory/mem0/__init__.py
 @@ -4,7 +4,7 @@ Server-side fact extraction and semantic search via the Mem0 Platform API (cloud
@@ -53,7 +53,16 @@ index 77f6164..b060d40 100644
  
  # Sentence ends recognized when trimming a synced message. Deliberately unordered:
  # the LAST boundary of ANY kind wins, so one CJK stop early in a mixed-script turn
-@@ -131,6 +143,7 @@ class Mem0MemoryProvider(MemoryProvider):
+@@ -86,6 +98,8 @@ def _load_config() -> dict:
+               "agent_id": get_secret("MEM0_AGENT_ID", "") or "hermes", "oss": {}}
+     if user_id := get_secret("MEM0_USER_ID", ""):  # only when explicitly configured, so initialize() can fall back to the gateway-native id
+         config["user_id"] = user_id
++    if auto_sync := get_secret("MEM0_AUTO_SYNC", ""):
++        config["auto_sync"] = auto_sync
+     file_cfg = read_json_or_empty(get_hermes_home() / "mem0.json")
+     config.update({k: v for k, v in file_cfg.items() if v is not None and v != ""})
+     # MEM0_API_KEY authenticates the Platform and self-hosted HTTP backends; pure OSS mode builds its
+@@ -131,6 +145,7 @@ class Mem0MemoryProvider(MemoryProvider):
          self._mode, self._api_key, self._host, self._user_id, self._agent_id = "platform", "", "", _DEFAULT_USER_ID, "hermes"
          self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
          self._sync_max_chars = _SYNC_MSG_MAX_CHARS
@@ -61,7 +70,7 @@ index 77f6164..b060d40 100644
          self._prefetch_query = self._prefetch_result = ""
          self._prefetch_done = self._atexit_registered = False
          self._consecutive_failures, self._breaker_open_until = 0, 0.0  # circuit breaker state
-@@ -159,6 +172,7 @@ class Mem0MemoryProvider(MemoryProvider):
+@@ -159,6 +174,7 @@ class Mem0MemoryProvider(MemoryProvider):
              {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
              {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
              {"key": "rerank", "description": "Enable reranking for recall", "default": "false", "choices": ["true", "false"]},
@@ -69,7 +78,7 @@ index 77f6164..b060d40 100644
          ]
  
      def post_setup(self, hermes_home: str, config: dict) -> None:
-@@ -236,6 +250,7 @@ class Mem0MemoryProvider(MemoryProvider):
+@@ -236,6 +252,7 @@ class Mem0MemoryProvider(MemoryProvider):
          self._rerank_default = _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
          self._channel = kwargs.get("platform") or "cli"
          self._sync_max_chars = int(cfg.get("sync_max_chars") or _SYNC_MSG_MAX_CHARS)
@@ -77,7 +86,7 @@ index 77f6164..b060d40 100644
          self._backend = self._create_backend()
          if self._backend and not self._atexit_registered:
              atexit.register(self._shutdown_backend)
-@@ -301,6 +316,9 @@ class Mem0MemoryProvider(MemoryProvider):
+@@ -301,6 +318,9 @@ class Mem0MemoryProvider(MemoryProvider):
  
      def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
          """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
