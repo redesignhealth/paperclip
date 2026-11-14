@@ -210,10 +210,17 @@ export const RH_MCP_SERVICE_TOOLS_BY_SCOPE = Object.freeze({
     "definitive_healthcare__get_organization",
   ],
   "voice:read": ["voice_get_humanizer_checklist"],
+  // Async comps run (TECH-8433): start returns a job id at once, get polls, cancel stops it. `comps__run_business_area_comps`
+  // (one call that waits 30-90 s) is deliberately absent: it outlives the gateway's 60 s per-call clamp.
+  "comps:run": ["comps__start", "comps__get", "comps__cancel"],
 } as const satisfies Record<string, readonly string[]>);
 
-/** Version of `RH_MCP_SERVICE_REVIEWED_TOOLS`. Bump it whenever the tool or scope set changes. */
-export const RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION = 1;
+/**
+ * Version of `RH_MCP_SERVICE_REVIEWED_TOOLS`. Bump it whenever the tool or scope set changes (v2 = + `comps:run`, TECH-8433).
+ * Changing the scope set does not re-issue existing org tokens: nothing reads `RH_MCP_SERVICE_TOKEN_SCOPES_VERSION`, and
+ * the sweep only rotates a token near expiry. Rotate each org's token by hand (see DEFAULT-MCP-SPEC.md).
+ */
+export const RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION = 2;
 export const RH_MCP_SERVICE_REVIEWED_TOOLS: readonly string[] = Object.freeze(
   Object.values(RH_MCP_SERVICE_TOOLS_BY_SCOPE).flatMap((tools) => [...tools]),
 );
@@ -222,6 +229,8 @@ export const RH_MCP_SERVICE_REVIEWED_TOOLS: readonly string[] = Object.freeze(
 export const MAX_TOOL_TIMEOUT_MS = 60_000;
 /** api-main (Lambda) can take 8-15 s on a cold start, so the Argus verbs get 30 s instead of the 10 s default. */
 export const ARGUS_REVIEW_TOOL_TIMEOUT_MS = 30_000;
+/** The async comps verbs are the same thin api-main wrappers as the Argus ones, so they get the same 30 s (TECH-8433). */
+export const COMPS_TOOL_TIMEOUT_MS = ARGUS_REVIEW_TOOL_TIMEOUT_MS;
 
 /** Fixed, unforgeable uid of the Paperclip-created static Arcana template (client uids always carry a random suffix). */
 export const ARCANA_STATIC_TEMPLATE_UID = "rh-arcana-brain/default-mcp-template";
@@ -455,7 +464,10 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     authKind: "managed_token",
     defaultEnabled: true,
     reviewedTools: { version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION, allow: RH_MCP_SERVICE_REVIEWED_TOOLS },
-    toolTimeoutMs: Object.fromEntries(ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS])),
+    toolTimeoutMs: Object.fromEntries([
+      ...ARGUS_REVIEW_REVIEWED_TOOLS.map((tool) => [tool, ARGUS_REVIEW_TOOL_TIMEOUT_MS]),
+      ...RH_MCP_SERVICE_TOOLS_BY_SCOPE["comps:run"].map((tool) => [tool, COMPS_TOOL_TIMEOUT_MS]),
+    ]),
   },
   {
     // OAuth is left to the existing per-user consent flow. Creating an agent never starts it.

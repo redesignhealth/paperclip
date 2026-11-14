@@ -131,7 +131,9 @@ describe("rh-mcp service tool set", () => {
   it("scopes are exactly the keys of the tool map, and never a write, secrets, impersonation or supabase scope", () => {
     expect([...RH_MCP_SERVICE_TOKEN_SCOPES].sort()).toEqual(Object.keys(RH_MCP_SERVICE_TOOLS_BY_SCOPE).sort());
     for (const scope of RH_MCP_SERVICE_TOKEN_SCOPES) {
-      expect(scope).not.toMatch(/:(write|run|secrets|impersonate)$/);
+      expect(scope).not.toMatch(/:(write|secrets|impersonate)$/);
+      // `comps:run` is the one reviewed `:run` scope (TECH-8433): it only starts/polls/cancels an api-main comps job.
+      if (scope.endsWith(":run")) expect(scope).toBe("comps:run");
       expect(scope.startsWith("supabase:")).toBe(false);
       expect(scope.startsWith("ownership:")).toBe(false);
       expect(scope.startsWith("comms:")).toBe(false);
@@ -148,6 +150,9 @@ describe("rh-mcp service tool set", () => {
     for (const identityKeyed of ["mdm_get_user_annotations", "mdm_granola_status", "voice_get_style_guide", "voice_list_voices", "voice_list_source_docs"]) {
       expect(RH_MCP_SERVICE_REVIEWED_TOOLS).not.toContain(identityKeyed);
     }
+    expect(RH_MCP_SERVICE_TOOLS_BY_SCOPE["comps:run"]).toEqual(["comps__start", "comps__get", "comps__cancel"]);
+    // The blocking one-call comps tool outlives the gateway's 60 s clamp, so only the async verbs are offered.
+    expect(RH_MCP_SERVICE_REVIEWED_TOOLS).not.toContain("comps__run_business_area_comps");
     // The review verbs are what ClaudeBot-style agents need; losing them would silently recreate TECH-8066.
     expect(RH_MCP_SERVICE_REVIEWED_TOOLS).toEqual(expect.arrayContaining(["argus_start_review", "argus_get_review", "argus_cancel_review"]));
   });
