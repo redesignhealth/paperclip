@@ -489,6 +489,97 @@ class TestMem0AutoSyncControl(unittest.TestCase):
 
         self.assertEqual(mock_backend.add.call_count, 1)
 
+    def test_env_auto_sync_false_without_mem0_json_disables_sync_turn(self):
+        """When MEM0_AUTO_SYNC=false in env and no mem0.json exists, sync_turn stores nothing."""
+        mock_backend = MagicMock()
+        mock_backend.add.return_value = {"results": []}
+
+        provider = self.mem0_mod.Mem0MemoryProvider()
+        provider._create_backend = lambda: mock_backend
+
+        with tempfile.TemporaryDirectory() as hermes_home_dir:
+            env = {"HERMES_HOME": hermes_home_dir, "MEM0_AUTO_SYNC": "false"}
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                provider.initialize(session_id="session-env-false")
+
+            self.assertIs(provider._auto_sync, False)
+            provider.sync_turn("User states task progress", "Acknowledged progress")
+            if provider._sync_thread and provider._sync_thread.is_alive():
+                provider._sync_thread.join(timeout=2.0)
+
+            self.assertEqual(mock_backend.add.call_count, 0)
+            self.assertIsNone(provider._sync_thread)
+
+    def test_env_false_but_mem0_json_true_wins(self):
+        """When MEM0_AUTO_SYNC=false in env but mem0.json specifies auto_sync=true, mem0.json wins."""
+        mock_backend = MagicMock()
+        mock_backend.add.return_value = {"results": []}
+
+        provider = self.mem0_mod.Mem0MemoryProvider()
+        provider._create_backend = lambda: mock_backend
+
+        with tempfile.TemporaryDirectory() as hermes_home_dir:
+            mem0_json = Path(hermes_home_dir) / "mem0.json"
+            mem0_json.write_text(json.dumps({"auto_sync": True}), encoding="utf-8")
+
+            env = {"HERMES_HOME": hermes_home_dir, "MEM0_AUTO_SYNC": "false"}
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                provider.initialize(session_id="session-env-false-file-true")
+
+            self.assertIs(provider._auto_sync, True)
+            provider.sync_turn("User states task progress", "Acknowledged progress")
+            if provider._sync_thread and provider._sync_thread.is_alive():
+                provider._sync_thread.join(timeout=2.0)
+
+            self.assertEqual(mock_backend.add.call_count, 1)
+
+    def test_env_true_or_unset_syncs_turns(self):
+        """When MEM0_AUTO_SYNC=true or unset without mem0.json, legacy turn sync is preserved."""
+        for env_val in ("true", None):
+            with self.subTest(env_val=env_val):
+                mock_backend = MagicMock()
+                mock_backend.add.return_value = {"results": []}
+
+                provider = self.mem0_mod.Mem0MemoryProvider()
+                provider._create_backend = lambda: mock_backend
+
+                with tempfile.TemporaryDirectory() as hermes_home_dir:
+                    env = {"HERMES_HOME": hermes_home_dir}
+                    if env_val is not None:
+                        env["MEM0_AUTO_SYNC"] = env_val
+
+                    with unittest.mock.patch.dict(os.environ, env, clear=False):
+                        if env_val is None:
+                            os.environ.pop("MEM0_AUTO_SYNC", None)
+                        provider.initialize(session_id=f"session-env-{env_val}")
+
+                    self.assertIs(provider._auto_sync, True)
+                    provider.sync_turn("User states task progress", "Acknowledged progress")
+                    if provider._sync_thread and provider._sync_thread.is_alive():
+                        provider._sync_thread.join(timeout=2.0)
+
+                    self.assertEqual(mock_backend.add.call_count, 1)
+
+    def test_invalid_env_falls_back_to_default_true(self):
+        """Invalid MEM0_AUTO_SYNC value in env falls back to default true and syncs turns."""
+        mock_backend = MagicMock()
+        mock_backend.add.return_value = {"results": []}
+
+        provider = self.mem0_mod.Mem0MemoryProvider()
+        provider._create_backend = lambda: mock_backend
+
+        with tempfile.TemporaryDirectory() as hermes_home_dir:
+            env = {"HERMES_HOME": hermes_home_dir, "MEM0_AUTO_SYNC": "invalid_value_123"}
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                provider.initialize(session_id="session-env-invalid")
+
+            self.assertIs(provider._auto_sync, True)
+            provider.sync_turn("User query", "Assistant response")
+            if provider._sync_thread and provider._sync_thread.is_alive():
+                provider._sync_thread.join(timeout=2.0)
+
+            self.assertEqual(mock_backend.add.call_count, 1)
+
     # --- Patch 0003: opt-in MEM0_PROXY for SelfHostedBackend (mem0 traffic only) ---
 
     def _pool_class(self, backend) -> str:

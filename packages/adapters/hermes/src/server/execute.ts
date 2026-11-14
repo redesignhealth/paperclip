@@ -1910,6 +1910,15 @@ export async function execute(
   // Unconditionally disable mem0 telemetry on every run
   env.MEM0_TELEMETRY = "False";
 
+  // TECH-8574: For env-configured Mem0 agents (adapterConfig.memoryProvider='mem0', no runtime
+  // memory) running under the mem0AutoSyncOff flag, disable automatic turn fact extraction by
+  // projecting MEM0_AUTO_SYNC=false into the child environment. Agents on runtime memory receive
+  // auto_sync: false via mem0.json instead. Agent-provided MEM0_AUTO_SYNC in config.env cannot
+  // defeat the flag when active.
+  if (hardeningFlags.mem0AutoSyncOff && memoryProvider === "mem0") {
+    env.MEM0_AUTO_SYNC = "false";
+  }
+
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
   // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
@@ -2248,6 +2257,9 @@ export async function execute(
 
     // Re-enforce protected security invariants after all runtime profile & provider merges
     env.HERMES_DISABLE_LAZY_INSTALLS = "1";
+    if (hardeningFlags.mem0AutoSyncOff && memoryProvider === "mem0") {
+      env.MEM0_AUTO_SYNC = "false";
+    }
 
     let scanPolicy: ReturnType<typeof applyCommandScanPolicy>;
     try {
