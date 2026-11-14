@@ -3553,6 +3553,1217 @@ rl.on("line", (line) => {
     }
   });
 
+  describe("TECH-8431: personal proxy token refresh and expiry handling", () => {
+    async function createPersonalSecret(companyId: string, userId: string, value: string, connectionId: string) {
+      const secrets = secretService(db);
+      const definition = await secrets.createUserSecretDefinition(companyId, {
+        name: `Personal remote token ${randomUUID()}`,
+        key: `personal_token_${randomUUID().replace(/-/g, "")}`,
+        provider: "local_encrypted",
+      });
+      const secret = await secrets.createCurrentUserSecretValue(companyId, userId, {
+        definitionId: definition.id,
+        value,
+      });
+      await db.insert(userSecretDeclarations).values({
+        companyId,
+        userSecretDefinitionId: definition.id,
+        targetType: "tool_connection",
+        targetId: connectionId,
+        configPath: "oauth.access_token",
+        envKey: "Authorization",
+      });
+      return secret;
+    }
+
+    it("handles upstream 401 with force refresh, returns explicit 409 and does not automatically replay", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const staleToken = `stale-token-${randomUUID()}`;
+      const refreshedToken = `refreshed-token-${randomUUID()}`;
+
+      let requestCount = 0;
+      const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+        requestCount++;
+        if (fakeRequest.headers.authorization === `Bearer ${staleToken}`) {
+          return { status: 401, body: { error: "invalid_token" } };
+        }
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { content: [{ type: "text", text: "recovered" }], structuredContent: {} },
+          },
+        };
+      });
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431",
+          connectionName: "Personal Google (TECH-8431 401 test)",
+          toolName: "list_threads",
+          riskLevel: "read",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, staleToken, remoteTool.connection.id);
+
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalls = 0;
+        let refreshForceArg: boolean | undefined;
+        gateway.configureGrantRefresh(async (input) => {
+          refreshCalls++;
+          refreshForceArg = input.force;
+          // Rotate the secret so subsequent reads get the new token
+          await secretService(db).rotateCurrentUserSecretValue(company.id, responsibleUserId, secret.id, { value: refreshedToken });
+          return { accessToken: refreshedToken, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+        expect(connectedTool).toBeTruthy();
+
+        // 1. Initial call returns 401, triggers force refresh, and throws 409 oauth_refreshed_retry_required
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+
+        expect(refreshCalls).toBe(1);
+        expect(refreshForceArg).toBe(true);
+        // NO automatic replay: server was only called once
+        expect(requestCount).toBe(1);
+
+        // 2. Explicit caller retry starts fresh call with the refreshed token and succeeds
+        const retryResult = await gateway.executeTool({
+          sessionToken: session.token,
+          callId: `call-retry-${randomUUID()}`,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(retryResult).toMatchObject({ status: "completed" });
+        expect(requestCount).toBe(2);
+        expect(fake.requests[1]!.headers.authorization).toBe(`Bearer ${refreshedToken}`);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("falls back to canonical metadata in providerTenant.oauth when credentialSecretRefs has no expiresAt", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const staleToken = `stale-token-${randomUUID()}`;
+      const refreshedToken = `refreshed-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+        expect(fakeRequest.headers.authorization).toBe(`Bearer ${refreshedToken}`);
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+          },
+        };
+      });
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-proactive",
+          connectionName: "Personal Google (proactive metadata test)",
+          toolName: "list_files",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, staleToken, remoteTool.connection.id);
+
+        // grant has NO expiresAt on credentialSecretRefs, but HAS accessTokenExpiresAt in providerTenant.oauth
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              strategy: "direct_oauth",
+              accessTokenExpiresAt: new Date(Date.now() - 100_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalled = false;
+        gateway.configureGrantRefresh(async () => {
+          refreshCalled = true;
+          return { accessToken: refreshedToken, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+        expect(refreshCalled).toBe(true);
+        expect(fake.requests).toHaveLength(1);
+        expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${refreshedToken}`);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("proactively refreshes tokens expiring within the 5-minute skew window", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const staleToken = `stale-token-${randomUUID()}`;
+      const refreshedToken = `refreshed-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+        expect(fakeRequest.headers.authorization).toBe(`Bearer ${refreshedToken}`);
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+          },
+        };
+      });
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-skew",
+          connectionName: "Personal Google (skew test)",
+          toolName: "list_items",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, staleToken, remoteTool.connection.id);
+
+        // Token expires in 2 minutes (120s from now) with an issue time 50 minutes ago (total TTL 52m)
+        // 5 min skew applies and triggers proactive refresh
+        const now = Date.now();
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              refreshedAt: new Date(now - 50 * 60_000).toISOString(),
+              accessTokenExpiresAt: new Date(now + 2 * 60_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(now + 2 * 60_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalled = false;
+        gateway.configureGrantRefresh(async () => {
+          refreshCalled = true;
+          return { accessToken: refreshedToken, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+        expect(refreshCalled).toBe(true);
+        expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${refreshedToken}`);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("does not refresh when the token is unexpired (30 minutes in the future)", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const validToken = `valid-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+        expect(fakeRequest.headers.authorization).toBe(`Bearer ${validToken}`);
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+          },
+        };
+      });
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-valid",
+          connectionName: "Personal Google (valid test)",
+          toolName: "list_items",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, validToken, remoteTool.connection.id);
+
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalled = false;
+        gateway.configureGrantRefresh(async () => {
+          refreshCalled = true;
+          return { accessToken: "should-not-be-used", expiresAt: null };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+        expect(refreshCalled).toBe(false);
+        expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${validToken}`);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("does not refresh on upstream 403 response", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const validToken = `valid-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 403,
+        body: { error: "forbidden" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-403",
+          connectionName: "Personal Google (403 test)",
+          toolName: "list_items",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, validToken, remoteTool.connection.id);
+
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalled = false;
+        gateway.configureGrantRefresh(async () => {
+          refreshCalled = true;
+          return { accessToken: "should-not-be-used", expiresAt: null };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 502,
+        });
+
+        expect(refreshCalled).toBe(false);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("safely returns 502 without uncaught error when refresh hook returns null or throws on 401", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 401,
+        body: { error: "unauthorized" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-fail",
+          connectionName: "Personal Google (refresh failure test)",
+          toolName: "list_items",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, "expired-upstream", remoteTool.connection.id);
+
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        // Hook returns null (refresh failed)
+        gateway.configureGrantRefresh(async () => null);
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 502,
+          reasonCode: "mcp_remote_status",
+        });
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("cloud strategy precedence ignores ref.expiresAt and only reads providerTenant.oauth.accessTokenExpiresAt", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const validToken = `valid-cloud-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+        expect(fakeRequest.headers.authorization).toBe(`Bearer ${validToken}`);
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+          },
+        };
+      });
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-cloud",
+          connectionName: "Personal Cloud (cloud precedence test)",
+          toolName: "list_items",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: {
+              url: fake.url,
+              identityModel: "personal_only",
+              oauth: { strategy: "paperclip_cloud_connector" },
+            },
+            transportConfig: {
+              url: fake.url,
+              identityModel: "personal_only",
+              oauth: { strategy: "paperclip_cloud_connector" },
+            },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, validToken, remoteTool.connection.id);
+
+        // ref.expiresAt is in the past, but providerTenant has a future expiry
+        // Cloud strategy must IGNORE ref.expiresAt and use providerTenant expiry!
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              strategy: "paperclip_cloud_connector",
+              refreshedAt: new Date(Date.now() - 60_000).toISOString(),
+              accessTokenExpiresAt: new Date(Date.now() + 7200_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(Date.now() - 100_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalled = false;
+        gateway.configureGrantRefresh(async () => {
+          refreshCalled = true;
+          return { accessToken: "should-not-refresh", expiresAt: null };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+        // Did not refresh because cloud strategy reads providerTenant ONLY
+        expect(refreshCalled).toBe(false);
+        expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${validToken}`);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("direct OAuth falls back to providerTenant when ref.expiresAt is superseded by refreshedAt", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const validToken = `valid-superseded-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async (fakeRequest) => {
+        expect(fakeRequest.headers.authorization).toBe(`Bearer ${validToken}`);
+        return {
+          body: {
+            jsonrpc: "2.0",
+            id: fakeRequest.body?.id,
+            result: { content: [{ type: "text", text: "ok" }], structuredContent: {} },
+          },
+        };
+      });
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-superseded",
+          connectionName: "Personal Direct (superseded test)",
+          toolName: "list_items",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, validToken, remoteTool.connection.id);
+
+        // ref.expiresAt is <= refreshedAt (demonstrably superseded)
+        // providerTenant has valid future expiry
+        const now = Date.now();
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              strategy: "direct_oauth",
+              refreshedAt: new Date(now - 30_000).toISOString(),
+              accessTokenExpiresAt: new Date(now + 3600_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(now - 60_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let refreshCalled = false;
+        gateway.configureGrantRefresh(async () => {
+          refreshCalled = true;
+          return { accessToken: "should-not-refresh", expiresAt: null };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        const result = await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: {},
+        });
+        expect(result).toMatchObject({ status: "completed" });
+        // ref was superseded so providerTenant valid expiry was used; not expired so no refresh
+        expect(refreshCalled).toBe(false);
+        expect(fake.requests[0]!.headers.authorization).toBe(`Bearer ${validToken}`);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("fresh rejected token with same generation does not 409 loop, falls through to error", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+      const staleToken = `stale-token-${randomUUID()}`;
+
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 401,
+        body: { error: "invalid_token" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-no-loop",
+          connectionName: "Personal Google (no loop test)",
+          toolName: "list_threads",
+          riskLevel: "read",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, staleToken, remoteTool.connection.id);
+
+        const currentRefreshedAt = new Date().toISOString();
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              refreshedAt: currentRefreshedAt,
+              accessTokenExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        const gateway = createTestToolGatewayService(db);
+        let hookObservedGeneration: string | null | undefined;
+        gateway.configureGrantRefresh(async (input) => {
+          hookObservedGeneration = input.observedRefreshedAt;
+          // Hook cannot advance (returns null, simulated failure to refresh)
+          return null;
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        // Tool fails with 502, NOT a 409 loop
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 502,
+          reasonCode: "mcp_remote_status",
+        });
+
+        // The observedRefreshedAt was correctly passed to the hook
+        expect(hookObservedGeneration).toBe(currentRefreshedAt);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("bounds persistent 401s: rotates once on initial 401, skips unbounded rotation on immediate repeat, and recovers on future expiry", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      let mockTime = Date.now();
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 401,
+        body: { error: "invalid_token" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-bound401",
+          connectionName: "Personal Google (bound 401 test)",
+          toolName: "list_threads",
+          riskLevel: "read",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, "token-v1", remoteTool.connection.id);
+
+        const gen1 = new Date(mockTime - 10_000).toISOString();
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {
+            oauth: {
+              refreshedAt: gen1,
+              accessTokenExpiresAt: new Date(mockTime + 3600_000).toISOString(),
+            },
+          },
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+              expiresAt: new Date(mockTime + 3600_000).toISOString(),
+            },
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.refresh_token",
+              required: true,
+              label: "Refresh token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        let refreshHookCalls = 0;
+        let tokenVersion = 1;
+        const gateway = createTestToolGatewayService(db, { now: () => mockTime });
+        gateway.configureGrantRefresh(async () => {
+          refreshHookCalls++;
+          tokenVersion++;
+          const newGen = new Date(mockTime).toISOString();
+          const newToken = `token-v${tokenVersion}`;
+          await secretService(db).rotateCurrentUserSecretValue(company.id, responsibleUserId, secret.id, { value: newToken });
+          await db.update(connectionGrants).set({
+            providerTenant: {
+              oauth: {
+                refreshedAt: newGen,
+                accessTokenExpiresAt: new Date(mockTime + 3600_000).toISOString(),
+              },
+            },
+          }).where(eq(connectionGrants.id, grant!.id));
+          return {
+            accessToken: newToken,
+            expiresAt: new Date(mockTime + 3600_000).toISOString(),
+            refreshedAt: newGen,
+            rotated: true,
+          };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        // 1. Initial 401 rotates token once and throws explicit 409
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+        expect(refreshHookCalls).toBe(1);
+
+        // 2. Caller immediately retries; upstream returns 401 again on the freshly minted token.
+        // It must NOT rotate again unbounded: skips rotation and throws 502 mcp_remote_status!
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            callId: `retry-call-${randomUUID()}`,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 502,
+          reasonCode: "mcp_remote_status",
+        });
+        // Hook was NOT called a second time
+        expect(refreshHookCalls).toBe(1);
+
+        // 3. Time advances past the 5-minute freshness window (e.g. 10 minutes later when token expires)
+        mockTime += 10 * 60_000;
+
+        // Upstream 401 now triggers rotation again (future expiry recovers!)
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            callId: `future-call-${randomUUID()}`,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+        expect(refreshHookCalls).toBe(2);
+      } finally {
+        await fake.close();
+      }
+    });
+
+    it("preserves undefined observedRefreshedAt for unknown baseline on 401 refresh", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const responsibleUserId = `user-${randomUUID()}`;
+      await createActiveMember(db, company.id, responsibleUserId);
+      await db.update(heartbeatRuns)
+        .set({ responsibleUserId, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), responsibleUserId } })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      const fake = await startFakeRemoteMcpServer(async () => ({
+        status: 401,
+        body: { error: "invalid_token" },
+      }));
+
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          applicationKey: "personal-google-tech8431-undefined-gen",
+          connectionName: "Personal Google (undefined gen test)",
+          toolName: "list_threads",
+          riskLevel: "read",
+          url: fake.url,
+        });
+        await db.update(toolConnections)
+          .set({
+            config: { url: fake.url, identityModel: "personal_only" },
+            transportConfig: { url: fake.url, identityModel: "personal_only" },
+          })
+          .where(eq(toolConnections.id, remoteTool.connection.id));
+
+        const secret = await createPersonalSecret(company.id, responsibleUserId, "token-unknown-gen", remoteTool.connection.id);
+
+        // Grant has NO providerTenant.oauth (so personalCreds.observedRefreshedAt is undefined)
+        const [grant] = await db.insert(connectionGrants).values({
+          companyId: company.id,
+          connectionId: remoteTool.connection.id,
+          kind: "user",
+          subjectUserId: responsibleUserId,
+          status: "active",
+          providerTenant: {},
+          credentialSecretRefs: [
+            {
+              secretId: secret.id,
+              versionSelector: "latest",
+              configPath: "oauth.access_token",
+              required: true,
+              label: "Access token",
+            },
+          ],
+        }).returning();
+
+        await db.insert(companySecretBindings).values({
+          companyId: company.id,
+          secretId: secret.id,
+          targetType: "connection_grant",
+          targetId: grant!.id,
+          configPath: "oauth.access_token",
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+
+        let receivedObservedRefreshedAt: string | null | undefined = "sentinel";
+        const gateway = createTestToolGatewayService(db);
+        gateway.configureGrantRefresh(async (input) => {
+          receivedObservedRefreshedAt = input.observedRefreshedAt;
+          return {
+            accessToken: "token-v2",
+            expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+            refreshedAt: new Date().toISOString(),
+            rotated: true,
+          };
+        });
+
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+
+        await expect(
+          gateway.executeTool({
+            sessionToken: session.token,
+            callId: `call-${randomUUID()}`,
+            tool: connectedTool!.name,
+            parameters: {},
+          }),
+        ).rejects.toMatchObject({
+          status: 409,
+          reasonCode: "oauth_refreshed_retry_required",
+        });
+
+        // Must preserve undefined, NOT convert to null:
+        expect(receivedObservedRefreshedAt).toBeUndefined();
+      } finally {
+        await fake.close();
+      }
+    });
+  });
+
   it("creates a personal authorization card and resumes after the user grant exists", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
