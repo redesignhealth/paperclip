@@ -1,43 +1,64 @@
 # Legacy Hermes memory → rh-memory-mcp runbook
 
-Copy one Hermes agent's legacy Mem0 memories into external, per-agent
-`rh-memory-mcp`. This is **not** the in-place Mem0 flip/drain/verify path:
-those gates do not observe it. The legacy company collection stays untouched
-as fallback; there is no prune.
+This runbook covers an additive import into external, per-agent
+`rh-memory-mcp`. It is **not** the in-place Mem0 flip/drain/verify path. The
+old tenant remains the fallback: do not publish, flip, drain, prune, or run an
+external production sweep/import from this runbook without separate explicit
+approval. A staging sweep writes only staging data and spends its approved LLM
+budget; the source collection remains unchanged.
 
-See the operations appendix for importer status, rollback, and pilot details.
+See the [operations appendix](./COMPANY-MEMORY-RMM-MIGRATION-OPS.md) for the
+import contract, guards, rollback, and verification requirements.
 
-## Before starting
+## Current pilot: already-enrolled five
 
-- Run the read-only census and review source, eligible, dropped, quarantined,
-  and cost counts. Confirm `text-embedding-3-small` / 1536 dimensions.
-- Run a company sweep in staging and record its cost estimate and totals. The
-  converter emits at most 6 records per source. Quarantine halts when more
-  than 50 are quarantined, or when quarantines exceed 2% after at least 200
-  considered sources. Quarantined, dropped, and unroutable records are not
-  exported.
-- Confirm the pilot agents are **not enrolled**: no `agent-memory` default-MCP
-  entry and no `adapterConfig.memoryProvider` (or `runtimeMemory`) memory
-  settings. Enrollment is the cutover: it adds the entry, mints the
-  `agent_memory.<agentId>` secret, and the setup hook writes the `MEM0_*` env,
-  `memoryProvider=mem0`, and `runtimeMemory=false`. Decide whether to disable
-  Hermes auto-sync (`MEM0_AUTO_SYNC=false` is projected); this does not stop
-  Claude Code or Codex Stop hooks from capturing.
+Production `dan-costanza` already has Chief of Staff, CTO, Talent, ArcQA, and
+LeadDeveloper enrolled by dsc-agent2. **Do not enroll or unenroll anyone.**
+Do not use the company-wide missing-entry endpoint: it can enroll other
+agents. This pilot makes no global configuration change and does not enable
+capture universally. There has been no production sweep or import by us.
 
-## Procedure (all pilot agents together)
+At the last census only these three had legacy rows: Chief of Staff (6,912),
+CTO (541), and Talent (181). ArcQA and LeadDeveloper had no legacy rows;
+recheck the census immediately before any action and import only confirmed
+rows. A later census may change that result.
 
-Set `C`, `A`, `TENANT_DSN`, and `CP_DSN` from the operator's approved secret
-store; do not put credentials or memory text in shell history or examples.
-The importer writes `user_id` from the manifest's agent id directly and needs
-neither that agent's token nor enrollment.
+The pilot is additive: import into the already-enrolled five's target, then
+verify. It does not change enrollment, capture settings, the old tenant, or
+the external backend selection. The coordinated plan is code/review and merge
+of the GET-by-id service change, importer PR 12155, and PRs 400/401 (401 is
+merged); then, with Dan's explicit go, dsc-agent2 performs the one production
+`rh-memory-mcp` service apply. After that service deployment, smoke-test
+`GET /memories/{id}` before any import. Separately, pin one Paperclip image
+through dev first, then apply that image in production; the planned ~5-minute
+Paperclip downtime requires its own go and is not approved now. PR 400's final
+SHA is not known here. No pin or deployment is performed by this runbook owner.
 
-1. **Sweep once, staging only.** Run `pnpm memory:upgrade sweep --database-url "$TENANT_DSN" --control-plane-url "$CP_DSN" --company "$C" --confirm "$C"` with supported budget/model flags. Never run `publish` or `flip`; review totals against the census. One sweep upgrade covers every agent.
-2. **Export each agent with records.** For every `A` reported by the sweep, run the export dry run and then confirmed export using the **same explicit `--upgrade-id "$U"`**. Export requires it when upgrades are ambiguous; the one-upgrade-per-agent rule still applies.
-3. **Transfer.** These steps read memory text. Keep files in a protected directory, delete them after use, and transfer only through ECS execute-command, never a public bucket:
-   `base64 -i export-<agent>.manifest.json | aws ecs execute-command ... "base64 -d > /tmp/export.manifest.json && chmod 0600 /tmp/export.manifest.json"`
-   and repeat for JSONL. Use the deployed task/container and approved AWS context.
-4. **Import and verify each agent.** In `/repo/services/rh-memory-mcp`, run the dry run, apply, and `--verify --verify-probes 5` for each transferred pair. Use `rh_memory_mcp_prod`/`memories` in production or `rh_memory_mcp`/`memories` in dev. Compare every agent's imported count and verify result with its export and sweep totals; delete `/tmp` files afterwards.
-5. **Enrollment dry run.** POST `/api/companies/:companyId/default-mcp/missing-entry-enrollment` with `{"keys":["agent-memory"]}` and record exactly which agents it would enroll. It considers `hermes_local`, `claude_local`, and `codex_local` agents with a `defaultMcp` state; terminated agents are skipped, while paused agents are not specially skipped by this service. Review the report with the operator.
-6. **Cut over together.** Only after every agent with legacy records is imported and verified, repeat the POST with `{"dryRun":false,"confirm":"add-missing-default-mcp-entries","keys":["agent-memory"]}`. There is no per-agent filter. Enrolled agents read the new store only; an enrolled agent without imported memories starts empty. Claude Code and Codex enrollment enables capture through the rh-memory-hook Stop hook. Watch errors, latency, rate limits, and recall.
+## Future generic path (not the current pilot)
 
-See [migration limits, rollback, pilot, and troubleshooting](./COMPANY-MEMORY-RMM-MIGRATION-OPS.md) before applying or cutting over.
+For a future **new** agent, import-before-enroll is a separate, explicitly
+approved path: census → staging sweep → unpublished export → protected
+transfer → guarded import/verify → separately reviewed enrollment. Never
+generalize that path to a company-wide enrollment call. Enrollment and
+unenrollment require their own change and approval.
+
+## Safe sequence
+
+1. Recheck census counts, target enrollment, schema/collection/role/model
+   configuration, and the service deployment smoke check.
+2. Run a staging sweep and export only its unpublished upgrade, using the
+   exact `--upgrade-id`. Never publish, flip, drain, or prune. `source upgrade`
+   must remain `new sweep → export`, never a published upgrade.
+3. Keep manifest/JSONL in a protected, local directory. Use an approved
+   operator host with restricted target access, or a separately rehearsed and
+   approved transport. Otherwise the operation is BLOCKED. See the appendix's
+   transfer gate.
+4. From the importer source, use `uv run python -m scripts.import_memories`
+   for dry-run, apply, and verification, with every target guard explicitly
+   supplied. Do not invent flags; inspect the checked-out CLI help/source.
+5. Record counts, errors, metadata/text verification, and operator-approved
+   recall probes. A zero exit code is not recall proof. Delete protected
+   working files after retention requirements are met.
+
+No production apply, enrollment change, backend flip, or rollback is implied
+by this document.
