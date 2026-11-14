@@ -77,6 +77,12 @@ import {
   type RunRecoverCliDependencies,
 } from "./memory-upgrade-recover.js";
 import {
+  ALLOWED_EXPORT_FLAGS,
+  BOOLEAN_EXPORT_FLAGS,
+  runExportCli,
+  type RunExportCliDependencies,
+} from "./memory-upgrade-export.js";
+import {
   LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES,
   LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES,
   LIFECYCLE_SAFE_STATE_MISMATCH_MESSAGES,
@@ -90,6 +96,7 @@ export {
   ALLOWED_ROLLBACK_FLAGS, BOOLEAN_ROLLBACK_FLAGS, runRollbackCli, type RunRollbackCliDependencies,
   ALLOWED_STATUS_FLAGS, BOOLEAN_STATUS_FLAGS,
   ALLOWED_RECOVER_FLAGS, BOOLEAN_RECOVER_FLAGS, runRecoverCli, type RunRecoverCliDependencies,
+  ALLOWED_EXPORT_FLAGS, BOOLEAN_EXPORT_FLAGS, runExportCli, type RunExportCliDependencies,
 };
 
 export const VALUE_FLAGS = new Set([
@@ -97,6 +104,9 @@ export const VALUE_FLAGS = new Set([
   "--company",
   "--confirm",
   "--control-plane-url",
+  "--agent",
+  "--upgrade-id",
+  "--output-dir",
   "--output",
   "--out",
   "--format",
@@ -760,6 +770,31 @@ export function sanitizeCliErrorMessage(error: unknown): string {
         return `[${code}] Unable to determine current database and user identity from tenant connection.`;
       }
 
+      if (code === "EXPORT_UPGRADE_ALREADY_PUBLISHED" || code === "export_upgrade_already_published") {
+        const isSafe = /^This upgrade has \d+ staging row\(s\) already published to the company collection; export supports unpublished upgrades only\.$/.test(rawMsg);
+        return `[${code}] ${isSafe ? rawMsg : "This upgrade has staging rows already published to the company collection; export supports unpublished upgrades only."}`;
+      }
+
+      if (code === "AMBIGUOUS_UPGRADE" || code === "ambiguous_upgrade") {
+        const isSafe = /^Multiple upgrade records exist for company \(\d+ candidates: [a-z0-9_,:() .T-]+\)\. Please specify --upgrade-id <uuid>\.$/i.test(rawMsg);
+        return `[${code}] ${isSafe ? rawMsg : "Multiple upgrade records exist for company. Please specify --upgrade-id <uuid>."}`;
+      }
+
+      if (code === "IMPORTER_CONTRACT_VIOLATION" || code === "importer_contract_violation") {
+        const isSafe = /^Importer contract violation detected \([a-z0-9_,: ]+\)\. Export aborted\.$/.test(rawMsg);
+        return `[${code}] ${isSafe ? rawMsg : "Importer contract violation detected in staging rows. Export aborted."}`;
+      }
+
+      if (code === "MALFORMED_PAYLOAD" || code === "malformed_payload") {
+        const isSafe = /^Malformed payload in \d+ staging row\(s\); export aborted\.$/.test(rawMsg);
+        return `[${code}] ${isSafe ? rawMsg : "Malformed payload detected in staging rows. Export aborted."}`;
+      }
+
+      if (code === "PAYLOAD_USER_ID_MISMATCH" || code === "payload_user_id_mismatch") {
+        const isSafe = /^Payload user_id mismatch in \d+ staging row\(s\); export aborted\.$/.test(rawMsg);
+        return `[${code}] ${isSafe ? rawMsg : "Payload user_id does not match target agent. Export aborted."}`;
+      }
+
       const generic = SWEEP_CLI_GENERIC_ERROR_MESSAGES[code];
       if (generic) {
         return `[${code}] ${generic}`;
@@ -1060,7 +1095,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
 
   if (!subcommand) {
     console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-    console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback");
+    console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback, recover, export");
     return 1;
   }
 
@@ -1096,6 +1131,10 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     return await runRecoverCli(args.slice(1));
   }
 
+  if (subcommand === "export") {
+    return await runExportCli(args.slice(1));
+  }
+
   if (STUB_SUBCOMMANDS.has(subcommand)) {
     console.error(`Error: Subcommand '${subcommand}' is not implemented yet.`);
     return 1;
@@ -1107,7 +1146,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     console.error("Error: Unknown subcommand.");
   }
   console.error("Usage: pnpm memory:upgrade <subcommand> [options]");
-  console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback, recover");
+  console.error("Available subcommands: census, sweep, publish, flip, drain, verify, rollback, recover, export");
   return 1;
 }
 
