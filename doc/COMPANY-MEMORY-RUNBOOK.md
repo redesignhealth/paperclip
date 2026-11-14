@@ -2,6 +2,8 @@
 
 This runbook documents the deployment, security posture, operations, state machine, and disaster recovery for Paperclip's tenant-isolated semantic memory infrastructure using dedicated per-company PostgreSQL databases with `pgvector` and `mem0`.
 
+For migrating legacy Hermes memory into the external per-agent service, use the [rh-memory-mcp migration runbook](./COMPANY-MEMORY-RMM-MIGRATION.md). That path is separate from the in-place lifecycle below.
+
 The native rollout path is separate from the parked hosted probe harness. Hermes
 resolves a company's `OPENAI_API_KEY` secret reference into the adapter
 environment, and the Hermes child passes it to mem0. The platform-default
