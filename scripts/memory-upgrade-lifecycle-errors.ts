@@ -68,6 +68,54 @@ export const LIFECYCLE_CLI_GENERIC_ERROR_MESSAGES: Record<string, string> = {
   get recover_outcome_unknown(): string {
     return this.RECOVER_OUTCOME_UNKNOWN;
   },
+
+  UPGRADE_TABLES_MISSING:
+    "Upgrade staging or ledger table does not exist in target database. Run 'pnpm memory:upgrade sweep' first.",
+  get upgrade_tables_missing(): string {
+    return this.UPGRADE_TABLES_MISSING;
+  },
+
+  EXPORT_UPGRADE_ALREADY_PUBLISHED:
+    "This upgrade has staging rows already published to the company collection; export supports unpublished upgrades only.",
+  get export_upgrade_already_published(): string {
+    return this.EXPORT_UPGRADE_ALREADY_PUBLISHED;
+  },
+
+  AMBIGUOUS_UPGRADE:
+    "Multiple upgrade records exist for company. Please specify --upgrade-id <uuid>.",
+  get ambiguous_upgrade(): string {
+    return this.AMBIGUOUS_UPGRADE;
+  },
+
+  IMPORTER_CONTRACT_VIOLATION:
+    "Importer contract violation detected in staging rows. Export aborted.",
+  get importer_contract_violation(): string {
+    return this.IMPORTER_CONTRACT_VIOLATION;
+  },
+
+  AGENT_NOT_FOUND:
+    "Target agent record does not exist in control plane database for target company.",
+  get agent_not_found(): string {
+    return this.AGENT_NOT_FOUND;
+  },
+
+  AGENT_INELIGIBLE:
+    "Target agent is not a memory-eligible hermes_local agent.",
+  get agent_ineligible(): string {
+    return this.AGENT_INELIGIBLE;
+  },
+
+  MALFORMED_PAYLOAD:
+    "Malformed payload detected in staging rows. Export aborted.",
+  get malformed_payload(): string {
+    return this.MALFORMED_PAYLOAD;
+  },
+
+  PAYLOAD_USER_ID_MISMATCH:
+    "Payload user_id does not match target agent. Export aborted.",
+  get payload_user_id_mismatch(): string {
+    return this.PAYLOAD_USER_ID_MISMATCH;
+  },
 };
 
 export const LIFECYCLE_SAFE_STATE_MISMATCH_MESSAGES = [
@@ -78,6 +126,9 @@ export const LIFECYCLE_SAFE_STATE_MISMATCH_MESSAGES = [
   "Cannot run rollback: no flip has been performed for this upgrade.",
   "Cannot run recover: active upgrade is not in needs_recovery.",
   "No active memory upgrade for this company.",
+  "Upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' first.",
+  "Cannot run export: active upgrade is in needs_recovery. Run 'pnpm memory:upgrade recover' first.",
+  "Cannot run export: active upgrade is in aborted state.",
 ] as const;
 
 export const LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = [
@@ -87,4 +138,9 @@ export const LIFECYCLE_SAFE_INVALID_ARGUMENT_EXACT_MESSAGES = [
   "Invalid --probe-interval-minutes. Must be an integer of at least 10.",
   "Confirmation company ID does not match target company ID.",
   "Flag --confirm <uuid> must strictly match --company <uuid>.",
+  "Invalid --agent. Must be a valid UUID.",
+  "Invalid --upgrade-id. Must be a valid UUID.",
+  "Flag --company <uuid> is required for export.",
+  "Flag --agent <uuid> is required for export.",
+  "Flag --output-dir is required when --confirm is supplied.",
 ] as const;
