@@ -36,6 +36,12 @@ export const AGENT_MEMORY_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_ENABLED";
 export const AGENT_MEMORY_URL_ENV = "PAPERCLIP_AGENT_MEMORY_URL";
 export const AGENT_MEMORY_PROXY_ENV = "PAPERCLIP_AGENT_MEMORY_PROXY";
 /**
+ * Server-level switch for end-of-turn memory capture on Claude and Codex agents (TECH-8644).
+ * Defaults to off (recall-only); set to "on" to retain legacy capture behavior.
+ */
+export const AGENT_MEMORY_CAPTURE_ENV = "PAPERCLIP_AGENT_MEMORY_CAPTURE";
+export const RH_MEMORY_CAPTURE_KEY = "RH_MEMORY_CAPTURE";
+/**
  * Extra opt-in for EXISTING agents: when `true` (and the memory settings are valid), the operator-run missing-entry
  * enrollment may add the agent-memory entry to agents that already hold a default-MCP state. New agents never need it.
  */
@@ -181,7 +187,7 @@ function asRecord(value: unknown): Record<string, unknown> {
  */
 export async function applyAgentMemoryAdapterConfig(
   db: Db,
-  input: { companyId: string; agentId: string; secretId: string; config: AgentMemoryConfig },
+  input: { companyId: string; agentId: string; secretId: string; config: AgentMemoryConfig; env?: NodeJS.ProcessEnv },
 ): Promise<boolean> {
   const svc = agentService(db);
   const row = await svc.getById(input.agentId);
@@ -189,14 +195,26 @@ export async function applyAgentMemoryAdapterConfig(
   const profile = agentMemoryProfileFor(row.adapterType, row.adapterConfig);
   if (!profile) return false;
   const current = asRecord(row.adapterConfig);
+  const currentEnv = asRecord(current.env);
   const env: Record<string, unknown> = {
-    ...asRecord(current.env),
+    ...currentEnv,
     [profile.tokenEnvKey]: { type: "secret_ref", secretId: input.secretId, version: "latest" },
     [profile.urlEnvKey]: { type: "plain", value: input.config.url },
   };
   if (profile.userIdEnvKey) env[profile.userIdEnvKey] = { type: "plain", value: input.agentId };
   // No configured proxy leaves whatever the agent already has: every other key is kept.
   if (input.config.proxy) env[profile.proxyEnvKey] = { type: "plain", value: input.config.proxy };
+
+  const harness = agentHarnessType(row.adapterType, current);
+  if (harness === "claude_local" || harness === "codex_local") {
+    if (!(RH_MEMORY_CAPTURE_KEY in currentEnv)) {
+      const serverEnv = input.env ?? process.env;
+      if (serverEnv[AGENT_MEMORY_CAPTURE_ENV]?.trim().toLowerCase() !== "on") {
+        env[RH_MEMORY_CAPTURE_KEY] = { type: "plain", value: "off" };
+      }
+    }
+  }
+
   const updated = await svc.update(
     input.agentId,
     { adapterConfig: { ...current, env, ...(profile.adapterConfig ?? {}) } },
@@ -305,7 +323,7 @@ export const agentMemoryHook: DefaultMcpSetupHook = async (input) => {
   // Token stored: the rest is one local, idempotent, retryable transaction (no external call). Checkpoint errors are
   // raised above, outside this block, so a lost claim is never swallowed here.
   try {
-    const applied = await applyAgentMemoryAdapterConfig(db, { companyId, agentId, secretId: binding.secretId!, config: memoryConfig });
+    const applied = await applyAgentMemoryAdapterConfig(db, { companyId, agentId, secretId: binding.secretId!, config: memoryConfig, env: input.env });
     return applied ? { kind: "ready" } : { kind: "error", reason: "adapter_unsupported" };
   } catch (err) {
     logger.warn(

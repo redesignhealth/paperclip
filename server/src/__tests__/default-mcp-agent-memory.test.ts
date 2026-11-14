@@ -31,6 +31,7 @@ import {
   agentMemoryEligibleForNewAgent,
   agentMemoryProfileFor,
   resolveAgentMemoryConfig,
+  AGENT_MEMORY_CAPTURE_ENV, RH_MEMORY_CAPTURE_KEY, applyAgentMemoryAdapterConfig,
 } from "../services/default-mcp-agent-memory.js";
 import {
   AGENT_MEMORY_TOKEN_EXPIRES_IN_DAYS,
@@ -214,6 +215,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
   const envKeys = [
     FEATURE_ENV,
     AGENT_MEMORY_ENABLED_ENV,
+    AGENT_MEMORY_CAPTURE_ENV,
     AGENT_MEMORY_URL_ENV,
     AGENT_MEMORY_PROXY_ENV,
     COMMS_BOARD_MCP_URL_ENV,
@@ -387,6 +389,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     const [secret] = await secretsFor(companyId, agent.id);
     const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
     expect(config.env).toEqual({
+      RH_MEMORY_CAPTURE: { type: "plain", value: "off" },
       RH_MEMORY_TOKEN: expect.objectContaining({ type: "secret_ref", secretId: secret!.id, version: "latest" }),
       RH_MEMORY_URL: { type: "plain", value: MEMORY_URL },
       RH_MEMORY_PROXY: { type: "plain", value: MEMORY_PROXY },
@@ -399,6 +402,8 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
       { consumerType: "agent", consumerId: agent.id },
       { adapterType: "claude_local" },
     );
+    expect(config.env.RH_MEMORY_CAPTURE).toEqual({ type: "plain", value: "off" });
+    expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_CAPTURE).toBe("off");
     expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_TOKEN).toBe(BOARD_TOKEN);
   });
 
@@ -414,7 +419,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect((await rowOf(agent.id)).adapterType).toBe("paperclip_runner");
     expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
     const env = ((await rowOf(agent.id)).adapterConfig as Record<string, any>).env;
-    expect(Object.keys(env).sort()).toEqual(["RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
+    expect(Object.keys(env).sort()).toEqual(["RH_MEMORY_CAPTURE", "RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
   });
 
   it("new Codex local agent: attaches the same RH_MEMORY_* keys as Claude", async () => {
@@ -430,6 +435,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     const [secret] = await secretsFor(companyId, agent.id);
     const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
     expect(config.env).toEqual({
+      RH_MEMORY_CAPTURE: { type: "plain", value: "off" },
       RH_MEMORY_TOKEN: expect.objectContaining({ type: "secret_ref", secretId: secret!.id, version: "latest" }),
       RH_MEMORY_URL: { type: "plain", value: MEMORY_URL },
       RH_MEMORY_PROXY: { type: "plain", value: MEMORY_PROXY },
@@ -443,6 +449,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
       { consumerType: "agent", consumerId: agent.id },
       { adapterType: "codex_local" },
     );
+    expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_CAPTURE).toBe("off");
     expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_TOKEN).toBe(BOARD_TOKEN);
   });
 
@@ -455,7 +462,7 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
     expect(config.provider).toBe("codex");
     expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
-    expect(Object.keys(config.env).sort()).toEqual(["RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
+    expect(Object.keys(config.env).sort()).toEqual(["RH_MEMORY_CAPTURE", "RH_MEMORY_PROXY", "RH_MEMORY_TOKEN", "RH_MEMORY_URL"]);
   });
 
   it("keeps an existing proxy key when none is configured", async () => {
@@ -620,5 +627,30 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     await runDefaultMcpSetupForAgent({ db, now: () => new Date(Date.now() + 3_600_000) }, { companyId, agentId: agent.id });
     expect(fetchMock.calls.mint.length).toBe(mints);
     expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "error", reason: "secret_unavailable" } });
+  });
+
+  it("honors capture switch and operator overrides", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    vi.stubGlobal("fetch", downstreamFetch());
+
+    process.env[AGENT_MEMORY_CAPTURE_ENV] = "on";
+    const cOn = await createAgent(companyId, ownerId, { adapterType: "claude_local" });
+    const xOn = await createAgent(companyId, ownerId, { adapterType: "codex_local" });
+    for (const a of [cOn, xOn]) expect(((await rowOf(a.id)).adapterConfig as any).env[RH_MEMORY_CAPTURE_KEY]).toBeUndefined();
+
+    delete process.env[AGENT_MEMORY_CAPTURE_ENV];
+    const op = await createAgent(companyId, ownerId, {
+      adapterType: "claude_local", runner: "legacy", adapterConfig: { env: { [RH_MEMORY_CAPTURE_KEY]: { type: "plain", value: "on" } } },
+    });
+    const opEnv = () => rowOf(op.id).then((r) => (r.adapterConfig as any).env[RH_MEMORY_CAPTURE_KEY]);
+    expect(await opEnv()).toEqual({ type: "plain", value: "on" });
+    const [secret] = await secretsFor(companyId, op.id);
+    await applyAgentMemoryAdapterConfig(db, { companyId, agentId: op.id, secretId: secret!.id, config: { url: MEMORY_URL, proxy: null } });
+    expect(await opEnv()).toEqual({ type: "plain", value: "on" });
+
+    const h = await createAgent(companyId, ownerId, { adapterType: "hermes_local" });
+    expect(((await rowOf(h.id)).adapterConfig as any).env[RH_MEMORY_CAPTURE_KEY]).toBeUndefined();
   });
 });

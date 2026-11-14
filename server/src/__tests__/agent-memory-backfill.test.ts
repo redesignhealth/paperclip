@@ -24,9 +24,11 @@ import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.
 import { MISSING_ENTRY_CONFIRMATION, addMissingDefaultMcpEntries } from "../services/default-mcp-missing-entry-enrollment.js";
 import {
   AGENT_MEMORY_BACKFILL_ENABLED_ENV,
+  AGENT_MEMORY_CAPTURE_ENV,
   AGENT_MEMORY_ENABLED_ENV,
   AGENT_MEMORY_PROXY_ENV,
   AGENT_MEMORY_URL_ENV,
+  RH_MEMORY_CAPTURE_KEY,
 } from "../services/default-mcp-agent-memory.js";
 import {
   COMMS_BOARD_ADMIN_TOKEN_ENV,
@@ -60,6 +62,7 @@ describeEmbeddedPostgres("agent memory backfill", () => {
     FEATURE_ENV,
     AGENT_MEMORY_ENABLED_ENV,
     AGENT_MEMORY_BACKFILL_ENABLED_ENV,
+    AGENT_MEMORY_CAPTURE_ENV,
     AGENT_MEMORY_URL_ENV,
     AGENT_MEMORY_PROXY_ENV,
     COMMS_BOARD_MCP_URL_ENV,
@@ -230,4 +233,43 @@ describeEmbeddedPostgres("agent memory backfill", () => {
     expect(mintCalls(fetchMock)).toHaveLength(1);
   });
 
+  it("backfilling Claude and Codex agents sets RH_MEMORY_CAPTURE off by default and preserves existing operator value", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const claude = await existingAgentWithoutMemory(companyId, ownerId, {
+      adapterType: "claude_local",
+      runner: "legacy",
+    });
+    const codex = await existingAgentWithoutMemory(companyId, ownerId, {
+      adapterType: "codex_local",
+      runner: "legacy",
+      adapterConfig: {
+        env: {
+          [RH_MEMORY_CAPTURE_KEY]: { type: "plain", value: "on" },
+        },
+      },
+    });
+    enableMemory({ backfill: true });
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const report = await addMissingDefaultMcpEntries(db, {
+      companyId,
+      dryRun: false,
+      confirm: MISSING_ENTRY_CONFIRMATION,
+      keys: ["agent-memory"],
+    });
+    await waitForScheduledDefaultMcpSetups();
+
+    expect(report.outcomes.find((o) => o.agentId === claude.id)).toMatchObject({ result: "added", keys: ["agent-memory"] });
+    expect(report.outcomes.find((o) => o.agentId === codex.id)).toMatchObject({ result: "added", keys: ["agent-memory"] });
+
+    const claudeConfig = (await rowOf(claude.id)).adapterConfig as Record<string, any>;
+    const codexConfig = (await rowOf(codex.id)).adapterConfig as Record<string, any>;
+
+    // Claude got default off
+    expect(claudeConfig.env[RH_MEMORY_CAPTURE_KEY]).toEqual({ type: "plain", value: "off" });
+    // Codex preserved existing operator value "on"
+    expect(codexConfig.env[RH_MEMORY_CAPTURE_KEY]).toEqual({ type: "plain", value: "on" });
+  });
 });
