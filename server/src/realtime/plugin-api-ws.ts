@@ -73,9 +73,20 @@ export function acquireWebSocketSlot(companyId: string, actorId: string, pluginI
   };
 }
 
+let testProxyOverride: typeof proxyPluginApiWebSocket | null = null;
+
 export function resetWebSocketSlotsForTest() {
   activePerActorPlugin.clear();
   activePerCompany.clear();
+  testProxyOverride = null;
+}
+
+// fork(TECH-8283 Material 4): Set test proxy override within test runtime only
+export function setGuardedWebSocketProxyForTesting(proxy: typeof proxyPluginApiWebSocket | null): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("setGuardedWebSocketProxyForTesting is only permitted in test environments");
+  }
+  testProxyOverride = proxy;
 }
 
 // fork(TECH-8283 Finding 6): Header allowlist with explicit denylist of routing/proxy headers
@@ -175,7 +186,7 @@ function isTestRuntimeEnvironment(): boolean {
 
 /**
  * Explicit test factory with runtime test-environment guard.
- * fork(TECH-8283 Finding 3): Throws outside test runtime; prevents production bypass.
+ * fork(TECH-8283 Finding 3, Material 4): Throws outside test runtime; prevents production bypass.
  */
 export function createGuardedWebSocketProxyForTesting(
   testSeam: PluginApiWsTestSeam,
@@ -186,7 +197,7 @@ export function createGuardedWebSocketProxyForTesting(
   available: () => Promise<boolean>,
   options?: PluginApiWsLifecycleOptions,
 ) => Promise<void> {
-  if (!isTestRuntimeEnvironment()) {
+  if (process.env.NODE_ENV !== "test") {
     throw new Error("createGuardedWebSocketProxyForTesting is only permitted in test environments");
   }
   return (req, res, target, available, options) =>
@@ -246,13 +257,16 @@ export function setupPluginApiWebSocketServer(
     response.once("finish", clearDeadline);
     response.once("close", clearDeadline);
 
-    socket.on("error", () => {
+    const onTerminalAbort = () => {
       settle("error");
-      socket.destroy();
-    });
-    socket.once("close", () => {
-      settle("error");
-    });
+      if (!socket.destroyed) socket.destroy();
+    };
+    socket.on("error", onTerminalAbort);
+    socket.once("close", onTerminalAbort);
+    socket.once("end", onTerminalAbort);
+    request.once("close", onTerminalAbort);
+    request.once("aborted", onTerminalAbort);
+    response.once("close", onTerminalAbort);
 
     if (request.method !== "GET" || request.headers.upgrade?.toLowerCase() !== "websocket"
       || request.headers["content-length"] || request.headers["transfer-encoding"]) {
@@ -278,7 +292,7 @@ export function setupPluginApiWebSocketServer(
 
 /**
  * Production exported proxy wrapper.
- * fork(TECH-8283 Finding 3): Accepts ONLY safe lifecycle options; no test seam bypass parameters.
+ * fork(TECH-8283 Finding 3, Material 4): Accepts ONLY safe lifecycle options; no test seam bypass parameters.
  */
 export async function proxyPluginApiWebSocket(
   req: Request,
@@ -287,6 +301,9 @@ export async function proxyPluginApiWebSocket(
   available: () => Promise<boolean>,
   options?: PluginApiWsLifecycleOptions,
 ): Promise<void> {
+  if (process.env.NODE_ENV === "test" && testProxyOverride) {
+    return testProxyOverride(req, res, target, available, options);
+  }
   return internalProxyPluginApiWebSocket(req, res, target, available, options, undefined);
 }
 

@@ -4,8 +4,10 @@ import { once } from "node:events";
 import { WebSocket, WebSocketServer } from "ws";
 import {
   setupPluginApiWebSocketServer,
+  acquireWebSocketSlot,
   resetWebSocketSlotsForTest,
   createGuardedWebSocketProxyForTesting,
+  setGuardedWebSocketProxyForTesting,
 } from "../realtime/plugin-api-ws.js";
 
 // fork(TECH-8283 F1): Support options-object call shape for pinned DNS requests
@@ -106,14 +108,16 @@ async function createApp(input: {
   mockRegistry.getById.mockResolvedValue(input.plugin ?? null);
   mockRegistry.getByKey.mockResolvedValue(input.plugin ?? null);
 
-  // fork(TECH-8283 Finding 3): Integration harness uses explicit test factory only in test runtime
-  const proxyWs = input.useProductionProxy
-    ? undefined
-    : createGuardedWebSocketProxyForTesting({
-        allowPrivateNetwork: input.wsOptions?.allowPrivateNetwork ?? true,
-        lookup: input.wsOptions?.lookup as never,
-        handshakeDeadlineMs: input.wsOptions?.handshakeDeadlineMs,
-      });
+  // fork(TECH-8283 Finding 3, Material 4): Set test proxy override in test runtime
+  if (input.useProductionProxy) {
+    setGuardedWebSocketProxyForTesting(null);
+  } else {
+    setGuardedWebSocketProxyForTesting(createGuardedWebSocketProxyForTesting({
+      allowPrivateNetwork: input.wsOptions?.allowPrivateNetwork ?? true,
+      lookup: input.wsOptions?.lookup as never,
+      handshakeDeadlineMs: input.wsOptions?.handshakeDeadlineMs,
+    }));
+  }
 
   const app = express();
   app.use(express.json());
@@ -126,7 +130,7 @@ async function createApp(input: {
       undefined,
       undefined,
       undefined,
-      { workerManager, wsOptions: input.wsOptions, proxyWs } as never,
+      { workerManager, wsOptions: input.wsOptions } as never,
     ),
   );
   app.use(errorHandler);
@@ -1009,6 +1013,217 @@ describe("plugin browser WebSockets", () => {
     }
   });
 
+  // fork(TECH-8283 Material 6): Non-WS routes reject WebSocket upgrades before worker dispatch
+  it("rejects WebSocket upgrade on non-WS route with 400 before worker dispatch", async () => {
+    const httpRoutes = manifest([{
+      routeKey: "http.get", method: "GET", path: "/plain-http", auth: "board",
+      capability: "api.routes.register", companyResolution: { from: "query", key: "companyId" },
+    }]);
+    const { app, workerManager } = await createApp({
+      actor: board,
+      plugin: { id: pluginId, pluginKey: httpRoutes.id, status: "ready", manifestJson: httpRoutes },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    try {
+      expect(await connectWsExpectStatus(`${base}/api/plugins/${pluginId}/api/plain-http?companyId=${companyId}`)).toBe(400);
+      expect(workerManager.call).not.toHaveBeenCalled();
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  // fork(TECH-8283 Material 6): Missing http.outbound capability rejects with 426 before worker dispatch
+  it("rejects WebSocket route when manifest lacks http.outbound capability with 426 before worker dispatch", async () => {
+    const noOutboundRoutes = {
+      ...apiRoutes,
+      capabilities: ["api.routes.register"], // missing http.outbound
+    };
+    const { app, workerManager } = await createApp({
+      actor: board,
+      plugin: { id: pluginId, pluginKey: noOutboundRoutes.id, status: "ready", manifestJson: noOutboundRoutes },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    try {
+      expect(await connectWsExpectStatus(`${base}${endpoint}`)).toBe(426);
+      expect(workerManager.call).not.toHaveBeenCalled();
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  // fork(TECH-8283 Material 4): Production proxy wrapper rejects private endpoint without dialing
+  it("production wrapper strictly rejects private destination and never dials", async () => {
+    const { request: httpsReq } = await import("node:https");
+    const dialSpy = vi.spyOn({ req: httpsReq }, "req");
+    const { app } = await createApp({
+      actor: board,
+      plugin,
+      useProductionProxy: true,
+      workerResult: { websocket: { url: "wss://127.0.0.1:9999/channels/build-output" } },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    try {
+      expect(await connectWsExpectStatus(`${base}${endpoint}`)).toBe(502);
+      expect(dialSpy).not.toHaveBeenCalled();
+    } finally {
+      dialSpy.mockRestore();
+      await closeServer(server);
+    }
+  });
+
+  // fork(TECH-8283 Material 1): Abort before slot acquisition releases state and does not leak slots
+  it("does not leak slots or dispatch worker when client aborts before slot acquisition", async () => {
+    let stallResolve = false;
+    let onStallReached: (() => void) | undefined;
+    let releaseStall: (() => void) | undefined;
+    const stallAgentId = "33333333-3333-4333-8333-333333333333";
+    const stallRoute = manifest([{
+      routeKey: "agent.stall", method: "GET", path: "/agents/:agentId/stall", transport: "websocket",
+      auth: "board", capability: "api.routes.register", companyResolution: { from: "agent", param: "agentId" },
+    }]);
+    const stallPlugin = { id: pluginId, pluginKey: stallRoute.id, status: "ready", manifestJson: stallRoute };
+    const stallEndpoint = `/api/plugins/${pluginId}/api/agents/${stallAgentId}/stall`;
+
+    const chain = {
+      from: () => chain,
+      where: () => chain,
+      limit: vi.fn().mockImplementation(() => {
+        if (stallResolve) {
+          return new Promise((resolve) => {
+            releaseStall = () => resolve([{ id: stallAgentId, companyId }]);
+            onStallReached?.();
+          });
+        }
+        return Promise.resolve([{ id: stallAgentId, companyId }]);
+      }),
+    };
+    const { app, workerManager } = await createApp({
+      db: { select: () => chain },
+      actor: board,
+      plugin: stallPlugin,
+      workerResult: { websocket: { url: "wss://valid.test/ws" } },
+    });
+    const server = createServer(app);
+    let currentSocket: Socket | undefined;
+    server.on("upgrade", (_req, socket) => {
+      currentSocket = socket as Socket;
+    });
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+
+    try {
+      stallResolve = true;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const stallPromise = new Promise<void>((r) => { onStallReached = r; });
+        const ws = new WebSocket(`${base}${stallEndpoint}`, { origin: "http://localhost:3100" });
+        ws.on("error", () => {});
+        await stallPromise;
+
+        ws.terminate();
+        if (currentSocket && !currentSocket.destroyed) {
+          await once(currentSocket, "close");
+        }
+
+        releaseStall?.();
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      expect(workerManager.call).not.toHaveBeenCalled();
+
+      // All 4 slots remain available because no slots leaked across 5 aborted attempts
+      for (let i = 0; i < 4; i += 1) {
+        expect(acquireWebSocketSlot(companyId, "test-user", pluginId)).not.toBeNull();
+      }
+      resetWebSocketSlotsForTest();
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  // fork(TECH-8283 Material 2): Watchdog revokes connection when session actor membership is revoked
+  it("watchdog promptly closes connection when session actor company membership is revoked in DB", async () => {
+    const mockWs = await startMockWsUpstream();
+    let membershipActive = true;
+    const dbMock = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: () => Promise.resolve(membershipActive ? [{ id: "membership-1" }] : []),
+          }),
+        }),
+      }),
+    };
+    const sessionActor = { type: "board", source: "session", userId: "user-session-1", companyIds: [companyId] };
+    const { app } = await createApp({
+      db: dbMock,
+      actor: sessionActor,
+      plugin,
+      workerResult: { websocket: { url: mockWs.base.replace("http:", "wss:") + "/channels/build-output" } },
+      wsOptions: { allowPrivateNetwork: true, watchIntervalMs: 25 },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const ws = new WebSocket(`${base}${endpoint}`, { origin: "http://localhost:3100" });
+    try {
+      await once(ws, "open");
+      membershipActive = false;
+      expect(await once(ws, "close")).toBeDefined();
+    } finally {
+      ws.terminate();
+      await Promise.all([closeServer(server), mockWs.close()]);
+    }
+  });
+
+  // fork(TECH-8283 Material 2): Watchdog revokes agent-scoped route connection when agent:read permission is revoked
+  it("watchdog promptly closes agent-scoped connection when agent:read is revoked without dropping membership", async () => {
+    const agentId = "33333333-3333-4333-8333-333333333333";
+    const agentWsRoutes = manifest([{
+      routeKey: "agent.connect", method: "GET", path: "/agents/:agentId/connect", transport: "websocket",
+      auth: "board", capability: "api.routes.register", companyResolution: { from: "agent", param: "agentId" },
+    }]);
+    const mockWs = await startMockWsUpstream();
+    const dbMock = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: () => Promise.resolve([{ id: agentId, companyId }]),
+          }),
+        }),
+      }),
+    };
+    let agentReadAllowed = true;
+    mockAccess.decide.mockImplementation(async () => ({ allowed: agentReadAllowed }));
+
+    const { app } = await createApp({
+      db: dbMock,
+      actor: board,
+      plugin: { id: pluginId, pluginKey: agentWsRoutes.id, status: "ready", manifestJson: agentWsRoutes },
+      workerResult: { websocket: { url: mockWs.base.replace("http:", "wss:") + "/channels/build-output" } },
+      wsOptions: { allowPrivateNetwork: true, watchIntervalMs: 25 },
+    });
+    const server = createServer(app);
+    setupPluginApiWebSocketServer(server, app);
+    const base = await listen(server);
+    const agentEndpoint = `/api/plugins/${pluginId}/api/agents/${agentId}/connect`;
+    const ws = new WebSocket(`${base}${agentEndpoint}`, { origin: "http://localhost:3100" });
+    try {
+      await once(ws, "open");
+      agentReadAllowed = false;
+      expect(await once(ws, "close")).toBeDefined();
+    } finally {
+      ws.terminate();
+      mockAccess.decide.mockResolvedValue({ allowed: true });
+      await Promise.all([closeServer(server), mockWs.close()]);
+    }
+  });
+
   it("only permits declared board GET WebSockets", () => {
     expect(pluginManifestV1Schema.safeParse(apiRoutes).success).toBe(true);
     const bad = structuredClone(apiRoutes);
@@ -1035,4 +1250,11 @@ it("agent-scoped plugin routes reuse agent:read and refuse denied access before 
   expect(crossCompany.status).toBe(404);
   expect(crossCompany.body).toEqual(missing.body);
   expect(workerManager.call).not.toHaveBeenCalled();
+
+  // fork(TECH-8283 Material 3): Malformed agentId UUID -> 400 before DB query
+  chain.limit.mockClear();
+  const badIdRes = await request(app).get(`/api/plugins/${pluginId}/api/agents/not-a-valid-uuid/status`);
+  expect(badIdRes.status).toBe(400);
+  expect(badIdRes.body.error).toContain("Invalid agent ID");
+  expect(chain.limit).not.toHaveBeenCalled();
 });

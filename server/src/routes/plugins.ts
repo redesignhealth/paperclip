@@ -104,6 +104,8 @@ import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
  * (`instance.plugins` in PAPERCLIP_HIDDEN_SETTINGS), plugin lifecycle and
@@ -454,8 +456,6 @@ export interface PluginRouteBridgeDeps {
   streamBus?: PluginStreamBus;
   // fork(TECH-8283 Finding 5): Safe lifecycle options for production proxy
   wsOptions?: PluginApiWsLifecycleOptions;
-  // fork(TECH-8283 Finding 5): Optional injected proxy for test harness only
-  proxyWs?: typeof proxyPluginApiWebSocket;
 }
 
 export interface PluginRouteToolGatewayDeps {
@@ -646,11 +646,15 @@ export function pluginRoutes(
     if (resolution.from === "agent") {
       const id = params[resolution.param];
       if (!id) return null;
+      // fork(TECH-8283 Material 3): Validate agentId UUID before DB query; malformed -> 400
+      if (!UUID_PATTERN.test(id)) {
+        throw badRequest("Invalid agent ID");
+      }
       const [agent] = await db.select({ id: agents.id, companyId: agents.companyId }).from(agents).where(eq(agents.id, id)).limit(1);
       if (!agent || !hasCompanyAccess(req, agent.companyId)) throw notFound("Agent not found");
-      assertCompanyAccess(req, agent.companyId);
       const decision = await authorizationService(db).decide({ actor: req.actor, action: "agent:read", resource: { type: "agent", companyId: agent.companyId, agentId: agent.id } });
       if (!decision.allowed) throw notFound("Agent not found");
+      assertCompanyAccess(req, agent.companyId);
       return agent.companyId;
     }
 
@@ -1931,9 +1935,12 @@ export function pluginRoutes(
 
       const actor = getActorInfo(req);
 
-      // fork(TECH-8283 F3): Concurrency cap per (actor, plugin) = 4, per company = 32. Reject 429 BEFORE worker dispatch.
+      // fork(TECH-8283 F3, Material 1): Check state before acquisition and install idempotent release immediately
       let releaseSlot: (() => void) | null = null;
       if (match.route.transport === "websocket") {
+        if (upgrade && (upgrade.signal.aborted || upgrade.socket.destroyed || res.writableEnded || res.headersSent || req.destroyed)) {
+          return;
+        }
         releaseSlot = acquireWebSocketSlot(companyId, actor.actorId, plugin.id);
         if (!releaseSlot) {
           res.status(429).json({ error: "Too many concurrent plugin WebSocket connections" });
@@ -1941,6 +1948,13 @@ export function pluginRoutes(
         }
         res.once("close", releaseSlot);
         res.once("finish", releaseSlot);
+        upgrade?.socket.once("close", releaseSlot);
+        upgrade?.socket.once("end", releaseSlot);
+
+        if (upgrade && (upgrade.signal.aborted || upgrade.socket.destroyed || res.writableEnded || res.headersSent)) {
+          releaseSlot();
+          return;
+        }
       }
 
       const input: PluginScopedApiRequest = {
@@ -1961,26 +1975,33 @@ export function pluginRoutes(
         headers: sanitizePluginRequestHeaders(req),
       };
 
-      // fork(TECH-8283 Finding B): Race workerManager.call against upgrade.signal
+      // fork(TECH-8283 Finding B, Material 7): Race workerManager.call against upgrade.signal; clean up abort listener
       let result: PluginScopedApiResponse;
       if (match.route.transport === "websocket" && upgrade) {
         const callPromise = bridgeDeps.workerManager.call(plugin.id, "handleApiRequest", input) as Promise<PluginScopedApiResponse>;
         callPromise.catch(() => {});
         if (upgrade.signal.aborted) {
+          releaseSlot?.();
           if (!res.headersSent && !upgrade.socket.destroyed) res.status(504).json({ error: "Plugin upgrade timed out" });
           return;
         }
+        let onAbort: (() => void) | undefined;
         const abortPromise = new Promise<never>((_, reject) => {
-          upgrade.signal.addEventListener("abort", () => reject(Object.assign(new Error("Plugin upgrade timed out"), { name: "AbortError" })), { once: true });
+          onAbort = () => reject(Object.assign(new Error("Plugin upgrade timed out"), { name: "AbortError" }));
+          upgrade.signal.addEventListener("abort", onAbort, { once: true });
         });
         try {
           result = await Promise.race([callPromise, abortPromise]);
         } catch (err: unknown) {
+          releaseSlot?.();
           if ((err as Error)?.name === "AbortError" || upgrade.signal.aborted) {
             if (!res.headersSent && !upgrade.socket.destroyed) res.status(504).json({ error: "Plugin upgrade timed out" });
             return;
           }
           throw err;
+        } finally {
+          // fork(TECH-8283 Material 7): Remove abort listener when worker promise settles
+          if (onAbort) upgrade.signal.removeEventListener("abort", onAbort);
         }
       } else {
         result = await bridgeDeps.workerManager.call(plugin.id, "handleApiRequest", input) as PluginScopedApiResponse;
@@ -1988,14 +2009,15 @@ export function pluginRoutes(
 
       if (match.route.transport === "websocket") {
         if (result.websocket) {
-          // fork(TECH-8283 F2, Finding C): Re-check company access and plugin status on tick & 101
+          // fork(TECH-8283 F2, Material 2): Re-check full authority on every tick & at 101
           const checkAvailable = async (): Promise<boolean> => {
             if (!bridgeDeps.workerManager.isRunning(plugin.id)) return false;
             try {
               const currentPlugin = await registry.getById(plugin.id);
               if (!currentPlugin || currentPlugin.status !== "ready") return false;
+
               if (req.actor.source !== "local_implicit") {
-                if (req.actor.type === "board" && req.actor.userId && typeof db.select === "function") {
+                if (req.actor.type === "board" && req.actor.userId) {
                   const [membership] = await db
                     .select({ id: companyMemberships.id })
                     .from(companyMemberships)
@@ -2006,13 +2028,34 @@ export function pluginRoutes(
                   return false;
                 }
               }
+
+              if (match.route.companyResolution?.from === "agent") {
+                const agentParam = match.route.companyResolution.param;
+                const targetAgentId = match.params?.[agentParam];
+                if (!targetAgentId || !UUID_PATTERN.test(targetAgentId)) return false;
+
+                const [currentAgent] = await db
+                  .select({ id: agents.id, companyId: agents.companyId })
+                  .from(agents)
+                  .where(eq(agents.id, targetAgentId))
+                  .limit(1);
+                if (!currentAgent || currentAgent.companyId !== companyId) return false;
+
+                const decision = await authorizationService(db).decide({
+                  actor: req.actor,
+                  action: "agent:read",
+                  resource: { type: "agent", companyId: currentAgent.companyId, agentId: currentAgent.id },
+                });
+                if (!decision.allowed) return false;
+              }
+
               return true;
             } catch {
               return false;
             }
           };
-          const proxyFn = bridgeDeps?.proxyWs ?? proxyPluginApiWebSocket;
-          await proxyFn(
+          // fork(TECH-8283 Material 4): Production route calls safe proxy directly without test seams
+          await proxyPluginApiWebSocket(
             req,
             res,
             result.websocket,

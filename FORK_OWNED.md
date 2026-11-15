@@ -125,3 +125,11 @@ any new fork patch; remove one when the patch is upstreamed.
 
 - `server/src/realtime/plugin-api-ws.ts`
 - `server/src/services/plugin-egress-guard.ts`
+- `server/src/routes/plugins.ts`
+- `server/src/http/server.ts`
+- `server/src/http/server.test.ts`
+- `server/src/services/plugin-host-services.ts`
+- `doc/plugins/PLUGIN_SPEC.md`
+- `packages/plugins/sdk/src/define-plugin.ts`
+- `packages/shared/src/types/plugin.ts`
+- `packages/shared/src/validators/plugin.ts`

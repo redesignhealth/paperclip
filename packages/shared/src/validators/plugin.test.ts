@@ -470,6 +470,32 @@ describe("plugin WebSocket company resolution", () => {
     expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, companyResolution, transport: "websocket" }).success).toBe(false);
   });
 
+  it("requires GET method and board authentication for WebSocket routes", () => {
+    // fork(TECH-8283 Material 6): Explicitly test GET and board auth requirements
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, transport: "websocket" }).success).toBe(true);
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, method: "POST", transport: "websocket" }).success).toBe(false);
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, auth: "agent", transport: "websocket" }).success).toBe(false);
+  });
+
+  it("rejects empty agent param", () => {
+    // fork(TECH-8283 Material 6): Empty agent param rejected
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, companyResolution: { from: "agent", param: "" } }).success).toBe(false);
+  });
+
+  it("requires http.outbound capability when manifest declares WebSocket routes", () => {
+    // fork(TECH-8283 Material 6): Missing http.outbound rejected
+    const validManifest = {
+      id: "test.ws", apiVersion: 1, version: "1.0.0", displayName: "Test",
+      description: "Test", author: "RH", categories: ["automation"],
+      capabilities: ["api.routes.register", "http.outbound"],
+      entrypoints: { worker: "dist/worker.js" },
+      apiRoutes: [{ ...route, transport: "websocket" }],
+    };
+    expect(pluginManifestV1Schema.safeParse(validManifest).success).toBe(true);
+    const missingOutbound = { ...validManifest, capabilities: ["api.routes.register"] };
+    expect(pluginManifestV1Schema.safeParse(missingOutbound).success).toBe(false);
+  });
+
   it.each([
     undefined,
     { from: "query", key: "companyId" },
