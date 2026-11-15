@@ -8,7 +8,7 @@ import { buildForkOwnedMatcher, parseForkOwned, touchesMigrations } from "../lib
 import { extractPr, extractRevertSha, gitInput, listCommitsAfter, parseLog, parseNameList } from "../lib/upstreamGit.mjs";
 import { createBudget } from "../lib/budget.mjs";
 import { escapeMarkdownCell, renderOutboxText } from "../lib/alerts.mjs";
-import { buildPrompt, heuristicClassify, isBreaking, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
+import { buildPrompt, heuristicClassify, isBreaking, mergeClassification, parseLlmResponse, securitySignal } from "../lib/classify.mjs";
 import { escapeSlack, formatRowAlert, neutralizeMentions, renderAlert } from "../lib/alerts.mjs";
 import { loadConfig, resolveWorkerRefs } from "../lib/config.mjs";
 
@@ -278,6 +278,29 @@ test("a `Breaking changes` heading followed by None is not BREAKING (#21013, #21
   assert.equal(heuristicClassify(PR_21096).category, "feature");
   // The pin still applies to non-breaking rows: the model's category is used.
   assert.equal(mergeClassification(PR_21013, { category: "perf", summary: "faster" }, "m").category, "perf");
+});
+
+// paperclipai/paperclip #21649: a broad mixed-file PR whose only security token is a
+// CI-status sentence. The all-non-prod gate does not apply, so the phrase must be ignored.
+const PR_21649 = {
+  title: "fix(issues): keep source-sdk public inputs in sync (#21649)",
+  body: "## Verification\n\nThe separate security status passes.\nTests pass locally.",
+  files: [
+    "ui/src/pages/IssueDetail.tsx",
+    "server/src/routes/issues.ts",
+    "packages/shared/src/validators/issue.ts",
+    "doc/PRODUCT.md",
+    "docs/api/issues.md",
+    "tests/runner-e2e/source-sdk-public-inputs.json",
+  ],
+};
+
+test("a CI-status sentence on a mixed-file PR is not a security signal (#21649)", () => {
+  assert.equal(securitySignal(PR_21649), null);
+  assert.notEqual(heuristicClassify(PR_21649).category, "security");
+  // Real keyword use on the same file set still counts.
+  assert.equal(securitySignal({ ...PR_21649, body: "Fixes an XSS in the issue title." }), "weak");
+  assert.equal(securitySignal({ ...PR_21649, body: "The security status passes. Also closes an auth bypass." }), "weak");
 });
 
 test("heading variants and prose mentioning breaking changes are not BREAKING", () => {

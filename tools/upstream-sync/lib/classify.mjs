@@ -28,6 +28,10 @@ const TEST_OR_DOC_RE = /(^|\/)(__tests__|tests?)\/|\.test\.|\.spec\.|\.md$|^doc(
 const SECURITY_STRONG_TEXT_RE = /\b(cve-\d|ghsa-[0-9a-z]{4}-)/;
 const SECURITY_WEAK_TEXT_RE = /\b(vulnerab|security|xss|csrf|ssrf|sql injection|\brce\b|auth bypass|privilege escalation|secret leak)/;
 
+// A CI/status mention ("the separate security status passes", "security check is
+// green") names a pipeline gate, not a security change (#21649).
+const SECURITY_CI_PHRASE_RE = /\bsecurity[ -](status(es)?|checks?|jobs?|scans?|workflows?|gates?|audits?)\b/g;
+
 function isNonProdFile(f) {
   return INFRA_FILE_RE.test(f) || TEST_OR_DOC_RE.test(f);
 }
@@ -41,7 +45,7 @@ export function securitySignal(c) {
   const m = t.match(/^([a-z]+)(?:\(([^)]*)\))?!?:/);
   if (SECURITY_STRONG_TEXT_RE.test(text)) return "strong";
   if (m && (m[1] === "security" || (m[2] || "").split(/[,/ ]+/).includes("security"))) return "strong";
-  if (SECURITY_WEAK_TEXT_RE.test(text) && !(c.files.length && c.files.every(isNonProdFile))) return "weak";
+  if (SECURITY_WEAK_TEXT_RE.test(text.replace(SECURITY_CI_PHRASE_RE, " ")) && !(c.files.length && c.files.every(isNonProdFile))) return "weak";
   return null;
 }
 
