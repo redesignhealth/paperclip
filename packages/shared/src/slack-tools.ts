@@ -77,7 +77,7 @@ export const SLACK_TOOLS = [
     "conversations.open",
     ["im:write"],
     "write",
-    "Open or resume this bot's DM with the current task's linked requester, or with another active workspace member when you pass their Slack user ID in `user`. Returns a channel ID for slack_post_message. Never DMs bots, deactivated users, guests or people outside this workspace.",
+    "Open or resume this bot's DM with the current task's linked requester, or with another active workspace member when you pass their Slack user ID in `user`. Returns a channel ID for slack_post_message. Requires the Proactive DMs opt-in; to message the linked requester, prefer their existing DM from slack_channels and call this only if none exists. Never DMs bots, deactivated users, guests or people outside this workspace.",
     {
       ...write,
       user: user

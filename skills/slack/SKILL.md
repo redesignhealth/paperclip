@@ -69,8 +69,13 @@ Paperclip tasks, documents, assignments and approvals.
 
 ## Tasks and routines
 
-For “send me a Slack message,” call `slack_open_dm` to obtain the linked responsible
-user's DM channel, then use `slack_post_message`. To message someone else, find their Slack user ID with
+For “send me a Slack message,” first call `slack_channels` and use the existing DM
+between the bot and the linked responsible user (an `is_im` entry whose `user` is the
+requester), then `slack_post_message` to it. Call `slack_open_dm` only when no such DM
+exists. It needs the Proactive DMs opt-in; if it returns `slack_tool_not_enabled` (HTTP
+403), do not retry or send a test message: report the delivery as not sent, with the
+reason, and keep the saved report. Do not call a run delivered without a
+`slack_post_message` receipt. To message someone else, find their Slack user ID with
 `slack_find_user` (a name or email fragment; if several people match, ask which one is meant), call
 `slack_open_dm` with that `user`, then use `slack_post_message`. `slack_user` only describes a known ID.
 Do not guess a user or DM ID. Only message people the request

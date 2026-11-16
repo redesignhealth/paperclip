@@ -209,7 +209,7 @@ idempotent wakeup outbox. Provider outages leave durable delivery state for retr
 
 The agent can use `slack_open_dm` to open its DM with the current task's linked
 responsible user, or, by passing `user` (a Slack user ID), with any other active
-member of the bot's workspace, followed by `slack_post_message`. This needs
+member of the bot's workspace, followed by `slack_post_message`. For the linked requester, routines should prefer the existing bot DM listed by `slack_channels` and only call `slack_open_dm` when none exists, since opening a DM is gated by Proactive DMs and fails with `slack_tool_not_enabled` (403) without it. This needs
 `im:write` (the Proactive DMs permission); existing apps
 without that scope require reinstalling with the updated manifest. The target must
 be a full member of the bot's own workspace: bots, deactivated users, guests and
