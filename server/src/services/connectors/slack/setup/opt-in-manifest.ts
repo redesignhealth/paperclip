@@ -4,7 +4,10 @@ import { chatEndpoints, chatSlackRegistrations, type Db } from "@paperclipai/db"
 import {
   buildSlackAppManifest,
   isSlackManifestUpdatePending,
+  normalizeSlackOptInGroups,
   slackAppConfigurationSchema,
+  slackBotScopes,
+  slackManifestBotScopes,
   slackOptInGroupsForSetup,
   slackOptInGroupsFromScopes,
   slackRequestedOptInGroups,
@@ -190,6 +193,76 @@ export async function recordInstalledSlackOptIns(
       and(
         eq(chatEndpoints.id, input.endpointId),
         eq(chatEndpoints.companyId, input.companyId),
+      ),
+    );
+}
+
+/**
+ * Ensures the stored Slack app manifest bot scopes reflect current default and
+ * requested opt-in scopes. Rebuilds and marks pending if scopes drifted. Idempotent.
+ */
+export async function ensureSlackManifestScopesCurrent(
+  executor: Executor,
+  input: {
+    endpointId: string;
+    companyId: string;
+    agentName: string;
+    app: unknown;
+    setup: {
+      slackOptInScopeGroups?: readonly SlackOptInScopeGroup[] | readonly unknown[];
+      slackInstalledOptInScopeGroups?: readonly SlackOptInScopeGroup[] | readonly unknown[];
+    };
+  },
+): Promise<void> {
+  const [row] = await executor
+    .select()
+    .from(chatSlackRegistrations)
+    .where(
+      and(
+        eq(chatSlackRegistrations.endpointId, input.endpointId),
+        eq(chatSlackRegistrations.companyId, input.companyId),
+      ),
+    );
+  if (!row?.appId || row.status === "removed") return;
+  const eventUrl = object(object(row.manifest.settings).event_subscriptions)
+    .request_url;
+  if (typeof eventUrl !== "string" || !eventUrl) return;
+
+  const currentBotScopes = slackManifestBotScopes(row.manifest);
+  const normalizedGroups = normalizeSlackOptInGroups(input.setup.slackOptInScopeGroups);
+  const targetBotScopes = slackBotScopes(normalizedGroups);
+  if (
+    JSON.stringify([...currentBotScopes].sort()) ===
+    JSON.stringify([...targetBotScopes].sort())
+  ) {
+    return;
+  }
+
+  const app = slackAppConfigurationSchema.parse(input.app);
+  const manifest = buildSlackAppManifest({
+    app,
+    agentName: input.agentName,
+    webhookUrl: eventUrl,
+    redirectUri: row.callbackUri,
+    optInScopeGroups: normalizedGroups,
+  });
+  const manifestHash = slackInstallManifestHash(manifest);
+
+  await executor
+    .update(chatSlackRegistrations)
+    .set({
+      manifest,
+      manifestHash,
+      errorCode:
+        row.errorCode === "slack_manifest_update_pending"
+          ? row.errorCode
+          : SLACK_PERMISSIONS_UPDATE_PENDING,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(chatSlackRegistrations.endpointId, input.endpointId),
+        eq(chatSlackRegistrations.companyId, input.companyId),
       ),
     );
 }

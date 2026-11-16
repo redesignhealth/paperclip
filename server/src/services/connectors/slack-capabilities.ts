@@ -1,6 +1,7 @@
 import { and, eq } from "drizzle-orm";
-import { chatEndpoints, toolConnections, type Db } from "@paperclipai/db";
+import { agents, chatEndpoints, toolConnections, type Db } from "@paperclipai/db";
 import {
+  isProvisionedSlackSetup,
   SLACK_DEFAULT_BOT_SCOPES,
   SLACK_OPT_IN_BOT_SCOPE_GROUPS,
   SLACK_OPT_IN_SCOPE_GROUPS,
@@ -12,6 +13,7 @@ import { notFound } from "../../errors.js";
 import { secretService } from "../secrets.js";
 import { slackClient } from "./slack-client.js";
 import { ensureSlackBotCatalogCurrent, slackActiveCatalogToolNames } from "./slack-catalog.js";
+import { ensureSlackManifestScopesCurrent } from "./slack/setup/opt-in-manifest.js";
 import {
   isSlackToolEnabledForOptIns,
   slackEnabledOptInGroups,
@@ -23,7 +25,11 @@ export async function slackCapabilities(
   endpointId: string,
 ): Promise<SlackToolCapabilities> {
   const [row] = await db
-    .select({ endpoint: chatEndpoints, connection: toolConnections })
+    .select({
+      endpoint: chatEndpoints,
+      connection: toolConnections,
+      agentName: agents.name,
+    })
     .from(chatEndpoints)
     .innerJoin(
       toolConnections,
@@ -32,6 +38,7 @@ export async function slackCapabilities(
         eq(toolConnections.companyId, companyId),
       ),
     )
+    .leftJoin(agents, eq(agents.id, chatEndpoints.assignedAgentId))
     .where(
       and(
         eq(chatEndpoints.companyId, companyId),
@@ -74,6 +81,16 @@ export async function slackCapabilities(
   const tools = SLACK_TOOLS.filter((tool) => isSlackToolEnabledForOptIns(tool, enabled));
   // Settings refresh is system maintenance, not a user review of tool grants.
   await ensureSlackBotCatalogCurrent(db, row.endpoint, null);
+  if (isProvisionedSlackSetup(row.endpoint.setup?.slackSetupMethod)) {
+    const agentName = row.agentName ?? row.endpoint.botDisplayName ?? "agent";
+    await ensureSlackManifestScopesCurrent(db, {
+      endpointId: row.endpoint.id,
+      companyId: row.endpoint.companyId,
+      agentName,
+      app: row.endpoint.setup?.slackApp,
+      setup: row.endpoint.setup ?? {},
+    });
+  }
   const activeNames = await slackActiveCatalogToolNames(db, row.endpoint);
   // Guidance names the permission group to enable, not just raw scopes: a
   // scope can be enabled through a switch the operator recognises.
@@ -107,6 +124,7 @@ export async function slackCapabilities(
     grantedScopes: scopes,
     missingScopes: scopes ? [...required].filter((scope) => !scopes.includes(scope)) : [],
     missingGroups,
+    dmReconnectRequired: scopes ? !scopes.includes("im:write") : false,
     // Only tools this agent may actually call are listed: a gated-off group's
     // tool is neither offered nor reported as merely unavailable.
     tools: tools.map((t) => ({

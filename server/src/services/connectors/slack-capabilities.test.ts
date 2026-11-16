@@ -8,17 +8,25 @@ vi.mock("./slack-catalog.js", async importOriginal => ({
   ...await importOriginal<typeof import("./slack-catalog.js")>(),
   ensureSlackBotCatalogCurrent: vi.fn(async () => undefined),
 }));
+vi.mock("./slack/setup/opt-in-manifest.js", () => ({
+  ensureSlackManifestScopesCurrent: vi.fn(async () => undefined),
+}));
 vi.mock("../secrets.js", () => ({ secretService: () => ({ resolveSecretValue: async () => "test-token" }) }));
 afterEach(() => vi.resetAllMocks());
 
 describe("Slack capabilities runtime agreement", () => {
   function fixture(setup: Record<string, unknown> | null, status = "active") {
     const endpoint = { id: "endpoint", companyId: "company", connectionId: "connection", status: "active", setup };
-    const db = { select: () => ({ from: (table: unknown) => ({
-      innerJoin: () => ({ where: async () => table === toolCatalogEntries
+    const queryResult = (table: unknown) =>
+      table === toolCatalogEntries
         ? status === "active" ? [{ toolName: "slack_upload_file" }] : []
         : [{ endpoint, connection: { id: "connection", enabled: true,
-        credentialSecretRefs: [{ configPath: "credentials.botToken", secretId: "secret" }] } }] }),
+        credentialSecretRefs: [{ configPath: "credentials.botToken", secretId: "secret" }] } }];
+    const db = { select: () => ({ from: (table: unknown) => ({
+      innerJoin: () => ({
+        leftJoin: () => ({ where: async () => queryResult(table) }),
+        where: async () => queryResult(table),
+      }),
       where: async () => {
         if (table === chatEndpoints) return [{ ...endpoint, botExternalId: null }];
         if (table === toolCatalogEntries) return [{ toolName: "slack_upload_file", status, quarantinedAt: null }];
