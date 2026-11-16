@@ -161,6 +161,9 @@ describe("Slack opt-in setup state", () => {
   it("keeps opt-ins off for a new agent and reads back exactly what was requested", () => {
     expect(slackRequestedOptInGroups({ slackOptInScopeGroups: [] })).toEqual([]);
     expect(slackRequestedOptInGroups({ slackOptInScopeGroups: ["file_upload"] })).toEqual(["file_upload"]);
+    // A legacy requested value is parsed away rather than erroring (TECH-8783).
+    expect(slackRequestedOptInGroups({ slackOptInScopeGroups: ["proactive_dms"] })).toEqual([]);
+    expect(slackRequestedOptInGroups({ slackOptInScopeGroups: ["proactive_dms", "file_upload"] })).toEqual(["file_upload"]);
     expect(slackOptInGroupsForSetup({ slackOptInScopeGroups: [] })).toEqual([]);
   });
   it("only treats a fieldless row as a legacy full grant when a prior install exists", () => {

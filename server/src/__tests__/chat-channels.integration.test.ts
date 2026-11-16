@@ -10816,6 +10816,95 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("unauthorized reply revoked between admission and the locked task mutation creates no task", async () => {
+    const fixture = await seedCompany();
+    const outboundFetch = vi.fn(fakeSlackFetch());
+    let assignGrantId = "";
+    let revoked = false;
+    const { callbacks, endpoint, service, wakeup } = await configuredSlackEndpoint(fixture, {
+      allowUnlinkedPeople: false,
+      fetch: outboundFetch as any,
+      // The barrier runs inside the authoritative task-mutation transaction,
+      // after admission already authorized this sender. Revoking the only
+      // grant that lets the linked user direct the assigned agent must still
+      // filter the message at the locked boundary (TECH-8783). It then stays
+      // inert so the control send below is unaffected.
+      reachAuthorizationBarrier: async () => {
+        if (revoked || !assignGrantId) return;
+        revoked = true;
+        await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.id, assignGrantId));
+      },
+    });
+    await service.update(endpoint.id, { allowDirectMessages: true }, "owner-user");
+    await db.update(agents).set({
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } },
+    }).where(eq(agents.id, fixture.assignedAgentId));
+    const [assignGrant] = await db.insert(principalPermissionGrants).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "owner-user",
+      permissionKey: "tasks:assign",
+      scope: null,
+    }).returning({ id: principalPermissionGrants.id });
+    assignGrantId = assignGrant.id;
+    const now = new Date();
+    const [principalOwner] = await db.insert(chatExternalPrincipals).values({
+      companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "U_OWNER",
+    }).returning();
+    await db.insert(chatIdentityLinks).values({
+      companyId: fixture.companyId, endpointId: endpoint.id, principalId: principalOwner.id,
+      paperclipUserId: "owner-user", status: "linked", confirmedAt: now,
+    });
+    const send = (id: string, text = "Please do work") =>
+      deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: makeThread({ channelId: "D-U_OWNER", id: "slack:D-U_OWNER:", isDM: true }).thread,
+        message: makeMessage({ id, text, userId: "U_OWNER" }),
+        trigger: "direct_message",
+      });
+
+    await send("8783.10");
+
+    // The locked boundary re-derived authorization and filtered the delivery.
+    // Its reason string is not pinned here: this path currently reports
+    // "Linked Paperclip account is not currently permitted" while admission
+    // uses "Sender is not authorized to direct this agent".
+    const [delivery] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.endpointId, endpoint.id),
+          eq(chatDeliveries.providerEventId, "slack:D-U_OWNER::8783.10"),
+        ),
+      );
+    expect(delivery).toMatchObject({ state: "filtered" });
+
+    // no issue/task, message link, comment, run, or outbound Slack message
+    expect(await db.select().from(issues).where(eq(issues.companyId, fixture.companyId))).toHaveLength(0);
+    expect(await db.select().from(chatMessageLinks).where(eq(chatMessageLinks.endpointId, endpoint.id))).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.companyId, fixture.companyId))).toHaveLength(0);
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, fixture.companyId))).toHaveLength(0);
+    expect(outboundFetch.mock.calls.filter(([url]) => String(url).endsWith("/chat.postMessage"))).toHaveLength(0);
+
+    // Control: the same linked sender with the grant left intact creates the
+    // task, proving the filter above came from the revoked grant, not the barrier.
+    await db.insert(principalPermissionGrants).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "owner-user",
+      permissionKey: "tasks:assign",
+      scope: null,
+    });
+    await send("8783.11", "Now do the work");
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issues).where(eq(issues.companyId, fixture.companyId))).toHaveLength(1);
+
+    await service.shutdown();
+  });
+
   it("does not turn a revoked Slack identity back into a pending link when it sends connect", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture, { allowUnlinkedPeople: true });
