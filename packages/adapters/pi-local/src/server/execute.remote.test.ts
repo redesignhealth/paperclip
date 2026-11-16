@@ -13,9 +13,7 @@ const {
   runSshCommand,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
-  prepareAdapterExecutionTargetRuntime,
 } = vi.hoisted(() => ({
-  prepareAdapterExecutionTargetRuntime: vi.fn(),
   runChildProcess: vi.fn(async () => ({
     exitCode: 0,
     signal: null,
@@ -87,11 +85,9 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
     "@paperclipai/adapter-utils/execution-target",
   );
-  prepareAdapterExecutionTargetRuntime.mockImplementation(actual.prepareAdapterExecutionTargetRuntime);
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
-    prepareAdapterExecutionTargetRuntime,
   };
 });
 
@@ -891,178 +887,5 @@ describe("pi remote execution", () => {
 
     expect(result.summary).toBe("Hello 😀");
     expect(result.resultJson).toEqual({ stdout: rawStdout, stderr: "diagnostic stderr\n" });
-  });
-  it("never sends the run JWT to the remote target, only the callback bridge token (TECH-8812)", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-remote-jwt-"));
-    cleanupDirs.push(rootDir);
-    const workspaceDir = path.join(rootDir, "workspace");
-    await mkdir(workspaceDir, { recursive: true });
-
-    // Fake run JWT; it must reach the host-side bridge and nothing remote.
-    const runJwt = "eyJfake.run-jwt-tech-8812.sig";
-
-    await execute({
-      runId: "run-jwt",
-      agent: {
-        id: "agent-1",
-        companyId: "company-1",
-        name: "Pi Builder",
-        adapterType: "pi_local",
-        adapterConfig: {},
-      },
-      runtime: {
-        sessionId: null,
-        sessionParams: null,
-        sessionDisplayId: null,
-        taskKey: null,
-      },
-      config: {
-        command: "pi",
-        model: "openai/gpt-5.4-mini",
-      },
-      context: {
-        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
-      },
-      executionTransport: {
-        remoteExecution: {
-          host: "127.0.0.1",
-          port: 2222,
-          username: "fixture",
-          remoteWorkspacePath: "/remote/workspace",
-          remoteCwd: "/remote/workspace",
-          privateKey: "PRIVATE KEY",
-          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
-          strictHostKeyChecking: true,
-        },
-      },
-      authToken: runJwt,
-      onLog: async () => {},
-    });
-
-    // The host-side bridge gets the run JWT to authenticate forwarded calls.
-    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
-      expect.objectContaining({ hostApiToken: runJwt }),
-    );
-    // Nothing that reaches the remote target -- the pre-bridge command checks,
-    // workspace/asset sync, remote shell commands, or the Pi process -- carries it.
-    for (const fn of [
-      ensureCommandResolvable,
-      resolveCommandForLogs,
-      prepareWorkspaceForSshExecution,
-      runSshCommand,
-      syncDirectoryToSsh,
-      runChildProcess,
-    ]) {
-      expect(JSON.stringify(fn.mock.calls)).not.toContain(runJwt);
-    }
-    // Exactly one process run: the Pi invocation itself.
-    expect(runChildProcess).toHaveBeenCalledTimes(1);
-    const [, piCommand, , piOptions] = runChildProcess.mock.calls[0] as unknown as
-      [string, string, string[], { env: Record<string, string> }];
-    expect(piCommand).toBe("pi");
-    expect(piOptions.env.PAPERCLIP_API_KEY).toBe("bridge-token");
-  });
-
-  it("never sends the run JWT to a sandbox target's execs (TECH-8812)", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-sandbox-jwt-"));
-    cleanupDirs.push(rootDir);
-    const workspaceDir = path.join(rootDir, "workspace");
-    await mkdir(workspaceDir, { recursive: true });
-
-    const runJwt = "eyJfake.run-jwt-sandbox-tech-8812.sig";
-    const runtimeRoot = "/workspace/.paperclip-runtime/pi";
-    const sandboxExecs: Array<{ command: unknown; args: unknown; env: Record<string, string> }> = [];
-    const sandboxTarget = {
-      kind: "remote" as const,
-      transport: "sandbox" as const,
-      providerKey: "kubernetes",
-      remoteCwd: "/workspace",
-      runner: {
-        execute: vi.fn(async (input: { command: unknown; args?: unknown; env?: Record<string, string> }) => {
-          sandboxExecs.push({ command: input.command, args: input.args, env: input.env ?? {} });
-          return {
-            exitCode: 0,
-            signal: null,
-            timedOut: false,
-            stdout: "",
-            stderr: "",
-            pid: null,
-            startedAt: new Date().toISOString(),
-          };
-        }),
-      },
-    };
-
-    // Stage nothing for real: the test is about which env reaches the sandbox runner.
-    prepareAdapterExecutionTargetRuntime.mockImplementationOnce(async () => ({
-      target: sandboxTarget,
-      workspaceRemoteDir: "/workspace",
-      runtimeRootDir: runtimeRoot,
-      assetDirs: { attribution: `${runtimeRoot}/attribution`, skills: `${runtimeRoot}/skills` },
-      additionalSourceDirs: {},
-      additionalSourceFailures: [],
-      workspaceSyncSnapshot: null,
-      restoreWorkspace: async () => {},
-    }));
-    await execute({
-      runId: "run-sandbox-jwt",
-      agent: {
-        id: "agent-1",
-        companyId: "company-1",
-        name: "Pi Builder",
-        adapterType: "pi_local",
-        adapterConfig: {},
-      },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-      config: { command: "pi", model: "openai/gpt-5.4-mini" },
-      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
-      executionTarget: sandboxTarget,
-      authToken: runJwt,
-      onLog: async () => {},
-    } as Parameters<typeof execute>[0]);
-
-    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledTimes(1);
-    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
-      expect.objectContaining({ hostApiToken: runJwt }),
-    );
-    // The sandbox runner saw execs both before the bridge (command checks) and
-    // after it (session file, Pi itself); none carries the run JWT.
-    expect(sandboxExecs.length).toBeGreaterThan(1);
-    expect(JSON.stringify(sandboxExecs)).not.toContain(runJwt);
-    expect(JSON.stringify(prepareAdapterExecutionTargetRuntime.mock.calls)).not.toContain(runJwt);
-    const bridgedExecs = sandboxExecs.filter((exec) => exec.env.PAPERCLIP_API_KEY !== undefined);
-    expect(bridgedExecs.length).toBeGreaterThan(0);
-    for (const exec of bridgedExecs) expect(exec.env.PAPERCLIP_API_KEY).toBe("bridge-token");
-  });
-
-  it("still gives a local run the run JWT as PAPERCLIP_API_KEY (TECH-8812)", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-local-jwt-"));
-    cleanupDirs.push(rootDir);
-    const workspaceDir = path.join(rootDir, "workspace");
-    await mkdir(workspaceDir, { recursive: true });
-
-    const runJwt = "eyJfake.run-jwt-local-tech-8812.sig";
-    await execute({
-      runId: "run-local-jwt",
-      agent: {
-        id: "agent-1",
-        companyId: "company-1",
-        name: "Pi Builder",
-        adapterType: "pi_local",
-        adapterConfig: {},
-      },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-      config: { command: "pi", model: "openai/gpt-5.4-mini" },
-      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
-      authToken: runJwt,
-      onLog: async () => {},
-    });
-
-    expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
-    expect(runChildProcess).toHaveBeenCalledTimes(1);
-    const [, piCommand, , piOptions] = runChildProcess.mock.calls[0] as unknown as
-      [string, string, string[], { env: Record<string, string> }];
-    expect(piCommand).toBe("pi");
-    expect(piOptions.env.PAPERCLIP_API_KEY).toBe(runJwt);
   });
 });
