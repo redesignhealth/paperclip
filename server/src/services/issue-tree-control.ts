@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm"
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
+  chatActions,
   heartbeatRuns,
   issueComments,
   issueTreeHoldMembers,
@@ -223,6 +224,57 @@ export async function isVerifiedIssueTreeControlInteractionWake(
     commentId,
     comment,
   });
+}
+
+export const EXTERNAL_CHAT_WAKE_REASON = "External chat message received";
+
+/**
+ * Re-derives, from durable rows, that a queued wake is an accepted inbound chat
+ * message for this exact agent, issue and comment. The serialized context only
+ * names the claim; the chat action and its admission receipt are the authority.
+ */
+export async function isVerifiedExternalChatInteractionWake(
+  dbOrTx: Pick<Db, "select">,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    wakeupRequestId?: string | null;
+    contextSnapshot: Record<string, unknown> | null | undefined;
+  },
+) {
+  const context = input.contextSnapshot ?? null;
+  const source = readNonEmptyStringFromRecord(context, "source");
+  if (!input.wakeupRequestId || !source?.startsWith("chat:")) return false;
+  if (readNonEmptyStringFromRecord(context, "wakeReason") !== EXTERNAL_CHAT_WAKE_REASON) return false;
+  const commentId = readInteractionWakeCommentId(context);
+  if (!commentId) return false;
+
+  const action = await dbOrTx
+    .select({ id: chatActions.id })
+    .from(chatActions)
+    .innerJoin(agentWakeupRequests, eq(agentWakeupRequests.id, chatActions.id))
+    .innerJoin(
+      issueComments,
+      and(eq(issueComments.id, commentId), eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId)),
+    )
+    .where(
+      and(
+        eq(chatActions.id, input.wakeupRequestId),
+        eq(chatActions.companyId, input.companyId),
+        eq(chatActions.kind, "inbound_wakeup"),
+        sql`${chatActions.payload} ->> 'issueId' = ${input.issueId}`,
+        sql`${chatActions.payload} ->> 'agentId' = ${input.agentId}`,
+        sql`${chatActions.payload} ->> 'commentId' = ${commentId}`,
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        sql`${agentWakeupRequests.idempotencyKey} like 'chat-inbound:%'`,
+        sql`${agentWakeupRequests.status} <> 'skipped'`,
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return action !== null;
 }
 
 function normalizeReleasePolicy(

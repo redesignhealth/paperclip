@@ -135,6 +135,7 @@ import { logActivity } from "../activity-log.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../issue-dependency-wakeups.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
+  isVerifiedExternalChatInteractionWake,
   isVerifiedIssueTreeControlInteractionWake,
 } from "../issue-tree-control.js";
 import {
@@ -1124,7 +1125,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-        )
+        ) &&
+        !(await isVerifiedExternalChatInteractionWake(db, {
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          wakeupRequestId: run.wakeupRequestId,
+          contextSnapshot: context,
+        }))
       ) {
         await cancelQueuedRunForBlockedDependencies(
           run,
@@ -3647,10 +3655,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsIssueInteractionWake(
+            (allowsIssueInteractionWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-            );
+            ) ||
+              // Bound to this agent, issue, comment and actor, and re-authorized
+              // against the live endpoint earlier in this transaction.
+              (durableRequest !== undefined &&
+                !durableRequest.failedRunRetry &&
+                durableRequest.commentId === wakeCommentId));
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;
