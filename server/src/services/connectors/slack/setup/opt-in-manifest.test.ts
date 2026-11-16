@@ -392,5 +392,92 @@ describe("Slack opt-in manifest machinery", () => {
       expect(updatedRow!.status).toBe("install");
       expect(updatedRow!.errorCode).toBeNull();
     });
+
+    it("preserves legacy manifest opt-in scopes when refreshing an untouched legacy install lacking im:write", async () => {
+      const f = await fixture();
+      // Untouched legacy install: neither opt-in field present
+      const untouchedSetup = {
+        step: "complete" as const,
+        slackSetupMethod: "managed" as const,
+        slackApp: f.endpoint.setup.slackApp,
+        slackOptInScopeGroups: undefined,
+        slackInstalledOptInScopeGroups: undefined,
+      };
+      await db!.update(chatEndpoints).set({
+        setup: sql`(${chatEndpoints.setup} - 'slackOptInScopeGroups') - 'slackInstalledOptInScopeGroups'`,
+      }).where(eq(chatEndpoints.id, f.endpoint.id));
+
+      // Existing legacy manifest had full grant scopes but lacked im:write
+      const legacyScopesWithoutImWrite = [
+        "channels:history",
+        "chat:write",
+        "channels:manage",
+        "groups:write",
+        "files:write",
+      ];
+      const legacyManifest = buildSlackAppManifest({
+        app: f.endpoint.setup.slackApp!,
+        agentName: "Maya",
+        webhookUrl: "https://paperclip.example/api/chat-webhooks/public/slack",
+      });
+      (legacyManifest as any).oauth_config.scopes.bot = legacyScopesWithoutImWrite;
+      await db!.update(chatSlackRegistrations).set({
+        manifest: legacyManifest,
+        manifestHash: slackInstallManifestHash(legacyManifest),
+        errorCode: null,
+      }).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+
+      await ensureSlackManifestScopesCurrent(db!, {
+        endpointId: f.endpoint.id,
+        companyId: f.company.id,
+        agentName: "Maya",
+        app: f.endpoint.setup.slackApp,
+        setup: untouchedSetup,
+      });
+
+      const [row] = await db!.select().from(chatSlackRegistrations).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+      expect(row!.errorCode).toBe("slack_permissions_update_pending");
+      const botScopes = (row!.manifest as any).oauth_config.scopes.bot;
+      expect(botScopes).toContain("im:write");
+      // Retains channel and file opt-in scopes!
+      expect(botScopes).toContain("channels:manage");
+      expect(botScopes).toContain("groups:write");
+      expect(botScopes).toContain("files:write");
+    });
+
+    it("removes optional groups when explicitly requested as empty [] even if previous manifest had them", async () => {
+      const f = await fixture();
+      const explicitEmptySetup = {
+        ...f.endpoint.setup,
+        slackOptInScopeGroups: [],
+        slackInstalledOptInScopeGroups: ["file_upload" as const],
+      };
+      // Manifest previously had file_upload scope
+      const manifestWithFile = buildSlackAppManifest({
+        app: f.endpoint.setup.slackApp!,
+        agentName: "Maya",
+        webhookUrl: "https://paperclip.example/api/chat-webhooks/public/slack",
+      });
+      (manifestWithFile as any).oauth_config.scopes.bot = ["chat:write", "files:write"];
+      await db!.update(chatSlackRegistrations).set({
+        manifest: manifestWithFile,
+        manifestHash: slackInstallManifestHash(manifestWithFile),
+        errorCode: null,
+      }).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+
+      await ensureSlackManifestScopesCurrent(db!, {
+        endpointId: f.endpoint.id,
+        companyId: f.company.id,
+        agentName: "Maya",
+        app: f.endpoint.setup.slackApp,
+        setup: explicitEmptySetup,
+      });
+
+      const [row] = await db!.select().from(chatSlackRegistrations).where(eq(chatSlackRegistrations.endpointId, f.endpoint.id));
+      expect(row!.errorCode).toBe("slack_permissions_update_pending");
+      const botScopes = (row!.manifest as any).oauth_config.scopes.bot;
+      expect(botScopes).toContain("im:write");
+      expect(botScopes).not.toContain("files:write");
+    });
   });
 });

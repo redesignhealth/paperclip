@@ -229,7 +229,12 @@ export async function ensureSlackManifestScopesCurrent(
   if (typeof eventUrl !== "string" || !eventUrl) return;
 
   const currentBotScopes = slackManifestBotScopes(row.manifest);
-  const normalizedGroups = normalizeSlackOptInGroups(input.setup.slackOptInScopeGroups);
+  const isUntouchedLegacy =
+    input.setup.slackOptInScopeGroups === undefined &&
+    input.setup.slackInstalledOptInScopeGroups === undefined;
+  const normalizedGroups = isUntouchedLegacy
+    ? slackOptInGroupsFromScopes(currentBotScopes)
+    : normalizeSlackOptInGroups(input.setup.slackOptInScopeGroups);
   const targetBotScopes = slackBotScopes(normalizedGroups);
   if (
     JSON.stringify([...currentBotScopes].sort()) ===
