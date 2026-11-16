@@ -75,6 +75,13 @@ export function wrapCommandWithEnv(
   };
 }
 
+// The command execInPod actually runs when it has a stdin payload: `head -c <N>`
+// (N = the payload's BYTE length) piped into the original command. See the
+// stdin-handling note inside execInPod for why.
+export function boundCommandToStdin(command: string[], stdinPayload: Buffer): string[] {
+  return ["/bin/sh", "-c", `head -c ${stdinPayload.length} | ${command.map(shQuote).join(" ")}`];
+}
+
 export async function execInPod(
   kc: KubeConfig,
   namespace: string,
@@ -124,9 +131,7 @@ export async function execInPod(
   // `head -c` which counts bytes). Do NOT substitute `string.length` here
   // if the input is ever non-ASCII — UTF-8 multi-byte sequences would
   // give a byte count that differs from JS character count.
-  const effectiveCommand = stdinPayload
-    ? ["/bin/sh", "-c", `head -c ${stdinPayload.length} | ${command.map(shQuote).join(" ")}`]
-    : command;
+  const effectiveCommand = stdinPayload ? boundCommandToStdin(command, stdinPayload) : command;
 
   let stdoutData = "";
   let stderrData = "";

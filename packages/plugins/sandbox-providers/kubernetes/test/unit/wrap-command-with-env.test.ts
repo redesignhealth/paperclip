@@ -1,19 +1,27 @@
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { Exec } from "@kubernetes/client-node";
 import type { KubeConfig } from "@kubernetes/client-node";
-import { wrapCommandWithEnv } from "../../src/pod-exec.js";
+import { boundCommandToStdin, wrapCommandWithEnv } from "../../src/pod-exec.js";
 
 // Fake (obviously non-real) secret values. The tests assert none of them ever
 // appears in the exec argv or in the exec request URI built from it.
+// If quoting ever regressed and the shell ran the substitution in SHELLY, this
+// file would be created; the real-shell test asserts it never is.
+const INJECTION_MARKER = join(mkdtempSync(join(tmpdir(), "tech-8812-")), "should-not-exist");
 const SECRET_ENV = {
   RAMP_ROUTER_API_KEY: "rr-fake-model-key-0001",
   ANTHROPIC_API_KEY: "sk-ant-fake-0002",
   PAPERCLIP_API_KEY: "bridge-fake-token-0003",
   QUOTED: "it's a 'quoted' value",
   MULTILINE: "line one\nline two\n",
-  SHELLY: "$(touch /tmp/should-not-run) `id` $HOME \\n %s",
+  SHELLY: `$(touch ${INJECTION_MARKER}) \`touch ${INJECTION_MARKER}\` $HOME \\n %s`,
+  CRLF: "crlf\r\nvalue\r",
+  BIG: "b".repeat(64 * 1024),
   XDG_CONFIG_HOME: "/tmp/cfg",
 };
 
@@ -32,12 +40,17 @@ async function execRequestPath(command: string[]): Promise<string> {
   return captured;
 }
 
-// Run the wrapped command under the local /bin/sh with the wrapped stdin.
+// Run the wrapped command under the local /bin/sh exactly as execInPod would:
+// with a stdin payload, the argv is the `head -c <N> | ...` bound around it.
 function runWrapped(command: string[], env: Record<string, string>, stdin?: string) {
   const wrapped = wrapCommandWithEnv(command, env, stdin);
-  const [file, ...args] = wrapped.command;
+  const payload =
+    wrapped.stdin === undefined ? undefined
+    : Buffer.isBuffer(wrapped.stdin) ? wrapped.stdin
+    : Buffer.from(wrapped.stdin, "utf-8");
+  const [file, ...args] = payload && payload.length > 0 ? boundCommandToStdin(wrapped.command, payload) : wrapped.command;
   return spawnSync(file!, args, {
-    input: wrapped.stdin,
+    input: payload,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     encoding: "utf-8",
   });
@@ -88,20 +101,23 @@ describe("wrapCommandWithEnv", () => {
       [
         "/bin/sh",
         "-c",
-        'printf "[%s]" "$RAMP_ROUTER_API_KEY" "$QUOTED" "$MULTILINE" "$SHELLY" "$XDG_CONFIG_HOME" "$(cat)"',
+        'printf "[%s]" "$RAMP_ROUTER_API_KEY" "$QUOTED" "$MULTILINE" "$SHELLY" "$CRLF" "$BIG" "$XDG_CONFIG_HOME" "$(cat)"',
       ],
       SECRET_ENV,
-      "prompt line 1\nprompt line 2",
+      "prompt line 1\r\nprompt line 2",
     );
     expect(result.status).toBe(0);
+    expect(existsSync(INJECTION_MARKER)).toBe(false);
     expect(result.stdout).toBe(
       [
         SECRET_ENV.RAMP_ROUTER_API_KEY,
         SECRET_ENV.QUOTED,
         SECRET_ENV.MULTILINE,
         SECRET_ENV.SHELLY,
+        SECRET_ENV.CRLF,
+        SECRET_ENV.BIG,
         "/tmp/cfg",
-        "prompt line 1\nprompt line 2",
+        "prompt line 1\r\nprompt line 2",
       ].map((v) => `[${v}]`).join(""),
     );
   });
