@@ -32,7 +32,11 @@ the accepted linked user's request, using normal Paperclip task tools.
 The bot must belong to a channel and the requester must have access. Allowed
 Channels controls responding and writes; another shared channel can be readable
 without being enabled for responses. Do not join existing channels or change
-connection settings to widen access. Other people's bot DMs are only available when Proactive DMs is enabled.
+connection settings to widen access. Outbound DMs to eligible workspace members are
+standard for all agents when the app's granted scopes include `im:write`; there is
+no separate Proactive DMs opt-in. An inbound DM reply still starts or continues
+work only when the sender is authorized to use the assigned agent, not merely
+because the bot received the message.
 Private-channel material stays in that channel or a DM with the requester. Ask
 the requester to move to a DM for research spanning private channels in a Slack-origin task. Ordinary tasks must also keep private research in source channels or the requester's DM.
 
