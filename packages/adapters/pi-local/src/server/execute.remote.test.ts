@@ -888,4 +888,72 @@ describe("pi remote execution", () => {
     expect(result.summary).toBe("Hello 😀");
     expect(result.resultJson).toEqual({ stdout: rawStdout, stderr: "diagnostic stderr\n" });
   });
+  it("never sends the run JWT to the remote target, only the callback bridge token (TECH-8812)", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-remote-jwt-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    // Fake run JWT; it must reach the host-side bridge and nothing remote.
+    const runJwt = "eyJfake.run-jwt-tech-8812.sig";
+
+    await execute({
+      runId: "run-jwt",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Pi Builder",
+        adapterType: "pi_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "pi",
+        model: "openai/gpt-5.4-mini",
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      authToken: runJwt,
+      onLog: async () => {},
+    });
+
+    // The host-side bridge gets the run JWT to authenticate forwarded calls.
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
+      expect.objectContaining({ hostApiToken: runJwt }),
+    );
+    // Nothing that reaches the remote target -- the pre-bridge command checks,
+    // workspace/asset sync, remote shell commands, or the Pi process -- carries it.
+    for (const fn of [
+      ensureCommandResolvable,
+      resolveCommandForLogs,
+      prepareWorkspaceForSshExecution,
+      runSshCommand,
+      syncDirectoryToSsh,
+      runChildProcess,
+    ]) {
+      expect(JSON.stringify(fn.mock.calls)).not.toContain(runJwt);
+    }
+    const call = runChildProcess.mock.calls[0] as unknown as
+      | [string, string, string[], { env: Record<string, string> }]
+      | undefined;
+    expect(call?.[3].env.PAPERCLIP_API_KEY).toBe("bridge-token");
+  });
 });
