@@ -34,24 +34,45 @@ export function shQuote(segment: string): string {
   return `'${segment.replace(/'/g, "'\\''")}'`;
 }
 
-// Wrap a command so the given env vars are exported before it runs. The Kubernetes
-// exec API has no env field, so the only way to give an exec'd process additional
-// env is to run it under a shell that exports the vars and then `exec`s the real
-// command. PATH is deliberately skipped (the caller's PATH is the orchestrator's,
-// not the sandbox image's, and overriding it would break command resolution), and
-// only valid shell identifiers are exported. Returns the original command unchanged
+// Quote an env value as a single-line sh word. Like shQuote, but each newline is
+// emitted as "$__pc_nl" (a variable the wrapper below sets to a literal newline)
+// so the whole env block fits on one line that `read` can consume.
+function shQuoteSingleLine(value: string): string {
+  return value.split("\n").map(shQuote).join('"$__pc_nl"');
+}
+
+// Wrap a command so the given env vars are exported before it runs, WITHOUT putting
+// any env value in the command. The Kubernetes exec API has no env field, and the
+// command is sent as query parameters of the exec request URI, so anything in it
+// lands in the kube-apiserver audit log. Values are therefore delivered on stdin:
+// the returned stdin starts with ONE line of `export K='v';` statements, followed
+// by the caller's original stdin (if any). The wrapper shell reads that line with
+// the `read` builtin (which reads a pipe one byte at a time, so it never consumes
+// bytes past the newline), evals it, and `exec`s the real command, which inherits
+// the rest of stdin unchanged. Key names may appear in the command; values never do.
+//
+// PATH is deliberately skipped (the caller's PATH is the orchestrator's, not the
+// sandbox image's, and overriding it would break command resolution), and only
+// valid shell identifiers are exported. Returns the command and stdin unchanged
 // when there is nothing to apply.
 export function wrapCommandWithEnv(
   command: string[],
   env: Record<string, string> | undefined | null,
-): string[] {
+  stdin?: string,
+): { command: string[]; stdin: string | Buffer | undefined } {
   const entries = Object.entries(env && typeof env === "object" ? env : {}).filter(
     ([key, value]) =>
       typeof value === "string" && key !== "PATH" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key),
   );
-  if (entries.length === 0) return command;
-  const exports = entries.map(([k, v]) => `export ${k}=${shQuote(v)};`).join(" ");
-  return ["/bin/sh", "-c", `${exports} exec ${command.map(shQuote).join(" ")}`];
+  if (entries.length === 0) return { command, stdin };
+  const envLine = entries.map(([k, v]) => `export ${k}=${shQuoteSingleLine(v)};`).join(" ");
+  const script =
+    "__pc_nl='\n'; IFS= read -r __pc_env || exit 125; eval \"$__pc_env\" || exit 125; " +
+    `unset __pc_env __pc_nl; exec ${command.map(shQuote).join(" ")}`;
+  return {
+    command: ["/bin/sh", "-c", script],
+    stdin: Buffer.from(`${envLine}\n${stdin ?? ""}`, "utf-8"),
+  };
 }
 
 export async function execInPod(
