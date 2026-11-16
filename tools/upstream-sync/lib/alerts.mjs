@@ -214,10 +214,16 @@ export async function alertForClassifiedRows(db, cfg, { log = console.error, bud
 }
 
 // ---- ops alerts --------------------------------------------------------------
-// Edge-triggered with an episode counter: one alert when a condition starts, one
-// "recovered" note is not needed; the flag clears when the condition clears so the
-// next episode alerts again.
-export async function opsAlerts(db, cfg) {
+// Edge-triggered with an episode counter: one alert when a condition starts; the
+// flag clears when the condition clears so the next episode alerts again. While
+// the condition persists, the alert is re-enqueued every `cfg.ops.reminderHours`
+// (RED-1437/RED-1577) so a latched, never-cleared condition cannot go silent. The
+// flag value is the epoch-ms of the last alert (episode start, then each reminder).
+// The reminder dedup key carries the hour bucket, so two overlapping evaluations
+// in the same hour enqueue once.
+const HOUR_MS = 3600 * 1000;
+
+export async function opsAlerts(db, cfg, { now = Date.now() } = {}) {
   const out = [];
   const { rows } = await db.query(
     `SELECT count(*)::int AS depth,
@@ -226,17 +232,23 @@ export async function opsAlerts(db, cfg) {
   );
   const depth = rows[0].depth;
   const oldestH = rows[0].oldest_h === null ? 0 : Number(rows[0].oldest_h);
+  const reminderMs = (cfg.ops.reminderHours ?? 0) * HOUR_MS;
   const checks = [
     { name: "queue_depth", bad: depth > cfg.ops.queueDepthMax, text: `[upstream-sync OPS] Queue depth ${depth} > ${cfg.ops.queueDepthMax} pending upstream commits.` },
     { name: "oldest_pending", bad: oldestH > cfg.ops.oldestPendingHoursMax, text: `[upstream-sync OPS] Oldest pending upstream commit is ${oldestH.toFixed(1)}h old (> ${cfg.ops.oldestPendingHoursMax}h).` },
   ];
   for (const c of checks) {
     const flag = `ops_active_${c.name}`;
-    const active = (await getState(db, flag)) !== null;
+    const last = await getState(db, flag);
+    const active = last !== null;
     if (c.bad && !active) {
-      const episode = Date.now();
-      await setState(db, flag, String(episode));
-      if (await enqueueAlert(db, cfg, { dedupKey: `ops:${c.name}:${episode}`, kind: "ops", payload: { text: c.text } })) out.push(c.name);
+      await setState(db, flag, String(now));
+      if (await enqueueAlert(db, cfg, { dedupKey: `ops:${c.name}:${now}`, kind: "ops", payload: { text: c.text } })) out.push(c.name);
+    } else if (c.bad && reminderMs > 0 && !(now - Number(last) < reminderMs)) {
+      // `!(< )` rather than `>=` so a non-numeric flag value (NaN) counts as due.
+      await setState(db, flag, String(now));
+      const bucket = Math.floor(now / HOUR_MS);
+      if (await enqueueAlert(db, cfg, { dedupKey: `ops:${c.name}:h${bucket}`, kind: "ops", payload: { text: `${c.text} (reminder)` } })) out.push(c.name);
     } else if (!c.bad && active) {
       await delState(db, flag);
     }

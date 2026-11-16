@@ -194,13 +194,22 @@ async function main() {
     }
     if (cmd === "detect") return console.log(JSON.stringify(await detect(pool, cfg, log)));
     if (cmd === "classify") return console.log(JSON.stringify(await classifyPending(pool, cfg, { log })));
+    // Manual alert/flush take the same run lock as `run`: delivery is send-then-mark,
+    // so a flush overlapping the hourly run would send the same pending alert twice.
     if (cmd === "alert") {
-      const a = await alertForClassifiedRows(pool, cfg, { log });
-      const o = await opsAlerts(pool, cfg);
-      const f = await flushAlerts(pool, cfg, { log });
-      return console.log(JSON.stringify({ alerts: a, ops: o, flush: f }));
+      const r = await withRunLock(pool, async (db) => ({
+        alerts: await alertForClassifiedRows(db, cfg, { log }),
+        ops: await opsAlerts(db, cfg),
+        flush: await flushAlerts(db, cfg, { log }),
+      }));
+      if (r.locked) return log("another run holds the lock; exiting");
+      return console.log(JSON.stringify(r.value));
     }
-    if (cmd === "flush") return console.log(JSON.stringify(await flushAlerts(pool, cfg, { log })));
+    if (cmd === "flush") {
+      const r = await withRunLock(pool, (db) => flushAlerts(db, cfg, { log }));
+      if (r.locked) return log("another run holds the lock; exiting");
+      return console.log(JSON.stringify(r.value));
+    }
     if (cmd === "status") return console.log(JSON.stringify(await status(pool), null, 2));
     if (cmd === "pause") { await setState(pool, PAUSED_KEY, "true"); return log("detector paused"); }
     if (cmd === "resume") { await delState(pool, PAUSED_KEY); return log("detector resumed"); }
