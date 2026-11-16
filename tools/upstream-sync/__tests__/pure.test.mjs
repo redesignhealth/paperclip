@@ -599,13 +599,13 @@ test("alertForClassifiedRows alerts a perf row that touches migrations, once, an
     upstream_sha: String(n).padStart(40, "0"), category: "perf", summary: `s${n}`, title: `t${n}`,
     upstream_pr: n, fork_owned_hits: [], touches_migrations: touches, status: "pending", alert_state: null,
   });
-  const log = [mk(1, true), mk(2, false)];
+  const log = [mk(1, true), mk(2, false), { ...mk(3, true), category: null }];
   const dedup = new Set();
   let queuedPayloads = [];
   const db = {
     async query(sql, params) {
-      if (/FROM upstream_sync_log\s+WHERE \(category = ANY\(\$1\) OR touches_migrations IS TRUE\) AND alert_state IS NULL/.test(sql)) {
-        const rows = log.filter((r) => (params[0].includes(r.category) || r.touches_migrations === true) && r.alert_state === null);
+      if (/FROM upstream_sync_log\s+WHERE \(category = ANY\(\$1\) OR \(category IS NOT NULL AND touches_migrations IS TRUE\)\) AND alert_state IS NULL/.test(sql)) {
+        const rows = log.filter((r) => (params[0].includes(r.category) || (r.category !== null && r.touches_migrations === true)) && r.alert_state === null);
         return { rows, rowCount: rows.length };
       }
       if (/INSERT INTO upstream_sync_alerts/.test(sql)) {

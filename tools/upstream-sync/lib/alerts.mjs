@@ -49,7 +49,7 @@ export function formatRowAlert(row) {
   const parts = {
     // A migration-touching row outside ALERT_CATEGORIES (e.g. perf) leads with MIGRATIONS so the
     // alert is not read as a routine note; alert categories keep their icon plus a suffix.
-    icon: { feature: "NEW", breaking: "BREAKING", security: "SECURITY" }[row.category] ?? "MIGRATIONS",
+    icon: { feature: "NEW", breaking: "BREAKING", security: "SECURITY" }[row.category] ?? (row.touches_migrations ? "MIGRATIONS" : String(row.category).toUpperCase()),
     note: row.touches_migrations && ALERT_CATEGORIES.includes(row.category) ? " (touches migrations)" : "",
     summary: String(row.summary ?? ""),
     title: String(row.title ?? ""),
@@ -181,7 +181,7 @@ export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.er
 export async function alertForClassifiedRows(db, cfg, { log = console.error, budget = null } = {}) {
   const { rows } = await db.query(
     `SELECT * FROM upstream_sync_log
-     WHERE (category = ANY($1) OR touches_migrations IS TRUE) AND alert_state IS NULL
+     WHERE (category = ANY($1) OR (category IS NOT NULL AND touches_migrations IS TRUE)) AND alert_state IS NULL
      ORDER BY id`,
     [ALERT_CATEGORIES],
   );
