@@ -565,7 +565,7 @@ test("alertForClassifiedRows leaves rows past the deadline for the next run", as
     calls: queries,
     async query(sql, params) {
       queries.push({ sql, params });
-      if (/FROM upstream_sync_log\s+WHERE category = ANY/.test(sql)) return { rows, rowCount: rows.length };
+      if (/FROM upstream_sync_log\s+WHERE \(category = ANY/.test(sql)) return { rows, rowCount: rows.length };
       return { rows: [], rowCount: 1 };
     },
   };
@@ -581,6 +581,51 @@ test("alertForClassifiedRows leaves rows past the deadline for the next run", as
   assert.ok(logs.some((m) => /budget exhausted; 2 row alert\(s\) deferred/.test(m)));
   // Deferred rows keep alert_state NULL so the next run re-selects them.
   assert.equal(db.calls.filter((c) => /SET alert_state='sent'/.test(c.sql)).length, 1);
+});
+
+test("alert text leads with MIGRATIONS for a non-alert category that touches migrations", () => {
+  const base = { summary: "Index tweak", title: "perf: idx (#7)", upstream_pr: 7, upstream_sha: "e".repeat(40), fork_owned_hits: [], status: "pending" };
+  const perf = formatRowAlert({ ...base, category: "perf", touches_migrations: true });
+  assert.match(perf.text.split("\n")[0], /^\[upstream-sync MIGRATIONS\] Index tweak/);
+  assert.match(perf.text, /Flags: touches Drizzle migrations\/schema/);
+  const feat = formatRowAlert({ ...base, category: "feature", touches_migrations: true });
+  assert.match(feat.text.split("\n")[0], /^\[upstream-sync NEW\] Index tweak \(touches migrations\)/);
+  assert.doesNotMatch(formatRowAlert({ ...base, category: "feature", touches_migrations: false }).text.split("\n")[0], /migrations/);
+});
+
+test("alertForClassifiedRows alerts a perf row that touches migrations, once, and not one that does not", async () => {
+  const { alertForClassifiedRows } = await import("../lib/alerts.mjs");
+  const mk = (n, touches) => ({
+    upstream_sha: String(n).padStart(40, "0"), category: "perf", summary: `s${n}`, title: `t${n}`,
+    upstream_pr: n, fork_owned_hits: [], touches_migrations: touches, status: "pending", alert_state: null,
+  });
+  const log = [mk(1, true), mk(2, false)];
+  const dedup = new Set();
+  let queuedPayloads = [];
+  const db = {
+    async query(sql, params) {
+      if (/FROM upstream_sync_log\s+WHERE \(category = ANY\(\$1\) OR touches_migrations IS TRUE\) AND alert_state IS NULL/.test(sql)) {
+        const rows = log.filter((r) => (params[0].includes(r.category) || r.touches_migrations === true) && r.alert_state === null);
+        return { rows, rowCount: rows.length };
+      }
+      if (/INSERT INTO upstream_sync_alerts/.test(sql)) {
+        if (dedup.has(params[0])) return { rows: [], rowCount: 0 };
+        dedup.add(params[0]); queuedPayloads.push(params[5]);
+        return { rows: [{ id: 1 }], rowCount: 1 };
+      }
+      if (/SET alert_state='sent'/.test(sql)) log.find((r) => r.upstream_sha === params[0]).alert_state = "sent";
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  const cfg = loadConfig({});
+  const r1 = await alertForClassifiedRows(db, cfg);
+  assert.equal(r1.queued, 1);
+  assert.deepEqual([...dedup], ["row:" + "1".padStart(40, "0")]);
+  assert.match(queuedPayloads[0].text, /^\[upstream-sync MIGRATIONS\]/);
+  // Re-run: alert_state is set, and even a reset row would hit the dedup key.
+  assert.equal((await alertForClassifiedRows(db, cfg)).queued, 0);
+  log[0].alert_state = null;
+  assert.equal((await alertForClassifiedRows(db, cfg)).queued, 0);
 });
 
 test("slack payload disables link unfurls", async () => {
