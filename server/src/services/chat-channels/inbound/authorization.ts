@@ -18,6 +18,8 @@ import {
 
 import type { Db } from "@paperclipai/db";
 
+import { authorizationService } from "../../authorization.js";
+
 import {
   authUsers,
   chatConversations,
@@ -47,6 +49,34 @@ type InboundAuthorityOptions = {
   runtimeCallbackEndpoint: (tx: DbTransaction, endpointId: string, context: LifecycleRuntimeFence, statuses: EndpointRow["status"][]) => Promise<EndpointRow | null>;
   fetchImpl?: typeof fetch;
 };
+/**
+ * Whether the acting user (or endpoint sponsor) holds permission to direct/assign
+ * the endpoint's assigned agent (TECH-8783).
+ */
+export async function principalMayDirectAssignedAgent(
+  executor: DbOrTransaction,
+  endpoint: { companyId: string; assignedAgentId?: string | null; sponsorUserId?: string | null },
+  userId?: string | null,
+): Promise<boolean> {
+  const actingUserId = userId ?? endpoint.sponsorUserId;
+  if (!actingUserId || !endpoint.assignedAgentId) return true;
+  const decision = await authorizationService(executor).decide({
+    actor: { type: "board", userId: actingUserId, source: "session" },
+    action: "tasks:assign",
+    resource: {
+      type: "issue",
+      companyId: endpoint.companyId,
+      issueId: null,
+      projectId: null,
+      parentIssueId: null,
+      assigneeAgentId: endpoint.assignedAgentId,
+      assigneeUserId: null,
+    },
+    scope: { assigneeAgentId: endpoint.assignedAgentId },
+  });
+  return decision.allowed;
+}
+
 export function createChatInboundAuthority(db: Db, options: InboundAuthorityOptions) {
   const { voiceStore, runtimeCallbackEndpoint, fetchImpl } = options;
 
@@ -296,6 +326,9 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
       const allowed =
         membership?.status === "active" &&
         membership.membershipRole !== "viewer";
+      if (allowed && !(await principalMayDirectAssignedAgent(tx, endpoint, link.userId))) {
+        return { allowed: false, linkedDenied: true, userId: null };
+      }
       return {
         allowed,
         linkedDenied: !allowed,
@@ -326,10 +359,14 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
       )
       .for("update")
       .then((rows) => rows[0] ?? null);
+    const allowed =
+      sponsorMembership?.status === "active" &&
+      sponsorMembership.membershipRole !== "viewer";
+    if (allowed && !(await principalMayDirectAssignedAgent(tx, endpoint, null))) {
+      return { allowed: false, linkedDenied: true, userId: null };
+    }
     return {
-      allowed:
-        sponsorMembership?.status === "active" &&
-        sponsorMembership.membershipRole !== "viewer",
+      allowed,
       linkedDenied: false,
       userId: null,
     };
