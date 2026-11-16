@@ -113,7 +113,7 @@ export async function execInPod(
   const stderrStream = new PassThrough();
 
   const stdinPayload: Buffer | null =
-    Buffer.isBuffer(stdin) ? stdin
+    Buffer.isBuffer(stdin) ? (stdin.length > 0 ? stdin : null)
     : typeof stdin === "string" && stdin.length > 0 ? Buffer.from(stdin, "utf-8")
     : null;
   const stdinStream: PassThrough | null = stdinPayload ? new PassThrough() : null;

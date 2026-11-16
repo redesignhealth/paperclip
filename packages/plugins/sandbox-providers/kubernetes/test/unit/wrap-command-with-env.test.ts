@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { Exec } from "@kubernetes/client-node";
 import type { KubeConfig } from "@kubernetes/client-node";
 import { boundCommandToStdin, wrapCommandWithEnv } from "../../src/pod-exec.js";
@@ -12,14 +12,15 @@ import { boundCommandToStdin, wrapCommandWithEnv } from "../../src/pod-exec.js";
 // appears in the exec argv or in the exec request URI built from it.
 // If quoting ever regressed and the shell ran the substitution in SHELLY, this
 // file would be created; the real-shell test asserts it never is.
-const INJECTION_MARKER = join(mkdtempSync(join(tmpdir(), "tech-8812-")), "should-not-exist");
+const MARKER_DIR = mkdtempSync(join(tmpdir(), "wrap-env-"));
+const INJECTION_MARKER = join(MARKER_DIR, "should-not-exist");
 const SECRET_ENV = {
   RAMP_ROUTER_API_KEY: "rr-fake-model-key-0001",
   ANTHROPIC_API_KEY: "sk-ant-fake-0002",
   PAPERCLIP_API_KEY: "bridge-fake-token-0003",
   QUOTED: "it's a 'quoted' value",
   MULTILINE: "line one\nline two\n",
-  SHELLY: `$(touch ${INJECTION_MARKER}) \`touch ${INJECTION_MARKER}\` $HOME \\n %s`,
+  SHELLY: `$(touch '${INJECTION_MARKER}') \`touch '${INJECTION_MARKER}'\` $HOME \\n %s`,
   CRLF: "crlf\r\nvalue\r",
   BIG: "b".repeat(64 * 1024),
   XDG_CONFIG_HOME: "/tmp/cfg",
@@ -55,6 +56,20 @@ function runWrapped(command: string[], env: Record<string, string>, stdin?: stri
     encoding: "utf-8",
   });
 }
+
+afterAll(() => rmSync(MARKER_DIR, { recursive: true, force: true }));
+
+describe("boundCommandToStdin", () => {
+  it("bounds stdin by its UTF-8 byte length and quotes every argument", () => {
+    const payload = Buffer.from("é✓\n", "utf-8");
+    expect(payload.length).toBe(6);
+    expect(boundCommandToStdin(["/bin/sh", "-c", "echo 'x'"], payload)).toEqual([
+      "/bin/sh",
+      "-c",
+      "head -c 6 | '/bin/sh' '-c' 'echo '\\''x'\\'''",
+    ]);
+  });
+});
 
 describe("wrapCommandWithEnv", () => {
   it("returns the command and stdin unchanged when there is no env", () => {
