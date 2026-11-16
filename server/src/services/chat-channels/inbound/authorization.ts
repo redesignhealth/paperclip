@@ -61,7 +61,8 @@ export async function principalMayDirectAssignedAgent(
   const actingUserId = userId ?? endpoint.sponsorUserId;
   if (!actingUserId || !endpoint.assignedAgentId) return true;
   const decision = await authorizationService(executor).decide({
-    actor: { type: "board", userId: actingUserId, source: "session" },
+    // Evaluate company-scoped membership grants without instance-admin bypass.
+    actor: { type: "board", userId: actingUserId, source: "session", ignoreInstanceAdmin: true },
     action: "tasks:assign",
     resource: {
       type: "issue",
@@ -270,18 +271,47 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
     userId: string | null;
     sponsorUserId?: string | null;
   }> {
+    async function gateProviderAuthority(
+      result: {
+        allowed: boolean;
+        linkedDenied: boolean;
+        userId: string | null;
+        sponsorUserId?: string | null;
+      },
+    ): Promise<{
+      allowed: boolean;
+      linkedDenied: boolean;
+      userId: string | null;
+      sponsorUserId?: string | null;
+    }> {
+      if (!result.allowed) return result;
+      const actor = result.userId ?? result.sponsorUserId ?? endpoint.sponsorUserId;
+      const allowed = await principalMayDirectAssignedAgent(tx, endpoint, actor);
+      if (!allowed) {
+        return { ...result, allowed: false, linkedDenied: true, userId: null };
+      }
+      return result;
+    }
+
     if (endpoint.provider === "speko") {
       const principal = await tx.select({ externalId: chatExternalPrincipals.externalId }).from(chatExternalPrincipals)
         .where(and(eq(chatExternalPrincipals.id, principalId), eq(chatExternalPrincipals.companyId, endpoint.companyId), eq(chatExternalPrincipals.provider, "speko"))).then((rows) => rows[0]);
       if (!principal) return { allowed: false, linkedDenied: true, userId: null };
-      try { return await voiceStore.authorizePrincipal(tx as import("../../voice/voice-session-store.js").VoiceTransaction, endpoint.companyId, endpoint.id, principal.externalId); }
-      catch (error) {
+      try {
+        const voiceAccess = await voiceStore.authorizePrincipal(
+          tx as import("../../voice/voice-session-store.js").VoiceTransaction,
+          endpoint.companyId,
+          endpoint.id,
+          principal.externalId,
+        );
+        return await gateProviderAuthority(voiceAccess);
+      } catch (error) {
         if (!(error instanceof HttpError && [403, 404].includes(error.status))) throw error;
         return { allowed: false, linkedDenied: true, userId: null };
       }
     }
     const githubAccess = await githubChatPrincipalAccess(tx, endpoint, principalId);
-    if (githubAccess) return githubAccess;
+    if (githubAccess) return await gateProviderAuthority(githubAccess);
     // Link confirmation already uses this transaction-scoped identity key.
     // Taking it at the final task mutation boundary prevents a newly confirmed
     // identity from racing the authorization snapshot. Row locks below also
@@ -323,6 +353,8 @@ export function createChatInboundAuthority(db: Db, options: InboundAuthorityOpti
         )
         .for("update")
         .then((rows) => rows[0] ?? null);
+      // Concurrent permission grant mutations are not serialized (pre-existing product-wide pattern);
+      // membership and link locks serialize link confirmation, revocation, and company departure.
       const allowed =
         membership?.status === "active" &&
         membership.membershipRole !== "viewer";

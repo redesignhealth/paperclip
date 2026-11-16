@@ -238,7 +238,9 @@ export async function ensureSlackManifestScopesCurrent(
     return;
   }
 
-  const app = slackAppConfigurationSchema.parse(input.app);
+  const parsedApp = slackAppConfigurationSchema.safeParse(input.app);
+  if (!parsedApp.success) return;
+  const app = parsedApp.data;
   const manifest = buildSlackAppManifest({
     app,
     agentName: input.agentName,
