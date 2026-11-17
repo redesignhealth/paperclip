@@ -501,9 +501,15 @@ describe("lease remote working dir (TECH-8174: runs that never realize a workspa
 
   it("still refuses to sync a lease with no remote dir at all, and confines runtime assets to the root", () => {
     expect(() => resolveSyncRemoteDir({ providerLeaseId: "x", metadata: {} } as never)).toThrow(/workspace remote dir/);
+    // A recorded root that is not a confinable dir is refused at sync time too.
+    for (const unsafe of ["/", "relative", "/workspace/../etc", "//workspace"]) {
+      expect(() => resolveSyncRemoteDir({ providerLeaseId: "x", metadata: { remoteCwd: unsafe } } as never)).toThrow(
+        /normalized absolute workspace remote dir/,
+      );
+    }
     expect(leaseRemoteCwd("  ")).toBe("/workspace");
     // Only a normalized absolute dir below / can become the confinement root.
-    for (const unsafe of ["/", "relative/dir", "/workspace/../etc", "/workspace/", 42]) {
+    for (const unsafe of ["/", "", "relative/dir", "/workspace/../etc", "/workspace/./x", "/workspace/", "//workspace", 42]) {
       expect(leaseRemoteCwd(unsafe)).toBe("/workspace");
     }
     expect(leaseRemoteCwd(" /workspace/project ")).toBe("/workspace/project");

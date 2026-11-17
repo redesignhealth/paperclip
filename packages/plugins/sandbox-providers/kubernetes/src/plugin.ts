@@ -171,9 +171,19 @@ export const DEFAULT_WORKSPACE_REMOTE_DIR = "/workspace";
 export function leaseRemoteCwd(existing: unknown): string {
   if (typeof existing !== "string") return DEFAULT_WORKSPACE_REMOTE_DIR;
   const trimmed = existing.trim();
-  const isConfinableRoot =
-    trimmed.startsWith("/") && trimmed !== "/" && path.posix.normalize(trimmed) === trimmed && !trimmed.endsWith("/");
-  return isConfinableRoot ? trimmed : DEFAULT_WORKSPACE_REMOTE_DIR;
+  return isConfinableRemoteDir(trimmed) ? trimmed : DEFAULT_WORKSPACE_REMOTE_DIR;
+}
+
+// A usable confinement root: absolute, below / (never / itself), already
+// normalized (no ., .., // or trailing /).
+export function isConfinableRemoteDir(value: string): boolean {
+  return (
+    value.startsWith("/") &&
+    !value.startsWith("//") &&
+    value !== "/" &&
+    !value.endsWith("/") &&
+    path.posix.normalize(value) === value
+  );
 }
 
 // The workspace remote dir is the confinement root for native file sync. It is
@@ -183,7 +193,13 @@ export function leaseRemoteCwd(existing: unknown): string {
 export function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   const remoteCwd = lease.metadata?.remoteCwd;
   if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
-    return remoteCwd.trim();
+    const trimmed = remoteCwd.trim();
+    // Validated here too, not only where it is written: a root such as "/" would
+    // make the whole container filesystem the confinement root.
+    if (!isConfinableRemoteDir(trimmed)) {
+      throw new Error("Kubernetes file sync requires a normalized absolute workspace remote dir below / on the lease metadata.");
+    }
+    return trimmed;
   }
   throw new Error("Kubernetes file sync requires a workspace remote dir on the lease metadata.");
 }
@@ -651,6 +667,8 @@ const plugin = definePlugin({
     // The agent pod already has /workspace mounted as an emptyDir at pod
     // scheduling time (see pod-spec-builder). Nothing to provision here —
     // we just hand back the cwd. Honor a caller-supplied remotePath if set.
+    // The server keeps only its own workspace-realization record from this
+    // result; the lease's remoteCwd (sync root) is the one set at acquire/resume.
     const cwd =
       params.workspace.remotePath && params.workspace.remotePath.trim().length > 0
         ? params.workspace.remotePath.trim()
