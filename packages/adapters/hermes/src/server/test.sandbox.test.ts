@@ -104,6 +104,14 @@ describe("hermes testEnvironment on a remote target (TECH-8174)", () => {
     expect(h.processCalls).toHaveLength(0);
   });
 
+  it("refuses managed AI connections like the run does", async () => {
+    for (const config of [{ managedAiRouting: { id: "x" } }, { managedAiConnection: { id: "x" } }]) {
+      const result = await run({ provider: "openai-api", model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-x" }, ...config });
+      expect(result.checks.map((c) => c.code)).toEqual(["hermes_remote_probe_unsupported"]);
+    }
+    expect(h.processCalls).toHaveLength(0);
+  });
+
   it("refuses an SSH target", async () => {
     const ssh = { kind: "remote", transport: "ssh", remoteCwd: "/srv", spec: {} } as unknown as AdapterExecutionTarget;
     const result = await run({ provider: "openai-api", model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-x" } }, ssh);

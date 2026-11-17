@@ -59,8 +59,9 @@ export async function testRemoteEnvironment(
     configuredModel,
     detected: null,
   });
-  // Managed connections still need a local hello probe, as before this stage.
-  if (config.managedAiRouting) {
+  // Managed connections still need a local hello probe, as before this stage; the sandbox run
+  // refuses them too (managedAiRouting or managedAiConnection).
+  if (config.managedAiRouting || config.managedAiConnection) {
     return result([{ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." }]);
   }
   // Ramp Router readiness is not verified on remote targets yet; refused before anything launches.

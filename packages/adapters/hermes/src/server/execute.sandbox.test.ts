@@ -113,12 +113,12 @@ import {
   HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE,
-  HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_RUNTIME_MEMORY_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE,
 } from "./execute-sandbox.js";
 import { HERMES_MAX_SYSTEM_PROMPT_BYTES } from "./execute.js";
+import { ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE } from "./router-readiness.js";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { prepareAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 
@@ -345,6 +345,28 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     expect(JSON.stringify(h.shipped)).not.toContain("must-not-ship");
   });
 
+  it("ships a symlinked external instructions file as a plain copy of its content, never the link target's directory", async () => {
+    const outside = path.join(root, "outside");
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(path.join(outside, "real.md"), "linked instructions");
+    await fs.writeFile(path.join(outside, ".env"), "SECRET=outside-must-not-ship");
+    const link = path.join(root, "bundle", "LINKED.md");
+    await fs.symlink(path.join(outside, "real.md"), link);
+    await execute(ctx({ config: { instructionsFilePath: link } }));
+    expect(h.shipped.instructions).toEqual({ "LINKED.md": "linked instructions" });
+    const localDir = h.prepareInputs[0]!.assets?.[1]?.localDir ?? "";
+    // The local copy lives in the run's scratch home and is removed with it.
+    await expect(fs.stat(localDir)).rejects.toThrow();
+  });
+
+  it("does not treat a managed-root file whose name starts with '..' as outside the root", async () => {
+    const bundleDir = path.dirname(instructionsPath);
+    const dotted = path.join(bundleDir, "..notes.md");
+    await fs.writeFile(dotted, "dotted");
+    await execute(ctx({ config: { instructionsFilePath: dotted, instructionsBundleMode: "managed", instructionsRootPath: bundleDir } }));
+    expect(h.prepareInputs[0]!.assets?.[1]?.localDir).toBe(bundleDir);
+  });
+
   it("redacts the agent's provider key and the bridge token from output", async () => {
     h.hermesStdout = `echo ${PROVIDER_KEY} and ${BRIDGE_TOKEN}\n\nsession_id: s\n`;
     const result = await execute(ctx());
@@ -405,10 +427,11 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     [
       "a Ramp Router run",
       () => ctx({ config: { provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } } }),
-      HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE,
+      ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
     ],
     ["a custom Hermes command", () => ctx({ config: { hermesCommand: "/tmp/evil-hermes" } }), HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE],
-    ["a managed AI connection", () => ctx({ config: { managedAiRouting: { id: "x" } } }), HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE],
+    ["managed AI routing", () => ctx({ config: { managedAiRouting: { id: "x" } } }), HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE],
+    ["a managed AI connection", () => ctx({ config: { managedAiConnection: { id: "x" } } }), HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE],
     [
       "a sandbox provider other than Kubernetes",
       () => ctx({ target: { ...sandboxTarget, providerKey: "modal" } as AdapterExecutionTarget }),

@@ -1,7 +1,7 @@
 import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
-import { isEnvironmentDriverSupportedForAdapter, isSandboxProviderSupportedForAdapter } from "@paperclipai/shared";
+import { isEnvironmentDriverSupportedForAdapter } from "@paperclipai/shared";
 import {
   adapterExecutionTargetToRemoteSpec,
   type AdapterExecutionTarget,
@@ -289,11 +289,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
       config: parseObject(input.environment.config),
     });
     if (parsed.driver !== "sandbox") {
-      return null;
-    }
-    // Sandbox-only adapters (hermes_local) are limited to specific providers; every other adapter
-    // accepts any configured provider, as before.
-    if (!isSandboxProviderSupportedForAdapter(input.adapterType, parsed.config.provider, [parsed.config.provider])) {
       return null;
     }
 

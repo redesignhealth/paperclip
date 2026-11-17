@@ -84,7 +84,11 @@ import {
   resolveHermesMemoryProvider,
 } from "./memory-config.js";
 import { normalizeConfiguredModel } from "./model-arg.js";
-import { RAMP_ROUTER_API_KEY_ENV, routerEnvNamesToStrip } from "./router-readiness.js";
+import {
+  RAMP_ROUTER_API_KEY_ENV,
+  ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  routerEnvNamesToStrip,
+} from "./router-readiness.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 export const HERMES_SANDBOX_ADAPTER_KEY = "hermes";
@@ -92,7 +96,9 @@ export const HERMES_SANDBOX_ADAPTER_KEY = "hermes";
 /**
  * Sandbox providers whose exec channel keeps env values out of the exec command (the Kubernetes
  * provider delivers env over stdin, fork #415). Hermes carries its system prompt and provider key in
- * env, so other providers are refused until they make the same guarantee.
+ * env, so other providers are refused until they make the same guarantee. Keep in sync with
+ * SANDBOX_ONLY_ADAPTER_PROVIDERS in packages/shared/src/environment-support.ts (the capability the UI
+ * offers); this adapter does not depend on that package, and this run-time check is authoritative.
  */
 export const HERMES_SANDBOX_PROVIDERS: readonly string[] = ["kubernetes"];
 
@@ -105,8 +111,6 @@ export const HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE =
   "Refusing to start: adapterConfig.memoryProvider is not yet supported for Hermes in sandbox environments (the memory service is not reachable from the sandbox). Remove memoryProvider or select the local environment.";
 export const HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE =
   "Refusing to start: PAPERCLIP_HERMES_COMMAND_SCAN=required is not yet supported for Hermes in sandbox environments.";
-export const HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE =
-  "Refusing to start: the Ramp Router provider is not yet supported for Hermes in sandbox environments. Select the local environment for this agent.";
 export const HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE =
   "Refusing to start: managed AI connections are not yet supported for Hermes in sandbox environments. Select the local environment for this agent.";
 export const HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE =
@@ -120,6 +124,7 @@ const REMOTE_RUN_HOME_SUBDIRS = ["config", "data", "cache", "state", "tmp", "run
 /** Placeholder at least as long as any in-sandbox bridge origin, for the pre-staging size check. */
 const BRIDGE_URL_SIZE_PLACEHOLDER = "http://127.0.0.1:65535";
 
+
 /**
  * The instructions asset. A Paperclip-managed bundle directory holds only the bundle and is shipped
  * whole; any other instructions file is shipped ALONE (its directory may be a repository or a home
@@ -128,6 +133,7 @@ const BRIDGE_URL_SIZE_PLACEHOLDER = "http://127.0.0.1:65535";
 async function prepareInstructionsAsset(
   config: Record<string, unknown>,
   instructionsFilePath: string,
+  instructionsContent: string,
   scratchDir: string,
 ): Promise<{ localDir: string; relativeFile: string }> {
   const filePath = path.resolve(instructionsFilePath);
@@ -135,14 +141,15 @@ async function prepareInstructionsAsset(
   if (managedRoot) {
     const root = path.resolve(managedRoot);
     const relative = path.relative(root, filePath);
-    if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
-      return { localDir: root, relativeFile: relative.split(path.sep).join("/") };
-    }
+    const insideRoot = relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    if (insideRoot) return { localDir: root, relativeFile: relative.split(path.sep).join("/") };
   }
+  // Ship exactly the content already loaded into the prompt, as a fresh regular file: nothing next
+  // to it, and no symlink is followed or recreated.
   const dir = path.join(scratchDir, "instructions");
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const name = path.basename(filePath);
-  await fs.copyFile(filePath, path.join(dir, name));
+  const name = path.basename(filePath) || "instructions.md";
+  await fs.writeFile(path.join(dir, name), instructionsContent, { mode: 0o600, flag: "wx" });
   return { localDir: dir, relativeFile: name };
 }
 
@@ -239,7 +246,9 @@ async function executeHermesInSandbox(
     configuredModel,
     detected: null,
   });
-  if (effective.isRouter) await refuse(ctx, HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE);
+  // Same refusal and message as the environment test (test-sandbox.ts) until Router is verified in
+  // the sandbox.
+  if (effective.isRouter) await refuse(ctx, ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE);
   if (!effective.ok) return await refuse(ctx, effective.message);
   const resolvedProvider = effective.provider;
   const model = effective.effectiveModel;
@@ -302,7 +311,7 @@ async function executeHermesInSandbox(
   const composePrompts = (
     apiUrl: string | undefined,
     remoteInstructionsFile: string | null,
-  ): { query: string; systemPrompt: string } => {
+  ): { query: string; systemPrompt: string; relocated: boolean } => {
     const promptConfig: Record<string, unknown> = { ...config };
     if (apiUrl) {
       promptConfig.paperclipApiUrl = apiUrl;
@@ -321,7 +330,7 @@ async function executeHermesInSandbox(
       agentInstructions,
       renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: true, agentPromptTemplate }),
     ]);
-    if (!built.hermesPromptSplit) return { query: built.query, systemPrompt: unsplitSystemPrompt() };
+    if (!built.hermesPromptSplit) return { query: built.query, systemPrompt: unsplitSystemPrompt(), relocated: false };
     const candidateOverlay = joinPromptSections([
       userEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
       agentInstructions,
@@ -329,7 +338,7 @@ async function executeHermesInSandbox(
       renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: false, agentPromptTemplate }),
     ]);
     if (Buffer.byteLength(candidateOverlay, "utf8") <= HERMES_MAX_SYSTEM_PROMPT_BYTES) {
-      return { query: built.query, systemPrompt: candidateOverlay };
+      return { query: built.query, systemPrompt: candidateOverlay, relocated: false };
     }
     // Same fallback as the host path: keep the relocated sections in the query instead.
     const fallback = buildPrompt(ctx, promptConfig, {
@@ -337,7 +346,7 @@ async function executeHermesInSandbox(
       returnSections: true,
       hardeningFlags: { ...hardeningFlags, hermesPromptSplit: false },
     });
-    return { query: fallback.query, systemPrompt: unsplitSystemPrompt() };
+    return { query: fallback.query, systemPrompt: unsplitSystemPrompt(), relocated: true };
   };
 
   const assertSystemPromptFits = async (systemPrompt: string) => {
@@ -422,13 +431,19 @@ async function executeHermesInSandbox(
     }
 
     const instructionsAsset = instructionsContent !== null && instructionsFilePath
-      ? await prepareInstructionsAsset(config, instructionsFilePath, assetHome.path)
+      ? await prepareInstructionsAsset(config, instructionsFilePath, instructionsContent, assetHome.path)
       : null;
 
     // Refuse an oversized system prompt before anything is staged. The in-sandbox API origin is not
     // known yet, so a placeholder at least as long as any bridge origin stands in for it.
     const usesBridge = adapterExecutionTargetUsesPaperclipBridge(target);
-    const preflightPrompt = composePrompts(usesBridge ? BRIDGE_URL_SIZE_PLACEHOLDER : undefined, null);
+    // The instructions land where the sandbox runtime stages assets by default
+    // (<remoteCwd>/.paperclip-runtime/hermes/<asset key>); the check after staging, with the actual
+    // path, stays authoritative.
+    const expectedRemoteInstructionsFile = instructionsAsset
+      ? path.posix.join(target.remoteCwd, ".paperclip-runtime", HERMES_SANDBOX_ADAPTER_KEY, "instructions", instructionsAsset.relativeFile)
+      : null;
+    const preflightPrompt = composePrompts(usesBridge ? BRIDGE_URL_SIZE_PLACEHOLDER : undefined, expectedRemoteInstructionsFile);
     await assertSystemPromptFits(preflightPrompt.systemPrompt);
 
     // ── Ship workspace and assets ──────────────────────────────────────────
@@ -490,7 +505,12 @@ async function executeHermesInSandbox(
         `[hermes] Loaded agent instructions from ${instructionsFilePath} (${instructionsContent.length} chars)\n`,
       );
     }
-    const { query: prompt, systemPrompt: finalSystemPrompt } = composePrompts(bridgeEnv.PAPERCLIP_API_URL, remoteInstructionsFile);
+    const composed = composePrompts(bridgeEnv.PAPERCLIP_API_URL, remoteInstructionsFile);
+    const prompt = composed.query;
+    const finalSystemPrompt = composed.systemPrompt;
+    if (composed.relocated) {
+      await ctx.onLog("stderr", "[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.\n");
+    }
     await assertSystemPromptFits(finalSystemPrompt);
 
     // ── Sandbox env: explicit layers only, never the host process env ──────

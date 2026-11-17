@@ -79,7 +79,9 @@ const REMOTE_MANAGED_ADAPTERS = new Set<AgentAdapterType>([
 // Adapters that run in sandbox environments only, never over SSH, and only on the
 // listed sandbox providers. hermes_local (TECH-8174) carries its system prompt and
 // provider key in the exec env, which only the Kubernetes provider keeps out of the
-// exec command (env over stdin), so other providers are not offered.
+// exec command (env over stdin), so other providers are not offered. Keep in sync with
+// HERMES_SANDBOX_PROVIDERS in packages/adapters/hermes/src/server/execute-sandbox.ts, which refuses
+// any other provider at run time (the adapter does not depend on this package).
 const SANDBOX_ONLY_ADAPTER_PROVIDERS: ReadonlyMap<AgentAdapterType, readonly string[]> = new Map([
   ["hermes_local", ["kubernetes"]],
 ]);

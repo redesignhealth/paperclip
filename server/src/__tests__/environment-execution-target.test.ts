@@ -318,7 +318,8 @@ describe("resolveEnvironmentExecutionTarget", () => {
     });
     expect(sandboxTarget).toMatchObject({ kind: "remote", transport: "sandbox", providerKey: "kubernetes" });
 
-    // Other sandbox providers do not keep exec env out of the exec command, so Hermes is not placed there.
+    // Another sandbox provider still resolves a sandbox target (never null, which callers treat
+    // as a local run); the Hermes adapter itself refuses providers it does not support.
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",
       config: { provider: "fake-plugin", reuseLease: false, timeoutMs: 30_000 },
@@ -333,7 +334,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
       lease: null,
       environmentRuntime: null,
     });
-    expect(otherProvider).toBeNull();
+    expect(otherProvider).toMatchObject({ kind: "remote", transport: "sandbox", providerKey: "fake-plugin" });
 
     mockResolveEnvironmentDriverConfigForRuntime.mockReset();
     const sshTarget = await resolveEnvironmentExecutionTarget({
