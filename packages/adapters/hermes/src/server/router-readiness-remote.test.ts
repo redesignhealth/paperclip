@@ -115,6 +115,19 @@ describe("probeHermesRouterSupportInTarget (TECH-8174)", () => {
     expect(result).toMatchObject({ supported: false, reason: "unknown" });
   });
 
+  it("refuses a relative probe dir without creating or removing anything", async () => {
+    const install = await createFakeHermesInstall(path.join(root, "image"), { layout: "venv-editable" });
+    const result = await probeHermesRouterSupportInTarget({
+      runId: "run-probe",
+      target: localSandbox(),
+      cwd: root,
+      probeDir: "relative/probe",
+      hermesBinDir: install.binDir,
+    });
+    expect(result).toMatchObject({ supported: false, reason: "unknown" });
+    await expect(fs.stat(path.join(root, "relative"))).rejects.toThrow();
+  });
+
   it("scrubs ambient credentials and import-path overrides from the probe's Python process", async () => {
     const install = await createFakeHermesInstall(path.join(root, "image"), {
       layout: "venv-editable",

@@ -94,7 +94,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
     })),
     runAdapterExecutionTargetProcess: vi.fn(async (_runId: string, _target: unknown, command: string, args: string[], options: ProcessCall["options"]) => {
       h.processCalls.push({ command, args, options });
-      const isHermes = command.endsWith("/hermes");
+      const isHermes = command.endsWith("/hermes") || (command === "env" && args.some((a) => a.endsWith("/hermes")));
       return {
         exitCode: isHermes ? h.hermesExit : h.stageExit,
         signal: null,
@@ -216,10 +216,23 @@ function ctx(overrides: { config?: Record<string, unknown>; target?: AdapterExec
   } as unknown as AdapterExecutionContext;
 }
 
-function hermesCall(): ProcessCall {
-  const call = h.processCalls.find((c) => c.command.endsWith("/hermes"));
-  if (!call) throw new Error("hermes was not launched");
-  return call;
+/** The Hermes launch, with a Router run's `env -u NAME ...` prefix peeled off. */
+function hermesCall(): ProcessCall & { unsetNames: string[] } {
+  for (const call of h.processCalls) {
+    if (call.command.endsWith("/hermes")) return { ...call, unsetNames: [] };
+    if (call.command === "env") {
+      const unsetNames: string[] = [];
+      let i = 0;
+      while (call.args[i] === "-u") {
+        unsetNames.push(call.args[i + 1]!);
+        i += 2;
+      }
+      if (call.args[i]?.endsWith("/hermes")) {
+        return { command: call.args[i]!, args: call.args.slice(i + 1), options: call.options, unsetNames };
+      }
+    }
+  }
+  throw new Error("hermes was not launched");
 }
 
 describe("Hermes execute on a sandbox target (TECH-8174)", () => {
@@ -438,7 +451,12 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     // The key travels only in the exec env (stdin on Kubernetes): never argv, never a shipped file.
     expect(call.options.env.RAMP_ROUTER_API_KEY).toBe(ROUTER_KEY);
     expect(JSON.stringify(call.args)).not.toContain(ROUTER_KEY);
-    expect(JSON.stringify(h.processCalls.filter((c) => c !== call))).not.toContain(ROUTER_KEY);
+    expect(JSON.stringify(h.processCalls.map((c) => c.args))).not.toContain(ROUTER_KEY);
+    expect(JSON.stringify(h.processCalls.filter((c) => c.options.env !== call.options.env))).not.toContain(ROUTER_KEY);
+    // The pod's own environment cannot reintroduce endpoint or import-path overrides.
+    expect(call.unsetNames).toEqual(expect.arrayContaining([
+      "RAMP_ROUTER_BASE_URL", "ROUTER_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE", "PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE",
+    ]));
     expect(JSON.stringify(h.shipped)).not.toContain(ROUTER_KEY);
     // Endpoint overrides and import-path overrides never reach a Router run.
     expect(call.options.env.RAMP_ROUTER_BASE_URL).toBeUndefined();
@@ -467,7 +485,7 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     await expect(execute(ctx({
       config: { provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } },
     }))).rejects.toThrow(/does not provide the native Ramp Router provider/);
-    expect(h.processCalls.some((c) => c.command.endsWith("/hermes"))).toBe(false);
+    expect(() => hermesCall()).toThrow("hermes was not launched");
     expect(h.restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 

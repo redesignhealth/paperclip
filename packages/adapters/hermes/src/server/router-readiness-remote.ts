@@ -36,6 +36,8 @@ const LAUNCHER_UNTRUSTED_MARKER = "paperclip_launcher_untrusted";
 /** Positional args: $1 probe dir, $2 probe script, $3 Hermes bin dir. Values never in the script text. */
 export const REMOTE_ROUTER_PROBE_WRAPPER = [
   'd="$1"',
+  // The probe dir is created and later removed recursively: only an absolute path below / is accepted.
+  'case "$d" in /?*) ;; *) exit 64 ;; esac',
   "umask 077",
   'mkdir -p "$d/home" "$d/tmp" "$d/hermes" "$d/work" || exit 70',
   "ok=1",
@@ -43,11 +45,13 @@ export const REMOTE_ROUTER_PROBE_WRAPPER = [
   'first=""',
   'IFS= read -r first < "$3/hermes" || ok=0',
   'case "$first" in "#!$3/python"|"#!$3/python3") ;; *) ok=0 ;; esac',
+  // Run the interpreter the launcher names (the one Hermes itself starts with).
+  'interp="${first#\\#!}"',
   'if [ "$ok" = 1 ]; then',
   '  cd "$d/work" && env -i PATH="$PATH" HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" ' +
     'XDG_DATA_HOME="$d/home/.local/share" XDG_CACHE_HOME="$d/home/.cache" XDG_STATE_HOME="$d/home/.local/state" ' +
     'TMPDIR="$d/tmp" HERMES_HOME="$d/hermes" HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONDONTWRITEBYTECODE=1 ' +
-    '"$3/python3" -B -c "$2" "$3"',
+    '"$interp" -B -c "$2" "$3"',
   "  rc=$?",
   "else",
   `  printf '%s\\n' '${LAUNCHER_UNTRUSTED_MARKER}'`,

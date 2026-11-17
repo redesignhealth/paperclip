@@ -643,7 +643,23 @@ async function executeHermesInSandbox(
       }
     };
 
-    const result = await runAdapterExecutionTargetProcess(ctx.runId, runtimeTarget, command, args, {
+    // The exec env is merged over the pod's own environment, which Paperclip does not control.
+    // A Router run therefore launches Hermes through `env -u` for every fixed endpoint-override and
+    // import-path name, so the pod cannot reintroduce one and the run loads the same registry the
+    // in-sandbox probe verified (the probe itself runs under `env -i`). Names only; no values.
+    const launch = isRouterRun
+      ? {
+          command: "env",
+          args: [
+            ...[...new Set([...routerEnvNamesToStrip({}, true), ...ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES])]
+              .sort()
+              .flatMap((name) => ["-u", name]),
+            command,
+            ...args,
+          ],
+        }
+      : { command, args };
+    const result = await runAdapterExecutionTargetProcess(ctx.runId, runtimeTarget, launch.command, launch.args, {
       cwd: remoteCwd,
       env,
       timeoutSec,
