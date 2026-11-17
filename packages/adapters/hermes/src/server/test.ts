@@ -605,6 +605,12 @@ export async function testEnvironment(
   }
 
   const config = (ctx.config ?? {}) as Record<string, unknown>;
+  // TECH-8174: a remote target is tested inside the target, mirroring the sandbox run path; nothing on
+  // this host (its ~/.hermes, its Hermes install, its launcher) is consulted. Local targets continue
+  // below unchanged.
+  if (isRemoteExecutionTarget(ctx)) {
+    return testRemoteEnvironment(ctx, config, scanMode);
+  }
   // Match execute.ts: non-empty strings only, no trimming or absolute-path normalization.
   const cwd = asString(config.cwd) || asString(config.workspaceDir) || ".";
   let command = resolveHermesCommand(config);
@@ -683,12 +689,6 @@ export async function testEnvironment(
       checks: [{ level: "error", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE, code: "hermes_router_remote_unsupported" }],
       testedAt: new Date().toISOString(),
     };
-  }
-
-  // TECH-8174: any other remote target is probed inside the target (never on this host), mirroring
-  // the sandbox run path. Local targets continue below unchanged.
-  if (isRemoteExecutionTarget(ctx)) {
-    return testRemoteEnvironment(ctx, config, scanMode);
   }
 
   // TECH-7895: a Router config binds its launcher once (absolute cwd, normalized PATH, credential-free

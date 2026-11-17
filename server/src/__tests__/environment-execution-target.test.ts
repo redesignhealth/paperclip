@@ -304,9 +304,26 @@ describe("resolveEnvironmentExecutionTarget", () => {
   it("resolves sandbox targets for hermes_local but never SSH targets (TECH-8174)", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",
-      config: { provider: "fake-plugin", reuseLease: false, timeoutMs: 30_000 },
+      config: { provider: "kubernetes", reuseLease: false, timeoutMs: 30_000 },
     });
     const sandboxTarget = await resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "hermes_local",
+      environment: { id: "env-1", driver: "sandbox", config: { provider: "kubernetes" } },
+      leaseId: "lease-1",
+      leaseMetadata: {},
+      lease: null,
+      environmentRuntime: null,
+    });
+    expect(sandboxTarget).toMatchObject({ kind: "remote", transport: "sandbox", providerKey: "kubernetes" });
+
+    // Other sandbox providers do not keep exec env out of the exec command, so Hermes is not placed there.
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "sandbox",
+      config: { provider: "fake-plugin", reuseLease: false, timeoutMs: 30_000 },
+    });
+    const otherProvider = await resolveEnvironmentExecutionTarget({
       db: {} as never,
       companyId: "company-1",
       adapterType: "hermes_local",
@@ -316,7 +333,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
       lease: null,
       environmentRuntime: null,
     });
-    expect(sandboxTarget).toMatchObject({ kind: "remote", transport: "sandbox", providerKey: "fake-plugin" });
+    expect(otherProvider).toBeNull();
 
     mockResolveEnvironmentDriverConfigForRuntime.mockReset();
     const sshTarget = await resolveEnvironmentExecutionTarget({

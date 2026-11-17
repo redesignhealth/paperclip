@@ -37,6 +37,7 @@ const h = vi.hoisted(() => ({
   bridgeStop: vi.fn(async () => {}),
   hermesStdout: "Pod answer.\n\nsession_id: sess-pod-1\n",
   hermesExit: 0 as number | null,
+  stageExit: 0,
 }));
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
@@ -90,7 +91,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
       h.processCalls.push({ command, args, options });
       const isHermes = command.endsWith("/hermes");
       return {
-        exitCode: isHermes ? h.hermesExit : 0,
+        exitCode: isHermes ? h.hermesExit : h.stageExit,
         signal: null,
         timedOut: false,
         stdout: isHermes ? h.hermesStdout : "",
@@ -109,6 +110,8 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
 import { execute } from "./execute.js";
 import {
   HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE,
+  HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE,
+  HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_RUNTIME_MEMORY_UNSUPPORTED_MESSAGE,
@@ -162,6 +165,7 @@ beforeEach(async () => {
   for (const key of Object.keys(h.shipped)) delete h.shipped[key];
   h.hermesStdout = "Pod answer.\n\nsession_id: sess-pod-1\n";
   h.hermesExit = 0;
+  h.stageExit = 0;
 });
 
 afterEach(async () => {
@@ -230,7 +234,9 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     expect(shippedHome).not.toContain("host-model");
     expect(shippedHome).not.toContain("sk-host-dotenv-SENTINEL");
     expect(shippedHome).not.toContain(RUN_JWT);
-    expect(h.shipped.instructions?.["notes.md"]).toBe("sibling file");
+    // An external instructions file is shipped alone: its directory may hold anything (.env, a repo).
+    expect(Object.keys(h.shipped.instructions ?? {})).toEqual(["AGENTS.md"]);
+    expect(prepare.assets?.[1]?.followSymlinks).toBe(false);
 
     // The prompt is staged over stdin, never in argv.
     const stage = h.processCalls[0]!;
@@ -322,6 +328,61 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     expect(result.clearSession).toBe(true);
   });
 
+  it("ships a Paperclip-managed instructions bundle whole, without following symlinks", async () => {
+    const bundleDir = path.dirname(instructionsPath);
+    await fs.writeFile(path.join(bundleDir, ".env"), "SECRET=never-ships-from-external-dirs");
+    await execute(ctx({ config: { instructionsBundleMode: "managed", instructionsRootPath: bundleDir } }));
+    expect(h.shipped.instructions?.["notes.md"]).toBe("sibling file");
+    expect(h.prepareInputs[0]!.assets?.[1]).toMatchObject({ localDir: bundleDir, followSymlinks: false });
+    expect(hermesCall().options.env.HERMES_EPHEMERAL_SYSTEM_PROMPT).toContain(`loaded from ${REMOTE_INSTRUCTIONS}/AGENTS.md`);
+  });
+
+  it("ships only the instructions file when the bundle is external, never its directory", async () => {
+    const bundleDir = path.dirname(instructionsPath);
+    await fs.writeFile(path.join(bundleDir, ".env"), "SECRET=must-not-ship");
+    await execute(ctx({ config: { instructionsBundleMode: "external", instructionsRootPath: bundleDir } }));
+    expect(Object.keys(h.shipped.instructions ?? {})).toEqual(["AGENTS.md"]);
+    expect(JSON.stringify(h.shipped)).not.toContain("must-not-ship");
+  });
+
+  it("redacts the agent's provider key and the bridge token from output", async () => {
+    h.hermesStdout = `echo ${PROVIDER_KEY} and ${BRIDGE_TOKEN}\n\nsession_id: s\n`;
+    const result = await execute(ctx());
+    const everything = JSON.stringify({ result, logs });
+    expect(everything).not.toContain(PROVIDER_KEY);
+    expect(everything).not.toContain(BRIDGE_TOKEN);
+  });
+
+  it("refuses an oversized system prompt before anything is staged", async () => {
+    await fs.writeFile(instructionsPath, "x".repeat(HERMES_MAX_SYSTEM_PROMPT_BYTES + 1));
+    await expect(execute(ctx())).rejects.toThrow(/exceeds maximum argument size/);
+    expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
+  });
+
+  it("fails a completed run when the workspace copy-back fails", async () => {
+    h.restoreWorkspace.mockRejectedValueOnce(new Error("copy-back failed"));
+    await expect(execute(ctx())).rejects.toThrow("copy-back failed");
+  });
+
+  it("keeps the original error when the run fails and the copy-back also fails", async () => {
+    h.restoreWorkspace.mockRejectedValueOnce(new Error("copy-back failed"));
+    h.stageExit = 1;
+    await expect(execute(ctx())).rejects.toThrow("Could not stage the Hermes prompt in the sandbox.");
+    expect(logs.some(([, line]) => line.includes("Sandbox workspace restore failed after the run failed: copy-back failed"))).toBe(true);
+    expect(h.processCalls.some((c) => c.command.endsWith("/hermes"))).toBe(false);
+    expect(h.shellCalls.some((c) => c.startsWith("rm -rf"))).toBe(true);
+  });
+
+  it("routes a legacy remote transport to the sandbox path (refused there as SSH)", async () => {
+    const c = ctx();
+    (c as unknown as Record<string, unknown>).executionTarget = undefined;
+    (c as unknown as Record<string, unknown>).executionTransport = {
+      remoteExecution: { host: "h", port: 22, username: "u", remoteWorkspacePath: "/srv", remoteCwd: "/srv", privateKey: "k", knownHosts: "h k", strictHostKeyChecking: true },
+    };
+    await expect(execute(c)).rejects.toThrow(HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE);
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
   const refusals: Array<[string, () => AdapterExecutionContext, string]> = [
     [
       "an SSH target",
@@ -347,6 +408,12 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
       HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE,
     ],
     ["a custom Hermes command", () => ctx({ config: { hermesCommand: "/tmp/evil-hermes" } }), HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE],
+    ["a managed AI connection", () => ctx({ config: { managedAiRouting: { id: "x" } } }), HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE],
+    [
+      "a sandbox provider other than Kubernetes",
+      () => ctx({ target: { ...sandboxTarget, providerKey: "modal" } as AdapterExecutionTarget }),
+      HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE,
+    ],
   ];
 
   for (const [label, makeCtx, message] of refusals) {

@@ -101,7 +101,6 @@ import {
 } from "./router-readiness.js";
 import dotenv from "dotenv";
 import { readAdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
-import { executeHermesOnRemoteTarget } from "./execute-sandbox.js";
 
 /**
  * Raw key/value view of the operator's host Hermes `.env` (local, non-isolated runs only). Used to
@@ -975,16 +974,16 @@ export async function checkHermesMemoryCapability(
 // Config helpers
 // ---------------------------------------------------------------------------
 
-function cfgString(v: unknown): string | undefined {
+export function cfgString(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
-function cfgNumber(v: unknown): number | undefined {
+export function cfgNumber(v: unknown): number | undefined {
   return typeof v === "number" ? v : undefined;
 }
-function cfgBoolean(v: unknown): boolean | undefined {
+export function cfgBoolean(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
 }
-function cfgStringArray(v: unknown): string[] | undefined {
+export function cfgStringArray(v: unknown): string[] | undefined {
   return Array.isArray(v) && v.every((i) => typeof i === "string")
     ? (v as string[])
     : undefined;
@@ -1503,7 +1502,12 @@ export async function execute(
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
-  if (remoteTarget?.kind === "remote") return executeHermesOnRemoteTarget(ctx, remoteTarget);
+  if (remoteTarget?.kind === "remote") {
+    // Loaded on demand: the sandbox module imports helpers from this one, and a static import in
+    // both directions would make module initialization order-dependent.
+    const { executeHermesOnRemoteTarget } = await import("./execute-sandbox.js");
+    return executeHermesOnRemoteTarget(ctx, remoteTarget);
+  }
 
   // Validate command scan policy mode FIRST before any spawn or capability probe
   getHermesCommandScanMode();

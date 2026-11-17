@@ -10,6 +10,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import {
+  readAdapterExecutionTarget,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
   runAdapterExecutionTargetProcess,
@@ -22,13 +23,15 @@ import { resolveHermesCommand } from "./execute.js";
 import {
   HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE,
-  HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE,
+  HERMES_SANDBOX_PROVIDERS,
+  HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE,
 } from "./execute-sandbox.js";
 import { HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE, hasExplicitHermesProviderCredential } from "./isolation.js";
 import { resolveHermesMemoryProvider } from "./memory-config.js";
 import { normalizeConfiguredModel } from "./model-arg.js";
+import { ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE } from "./router-readiness.js";
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
@@ -50,9 +53,29 @@ export async function testRemoteEnvironment(
   config: Record<string, unknown>,
   scanMode: HermesCommandScanMode,
 ): Promise<AdapterEnvironmentTestResult> {
-  const target = ctx.executionTarget;
+  const configuredModel = normalizeConfiguredModel(asString(config.model));
+  const effective = resolveEffectiveRunConfig({
+    explicitProvider: asString(config.provider),
+    configuredModel,
+    detected: null,
+  });
+  // Managed connections still need a local hello probe, as before this stage.
+  if (config.managedAiRouting) {
+    return result([{ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." }]);
+  }
+  // Ramp Router readiness is not verified on remote targets yet; refused before anything launches.
+  if (effective.isRouter) {
+    return result([{ level: "error", code: "hermes_router_remote_unsupported", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE }]);
+  }
+  const target = readAdapterExecutionTarget({ executionTarget: ctx.executionTarget });
   if (!target || target.kind !== "remote" || target.transport !== "sandbox") {
     return result([{ level: "error", code: "hermes_ssh_unsupported", message: HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE }]);
+  }
+  if (!HERMES_SANDBOX_PROVIDERS.includes(target.providerKey ?? "")) {
+    return result([{ level: "error", code: "hermes_sandbox_provider_unsupported", message: HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE }]);
+  }
+  if (scanMode === "required") {
+    return result([{ level: "error", code: "hermes_command_scan_sandbox_unsupported", message: HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE }]);
   }
   const checks: AdapterEnvironmentCheck[] = [
     {
@@ -62,20 +85,6 @@ export async function testRemoteEnvironment(
     },
   ];
 
-  // test.ts already answered managed-connection and Ramp Router configs for remote targets.
-  const configuredModel = normalizeConfiguredModel(asString(config.model));
-  const effective = resolveEffectiveRunConfig({
-    explicitProvider: asString(config.provider),
-    configuredModel,
-    detected: null,
-  });
-  if (effective.isRouter) {
-    checks.push({ level: "error", code: "hermes_router_remote_unsupported", message: HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE });
-    return result(checks);
-  }
-  if (scanMode === "required") {
-    checks.push({ level: "error", code: "hermes_command_scan_sandbox_unsupported", message: HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE });
-  }
   let memoryProvider: string | undefined;
   try {
     memoryProvider = resolveHermesMemoryProvider(config);

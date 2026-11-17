@@ -60,6 +60,10 @@ import {
   HERMES_MAX_SYSTEM_PROMPT_BYTES,
   augmentStaleImageError,
   buildPrompt,
+  cfgBoolean,
+  cfgNumber,
+  cfgString,
+  cfgStringArray,
   isBenignStderrLog,
   parseHermesOutput,
   renderHermesSystemPrompt,
@@ -69,6 +73,7 @@ import {
 import {
   HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE,
   hasExplicitHermesProviderCredential,
+  isHermesProviderCredentialName,
 } from "./isolation.js";
 import { cleanupHermesMcpHome, prepareHermesMcpHome } from "./mcp-config.js";
 import {
@@ -84,6 +89,14 @@ import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 export const HERMES_SANDBOX_ADAPTER_KEY = "hermes";
 
+/**
+ * Sandbox providers whose exec channel keeps env values out of the exec command (the Kubernetes
+ * provider delivers env over stdin, fork #415). Hermes carries its system prompt and provider key in
+ * env, so other providers are refused until they make the same guarantee.
+ */
+export const HERMES_SANDBOX_PROVIDERS: readonly string[] = ["kubernetes"];
+
+
 export const HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE =
   "Refusing to start: Hermes runs in sandbox environments only, not over SSH. Select a sandbox or the local environment for this agent.";
 export const HERMES_SANDBOX_RUNTIME_MEMORY_UNSUPPORTED_MESSAGE =
@@ -94,23 +107,43 @@ export const HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE =
   "Refusing to start: PAPERCLIP_HERMES_COMMAND_SCAN=required is not yet supported for Hermes in sandbox environments.";
 export const HERMES_SANDBOX_ROUTER_UNSUPPORTED_MESSAGE =
   "Refusing to start: the Ramp Router provider is not yet supported for Hermes in sandbox environments. Select the local environment for this agent.";
+export const HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE =
+  "Refusing to start: managed AI connections are not yet supported for Hermes in sandbox environments. Select the local environment for this agent.";
+export const HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE =
+  `Refusing to start: Hermes runs only in sandbox providers that keep env values out of the exec command (${HERMES_SANDBOX_PROVIDERS.join(", ")}).`;
 export const HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE =
   `Refusing to start: in a sandbox environment Hermes runs only from the image (${CANONICAL_HERMES_BIN}); a custom hermesCommand/command is not supported.`;
 
 /** Directories under the remote run home, mirroring adapter-utils createRunHome. */
 const REMOTE_RUN_HOME_SUBDIRS = ["config", "data", "cache", "state", "tmp", "runtime"] as const;
 
-function cfgString(v: unknown): string | undefined {
-  return typeof v === "string" && v.length > 0 ? v : undefined;
-}
-function cfgNumber(v: unknown): number | undefined {
-  return typeof v === "number" ? v : undefined;
-}
-function cfgBoolean(v: unknown): boolean | undefined {
-  return typeof v === "boolean" ? v : undefined;
-}
-function cfgStringArray(v: unknown): string[] | undefined {
-  return Array.isArray(v) && v.every((i) => typeof i === "string") ? (v as string[]) : undefined;
+/** Placeholder at least as long as any in-sandbox bridge origin, for the pre-staging size check. */
+const BRIDGE_URL_SIZE_PLACEHOLDER = "http://127.0.0.1:65535";
+
+/**
+ * The instructions asset. A Paperclip-managed bundle directory holds only the bundle and is shipped
+ * whole; any other instructions file is shipped ALONE (its directory may be a repository or a home
+ * directory). Symlinks are never followed.
+ */
+async function prepareInstructionsAsset(
+  config: Record<string, unknown>,
+  instructionsFilePath: string,
+  scratchDir: string,
+): Promise<{ localDir: string; relativeFile: string }> {
+  const filePath = path.resolve(instructionsFilePath);
+  const managedRoot = config.instructionsBundleMode === "managed" ? cfgString(config.instructionsRootPath) : undefined;
+  if (managedRoot) {
+    const root = path.resolve(managedRoot);
+    const relative = path.relative(root, filePath);
+    if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+      return { localDir: root, relativeFile: relative.split(path.sep).join("/") };
+    }
+  }
+  const dir = path.join(scratchDir, "instructions");
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const name = path.basename(filePath);
+  await fs.copyFile(filePath, path.join(dir, name));
+  return { localDir: dir, relativeFile: name };
 }
 
 /** The sandbox-side env for a run home rooted at `homeRoot` (POSIX), like createRunHome's env. */
@@ -138,8 +171,10 @@ export async function executeHermesOnRemoteTarget(
   target: AdapterExecutionTarget,
 ): Promise<AdapterExecutionResult> {
   if (target.kind !== "remote" || target.transport !== "sandbox") {
-    await ctx.onLog("stderr", `[hermes] ${HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE}\n`);
-    throw new Error(HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE);
+    return refuse(ctx, HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE);
+  }
+  if (!HERMES_SANDBOX_PROVIDERS.includes(target.providerKey ?? "")) {
+    return refuse(ctx, HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE);
   }
   return executeHermesInSandbox(ctx, target);
 }
@@ -186,6 +221,10 @@ async function executeHermesInSandbox(
     throw err;
   }
   if (memoryProvider) await refuse(ctx, HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE);
+
+  if (config.managedAiRouting || config.managedAiConnection) {
+    await refuse(ctx, HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE);
+  }
 
   const configuredCommand = resolveHermesCommand(config).trim();
   if (!TRUSTED_HERMES_LAUNCHERS.has(configuredCommand)) {
@@ -255,6 +294,61 @@ async function executeHermesInSandbox(
     ? cfgString((workspace as Record<string, unknown>).cwd)
     : undefined;
   const configuredCwd = cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir);
+
+  const memoryGuidance = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
+  const agentPromptTemplate = memoryGuidance ? buildPaperclipAgentPromptTemplate(memoryGuidance) : undefined;
+
+  /** The query and system prompt, exactly as the host path assembles them (split and fallback). */
+  const composePrompts = (
+    apiUrl: string | undefined,
+    remoteInstructionsFile: string | null,
+  ): { query: string; systemPrompt: string } => {
+    const promptConfig: Record<string, unknown> = { ...config };
+    if (apiUrl) {
+      promptConfig.paperclipApiUrl = apiUrl;
+    } else if (!cfgString(promptConfig.paperclipApiUrl) && cfgString(userEnv.PAPERCLIP_API_URL)) {
+      promptConfig.paperclipApiUrl = userEnv.PAPERCLIP_API_URL;
+    }
+    let agentInstructions = "";
+    if (instructionsContent !== null) {
+      const file = remoteInstructionsFile ?? instructionsFilePath ?? "";
+      agentInstructions =
+        `${instructionsContent}\nThe above agent instructions were loaded from ${file}. Resolve any relative file references from ${path.posix.dirname(file)}/.`;
+    }
+    const built = buildPrompt(ctx, promptConfig, { resumedSession: false, returnSections: true, hardeningFlags });
+    const unsplitSystemPrompt = () => joinPromptSections([
+      userEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+      agentInstructions,
+      renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: true, agentPromptTemplate }),
+    ]);
+    if (!built.hermesPromptSplit) return { query: built.query, systemPrompt: unsplitSystemPrompt() };
+    const candidateOverlay = joinPromptSections([
+      userEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+      agentInstructions,
+      ...built.systemSections,
+      renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: false, agentPromptTemplate }),
+    ]);
+    if (Buffer.byteLength(candidateOverlay, "utf8") <= HERMES_MAX_SYSTEM_PROMPT_BYTES) {
+      return { query: built.query, systemPrompt: candidateOverlay };
+    }
+    // Same fallback as the host path: keep the relocated sections in the query instead.
+    const fallback = buildPrompt(ctx, promptConfig, {
+      resumedSession: false,
+      returnSections: true,
+      hardeningFlags: { ...hardeningFlags, hermesPromptSplit: false },
+    });
+    return { query: fallback.query, systemPrompt: unsplitSystemPrompt() };
+  };
+
+  const assertSystemPromptFits = async (systemPrompt: string) => {
+    const bytes = Buffer.byteLength(systemPrompt, "utf8");
+    if (bytes > HERMES_MAX_SYSTEM_PROMPT_BYTES) {
+      await refuse(
+        ctx,
+        `HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds maximum argument size (${bytes} bytes > ${HERMES_MAX_SYSTEM_PROMPT_BYTES} bytes limit)`,
+      );
+    }
+  };
 
   const onCleanupWarning = (msg: string) => {
     void ctx.onLog("stdout", `[hermes] Warning: ${msg}\n`).catch(() => {});
@@ -327,6 +421,16 @@ async function executeHermesInSandbox(
       }
     }
 
+    const instructionsAsset = instructionsContent !== null && instructionsFilePath
+      ? await prepareInstructionsAsset(config, instructionsFilePath, assetHome.path)
+      : null;
+
+    // Refuse an oversized system prompt before anything is staged. The in-sandbox API origin is not
+    // known yet, so a placeholder at least as long as any bridge origin stands in for it.
+    const usesBridge = adapterExecutionTargetUsesPaperclipBridge(target);
+    const preflightPrompt = composePrompts(usesBridge ? BRIDGE_URL_SIZE_PLACEHOLDER : undefined, null);
+    await assertSystemPromptFits(preflightPrompt.systemPrompt);
+
     // ── Ship workspace and assets ──────────────────────────────────────────
     await ctx.onLog(
       "stdout",
@@ -342,9 +446,7 @@ async function executeHermesInSandbox(
       onRuntimeProgress: ctx.onRuntimeProgress,
       assets: [
         { key: "hermesHome", localDir: localHermesHome, followSymlinks: true },
-        ...(instructionsContent !== null && instructionsFilePath
-          ? [{ key: "instructions", localDir: path.dirname(instructionsFilePath), followSymlinks: true }]
-          : []),
+        ...(instructionsAsset ? [{ key: "instructions", localDir: instructionsAsset.localDir, followSymlinks: false }] : []),
       ],
     });
     restoreRemoteWorkspace = () => prepared.restoreWorkspace((line) => ctx.onLog("stdout", line));
@@ -379,75 +481,17 @@ async function executeHermesInSandbox(
     const bridgeEnv = paperclipBridge?.env ?? {};
 
     // ── Prompt (built with the in-sandbox API origin) ──────────────────────
-    const promptConfig: Record<string, unknown> = { ...config };
-    if (bridgeEnv.PAPERCLIP_API_URL) {
-      promptConfig.paperclipApiUrl = bridgeEnv.PAPERCLIP_API_URL;
-    } else if (!cfgString(promptConfig.paperclipApiUrl) && cfgString(userEnv.PAPERCLIP_API_URL)) {
-      promptConfig.paperclipApiUrl = userEnv.PAPERCLIP_API_URL;
-    }
-    const builtPrompt = buildPrompt(ctx, promptConfig, {
-      resumedSession: false,
-      returnSections: true,
-      hardeningFlags,
-    });
-
-    let agentInstructions = "";
+    const remoteInstructionsFile = instructionsAsset && remoteInstructionsDir
+      ? path.posix.join(remoteInstructionsDir, instructionsAsset.relativeFile)
+      : null;
     if (instructionsContent !== null && instructionsFilePath) {
-      const remoteInstructionsFile = remoteInstructionsDir
-        ? path.posix.join(remoteInstructionsDir, path.basename(instructionsFilePath))
-        : instructionsFilePath;
-      const remoteDir = remoteInstructionsDir ?? path.dirname(instructionsFilePath);
-      agentInstructions =
-        `${instructionsContent}\nThe above agent instructions were loaded from ${remoteInstructionsFile}. Resolve any relative file references from ${remoteDir}/.`;
       await ctx.onLog(
         "stdout",
         `[hermes] Loaded agent instructions from ${instructionsFilePath} (${instructionsContent.length} chars)\n`,
       );
     }
-
-    const memoryGuidance = await resolveMemoryGuidance(ctx, { usingIsolatedHome: true });
-    const agentPromptTemplate = memoryGuidance ? buildPaperclipAgentPromptTemplate(memoryGuidance) : undefined;
-    let prompt = builtPrompt.query;
-    let finalSystemPrompt: string;
-    if (builtPrompt.hermesPromptSplit) {
-      const candidateOverlay = joinPromptSections([
-        userEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-        agentInstructions,
-        ...builtPrompt.systemSections,
-        renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: false, agentPromptTemplate }),
-      ]);
-      if (Buffer.byteLength(candidateOverlay, "utf8") > HERMES_MAX_SYSTEM_PROMPT_BYTES) {
-        await ctx.onLog(
-          "stderr",
-          "[hermes] Ephemeral system prompt exceeds size limit; keeping relocated sections in query.\n",
-        );
-        prompt = buildPrompt(ctx, promptConfig, {
-          resumedSession: false,
-          returnSections: true,
-          hardeningFlags: { ...hardeningFlags, hermesPromptSplit: false },
-        }).query;
-        finalSystemPrompt = joinPromptSections([
-          userEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-          agentInstructions,
-          renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: true, agentPromptTemplate }),
-        ]);
-      } else {
-        finalSystemPrompt = candidateOverlay;
-      }
-    } else {
-      finalSystemPrompt = joinPromptSections([
-        userEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-        agentInstructions,
-        renderHermesSystemPrompt(ctx.agent, { includeDefaultIdentity: true, agentPromptTemplate }),
-      ]);
-    }
-    const finalSystemPromptBytes = Buffer.byteLength(finalSystemPrompt, "utf8");
-    if (finalSystemPromptBytes > HERMES_MAX_SYSTEM_PROMPT_BYTES) {
-      await refuse(
-        ctx,
-        `HERMES_EPHEMERAL_SYSTEM_PROMPT exceeds maximum argument size (${finalSystemPromptBytes} bytes > ${HERMES_MAX_SYSTEM_PROMPT_BYTES} bytes limit)`,
-      );
-    }
+    const { query: prompt, systemPrompt: finalSystemPrompt } = composePrompts(bridgeEnv.PAPERCLIP_API_URL, remoteInstructionsFile);
+    await assertSystemPromptFits(finalSystemPrompt);
 
     // ── Sandbox env: explicit layers only, never the host process env ──────
     const env: Record<string, string> = {
@@ -485,11 +529,20 @@ async function executeHermesInSandbox(
     env.MEM0_TELEMETRY = "False";
     env.PYTHONDONTWRITEBYTECODE = "1";
 
-    // Redaction: an agent-bound Router key never reaches the sandbox, but scrub it from output too.
-    for (const value of [userEnv[RAMP_ROUTER_API_KEY_ENV], userEnv[RAMP_ROUTER_API_KEY_ENV]?.trim()]) {
-      if (value && value.length <= MAX_CONFIG_STRING_LENGTH && canSafelyRedactSecret(value)) sensitiveValues.push(value);
+    // Redaction: every credential the agent binds (provider keys, including a Router key) and the
+    // bridge token are scrubbed from streamed and returned output. Values that cannot be redacted
+    // safely (too long, or no boundary-safe characters) are skipped rather than mangling output.
+    const redactionSet = new Set<string>();
+    const noteSecret = (value: string | undefined) => {
+      for (const variant of [value, value?.trim()]) {
+        if (variant && variant.length <= MAX_CONFIG_STRING_LENGTH && canSafelyRedactSecret(variant)) redactionSet.add(variant);
+      }
+    };
+    for (const [name, value] of Object.entries(userEnv)) {
+      if (isHermesProviderCredentialName(name)) noteSecret(value);
     }
-    sensitiveValues.sort((a, b) => b.length - a.length);
+    noteSecret(bridgeEnv.PAPERCLIP_API_KEY);
+    sensitiveValues.push(...[...redactionSet].sort((a, b) => b.length - a.length));
     redactor = createChunkAwareStreamingRedactor(sensitiveValues);
     const activeRedactor = redactor;
 
@@ -613,10 +666,14 @@ async function executeHermesInSandbox(
     }
     if (localHermesHome) await cleanupHermesMcpHome(localHermesHome, onCleanupWarning);
     await assetHome?.cleanup().catch(() => onCleanupWarning("Temporary asset home cleanup encountered an error"));
-    if (emptyWorkspaceDir) await fs.rm(emptyWorkspaceDir, { recursive: true, force: true }).catch(() => {});
+    if (emptyWorkspaceDir) {
+      await fs.rm(emptyWorkspaceDir, { recursive: true, force: true })
+        .catch(() => onCleanupWarning("Temporary empty workspace cleanup encountered an error"));
+    }
     if (restoreError) {
       if (completed) throw restoreError;
-      onCleanupWarning("Sandbox workspace restore encountered an error");
+      const reason = restoreError instanceof Error ? restoreError.message : String(restoreError);
+      onCleanupWarning(`Sandbox workspace restore failed after the run failed: ${reason}`);
     }
   }
 }

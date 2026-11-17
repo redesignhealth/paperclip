@@ -83,6 +83,27 @@ describe("hermes testEnvironment on a remote target (TECH-8174)", () => {
     expect(h.execFile).not.toHaveBeenCalled();
   });
 
+  it("refuses sandbox providers other than Kubernetes, and required command scan, before launching anything", async () => {
+    const modal = { ...sandboxTarget, providerKey: "modal" } as AdapterExecutionTarget;
+    const r1 = await run({ provider: "openai-api", model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-x" } }, modal);
+    expect(r1.checks.map((c) => c.code)).toEqual(["hermes_sandbox_provider_unsupported"]);
+    process.env.PAPERCLIP_HERMES_COMMAND_SCAN = "required";
+    try {
+      const r2 = await run({ provider: "openai-api", model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-x" } });
+      expect(r2.checks.map((c) => c.code)).toEqual(["hermes_command_scan_sandbox_unsupported"]);
+    } finally {
+      delete process.env.PAPERCLIP_HERMES_COMMAND_SCAN;
+    }
+    expect(h.processCalls).toHaveLength(0);
+    expect(h.execFile).not.toHaveBeenCalled();
+  });
+
+  it("reports a custom Hermes command as untrusted without probing", async () => {
+    const result = await run({ hermesCommand: "/tmp/evil", provider: "openai-api", model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-x" } });
+    expect(result.checks.map((c) => c.code)).toContain("hermes_untrusted_launcher");
+    expect(h.processCalls).toHaveLength(0);
+  });
+
   it("refuses an SSH target", async () => {
     const ssh = { kind: "remote", transport: "ssh", remoteCwd: "/srv", spec: {} } as unknown as AdapterExecutionTarget;
     const result = await run({ provider: "openai-api", model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-x" } }, ssh);

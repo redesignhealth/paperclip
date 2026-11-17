@@ -168,7 +168,8 @@ describe("wrapCommandWithEnv", () => {
   });
 
   it("delivers a maximum-size Hermes system prompt (131040 bytes, multi-line, UTF-8) intact (TECH-8174)", () => {
-    // HERMES_MAX_SYSTEM_PROMPT_BYTES in the Hermes adapter: 128 KiB minus the env entry overhead.
+    // HERMES_MAX_SYSTEM_PROMPT_BYTES in the Hermes adapter (packages/adapters/hermes execute.ts):
+    // 128 KiB minus the env entry overhead. Kept literal: this plugin does not depend on the adapter.
     const unit = "Line with 'quotes', $VARS, `ticks` and é✓\n";
     let prompt = "";
     while (Buffer.byteLength(prompt + unit, "utf-8") <= 131040) prompt += unit;
@@ -177,11 +178,12 @@ describe("wrapCommandWithEnv", () => {
     const { command } = wrapCommandWithEnv(["hermes"], { HERMES_EPHEMERAL_SYSTEM_PROMPT: prompt });
     expect(command.join(" ")).not.toContain("Line with");
     const result = runWrapped(
-      ["/bin/sh", "-c", 'printf "%s" "$HERMES_EPHEMERAL_SYSTEM_PROMPT"'],
+      ["/bin/sh", "-c", 'printf "%s|%s" "$HERMES_EPHEMERAL_SYSTEM_PROMPT" "$(cat)"'],
       { HERMES_EPHEMERAL_SYSTEM_PROMPT: prompt },
       "query text on stdin\n",
     );
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe(prompt);
+    // The env value arrives intact and the caller's stdin still follows the env line.
+    expect(result.stdout).toBe(`${prompt}|query text on stdin`);
   });
 });

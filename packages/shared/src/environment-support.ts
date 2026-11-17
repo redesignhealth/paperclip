@@ -76,11 +76,14 @@ const REMOTE_MANAGED_ADAPTERS = new Set<AgentAdapterType>([
   "pi_local",
 ]);
 
-// Adapters that run in sandbox environments only, never over SSH. hermes_local
-// (TECH-8174) has a dedicated sandbox execution path; an SSH target is refused.
-const SANDBOX_ONLY_ADAPTERS = new Set<AgentAdapterType>([
-  "hermes_local",
+// Adapters that run in sandbox environments only, never over SSH, and only on the
+// listed sandbox providers. hermes_local (TECH-8174) carries its system prompt and
+// provider key in the exec env, which only the Kubernetes provider keeps out of the
+// exec command (env over stdin), so other providers are not offered.
+const SANDBOX_ONLY_ADAPTER_PROVIDERS: ReadonlyMap<AgentAdapterType, readonly string[]> = new Map([
+  ["hermes_local", ["kubernetes"]],
 ]);
+const SANDBOX_ONLY_ADAPTERS = new Set<AgentAdapterType>(SANDBOX_ONLY_ADAPTER_PROVIDERS.keys());
 
 export function adapterSupportsRemoteManagedEnvironments(adapterType: string): boolean {
   return REMOTE_MANAGED_ADAPTERS.has(adapterType as AgentAdapterType);
@@ -102,9 +105,10 @@ export function supportedSandboxProvidersForAdapter(
   adapterType: string,
   additionalProviders: readonly string[] = [],
 ): SandboxEnvironmentProvider[] {
-  return adapterSupportsSandboxEnvironments(adapterType)
-    ? Array.from(new Set(additionalProviders)) as SandboxEnvironmentProvider[]
-    : [];
+  if (!adapterSupportsSandboxEnvironments(adapterType)) return [];
+  const providers = Array.from(new Set(additionalProviders));
+  const only = SANDBOX_ONLY_ADAPTER_PROVIDERS.get(adapterType as AgentAdapterType);
+  return (only ? providers.filter((provider) => only.includes(provider)) : providers) as SandboxEnvironmentProvider[];
 }
 
 export function isEnvironmentDriverSupportedForAdapter(
