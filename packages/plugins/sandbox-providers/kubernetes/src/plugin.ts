@@ -1114,10 +1114,7 @@ const plugin = definePlugin({
       kubernetesProviderConfigSchema.parse(params.config),
     );
     if (leaseBackend === "sandbox-cr" && check.podName && managedAdapter) {
-      const remoteCwd =
-        typeof params.leaseMetadata?.remoteCwd === "string" && params.leaseMetadata.remoteCwd.trim()
-          ? params.leaseMetadata.remoteCwd.trim()
-          : "/workspace";
+      const remoteCwd = leaseRemoteCwd(params.leaseMetadata?.remoteCwd);
       const idleTtlMs = kubernetesProviderConfigSchema.parse(params.config).runnerIdleTimeoutMs;
       // Track before scrubbing so a pod we then fail to delete stays visible to
       // the idle reaper and quota eviction, which retry the destroy.
