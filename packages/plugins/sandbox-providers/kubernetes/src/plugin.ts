@@ -157,11 +157,26 @@ const readySandboxesByLease = new Set<string>();
 const RESUME_READY_TIMEOUT_MS = 30_000;
 const RESUME_READY_POLL_MS = 1_000;
 
+// Every agent pod mounts an emptyDir at /workspace (sandbox-cr-builder /
+// pod-spec-builder). It is the lease's working dir until a workspace is realized.
+export const DEFAULT_WORKSPACE_REMOTE_DIR = "/workspace";
+
+// The lease's remote working dir: an already-recorded one (e.g. a realized
+// workspace's remotePath) is kept; otherwise the pod's /workspace mount. Recorded
+// at acquire/resume time so a run that never realizes a workspace (a plain task
+// with no project) still has a concrete sync root, and the server's execution
+// target uses the same dir (it falls back to /tmp when the lease carries none).
+export function leaseRemoteCwd(existing: unknown): string {
+  return typeof existing === "string" && existing.trim().length > 0
+    ? existing.trim()
+    : DEFAULT_WORKSPACE_REMOTE_DIR;
+}
+
 // The workspace remote dir is the confinement root for native file sync. It is
-// recorded on the lease metadata at realizeWorkspace time (`remoteCwd`); require
-// it so a sync can never run without a concrete root to confine every sandbox
-// path against.
-function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
+// recorded on the lease metadata (`remoteCwd`) at acquire/resume time and
+// updated at realizeWorkspace time; require it so a sync can never run without a
+// concrete root to confine every sandbox path against.
+export function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   const remoteCwd = lease.metadata?.remoteCwd;
   if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
     return remoteCwd.trim();
@@ -533,6 +548,7 @@ const plugin = definePlugin({
       // exposes one. Flag the job backend so the server keeps the base64 fallback
       // rather than routing its sync to a hook that would reject immediately.
       nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
+      remoteCwd: leaseRemoteCwd(undefined),
     };
 
     return {
@@ -612,6 +628,8 @@ const plugin = definePlugin({
       // See acquireLease: only the sandbox-cr backend has a pod-exec channel for
       // native sync, so a resumed job lease must keep the base64 fallback.
       nativeFileSyncUnsupported: leaseBackend !== "sandbox-cr",
+      // Keep a realized workspace's dir across resume; default to the pod mount.
+      remoteCwd: leaseRemoteCwd(params.leaseMetadata?.remoteCwd),
     };
 
     return {
@@ -632,7 +650,7 @@ const plugin = definePlugin({
     const cwd =
       params.workspace.remotePath && params.workspace.remotePath.trim().length > 0
         ? params.workspace.remotePath.trim()
-        : "/workspace";
+        : DEFAULT_WORKSPACE_REMOTE_DIR;
     return {
       cwd,
       metadata: {
