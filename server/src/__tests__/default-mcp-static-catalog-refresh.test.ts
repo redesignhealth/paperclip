@@ -351,10 +351,6 @@ describeEmbeddedPostgres("static-catalog connections survive a live catalog refr
     it("waits until the agent's own agent-memory entry is ready, then binds that same secret to a dedicated connection and installs it", async () => {
       const { companyId, agentId, secretId } = await memoryAgent();
       await ensureStaticCompanyTemplates(memoryCtx(), { companyId });
-      // Flag off: waits, writes nothing.
-      await runTools(companyId, agentId, { [AGENT_MEMORY_TOOLS_ENABLED_ENV]: "false" });
-      expect((await toolsEntry(agentId)).setup).toMatchObject({ state: "pending", reason: "provisioner_not_configured" });
-
       await runTools(companyId, agentId);
       const entry = await toolsEntry(agentId);
       expect(entry.setup.state).toBe("ready");
@@ -370,6 +366,15 @@ describeEmbeddedPostgres("static-catalog connections survive a live catalog refr
       // No second secret was minted: the vault still holds only the agent's one memory token.
       const secrets = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.key, `agent_memory.${agentId}`)));
       expect(secrets).toHaveLength(1);
+    });
+
+    it("waits (provisioner_not_configured) while the tools flag is off, writing no connection", async () => {
+      const { companyId, agentId } = await memoryAgent();
+      await ensureStaticCompanyTemplates(memoryCtx(), { companyId });
+      await runTools(companyId, agentId, { [AGENT_MEMORY_TOOLS_ENABLED_ENV]: "false" });
+      expect((await toolsEntry(agentId)).setup).toMatchObject({ state: "pending", reason: "provisioner_not_configured" });
+      const connections = await db.select().from(toolConnections).where(eq(toolConnections.companyId, companyId));
+      expect(connections.some((c) => c.name === `rh-agent-memory-tools:${agentId}`)).toBe(false);
     });
 
     it("waits (memory_token_unavailable) while the agent-memory entry is not ready", async () => {
