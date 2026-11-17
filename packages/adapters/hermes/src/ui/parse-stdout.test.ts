@@ -91,17 +91,47 @@ describe("parseHermesStdoutLine — tool-name auto-repair notice (TECH-8974)", (
         TS,
       ),
     ).toEqual([]);
+    expect(
+      parseHermesStdoutLine(
+        "TALENT \u{1F527} Auto-repaired tool name: 'mcp__mem0_search' -> 'mem0_search'",
+        TS,
+      ),
+    ).toEqual([]);
+    expect(
+      parseHermesStdoutLine(
+        "\u{1F527}\uFE0F Auto-repaired tool name: 'mcp__mem0_add' -> 'mem0_add'",
+        TS,
+      ),
+    ).toEqual([]);
   });
 
   it("still renders ordinary prose that mentions auto-repair as assistant text", () => {
     const r = parseHermesStdoutLine("I auto-repaired the tool name for you.", TS);
     expect(r).toHaveLength(1);
     expect(r[0]).toHaveProperty("kind", "assistant");
+
+    const r2 = parseHermesStdoutLine(
+      "Hermes reported: \u{1F527} Auto-repaired tool name: 'a' -> 'b'",
+      TS,
+    );
+    expect(r2).toHaveLength(1);
+    expect(r2[0]).toHaveProperty("kind", "assistant");
   });
 
-  it("ui-parser.cjs mirrors the TS parser for the auto-repair notice (TECH-8974)", () => {
-    const line = "\u{1F527} Auto-repaired tool name: 'mcp__mem0_search' -> 'mem0_search'";
-    expect(parseStdoutLine(line, TS)).toEqual([]);
-    expect(parseStdoutLine(line, TS)).toEqual(parseHermesStdoutLine(line, TS));
+  it("ui-parser.cjs mirrors the TS parser across all positive and negative notice cases (TECH-8974)", () => {
+    const testCases = [
+      "\u{1F527} Auto-repaired tool name: 'mcp__mem0_search' -> 'mem0_search'",
+      "  \u001b[2m\u{1F527} Auto-repaired tool name: 'mcp__mem0_search' -> 'mem0_search'\u001b[0m",
+      "TALENT \u{1F527} Auto-repaired tool name: 'mcp__mem0_search' -> 'mem0_search'",
+      "\u{1F527}\uFE0F Auto-repaired tool name: 'x' -> 'y'",
+      "\u{1F527} Auto-repaired tool name: 'mcp__mem0_add' -> 'mem0_add'",
+      "Hermes reported: \u{1F527} Auto-repaired tool name: 'a' -> 'b'",
+      "I auto-repaired the tool name for you.",
+      "🔧 Auto-repaired tool name: 'a' -> 'b' and then I did something else",
+    ];
+
+    for (const line of testCases) {
+      expect(parseStdoutLine(line, TS)).toEqual(parseHermesStdoutLine(line, TS));
+    }
   });
 });

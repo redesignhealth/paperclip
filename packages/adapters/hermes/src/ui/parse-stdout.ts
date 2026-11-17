@@ -198,6 +198,13 @@ export function parseHermesStdoutLine(
   const trimmed = stripAnsi(line).trim();
   if (!trimmed) return [];
 
+  // ── Hermes tool-name auto-repair notice (TECH-8974) ───────────────────
+  // A bare print() in Hermes's turn_tool_validation.py that survives -Q. It is an operator
+  // notice, not model output — dropped unconditionally before other classifiers.
+  if (HERMES_TOOL_REPAIR_NOTICE_RE.test(trimmed)) {
+    return [];
+  }
+
   // ── System/adapter messages ────────────────────────────────────────────
   if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
     return [{ kind: "system", ts, text: trimmed }];
@@ -278,14 +285,6 @@ export function parseHermesStdoutLine(
         text: trimmed.replace(/^💭\s*/, ""),
       },
     ];
-  }
-
-  // ── Hermes tool-name auto-repair notice (TECH-8974) ───────────────────
-  // A bare print() in Hermes's turn_tool_validation.py that survives -Q. It is an operator
-  // notice, not model output — without this it falls through to the `assistant` branch below
-  // and renders as if it were part of the agent's answer.
-  if (HERMES_TOOL_REPAIR_NOTICE_RE.test(trimmed)) {
-    return [];
   }
 
   // ── Error output ───────────────────────────────────────────────────────

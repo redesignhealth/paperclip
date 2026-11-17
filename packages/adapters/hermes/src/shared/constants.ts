@@ -144,11 +144,11 @@ export const THINKING_PREFIX = "💭";
  * runtime, never part of the model's answer, and Paperclip publishes surviving stdout to the
  * provider thread verbatim. See TECH-8974.
  *
- * Shape: optional `log_prefix`, U+1F527 WRENCH (optionally VS16), the fixed phrase, and the
- * quoted old -> new pair at end of line. Deliberately NOT start-anchored (log_prefix is
- * configurable) but end-anchored and structurally exact, so ordinary prose that merely mentions
- * auto-repair, or contains a wrench emoji, does not match.
+ * Shape: optional whitespace and single `log_prefix` token, U+1F527 WRENCH (optionally VS16),
+ * the fixed phrase, and the quoted old -> new pair at end of line. Both start-bounded (permitting
+ * only whitespace and at most one non-whitespace prefix token) and end-anchored, so ordinary
+ * prose like "Hermes reported: 🔧 Auto-repaired..." is not matched.
  */
 export const HERMES_TOOL_REPAIR_NOTICE_RE =
-  /\u{1F527}\uFE0F?\s*Auto-repaired tool name: '[^']*'\s*->\s*'[^']*'\s*$/u;
+  /^\s*(?:\S+\s+)?\u{1F527}\uFE0F?\s*Auto-repaired tool name: '[^']*'\s*->\s*'[^']*'\s*$/u;
 

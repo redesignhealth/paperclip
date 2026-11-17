@@ -85,6 +85,9 @@ describe("isHermesToolRepairNotice", () => {
     expect(isHermesToolRepairNotice(REPLY)).toBe(false);
     expect(isHermesToolRepairNotice("I auto-repaired the tool name for you.")).toBe(false);
     expect(
+      isHermesToolRepairNotice("Hermes reported: 🔧 Auto-repaired tool name: 'a' -> 'b'"),
+    ).toBe(false);
+    expect(
       isHermesToolRepairNotice("🔧 Auto-repaired tool name: 'a' -> 'b' and then I did something else"),
     ).toBe(false);
   });
