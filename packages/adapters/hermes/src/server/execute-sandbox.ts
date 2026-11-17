@@ -492,7 +492,9 @@ async function executeHermesInSandbox(
     if (!remoteHermesHome) throw new Error("The Hermes home was not staged to the sandbox.");
     const remoteHomeRoot = path.posix.join(runtimeRootDir, "home");
     const remoteQueryPath = path.posix.join(runtimeRootDir, "query.txt");
-    remoteCleanupPaths = [remoteHermesHome, remoteHomeRoot, remoteQueryPath];
+    // Per run, so concurrent runs in one workspace never share or delete each other's probe home.
+    const remoteRouterProbeDir = path.posix.join(runtimeRootDir, `router-probe-${ctx.runId}`);
+    remoteCleanupPaths = [remoteHermesHome, remoteHomeRoot, remoteQueryPath, remoteRouterProbeDir];
     const remoteInstructionsDir = prepared.assetDirs.instructions;
 
     await ensureAdapterExecutionTargetCommandResolvable(command, runtimeTarget, remoteCwd, {}, { timeoutSec });
@@ -503,7 +505,7 @@ async function executeHermesInSandbox(
         runId: ctx.runId,
         target: runtimeTarget,
         cwd: remoteCwd,
-        probeDir: path.posix.join(runtimeRootDir, "router-probe"),
+        probeDir: remoteRouterProbeDir,
       });
       if (!capability.supported) await refuse(ctx, capability.message);
       await ctx.onLog("stdout", `[hermes] Ramp Router provider verified in ${describeAdapterExecutionTarget(target)} for ${command}\n`);

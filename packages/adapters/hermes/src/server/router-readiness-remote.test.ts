@@ -74,7 +74,8 @@ async function probe(binDir: string) {
   return { result, probeDir };
 }
 
-describe("probeHermesRouterSupportInTarget (TECH-8174)", () => {
+// Each case builds a real venv; allow for a loaded CI runner.
+describe("probeHermesRouterSupportInTarget (TECH-8174)", { timeout: 30_000 }, () => {
   it("verifies the native Router provider through the target's own venv and cleans up", async () => {
     const install = await createFakeHermesInstall(path.join(root, "image"), { layout: "venv-editable" });
     const { result, probeDir } = await probe(install.binDir);
@@ -113,6 +114,21 @@ describe("probeHermesRouterSupportInTarget (TECH-8174)", () => {
     const install = await createFakeHermesInstall(path.join(root, "image"), { layout: "venv-editable", shebang: "env" });
     const { result } = await probe(install.binDir);
     expect(result).toMatchObject({ supported: false, reason: "unknown" });
+  });
+
+  it("refuses a probe dir with dot segments before mkdir or rm -rf", async () => {
+    const install = await createFakeHermesInstall(path.join(root, "image"), { layout: "venv-editable" });
+    const keep = path.join(root, "keep");
+    await fs.mkdir(keep);
+    const result = await probeHermesRouterSupportInTarget({
+      runId: "run-probe",
+      target: localSandbox(),
+      cwd: root,
+      probeDir: `${keep}/sub/..`,
+      hermesBinDir: install.binDir,
+    });
+    expect(result).toMatchObject({ supported: false });
+    await expect(fs.stat(keep)).resolves.toBeTruthy();
   });
 
   it("refuses a relative probe dir without creating or removing anything", async () => {

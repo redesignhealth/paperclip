@@ -27,6 +27,7 @@ import {
   HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_PROVIDERS,
   HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE,
+  HERMES_SANDBOX_ROUTER_KEY_UNREDACTABLE_MESSAGE,
   HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE,
 } from "./execute-sandbox.js";
@@ -36,9 +37,11 @@ import { normalizeConfiguredModel } from "./model-arg.js";
 import {
   ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
   ROUTER_KEY_MISSING_MESSAGE,
+  RAMP_ROUTER_API_KEY_ENV,
   ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
   readRouterApiKey,
 } from "./router-readiness.js";
+import { MAX_CONFIG_STRING_LENGTH, canSafelyRedactSecret } from "./memory-config.js";
 import { probeHermesRouterSupportInTarget } from "./router-readiness-remote.js";
 
 function asString(v: unknown): string | undefined {
@@ -111,10 +114,15 @@ export async function testRemoteEnvironment(
     if (Array.isArray(config.extraArgs) && config.extraArgs.length > 0) {
       checks.push({ level: "error", code: "hermes_router_extra_args", message: ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE });
     }
+    const rawKey = configEnv[RAMP_ROUTER_API_KEY_ENV];
+    const redactable = (value: string) => value.length <= MAX_CONFIG_STRING_LENGTH && canSafelyRedactSecret(value);
     checks.push(
-      readRouterApiKey(configEnv)
-        ? { level: "info", code: "hermes_router_key_found", message: "Ramp Router API key found (RAMP_ROUTER_API_KEY)" }
-        : { level: "error", code: "hermes_router_key_missing", message: ROUTER_KEY_MISSING_MESSAGE },
+      !readRouterApiKey(configEnv) || typeof rawKey !== "string"
+        ? { level: "error", code: "hermes_router_key_missing", message: ROUTER_KEY_MISSING_MESSAGE }
+        : !redactable(rawKey) || !redactable(rawKey.trim())
+        // The run refuses a key it cannot redact from output; report it here too.
+        ? { level: "error", code: "hermes_router_key_unredactable", message: HERMES_SANDBOX_ROUTER_KEY_UNREDACTABLE_MESSAGE }
+        : { level: "info", code: "hermes_router_key_found", message: "Ramp Router API key found (RAMP_ROUTER_API_KEY)" },
     );
   }
   checks.push(

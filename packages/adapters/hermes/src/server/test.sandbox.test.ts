@@ -102,6 +102,12 @@ describe("hermes testEnvironment on a remote target (TECH-8174)", () => {
     ]));
   });
 
+  it("reports a Router key the run could not redact", async () => {
+    const result = await run({ provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: "x".repeat(100_000) } });
+    expect(result.checks.map((c) => c.code)).toContain("hermes_router_key_unredactable");
+    expect(result.status).toBe("fail");
+  });
+
   it("still refuses a Router config on an SSH target", async () => {
     const ssh = { kind: "remote", transport: "ssh", remoteCwd: "/srv", spec: {} } as unknown as AdapterExecutionTarget;
     const result = await run({ provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: "rr-x" } }, ssh);

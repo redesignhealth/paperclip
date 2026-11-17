@@ -38,6 +38,7 @@ export const REMOTE_ROUTER_PROBE_WRAPPER = [
   'd="$1"',
   // The probe dir is created and later removed recursively: only an absolute path below / is accepted.
   'case "$d" in /?*) ;; *) exit 64 ;; esac',
+  'case "$d" in */..|*/../*|*/.|*/./*) exit 64 ;; esac',
   "umask 077",
   'mkdir -p "$d/home" "$d/tmp" "$d/hermes" "$d/work" || exit 70',
   "ok=1",

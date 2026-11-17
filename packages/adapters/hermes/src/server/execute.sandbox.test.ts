@@ -443,7 +443,7 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     expect(runChildProcess).not.toHaveBeenCalled();
     expect(probeHermesRouterSupportInTarget).toHaveBeenCalledWith(expect.objectContaining({
       cwd: REMOTE_WS,
-      probeDir: `${REMOTE_RUNTIME}/router-probe`,
+      probeDir: `${REMOTE_RUNTIME}/router-probe-run-sbx`,
     }));
     const call = hermesCall();
     expect(call.args).toEqual(expect.arrayContaining(["--provider", "router", "-m", "auto-jev-routing", "--max-turns", "1000"]));
@@ -459,6 +459,7 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     ]));
     expect(JSON.stringify(h.shipped)).not.toContain(ROUTER_KEY);
     // Endpoint overrides and import-path overrides never reach a Router run.
+    expect(h.shellCalls.some((c) => c.startsWith("rm -rf") && c.includes(`${REMOTE_RUNTIME}/router-probe-run-sbx`))).toBe(true);
     expect(call.options.env.RAMP_ROUTER_BASE_URL).toBeUndefined();
     expect(call.options.env.OPENAI_BASE_URL).toBeUndefined();
     expect(call.options.env.PYTHONPATH).toBeUndefined();
