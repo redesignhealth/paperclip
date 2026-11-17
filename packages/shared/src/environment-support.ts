@@ -76,22 +76,33 @@ const REMOTE_MANAGED_ADAPTERS = new Set<AgentAdapterType>([
   "pi_local",
 ]);
 
+// Adapters that run in sandbox environments only, never over SSH. hermes_local
+// (TECH-8174) has a dedicated sandbox execution path; an SSH target is refused.
+const SANDBOX_ONLY_ADAPTERS = new Set<AgentAdapterType>([
+  "hermes_local",
+]);
+
 export function adapterSupportsRemoteManagedEnvironments(adapterType: string): boolean {
   return REMOTE_MANAGED_ADAPTERS.has(adapterType as AgentAdapterType);
 }
 
+/** True when the adapter may run in a sandbox environment (remote-managed or sandbox-only). */
+export function adapterSupportsSandboxEnvironments(adapterType: string): boolean {
+  return adapterSupportsRemoteManagedEnvironments(adapterType) ||
+    SANDBOX_ONLY_ADAPTERS.has(adapterType as AgentAdapterType);
+}
+
 export function supportedEnvironmentDriversForAdapter(adapterType: string): EnvironmentDriver[] {
   if (adapterType === "paperclip_runner") return ["local", "ssh", "sandbox", "plugin"];
-  return adapterSupportsRemoteManagedEnvironments(adapterType)
-    ? ["local", "ssh", "sandbox"]
-    : ["local"];
+  if (adapterSupportsRemoteManagedEnvironments(adapterType)) return ["local", "ssh", "sandbox"];
+  return SANDBOX_ONLY_ADAPTERS.has(adapterType as AgentAdapterType) ? ["local", "sandbox"] : ["local"];
 }
 
 export function supportedSandboxProvidersForAdapter(
   adapterType: string,
   additionalProviders: readonly string[] = [],
 ): SandboxEnvironmentProvider[] {
-  return adapterSupportsRemoteManagedEnvironments(adapterType)
+  return adapterSupportsSandboxEnvironments(adapterType)
     ? Array.from(new Set(additionalProviders)) as SandboxEnvironmentProvider[]
     : [];
 }

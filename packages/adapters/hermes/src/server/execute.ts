@@ -100,6 +100,8 @@ import {
   routerEnvNamesToStrip,
 } from "./router-readiness.js";
 import dotenv from "dotenv";
+import { readAdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { executeHermesOnRemoteTarget } from "./execute-sandbox.js";
 
 /**
  * Raw key/value view of the operator's host Hermes `.env` (local, non-isolated runs only). Used to
@@ -1336,7 +1338,7 @@ const TOKEN_USAGE_REGEX =
 /** Regex to extract cost from Hermes output. */
 const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
 
-interface ParsedOutput {
+export interface ParsedOutput {
   sessionId?: string;
   response?: string;
   usage?: UsageSummary;
@@ -1402,7 +1404,7 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
+export function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
 
@@ -1495,6 +1497,14 @@ export function augmentStaleImageError(
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
+  // TECH-8174: a remote target (sandbox; SSH is refused there) takes the separate sandbox path, so
+  // nothing below runs on the host on its behalf. Local runs continue unchanged.
+  const remoteTarget = readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget,
+    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  });
+  if (remoteTarget?.kind === "remote") return executeHermesOnRemoteTarget(ctx, remoteTarget);
+
   // Validate command scan policy mode FIRST before any spawn or capability probe
   getHermesCommandScanMode();
 

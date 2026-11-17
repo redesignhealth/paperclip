@@ -166,4 +166,22 @@ describe("wrapCommandWithEnv", () => {
     expect(String(stdin)).not.toContain("NUMERIC");
     expect(command.join(" ")).not.toContain("GOOD_KEY");
   });
+
+  it("delivers a maximum-size Hermes system prompt (131040 bytes, multi-line, UTF-8) intact (TECH-8174)", () => {
+    // HERMES_MAX_SYSTEM_PROMPT_BYTES in the Hermes adapter: 128 KiB minus the env entry overhead.
+    const unit = "Line with 'quotes', $VARS, `ticks` and é✓\n";
+    let prompt = "";
+    while (Buffer.byteLength(prompt + unit, "utf-8") <= 131040) prompt += unit;
+    prompt += "x".repeat(131040 - Buffer.byteLength(prompt, "utf-8"));
+    expect(Buffer.byteLength(prompt, "utf-8")).toBe(131040);
+    const { command } = wrapCommandWithEnv(["hermes"], { HERMES_EPHEMERAL_SYSTEM_PROMPT: prompt });
+    expect(command.join(" ")).not.toContain("Line with");
+    const result = runWrapped(
+      ["/bin/sh", "-c", 'printf "%s" "$HERMES_EPHEMERAL_SYSTEM_PROMPT"'],
+      { HERMES_EPHEMERAL_SYSTEM_PROMPT: prompt },
+      "query text on stdin\n",
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(prompt);
+  });
 });
