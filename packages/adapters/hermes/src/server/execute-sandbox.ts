@@ -17,6 +17,7 @@
  * warning), sandbox targets only (never SSH).
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -493,7 +494,12 @@ async function executeHermesInSandbox(
     const remoteHomeRoot = path.posix.join(runtimeRootDir, "home");
     const remoteQueryPath = path.posix.join(runtimeRootDir, "query.txt");
     // Per run, so concurrent runs in one workspace never share or delete each other's probe home.
-    const remoteRouterProbeDir = path.posix.join(runtimeRootDir, `router-probe-${ctx.runId}`);
+    // The run id becomes one path segment of a directory that is later removed with rm -rf, so only
+    // a plain [A-Za-z0-9_-] id is used verbatim; anything else is replaced by its hash.
+    const probeRunSegment = /^[A-Za-z0-9_-]{1,128}$/.test(ctx.runId)
+      ? ctx.runId
+      : createHash("sha256").update(String(ctx.runId)).digest("hex").slice(0, 32);
+    const remoteRouterProbeDir = path.posix.join(runtimeRootDir, `router-probe-${probeRunSegment}`);
     remoteCleanupPaths = [remoteHermesHome, remoteHomeRoot, remoteQueryPath, remoteRouterProbeDir];
     const remoteInstructionsDir = prepared.assetDirs.instructions;
 

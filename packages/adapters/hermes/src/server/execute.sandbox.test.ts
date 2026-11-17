@@ -468,6 +468,17 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     expect(result.clearSession).toBe(true);
   });
 
+  it("never lets a run id with path segments shape the probe dir that is later removed", async () => {
+    const c = ctx({ config: { provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } } });
+    (c as unknown as { runId: string }).runId = "../../../escape";
+    await execute(c);
+    const probeDir = vi.mocked(probeHermesRouterSupportInTarget).mock.calls[0]![0].probeDir;
+    expect(probeDir).toMatch(new RegExp(`^${REMOTE_RUNTIME}/router-probe-[0-9a-f]{32}$`));
+    for (const cmd of h.shellCalls.filter((c) => c.startsWith("rm -rf"))) {
+      expect(cmd).not.toContain("escape");
+    }
+  });
+
   it("redacts the Router key from streamed and returned output", async () => {
     h.hermesStdout = `leaked ${ROUTER_KEY} here\n\nsession_id: s\n`;
     const result = await execute(ctx({
