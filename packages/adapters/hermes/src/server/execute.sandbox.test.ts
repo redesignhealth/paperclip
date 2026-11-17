@@ -40,6 +40,11 @@ const h = vi.hoisted(() => ({
   stageExit: 0,
 }));
 
+vi.mock("./router-readiness-remote.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./router-readiness-remote.js")>()),
+  probeHermesRouterSupportInTarget: vi.fn(async () => ({ supported: true })),
+}));
+
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
   return {
@@ -118,7 +123,8 @@ import {
   HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE,
 } from "./execute-sandbox.js";
 import { HERMES_MAX_SYSTEM_PROMPT_BYTES } from "./execute.js";
-import { ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE } from "./router-readiness.js";
+import { ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE, ROUTER_KEY_MISSING_MESSAGE } from "./router-readiness.js";
+import { probeHermesRouterSupportInTarget } from "./router-readiness-remote.js";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { prepareAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 
@@ -405,6 +411,73 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     expect(runChildProcess).not.toHaveBeenCalled();
   });
 
+  it("runs a production-style Ramp Router agent: key only in the exec env, probe in the sandbox", async () => {
+    const result = await execute(ctx({
+      config: {
+        provider: "router",
+        model: "auto-jev-routing",
+        quiet: true,
+        maxTurnsPerRun: 1000,
+        timeoutSec: 20000,
+        env: {
+          RAMP_ROUTER_API_KEY: ROUTER_KEY,
+          RAMP_ROUTER_BASE_URL: "https://evil.example/v1",
+          OPENAI_BASE_URL: "https://evil.example/openai",
+          PYTHONPATH: "/tmp/shadow",
+        },
+      },
+    }));
+    expect(runChildProcess).not.toHaveBeenCalled();
+    expect(probeHermesRouterSupportInTarget).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: REMOTE_WS,
+      probeDir: `${REMOTE_RUNTIME}/router-probe`,
+    }));
+    const call = hermesCall();
+    expect(call.args).toEqual(expect.arrayContaining(["--provider", "router", "-m", "auto-jev-routing", "--max-turns", "1000"]));
+    expect(call.options.timeoutSec).toBe(20000);
+    // The key travels only in the exec env (stdin on Kubernetes): never argv, never a shipped file.
+    expect(call.options.env.RAMP_ROUTER_API_KEY).toBe(ROUTER_KEY);
+    expect(JSON.stringify(call.args)).not.toContain(ROUTER_KEY);
+    expect(JSON.stringify(h.processCalls.filter((c) => c !== call))).not.toContain(ROUTER_KEY);
+    expect(JSON.stringify(h.shipped)).not.toContain(ROUTER_KEY);
+    // Endpoint overrides and import-path overrides never reach a Router run.
+    expect(call.options.env.RAMP_ROUTER_BASE_URL).toBeUndefined();
+    expect(call.options.env.OPENAI_BASE_URL).toBeUndefined();
+    expect(call.options.env.PYTHONPATH).toBeUndefined();
+    expect(JSON.stringify(call.options.env)).not.toContain(RUN_JWT);
+    expect(result.provider).toBe("router");
+    expect(result.clearSession).toBe(true);
+  });
+
+  it("redacts the Router key from streamed and returned output", async () => {
+    h.hermesStdout = `leaked ${ROUTER_KEY} here\n\nsession_id: s\n`;
+    const result = await execute(ctx({
+      config: { provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } },
+    }));
+    expect(JSON.stringify(result)).not.toContain(ROUTER_KEY);
+    expect(JSON.stringify(logs)).not.toContain(ROUTER_KEY);
+  });
+
+  it("refuses a Router run when the in-sandbox probe cannot verify the provider, before launching Hermes", async () => {
+    vi.mocked(probeHermesRouterSupportInTarget).mockResolvedValueOnce({
+      supported: false,
+      reason: "unsupported",
+      message: "The installed Hermes does not provide the native Ramp Router provider (profile_base_url).",
+    });
+    await expect(execute(ctx({
+      config: { provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } },
+    }))).rejects.toThrow(/does not provide the native Ramp Router provider/);
+    expect(h.processCalls.some((c) => c.command.endsWith("/hermes"))).toBe(false);
+    expect(h.restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a non-Router run's RAMP_ROUTER_API_KEY out of the sandbox", async () => {
+    await execute(ctx({ config: { env: { OPENAI_API_KEY: PROVIDER_KEY, RAMP_ROUTER_API_KEY: ROUTER_KEY } } }));
+    expect(hermesCall().options.env.RAMP_ROUTER_API_KEY).toBeUndefined();
+    expect(probeHermesRouterSupportInTarget).not.toHaveBeenCalled();
+  });
+
+
   const refusals: Array<[string, () => AdapterExecutionContext, string]> = [
     [
       "an SSH target",
@@ -425,9 +498,14 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
     ],
     ["an env-configured memory provider", () => ctx({ config: { memoryProvider: "mem0" } }), HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE],
     [
-      "a Ramp Router run",
-      () => ctx({ config: { provider: "router", model: "auto-jev-routing", env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } } }),
-      ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+      "a Ramp Router run without the agent's own RAMP_ROUTER_API_KEY binding",
+      () => ctx({ config: { provider: "router", model: "auto-jev-routing", env: { OPENAI_API_KEY: PROVIDER_KEY } } }),
+      ROUTER_KEY_MISSING_MESSAGE,
+    ],
+    [
+      "a Ramp Router run with extraArgs",
+      () => ctx({ config: { provider: "router", model: "auto-jev-routing", extraArgs: ["--profile", "x"], env: { RAMP_ROUTER_API_KEY: ROUTER_KEY } } }),
+      ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
     ],
     ["a custom Hermes command", () => ctx({ config: { hermesCommand: "/tmp/evil-hermes" } }), HERMES_SANDBOX_UNTRUSTED_COMMAND_MESSAGE],
     ["managed AI routing", () => ctx({ config: { managedAiRouting: { id: "x" } } }), HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE],

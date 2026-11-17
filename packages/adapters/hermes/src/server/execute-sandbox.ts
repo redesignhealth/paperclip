@@ -12,8 +12,9 @@
  *    delivers it over stdin (fork #415). The run JWT never enters the sandbox: Paperclip API access
  *    goes through the callback bridge, whose env replaces PAPERCLIP_API_URL / PAPERCLIP_API_KEY.
  *
- * Stage 1 scope (see docs/hermes-sandbox-execution.md): non-Router providers only, no memory,
- * no runtime MCP servers (dropped with a warning), sandbox targets only (never SSH).
+ * Scope (see docs/hermes-sandbox-execution.md): explicit providers including Ramp Router (stage 2,
+ * verified by an in-sandbox registry probe), no memory, no runtime MCP servers (dropped with a
+ * warning), sandbox targets only (never SSH).
  */
 
 import fs from "node:fs/promises";
@@ -86,9 +87,13 @@ import {
 import { normalizeConfiguredModel } from "./model-arg.js";
 import {
   RAMP_ROUTER_API_KEY_ENV,
-  ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
+  ROUTER_KEY_MISSING_MESSAGE,
+  ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES,
+  readRouterApiKey,
   routerEnvNamesToStrip,
 } from "./router-readiness.js";
+import { probeHermesRouterSupportInTarget } from "./router-readiness-remote.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 export const HERMES_SANDBOX_ADAPTER_KEY = "hermes";
@@ -111,6 +116,8 @@ export const HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE =
   "Refusing to start: adapterConfig.memoryProvider is not yet supported for Hermes in sandbox environments (the memory service is not reachable from the sandbox). Remove memoryProvider or select the local environment.";
 export const HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE =
   "Refusing to start: PAPERCLIP_HERMES_COMMAND_SCAN=required is not yet supported for Hermes in sandbox environments.";
+export const HERMES_SANDBOX_ROUTER_KEY_UNREDACTABLE_MESSAGE =
+  "Cannot safely redact the Ramp Router API key; refusing to start";
 export const HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE =
   "Refusing to start: managed AI connections are not yet supported for Hermes in sandbox environments. Select the local environment for this agent.";
 export const HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE =
@@ -246,10 +253,8 @@ async function executeHermesInSandbox(
     configuredModel,
     detected: null,
   });
-  // Same refusal and message as the environment test (test-sandbox.ts) until Router is verified in
-  // the sandbox.
-  if (effective.isRouter) await refuse(ctx, ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE);
   if (!effective.ok) return await refuse(ctx, effective.message);
+  const isRouterRun = effective.isRouter;
   const resolvedProvider = effective.provider;
   const model = effective.effectiveModel;
 
@@ -280,6 +285,19 @@ async function executeHermesInSandbox(
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
+  // TECH-7895 Router gates, as on the host: no extraArgs, and only the agent's own canonical
+  // RAMP_ROUTER_API_KEY binding (never a host .env, never the plugin's shared envKeys Secret).
+  // The key reaches the sandbox only in the exec env, which the Kubernetes provider delivers over
+  // stdin (never argv, never a file).
+  if (isRouterRun) {
+    if (extraArgs && extraArgs.length > 0) await refuse(ctx, ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE);
+    if (!readRouterApiKey(userEnv)) await refuse(ctx, ROUTER_KEY_MISSING_MESSAGE);
+    const routerKey = userEnv[RAMP_ROUTER_API_KEY_ENV]!;
+    const redactable = (value: string) => value.length <= MAX_CONFIG_STRING_LENGTH && canSafelyRedactSecret(value);
+    if (!redactable(routerKey) || !redactable(routerKey.trim())) {
+      await refuse(ctx, HERMES_SANDBOX_ROUTER_KEY_UNREDACTABLE_MESSAGE);
+    }
+  }
   const wantsPaperclipRuntimeSkills = Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills");
 
   // ── Instructions bundle (content read on the host; the directory is shipped) ─
@@ -406,7 +424,7 @@ async function executeHermesInSandbox(
       config,
       flags: hardeningFlags,
       onWarning: onCleanupWarning,
-      canonicalRouterEndpoint: false,
+      canonicalRouterEndpoint: isRouterRun,
       isolatedFromHost: true,
       ...(anthropicRequestTimeoutSec !== undefined ? { anthropicRequestTimeoutSec } : {}),
       tempDirPrefix: path.join(assetHome.path, "hermes-"),
@@ -479,6 +497,18 @@ async function executeHermesInSandbox(
 
     await ensureAdapterExecutionTargetCommandResolvable(command, runtimeTarget, remoteCwd, {}, { timeoutSec });
 
+    if (isRouterRun) {
+      // The registry probe runs inside the sandbox against the image's Hermes, not on this host.
+      const capability = await probeHermesRouterSupportInTarget({
+        runId: ctx.runId,
+        target: runtimeTarget,
+        cwd: remoteCwd,
+        probeDir: path.posix.join(runtimeRootDir, "router-probe"),
+      });
+      if (!capability.supported) await refuse(ctx, capability.message);
+      await ctx.onLog("stdout", `[hermes] Ramp Router provider verified in ${describeAdapterExecutionTarget(target)} for ${command}\n`);
+    }
+
     // ── Callback bridge: the only route to the Paperclip API from the sandbox ─
     if (adapterExecutionTargetUsesPaperclipBridge(runtimeTarget)) {
       paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
@@ -528,9 +558,15 @@ async function executeHermesInSandbox(
       if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) delete env[key];
     }
     for (const key of HERMES_FORBIDDEN_ENV_VARS) delete env[key];
-    for (const name of routerEnvNamesToStrip(env, false)) delete env[name];
-    // Not this run's credential (Router runs are refused above); keep it out of the sandbox.
-    delete env[RAMP_ROUTER_API_KEY_ENV];
+    // Endpoint overrides and aliases never reach Hermes; a Router run also drops the generic SDK
+    // endpoints and the Python import-path overrides (the probe verified the image's own registry).
+    for (const name of routerEnvNamesToStrip(env, isRouterRun)) delete env[name];
+    if (isRouterRun) {
+      for (const name of ROUTER_RUN_STRIPPED_PYTHON_ENV_NAMES) delete env[name];
+    } else {
+      // Not this run's credential; keep it out of the sandbox.
+      delete env[RAMP_ROUTER_API_KEY_ENV];
+    }
     Object.assign(env, preparedHome.env);
     if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
     const wakeContext = (ctx.context ?? {}) as Record<string, unknown>;

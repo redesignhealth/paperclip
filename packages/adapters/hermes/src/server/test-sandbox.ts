@@ -9,6 +9,8 @@ import type {
   AdapterEnvironmentTestContext,
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
+import path from "node:path";
+
 import {
   readAdapterExecutionTarget,
   describeAdapterExecutionTarget,
@@ -31,7 +33,13 @@ import {
 import { HERMES_EXPLICIT_CREDENTIAL_REQUIRED_MESSAGE, hasExplicitHermesProviderCredential } from "./isolation.js";
 import { resolveHermesMemoryProvider } from "./memory-config.js";
 import { normalizeConfiguredModel } from "./model-arg.js";
-import { ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE } from "./router-readiness.js";
+import {
+  ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE,
+  ROUTER_KEY_MISSING_MESSAGE,
+  ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE,
+  readRouterApiKey,
+} from "./router-readiness.js";
+import { probeHermesRouterSupportInTarget } from "./router-readiness-remote.js";
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
@@ -64,11 +72,13 @@ export async function testRemoteEnvironment(
   if (config.managedAiRouting || config.managedAiConnection) {
     return result([{ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." }]);
   }
-  // Ramp Router readiness is not verified on remote targets yet; refused before anything launches.
-  if (effective.isRouter) {
+  const target = readAdapterExecutionTarget({ executionTarget: ctx.executionTarget });
+  const isSandbox = target?.kind === "remote" && target.transport === "sandbox";
+  // Ramp Router readiness is verified inside sandbox targets only; any other remote target is
+  // refused before anything launches.
+  if (effective.isRouter && !isSandbox) {
     return result([{ level: "error", code: "hermes_router_remote_unsupported", message: ROUTER_REMOTE_TARGET_UNSUPPORTED_MESSAGE }]);
   }
-  const target = readAdapterExecutionTarget({ executionTarget: ctx.executionTarget });
   if (!target || target.kind !== "remote" || target.transport !== "sandbox") {
     return result([{ level: "error", code: "hermes_ssh_unsupported", message: HERMES_SANDBOX_SSH_UNSUPPORTED_MESSAGE }]);
   }
@@ -96,6 +106,17 @@ export async function testRemoteEnvironment(
     checks.push({ level: "error", code: "hermes_memory_sandbox_unsupported", message: HERMES_SANDBOX_MEMORY_PROVIDER_UNSUPPORTED_MESSAGE });
   }
   const configEnv = (config.env && typeof config.env === "object" ? config.env : {}) as Record<string, unknown>;
+  if (effective.isRouter) {
+    // The run's Router gates: no extraArgs, and the agent's own RAMP_ROUTER_API_KEY binding only.
+    if (Array.isArray(config.extraArgs) && config.extraArgs.length > 0) {
+      checks.push({ level: "error", code: "hermes_router_extra_args", message: ROUTER_EXTRA_ARGS_UNSUPPORTED_MESSAGE });
+    }
+    checks.push(
+      readRouterApiKey(configEnv)
+        ? { level: "info", code: "hermes_router_key_found", message: "Ramp Router API key found (RAMP_ROUTER_API_KEY)" }
+        : { level: "error", code: "hermes_router_key_missing", message: ROUTER_KEY_MISSING_MESSAGE },
+    );
+  }
   checks.push(
     hasExplicitHermesProviderCredential(configEnv)
       ? { level: "info", code: "hermes_api_keys_found", message: "Provider credential found in the agent's env" }
@@ -157,6 +178,21 @@ export async function testRemoteEnvironment(
       code: "hermes_version_failed",
       message: `hermes --version failed inside the environment: ${err instanceof Error ? err.message : String(err)}`,
     });
+  }
+
+  if (effective.isRouter) {
+    // Registry probe inside the target against the image's Hermes (never this host's).
+    const capability = await probeHermesRouterSupportInTarget({
+      runId,
+      target,
+      cwd: target.remoteCwd,
+      probeDir: path.posix.join(target.remoteCwd, ".paperclip-runtime", "hermes", "envtests", runId, "router-probe"),
+    });
+    checks.push(
+      capability.supported
+        ? { level: "info", code: "hermes_router_supported", message: `Hermes at "${CANONICAL_HERMES_BIN}" in the environment provides the native Ramp Router provider` }
+        : { level: "error", code: `hermes_router_${capability.reason}`, message: capability.message },
+    );
   }
   return result(checks);
 }
