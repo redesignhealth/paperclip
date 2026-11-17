@@ -131,3 +131,24 @@ export const TOOL_OUTPUT_PREFIX = "┊";
 
 /** Prefix for Hermes thinking blocks. */
 export const THINKING_PREFIX = "💭";
+
+/**
+ * Hermes's tool-name auto-repair notice, printed by `agent/turn_tool_validation.py:95`
+ * (pinned hermes-agent 0.21.3 / v2026.9.14):
+ *
+ *   print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{old}' -> '{new}'")
+ *
+ * It is a bare `print()` — the only status emission in that function that does not go through
+ * `_vprint`/`_buffer_vprint` — so it is the one notice that survives `hermes chat -Q`
+ * (`suppress_status_output`) and lands in captured stdout. It is an operator notice about the
+ * runtime, never part of the model's answer, and Paperclip publishes surviving stdout to the
+ * provider thread verbatim. See TECH-8974.
+ *
+ * Shape: optional `log_prefix`, U+1F527 WRENCH (optionally VS16), the fixed phrase, and the
+ * quoted old -> new pair at end of line. Deliberately NOT start-anchored (log_prefix is
+ * configurable) but end-anchored and structurally exact, so ordinary prose that merely mentions
+ * auto-repair, or contains a wrench emoji, does not match.
+ */
+export const HERMES_TOOL_REPAIR_NOTICE_RE =
+  /\u{1F527}\uFE0F?\s*Auto-repaired tool name: '[^']*'\s*->\s*'[^']*'\s*$/u;
+

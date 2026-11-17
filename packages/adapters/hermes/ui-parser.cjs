@@ -6,6 +6,11 @@ function stripAnsi(text) {
     .replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
 
+// Hermes tool-name auto-repair notice (TECH-8974). Must stay in sync with
+// HERMES_TOOL_REPAIR_NOTICE_RE in src/shared/constants.ts.
+const HERMES_TOOL_REPAIR_NOTICE_RE =
+  /\u{1F527}\uFE0F?\s*Auto-repaired tool name: '[^']*'\s*->\s*'[^']*'\s*$/u;
+
 const TOOL_OUTPUT_PREFIX = "\u250a";
 
 function stripKaomoji(text) {
@@ -183,6 +188,14 @@ function parseStdoutLine(line, ts) {
 
   if (isThinkingLine(trimmed)) {
     return [{ kind: "thinking", ts, text: trimmed.replace(/^\u{1f4ad}\s*/u, "") }];
+  }
+
+  // ── Hermes tool-name auto-repair notice (TECH-8974) ───────────────────
+  // A bare print() in Hermes's turn_tool_validation.py that survives -Q. It is an operator
+  // notice, not model output — without this it falls through to the `assistant` branch below
+  // and renders as if it were part of the agent's answer.
+  if (HERMES_TOOL_REPAIR_NOTICE_RE.test(trimmed)) {
+    return [];
   }
 
   if (
