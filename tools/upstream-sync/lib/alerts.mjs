@@ -84,7 +84,50 @@ export function renderOutboxText(payload) {
 }
 
 // ---- sinks -----------------------------------------------------------------
-async function deliver(cfg, alertRow, fetchImpl) {
+
+// The paperclip-comment sink is not idempotent by itself: the comments API only
+// honours clientRequestId for user actors, so an agent POST that the server
+// completes AFTER our client timeout fired (the row then stays undelivered) lands
+// as a comment and gets resent on the next run. Each comment therefore carries an
+// HTML-comment marker with the outbox dedup key (it survives the API round trip
+// verbatim and is invisible when rendered), and delivery first looks for that
+// marker. dedup_key is built from our own template (row:<sha>, ops:<name>:<ms>,
+// overflow:<sha>), never from untrusted text.
+const ALERT_MARKER_RE = /<!-- upstream-sync-alert:([A-Za-z0-9:_.-]+) -->/g;
+const alertMarker = (dedupKey) => `<!-- upstream-sync-alert:${dedupKey} -->`;
+const COMMENT_SCAN_LIMIT = 500; // server cap per page (MAX_ISSUE_COMMENT_LIMIT)
+
+function paperclipBase(cfg) {
+  return cfg.alert.paperclipApiUrl.replace(/\/$/, "").replace(/\/api$/, "");
+}
+
+function paperclipHeaders(cfg, json = false) {
+  return {
+    ...(json ? { "content-type": "application/json" } : {}),
+    authorization: `Bearer ${cfg.alert.paperclipApiKey}`,
+    ...(cfg.alert.paperclipRunId ? { "x-paperclip-run-id": cfg.alert.paperclipRunId } : {}),
+  };
+}
+
+// dedup_key -> comment id for alerts already posted on the alert issue. Fails
+// loudly: if we cannot tell whether an alert is already there, not sending it
+// this run (it stays undelivered and is retried) beats posting a duplicate.
+export async function loadPostedAlertKeys(cfg, fetchImpl = fetch) {
+  const res = await fetchImpl(`${paperclipBase(cfg)}/api/issues/${cfg.alert.issueId}/comments?order=desc&limit=${COMMENT_SCAN_LIMIT}`, {
+    headers: paperclipHeaders(cfg),
+    signal: AbortSignal.timeout(cfg.httpTimeoutMs ?? 30000),
+  });
+  if (!res.ok) throw new Error(`paperclip comment lookup HTTP ${res.status}`);
+  const list = await res.json();
+  if (!Array.isArray(list)) throw new Error("paperclip comment lookup returned a non-list body");
+  const seen = new Map();
+  for (const c of list) {
+    for (const m of String(c?.body ?? "").matchAll(ALERT_MARKER_RE)) if (!seen.has(m[1])) seen.set(m[1], c.id ?? "ok");
+  }
+  return seen;
+}
+
+async function deliver(cfg, alertRow, fetchImpl, ctx = {}) {
   const { sink } = cfg.alert;
   const timeout = cfg.httpTimeoutMs ?? 30000;
   if (sink === "outbox") return null; // stays undelivered until drained
@@ -110,19 +153,22 @@ async function deliver(cfg, alertRow, fetchImpl) {
     return "slack-webhook";
   }
   if (sink === "paperclip-comment") {
-    const base = cfg.alert.paperclipApiUrl.replace(/\/$/, "").replace(/\/api$/, "");
-    const res = await fetchImpl(`${base}/api/issues/${cfg.alert.issueId}/comments`, {
+    // Lazy, once per flush, and only when there is something to send. The promise
+    // is cached, so a failed lookup fails every remaining alert fast instead of
+    // re-trying (and re-timing-out) once per alert.
+    ctx.postedP ??= loadPostedAlertKeys(cfg, fetchImpl);
+    const posted = await ctx.postedP;
+    const already = posted.get(alertRow.dedup_key);
+    if (already !== undefined) return `paperclip-comment:${already}:existing`;
+    const res = await fetchImpl(`${paperclipBase(cfg)}/api/issues/${cfg.alert.issueId}/comments`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${cfg.alert.paperclipApiKey}`,
-        ...(cfg.alert.paperclipRunId ? { "x-paperclip-run-id": cfg.alert.paperclipRunId } : {}),
-      },
-      body: JSON.stringify({ body: `**Intended channel: ${alertRow.channel}**\n\n${renderAlert(alertRow.payload, "paperclip")}` }),
+      headers: paperclipHeaders(cfg, true),
+      body: JSON.stringify({ body: `**Intended channel: ${alertRow.channel}**\n\n${renderAlert(alertRow.payload, "paperclip")}\n\n${alertMarker(alertRow.dedup_key)}` }),
       signal: AbortSignal.timeout(timeout),
     });
     if (!res.ok) throw new Error(`paperclip comment HTTP ${res.status}`);
     const j = await res.json().catch(() => ({}));
+    posted.set(alertRow.dedup_key, j.id ?? "ok");
     return `paperclip-comment:${j.id ?? "ok"}`;
   }
   throw new Error(`unknown alert sink ${sink}`);
@@ -144,6 +190,7 @@ export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.er
     `SELECT * FROM upstream_sync_alerts WHERE delivered_at IS NULL ORDER BY id LIMIT 50`,
   );
   let delivered = 0, failed = 0, deferred = 0;
+  const ctx = {};
   for (const a of rows) {
     // Stop starting work at the run deadline; the rest stay undelivered, which
     // is the normal retry state for this table, so the next run sends them.
@@ -153,7 +200,7 @@ export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.er
       // sink accepted the message but before this UPDATE commits will resend it on
       // the next flush. Enqueue is exactly-once (unique dedup_key); delivery is
       // at-least-once. Keep handlers idempotent where the sink allows it.
-      const ref = await deliver(cfg, a, fetchImpl);
+      const ref = await deliver(cfg, a, fetchImpl, ctx);
       await db.query(
         `UPDATE upstream_sync_alerts SET delivered_at=now(), delivery_ref=$2, sink=$3, last_error=NULL WHERE id=$1`,
         [a.id, ref, cfg.alert.sink],

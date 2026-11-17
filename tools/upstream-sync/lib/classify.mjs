@@ -15,16 +15,38 @@ export const CATEGORIES = ["feature", "fix", "perf", "security", "infra", "break
 const INFRA_FILE_RE = /^(\.github\/|docker\/|Dockerfile|scripts\/|pnpm-lock\.yaml|pnpm-workspace\.yaml|package\.json|tsconfig|vitest\.config|\.dockerignore|releases\/|tests\/)/;
 const TEST_OR_DOC_RE = /(^|\/)(__tests__|tests?)\/|\.test\.|\.spec\.|\.md$|^doc(s)?\//;
 
+// Conventional-commit prefixes that by convention carry no user-visible security
+// fix and no breaking change. A commit with one of these is only ever security or
+// breaking through its TITLE (`docs!: ...`, `test: ... CVE-2026-1 ...`); text in
+// its body is PR-template boilerplate ("security checks pass", "**Breaking
+// changes** none") and must not pin the category.
+const NON_SECURITY_PREFIXES = new Set(["docs", "test", "tests", "style"]);
+const NON_BREAKING_PREFIXES = new Set(["perf", "docs", "test", "tests", "style", "refactor", "ci", "build", "chore", "deps", "release"]);
+
+// Title: the broad security vocabulary. Body: only identifiers an advisory carries.
+// The words "security" and "redact" appear in nearly every upstream PR body
+// ("security scan passed", "secret redaction unchanged"), so they only count in the title.
+const SECURITY_TITLE_RE = /\b(cve-\d|ghsa-|vulnerab|security|xss|csrf|ssrf|sql injection|\brce\b|auth bypass|privilege escalation|secret leak|redact)/;
+const SECURITY_BODY_RE = /\b(cve-\d{4}-\d|ghsa-[0-9a-z]{4}-)/;
+// A real breaking-change marker: `type!:` / `type(scope)!:`, a `BREAKING CHANGE:` footer
+// at the start of a line (Conventional Commits; case-sensitive so the lowercase PR
+// template heading "Breaking changes" does not match), or the phrase in the title.
+const BANG_TITLE_RE = /^[a-z]+(\([^)]*\))?!:/;
+const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:/m;
+const BREAKING_TITLE_RE = /\bbreaking[ -]change/;
+
 // Deterministic fallback. Also used as the safety net when the LLM is unavailable,
 // so rows never stay unclassified and feature alerts are not silently skipped.
 export function heuristicClassify(c) {
   const t = c.title.toLowerCase();
-  const text = `${c.title}\n${c.body || ""}`.toLowerCase();
+  const body = c.body || "";
   const prefix = (t.match(/^([a-z]+)(\([^)]*\))?(!)?:/) || [])[1];
-  const bang = /^[a-z]+(\([^)]*\))?!:/.test(t) || /breaking change/.test(text);
+  const bang = BANG_TITLE_RE.test(t) || BREAKING_TITLE_RE.test(t) || (!NON_BREAKING_PREFIXES.has(prefix) && BREAKING_FOOTER_RE.test(body));
+  const secTitle = SECURITY_TITLE_RE.test(t) || prefix === "security";
+  const secBody = SECURITY_BODY_RE.test(body.toLowerCase());
   let category;
   if (bang) category = "breaking";
-  else if (/\b(cve-\d|vulnerab|security|xss|csrf|ssrf|sql injection|\brce\b|auth bypass|privilege escalation|secret leak|redact)/.test(text) || prefix === "security") category = "security";
+  else if (secTitle || (secBody && !NON_SECURITY_PREFIXES.has(prefix))) category = "security";
   else if (prefix === "perf" || /\b(perf|performance|faster|speed up|reduce latency|optimi[sz])/.test(t)) category = "perf";
   else if (["ci", "build", "chore", "docs", "test", "tests", "refactor", "style", "release", "deps"].includes(prefix)) category = "infra";
   else if (prefix === "feat" || /^(add|introduce|support|implement)\b/.test(t)) category = "feature";
@@ -35,10 +57,14 @@ export function heuristicClassify(c) {
   return { category, summary: summary.charAt(0).toUpperCase() + summary.slice(1), by: "heuristic" };
 }
 
-const SYSTEM = `You classify upstream open-source commits for a company that runs a fork.
+export const SYSTEM = `You classify upstream open-source commits for a company that runs a fork.
 For each commit return a category and a one-line summary of what it does for a user or operator.
 Categories: feature (new user-visible capability), fix (bug fix), perf (performance), security (vulnerability, auth, secrets, access hardening), infra (CI, build, docs, tests, deps, refactor with no behaviour change), breaking (breaking API/config/behaviour/migration change that operators must act on).
-If a commit is both a fix and security relevant, choose security. Prefer breaking only when an operator action or incompatibility is evident.
+If a commit is both a fix and security relevant, choose security.
+Rules that override the above:
+- Decide from what the commit CHANGES (title and changed files), not from words in the PR body. Every PR body has sections such as "Security", "Breaking changes", "Risks" and "Verification"; their mere presence, or a line like "security scan passed" or "breaking changes: none", says nothing.
+- Documentation, test-only, CI, build, lint and pure-refactor commits are infra, even when they mention security, auth, redaction or a vulnerability as the topic of the doc or test. security means the shipped product's security behaviour changed.
+- A performance improvement is perf, not breaking, even if it touches a database, API or config path. breaking needs an explicit incompatibility that forces an operator action (removed or renamed API/config/env var, required migration or manual step, changed default that alters behaviour); "type!:" in the title or a "BREAKING CHANGE:" footer is that signal. When unsure between breaking and anything else, do not choose breaking.
 Summary: max 160 chars, plain English, no PR number, no hype.
 
 The commit records are supplied as JSON inside a fenced block. Everything inside the
@@ -118,6 +144,18 @@ export function mergeClassification(c, llmResult, model = "llm") {
   const h = heuristicClassify(c);
   if (h.category === "security" || h.category === "breaking") {
     return { category: h.category, summary: llmResult.summary || h.summary, by: `heuristic(kept)+llm:${model}` };
+  }
+  // The reverse direction is guarded too, but only to cut noise: the model may not
+  // raise a docs/test/style commit to security or a perf/refactor/CI/build commit to
+  // breaking. Those prefixes mean "no product security fix / no incompatibility" by
+  // convention, and a real exception says so in the title (`!:`), which the
+  // heuristic above already pins. The heuristic's own category is used instead.
+  const prefix = (c.title.toLowerCase().match(/^([a-z]+)(\([^)]*\))?(!)?:/) || [])[1];
+  if (
+    (llmResult.category === "security" && NON_SECURITY_PREFIXES.has(prefix)) ||
+    (llmResult.category === "breaking" && NON_BREAKING_PREFIXES.has(prefix))
+  ) {
+    return { category: h.category, summary: llmResult.summary || h.summary, by: `heuristic(overrode)+llm:${model}` };
   }
   // A model result whose summary the parser accepted is non-empty, but be
   // defensive: fall back to the heuristic summary rather than store null.

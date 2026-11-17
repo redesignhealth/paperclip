@@ -8,7 +8,7 @@ import { buildForkOwnedMatcher, parseForkOwned, touchesMigrations } from "../lib
 import { extractPr, extractRevertSha, gitInput, listCommitsAfter, parseLog, parseNameList } from "../lib/upstreamGit.mjs";
 import { createBudget } from "../lib/budget.mjs";
 import { escapeMarkdownCell, renderOutboxText } from "../lib/alerts.mjs";
-import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
+import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse, SYSTEM } from "../lib/classify.mjs";
 import { escapeSlack, formatRowAlert, neutralizeMentions, renderAlert } from "../lib/alerts.mjs";
 import { loadConfig, resolveWorkerRefs } from "../lib/config.mjs";
 
@@ -601,4 +601,141 @@ test("report cells escape backslash, pipe, CR and newline", () => {
   assert.equal(escapeMarkdownCell("one\r\ntwo\rthree\nfour"), "one two three four");
   assert.ok(!escapeMarkdownCell("[@D](user://u1)").includes("user://"));
   assert.equal(escapeMarkdownCell(null), "");
+});
+
+// ---- RED-1631: noisy categories ----------------------------------------------
+
+// Real PR-template boilerplate: every upstream body has these sections.
+const TEMPLATE_BODY = [
+  "## Thinking Path", "> - fix the thing", "## What Changed", "- stuff",
+  "## Verification", "- CI, security, and exact-head review gates passed; secret redaction unchanged.",
+  "## Risks", "Low risk.", "**Breaking changes** none. No schema or API change.",
+].join("\n");
+
+test("docs/test/CI/perf commits are not security or breaking because of PR-body boilerplate", () => {
+  const f = (title, body = TEMPLATE_BODY, files = ["server/src/x.ts"]) => heuristicClassify({ title, body, files }).category;
+  assert.equal(f("docs(connections): Google Workspace approval checklist and code-fix plan (#21996)"), "infra");
+  assert.equal(f("test(restart-chaos): long mid-tool outages (#20711)"), "infra");
+  assert.equal(f("chore(ci): remove the Docker dependency cache check (#21331)"), "infra");
+  assert.equal(f("perf(db): reuse dedicated connections instead of opening one per call (#21567)"), "perf");
+  assert.equal(f("perf(ci): stop printing Postgres TRUNCATE notices (#21903)"), "perf");
+  assert.equal(f("refactor(runner): rename codex-runtime-adapter (#20938)"), "infra");
+  // A plain fix whose body only says "security checks passed" is a fix.
+  assert.equal(f("fix(runner): retry stalled Pi Node archive downloads (#18126)"), "fix");
+});
+
+test("real security and breaking signals still win", () => {
+  const f = (title, body = "", files = ["server/src/x.ts"]) => heuristicClassify({ title, body, files }).category;
+  // Title vocabulary, any prefix.
+  assert.equal(f("fix(auth): close auth bypass on invite accept (#1)"), "security");
+  assert.equal(f("docs: security advisory for CVE-2026-1234 (#2)"), "security");
+  assert.equal(f("test: add XSS regression for comments (#3)"), "security");
+  // Advisory identifiers in the body count for product commits, not for docs/tests.
+  assert.equal(f("fix(deps): bump better-auth (#4)", "Fixes CVE-2026-12345 and GHSA-abcd-1234-efgh."), "security");
+  assert.equal(f("docs: changelog (#5)", "mentions CVE-2026-12345"), "infra");
+  // Breaking: bang, title phrase, and a real footer on a product commit.
+  assert.equal(f("feat(api)!: drop v1 routes (#6)"), "breaking");
+  assert.equal(f("docs!: rewrite upgrade notes (#7)"), "breaking");
+  assert.equal(f("fix(config): rename env var (#8)", "Rename.\n\nBREAKING CHANGE: PAPERCLIP_X is now PAPERCLIP_Y"), "breaking");
+  // ...but a perf commit with that footer is not auto-pinned, and the lowercase
+  // template heading never matches.
+  assert.equal(f("perf(db): index lookups (#9)", "BREAKING CHANGE: none"), "perf");
+  assert.equal(f("fix(ui): tidy (#10)", "**Breaking changes** none"), "fix");
+});
+
+test("the model cannot raise docs/test to security or perf/refactor/CI to breaking", () => {
+  const llm = (category) => ({ category, summary: "s" });
+  const docs = commit({ title: "docs(connections): approval checklist (#1)", body: TEMPLATE_BODY });
+  const r1 = mergeClassification(docs, llm("security"), "m");
+  assert.equal(r1.category, "infra");
+  assert.equal(r1.by, "heuristic(overrode)+llm:m");
+  const perf = commit({ title: "perf(db): reuse connections (#2)", body: TEMPLATE_BODY });
+  assert.equal(mergeClassification(perf, llm("breaking"), "m").category, "perf");
+  // A product commit can still be raised by the model, and perf stays reachable.
+  const fix = commit({ title: "fix(auth): stop leaking session ids (#3)" });
+  assert.equal(mergeClassification(commit({ title: "fix(runner): foo (#4)" }), llm("security"), "m").category, "security");
+  assert.equal(mergeClassification(fix, llm("security"), "m").category, "security");
+  // Other model verdicts on docs/perf commits are untouched.
+  assert.equal(mergeClassification(docs, llm("fix"), "m").category, "fix");
+});
+
+test("classifier prompt tells the model to ignore PR-body headings and keep perf/docs out of breaking/security", () => {
+  assert.match(SYSTEM, /not from words in the PR body/);
+  assert.match(SYSTEM, /Documentation, test-only, CI, build, lint and pure-refactor commits are infra/);
+  assert.match(SYSTEM, /performance improvement is perf, not breaking/);
+});
+
+// ---- RED-1631: exactly-one alert across timed-out / lost deliveries -----------
+
+function commentSinkCfg() {
+  return {
+    httpTimeoutMs: 1000,
+    alert: { sink: "paperclip-comment", channel: "#eng", paperclipApiUrl: "http://x/api", paperclipApiKey: "k", issueId: "i1", paperclipRunId: "r1" },
+  };
+}
+
+// In-memory Paperclip comments API: GET lists newest first, POST appends.
+function fakeCommentsApi({ failPostsAfterStore = 0 } = {}) {
+  const comments = [];
+  const state = { gets: 0, posts: 0 };
+  const fetchImpl = async (url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") {
+      state.gets++;
+      assert.match(url, /\/api\/issues\/i1\/comments\?order=desc&limit=500$/);
+      return { ok: true, status: 200, json: async () => [...comments].reverse() };
+    }
+    state.posts++;
+    const id = `c${state.posts}`;
+    comments.push({ id, body: JSON.parse(init.body).body });
+    // The server stored the comment but the client never saw the response.
+    if (state.posts <= failPostsAfterStore) throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    return { ok: true, status: 201, json: async () => ({ id }) };
+  };
+  return { fetchImpl, comments, state };
+}
+
+test("a comment posted before a timed-out delivery is not posted again next run", async () => {
+  const { flushAlerts } = await import("../lib/alerts.mjs");
+  const alert = { id: 9, dedup_key: "row:" + "e".repeat(40), channel: "#eng", payload: { text: "hello" } };
+  const api = fakeCommentsApi({ failPostsAfterStore: 1 });
+  const cfg = commentSinkCfg();
+  const quiet = () => {};
+
+  const run1 = await flushAlerts(fakeDb([alert]), cfg, { fetchImpl: api.fetchImpl, log: quiet });
+  assert.deepEqual(run1, { delivered: 0, failed: 1, deferred: 0 });
+  assert.equal(api.comments.length, 1, "the comment did land");
+
+  const db2 = fakeDb([alert]);
+  const run2 = await flushAlerts(db2, cfg, { fetchImpl: api.fetchImpl, log: quiet });
+  assert.deepEqual(run2, { delivered: 1, failed: 0, deferred: 0 });
+  assert.equal(api.comments.length, 1, "no duplicate comment");
+  assert.equal(api.state.posts, 1);
+  const marked = db2.calls.find((c) => /SET delivered_at=now\(\)/.test(c.sql));
+  assert.match(marked.params[1], /^paperclip-comment:c1:existing$/);
+});
+
+test("comment sink posts each alert once, lists comments once per flush, and hides the marker", async () => {
+  const { flushAlerts } = await import("../lib/alerts.mjs");
+  const alerts = [1, 2, 3].map((id) => ({ id, dedup_key: `row:${id}`, channel: "#eng", payload: { text: `a${id}` } }));
+  const api = fakeCommentsApi();
+  const r = await flushAlerts(fakeDb(alerts), commentSinkCfg(), { fetchImpl: api.fetchImpl, log: () => {} });
+  assert.deepEqual(r, { delivered: 3, failed: 0, deferred: 0 });
+  assert.equal(api.state.gets, 1);
+  assert.equal(api.state.posts, 3);
+  assert.match(api.comments[0].body, /\n\n<!-- upstream-sync-alert:row:1 -->$/);
+  // A second flush over the same rows (crash after send, before mark) posts nothing.
+  await flushAlerts(fakeDb(alerts), commentSinkCfg(), { fetchImpl: api.fetchImpl, log: () => {} });
+  assert.equal(api.state.posts, 3);
+});
+
+test("if existing comments cannot be listed, nothing is posted and the alerts stay undelivered", async () => {
+  const { flushAlerts } = await import("../lib/alerts.mjs");
+  const alerts = [1, 2].map((id) => ({ id, dedup_key: `row:${id}`, channel: "#eng", payload: { text: `a${id}` } }));
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return { ok: false, status: 503, json: async () => ({}) }; };
+  const db = fakeDb(alerts);
+  const r = await flushAlerts(db, commentSinkCfg(), { fetchImpl, log: () => {} });
+  assert.deepEqual(r, { delivered: 0, failed: 2, deferred: 0 });
+  assert.equal(calls, 1, "lookup failure is cached for the rest of the flush");
+  assert.equal(db.calls.filter((c) => /SET delivered_at=now\(\)/.test(c.sql)).length, 0);
 });
