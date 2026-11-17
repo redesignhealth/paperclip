@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   chatActions,
+  chatIdentityLinks,
   heartbeatRuns,
   issueComments,
   issueTreeHoldMembers,
@@ -251,7 +252,13 @@ export async function isVerifiedExternalChatInteractionWake(
   if (!commentId) return false;
 
   const action = await dbOrTx
-    .select({ id: chatActions.id })
+    .select({
+      id: chatActions.id,
+      endpointId: chatActions.endpointId,
+      principalId: chatActions.principalId,
+      actorType: sql<string | null>`${chatActions.payload} ->> 'requestedByActorType'`,
+      actorId: sql<string | null>`${chatActions.payload} ->> 'requestedByActorId'`,
+    })
     .from(chatActions)
     .innerJoin(agentWakeupRequests, eq(agentWakeupRequests.id, chatActions.id))
     .innerJoin(
@@ -274,7 +281,25 @@ export async function isVerifiedExternalChatInteractionWake(
     )
     .limit(1)
     .then((rows) => rows[0] ?? null);
-  return action !== null;
+  if (!action) return false;
+  // A requester admitted through a linked identity must still be that user:
+  // revoking the link after admission has to stop queued work.
+  if (action.actorType !== "user") return true;
+  if (!action.principalId || !action.actorId) return false;
+  const link = await dbOrTx
+    .select({ id: chatIdentityLinks.id })
+    .from(chatIdentityLinks)
+    .where(
+      and(
+        eq(chatIdentityLinks.companyId, input.companyId),
+        eq(chatIdentityLinks.endpointId, action.endpointId),
+        eq(chatIdentityLinks.principalId, action.principalId),
+        eq(chatIdentityLinks.status, "linked"),
+        eq(chatIdentityLinks.paperclipUserId, action.actorId),
+      ),
+    )
+    .limit(1);
+  return link.length > 0;
 }
 
 function normalizeReleasePolicy(

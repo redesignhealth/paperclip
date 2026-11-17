@@ -33905,6 +33905,158 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
+  for (const blockedCase of ["blocker_added_after_queue", "endpoint_paused_after_queue", "identity_revoked_after_queue"]) {
+  it(`re-checks a queued blocked Slack follow-up at claim time: ${blockedCase}`, async () => {
+    const fixture = await seedCompany();
+    const adapterType = `chat-blocked-test-${randomUUID()}`;
+    const finals = ["BLOCKED-FIRST", "BLOCKED-SECOND"];
+    let releaseHold!: () => void;
+    let notifyHold!: () => void;
+    const holdGate = new Promise<void>((resolve) => { releaseHold = resolve; });
+    const holdStarted = new Promise<void>((resolve) => { notifyHold = resolve; });
+    const execute = vi.fn(async (_input: unknown) => {
+      const n = execute.mock.calls.length;
+      if (n === 2) { notifyHold(); await holdGate; }
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: `fixture-answer-${n}`, provider: "test", model: "test-model" };
+    });
+    registerServerAdapter({
+      type: adapterType,
+      supportsLocalAgentJwt: false,
+      execute,
+      testEnvironment: async () => ({
+        adapterType,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+
+    const heartbeat = heartbeatService(db);
+    try {
+      await db
+        .update(companies)
+        .set({ defaultResponsibleUserId: "owner-user" })
+        .where(eq(companies.id, fixture.companyId));
+      await db
+        .update(agents)
+        .set({
+          adapterType,
+          runtimeConfig: {
+            heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+          },
+        })
+        .where(eq(agents.id, fixture.assignedAgentId));
+
+      const { callbacks, endpoint, runtime, service } =
+        await configuredSlackEndpoint(fixture, { wakeup: heartbeat.wakeup });
+      // Explicit fixture state for the canonical pause API precondition.
+      await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, endpoint.id));
+      const configuredEndpoint = await service.get(endpoint.id);
+      const [principal] = await db
+        .insert(chatExternalPrincipals)
+        .values({
+          companyId: fixture.companyId,
+          provider: "slack",
+          providerAccountId: configuredEndpoint.providerAccountId!,
+          externalId: "U-BLOCKED-LINKED",
+          kind: "user",
+          displayName: "Linked Chat User",
+        })
+        .returning();
+      await db.insert(chatIdentityLinks).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        principalId: principal!.id,
+        paperclipUserId: "owner-user",
+        status: "linked",
+        confirmedAt: new Date(),
+      });
+
+      const channel = makeThread({
+        channelId: "C-BLOCKED",
+        id: "slack:C-BLOCKED:blocked-root",
+        name: "blocked",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: "blocked-root",
+          text: "@maya answer the first question",
+          mentioned: true,
+          userId: "U-BLOCKED-LINKED",
+        }),
+        trigger: "mention",
+      });
+      await heartbeat.drainActiveRunExecutions();
+      await service.processPendingPublications(1_000);
+      expect(execute).toHaveBeenCalledTimes(1);
+
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, endpoint.id),
+            eq(chatConversations.externalThreadId, channel.thread.id),
+          ),
+        );
+      const holdIssueId = randomUUID();
+      await db.insert(issues).values({ id: holdIssueId, companyId: fixture.companyId,
+        title: "Unrelated running fixture", status: "todo", priority: "medium",
+        responsibleUserId: "owner-user", assigneeAgentId: fixture.assignedAgentId });
+      await heartbeat.wakeup(fixture.assignedAgentId, { source: "on_demand", triggerDetail: "manual",
+        reason: "local_hold", contextSnapshot: { issueId: holdIssueId }, payload: { issueId: holdIssueId } });
+      await holdStarted;
+      expect(execute).toHaveBeenCalledTimes(2);
+      const blockerId = randomUUID();
+      const addBlocker = async () => {
+        await db.insert(issues).values({ id: blockerId, companyId: fixture.companyId,
+          title: "Unresolved fixture dependency", status: "todo", priority: "medium", responsibleUserId: "owner-user" });
+        await db.insert(issueRelations).values({ companyId: fixture.companyId,
+          issueId: blockerId, relatedIssueId: conversation!.issueId, type: "blocks" });
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, conversation!.issueId));
+      };
+      if (blockedCase !== "blocker_added_after_queue") await addBlocker();
+      await deliverMessage({ callbacks, endpointId: endpoint.id, thread: channel.thread,
+        message: makeMessage({ id: "queued-followup", text: "Please answer this fixture follow-up",
+          userId: "U-BLOCKED-LINKED" }), trigger: "subscribed_message" });
+      const queued = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, fixture.companyId), eq(heartbeatRuns.status, "queued")));
+      expect(queued).toHaveLength(1);
+      expect(queued[0]!.contextSnapshot).toMatchObject({ issueId: conversation!.issueId });
+      if (blockedCase === "blocker_added_after_queue") {
+        expect(queued[0]!.contextSnapshot?.dependencyBlockedInteraction).not.toBe(true);
+        await addBlocker();
+      } else if (blockedCase === "endpoint_paused_after_queue") {
+        await service.configure(endpoint.id, { action: "pause" }, "owner-user");
+        expect((await service.get(endpoint.id)).status).toBe("paused");
+      } else {
+        await service.revokeLink(endpoint.id, principal!.id);
+        const [revoked] = await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, endpoint.id));
+        expect(revoked).toMatchObject({ status: "revoked", paperclipUserId: null });
+      }
+      releaseHold();
+      await heartbeat.drainActiveRunExecutions();
+      const targetCalls = execute.mock.calls.map(([input]) => input as any)
+        .filter((input) => input.runId === queued[0]!.id);
+      if (blockedCase === "blocker_added_after_queue") {
+        expect(targetCalls, "Exactly the queued target run must execute").toHaveLength(1);
+        expect(targetCalls[0].context).toMatchObject({
+          dependencyBlockedInteraction: true, unresolvedBlockerIssueIds: [blockerId] });
+      } else {
+        expect(targetCalls, "Revoked/paused queued chat must not execute").toHaveLength(0);
+      }
+    } finally {
+      releaseHold();
+      await heartbeat.drainActiveRunExecutions();
+      unregisterServerAdapter(adapterType);
+    }
+  }, 45000);
+  }
+
   it("answers a Slack follow-up in bounded mode while the conversation issue has an unresolved blocker", async () => {
     const fixture = await seedCompany();
     const adapterType = `chat-blocked-test-${randomUUID()}`;
