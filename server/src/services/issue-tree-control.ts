@@ -110,6 +110,18 @@ function readInteractionWakeCommentId(record: unknown) {
   return readNonEmptyStringFromRecord(record, "wakeCommentId") ?? readNonEmptyStringFromRecord(record, "commentId");
 }
 
+/** Every comment a (possibly merged) wake will hand to the agent, not just the latest. */
+function readInteractionWakeCommentIds(record: unknown) {
+  const ids = new Set<string>();
+  const latest = readInteractionWakeCommentId(record);
+  if (latest) ids.add(latest);
+  const value = record && typeof record === "object" ? (record as Record<string, unknown>).wakeCommentIds : null;
+  if (Array.isArray(value)) {
+    for (const entry of value) if (typeof entry === "string" && entry.trim()) ids.add(entry.trim());
+  }
+  return [...ids];
+}
+
 function hasVerifiedInteractionSource(wakeReason: string, contextSnapshot: Record<string, unknown>) {
   const source = readNonEmptyStringFromRecord(contextSnapshot, "source");
   if (!source) return false;
@@ -250,9 +262,20 @@ export async function isVerifiedExternalChatInteractionWake(
   const source = readNonEmptyStringFromRecord(context, "source");
   if ((!input.wakeupRequestId && !input.runId) || !source?.startsWith("chat:")) return false;
   if (readNonEmptyStringFromRecord(context, "wakeReason") !== EXTERNAL_CHAT_WAKE_REASON) return false;
-  const commentId = readInteractionWakeCommentId(context);
-  if (!commentId) return false;
+  const commentIds = readInteractionWakeCommentIds(context);
+  if (commentIds.length === 0) return false;
+  // A merged run carries several messages; each must still be authorized.
+  for (const commentId of commentIds) {
+    if (!(await isVerifiedExternalChatComment(dbOrTx, input, commentId))) return false;
+  }
+  return true;
+}
 
+async function isVerifiedExternalChatComment(
+  dbOrTx: Pick<Db, "select">,
+  input: { companyId: string; issueId: string; agentId: string; wakeupRequestId?: string | null; runId?: string | null },
+  commentId: string,
+) {
   const action = await dbOrTx
     .select({
       id: chatActions.id,

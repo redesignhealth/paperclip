@@ -33959,12 +33959,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       confirmedAt: new Date(),
     });
     const channel = makeThread({ channelId: "C-BLOCKED", id: "slack:C-BLOCKED:blocked-root", name: "blocked" });
-    const send = (id: string, text: string, trigger: "mention" | "subscribed_message") =>
+    const send = (id: string, text: string, trigger: "mention" | "subscribed_message", userId = "U-BLOCKED-LINKED") =>
       deliverMessage({
         callbacks,
         endpointId: endpoint.id,
         thread: channel.thread,
-        message: makeMessage({ id, text, mentioned: trigger === "mention", userId: "U-BLOCKED-LINKED" }),
+        message: makeMessage({ id, text, mentioned: trigger === "mention", userId }),
         trigger,
       });
     await send("blocked-root", "@maya answer the first question", "mention");
@@ -34051,6 +34051,36 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const calls = execute.mock.calls.map(([input]) => input as any).filter((input) => input.runId === queued[0]!.id);
     expect(calls).toHaveLength(1);
     expect(calls[0].context).toMatchObject({ dependencyBlockedInteraction: true, unresolvedBlockerIssueIds: [t.blockerId] });
+  }, 45000);
+
+  it("does not run a merged blocked Slack wake whose earlier sender was revoked", async () => {
+    const t = await seedBlockedSlackConversation(true);
+    const { fixture, heartbeat, endpoint, service, conversation, execute } = t;
+    const holdIssueId = randomUUID();
+    await db.insert(issues).values({ id: holdIssueId, companyId: fixture.companyId, title: "Unrelated running fixture",
+      status: "todo", priority: "medium", responsibleUserId: "owner-user", assigneeAgentId: fixture.assignedAgentId });
+    await heartbeat.wakeup(fixture.assignedAgentId, { source: "on_demand", triggerDetail: "manual",
+      reason: "local_hold", contextSnapshot: { issueId: holdIssueId }, payload: { issueId: holdIssueId } });
+    await t.holdStarted;
+    await t.addBlocker();
+    const [second] = await db.insert(chatExternalPrincipals).values({
+      companyId: fixture.companyId, provider: "slack", providerAccountId: t.principal.providerAccountId,
+      externalId: "U-BLOCKED-B", kind: "user", displayName: "Second Linked User",
+    }).returning();
+    await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: endpoint.id,
+      principalId: second!.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
+    await t.send("merge-a", "earlier sender question", "subscribed_message");
+    await t.send("merge-b", "later sender question", "subscribed_message", "U-BLOCKED-B");
+    const queued = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, fixture.companyId), eq(heartbeatRuns.status, "queued"),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${conversation.issueId}`));
+    expect(queued).toHaveLength(1);
+    await service.revokeLink(endpoint.id, t.principal.id);
+    const links = await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.endpointId, endpoint.id));
+    expect(links.map((l) => l.status).sort()).toEqual(["linked", "revoked"]);
+    t.releaseHold();
+    await heartbeat.drainActiveRunExecutions();
+    expect(execute.mock.calls.map(([input]) => input as any).filter((input) => input.runId === queued[0]!.id)).toHaveLength(0);
   }, 45000);
 
   it("answers a Slack follow-up in bounded mode while the conversation issue has an unresolved blocker", async () => {
