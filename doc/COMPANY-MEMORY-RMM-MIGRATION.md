@@ -190,11 +190,11 @@ Dry run first, then the real run (calls in section A, steps 2-3).
 
 ## Explicit memory tools for Claude and Codex agents (TECH-8832)
 
-Enrolling a Claude or Codex agent wires the recall hook (and, only if capture is on, the end-of-turn capture hook). It gives the agent no way to search, save or delete memory on its own. The optional `agent-memory-tools` entry adds that: `memory_search`, `memory_add` and `memory_delete`, through the agent's own gateway connection to the memory service, using the same `agent-memory-<agentId>` token (no second secret, one rotation).
+Enrolling a Claude or Codex agent wires the recall hook and sets its memory environment. The end-of-turn capture hook is registered in the image for every Claude and Codex run, and it captures unless `RH_MEMORY_CAPTURE` holds an off value; new enrolments get an explicit `off` unless the server sets `PAPERCLIP_AGENT_MEMORY_CAPTURE=on`, while a legacy agent with no value set captures. Either way the agent has no way to search, save or delete memory on its own. The optional `agent-memory-tools` entry (added by the memory tools PR in this series, so these steps apply once it is deployed) adds that: `memory_search`, `memory_add` and `memory_delete`, through the agent's own gateway connection to the memory service, using the same `agent-memory-<agentId>` token (no second secret, one rotation).
 
 - **Server flags:** `PAPERCLIP_AGENT_MEMORY_TOOLS_ENABLED=true` on top of the memory flags above. New Claude and Codex agents then get it at creation; Hermes agents never do.
-- **Existing agents:** run the missing-entry enrolment with `"keys": ["agent-memory-tools"]` (dry run first). It needs the backfill flag and an already-present `agent-memory` entry. The first run after enrolment starts a fresh Claude session per agent.
-- **What the agent is told:** the injected guidance names the three tools and says what to save (lasting decisions, preferences, corrections; never status, ids or URLs). It says the end of each turn is captured automatically only when capture is on for that agent; with the tools on, leave `RH_MEMORY_CAPTURE` off so a fact is not written twice.
+- **Existing agents:** run the missing-entry enrolment with `"keys": ["agent-memory-tools"]` (dry run first). It needs the backfill flag and an `agent-memory` entry already present on the agent.
+- **What the agent is told:** the injected guidance names the three tools and says what to save (lasting decisions, preferences, corrections; never status, ids or URLs). It says the end of each turn is captured automatically only when the agent's `RH_MEMORY_CAPTURE` is not an off value; with the tools on, leave capture off so a fact is not written twice.
 - **Without the entry:** the guidance says recall is automatic and that the agent has no tool to search or save memory in the run.
 
 ## Access and operations lessons
