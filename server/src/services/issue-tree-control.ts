@@ -241,12 +241,14 @@ export async function isVerifiedExternalChatInteractionWake(
     issueId: string;
     agentId: string;
     wakeupRequestId?: string | null;
+    /** A wake merged into a queued run keeps the first request id; its own receipt points at the run. */
+    runId?: string | null;
     contextSnapshot: Record<string, unknown> | null | undefined;
   },
 ) {
   const context = input.contextSnapshot ?? null;
   const source = readNonEmptyStringFromRecord(context, "source");
-  if (!input.wakeupRequestId || !source?.startsWith("chat:")) return false;
+  if ((!input.wakeupRequestId && !input.runId) || !source?.startsWith("chat:")) return false;
   if (readNonEmptyStringFromRecord(context, "wakeReason") !== EXTERNAL_CHAT_WAKE_REASON) return false;
   const commentId = readInteractionWakeCommentId(context);
   if (!commentId) return false;
@@ -267,7 +269,10 @@ export async function isVerifiedExternalChatInteractionWake(
     )
     .where(
       and(
-        eq(chatActions.id, input.wakeupRequestId),
+        or(
+          input.wakeupRequestId ? eq(chatActions.id, input.wakeupRequestId) : undefined,
+          input.runId ? eq(agentWakeupRequests.runId, input.runId) : undefined,
+        ),
         eq(chatActions.companyId, input.companyId),
         eq(chatActions.kind, "inbound_wakeup"),
         sql`${chatActions.payload} ->> 'issueId' = ${input.issueId}`,
@@ -284,6 +289,7 @@ export async function isVerifiedExternalChatInteractionWake(
   if (!action) return false;
   // A requester admitted through a linked identity must still be that user:
   // revoking the link after admission has to stop queued work.
+  if (!action.actorType) return false;
   if (action.actorType !== "user") return true;
   if (!action.principalId || !action.actorId) return false;
   const link = await dbOrTx

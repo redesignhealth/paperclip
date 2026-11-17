@@ -1131,6 +1131,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           issueId,
           agentId: run.agentId,
           wakeupRequestId: run.wakeupRequestId,
+          runId: run.id,
           contextSnapshot: context,
         }));
       let chatBlockedInteractionAuthorized = false;

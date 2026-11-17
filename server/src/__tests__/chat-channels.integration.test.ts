@@ -34030,6 +34030,29 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   }, 45000);
   }
 
+  it("answers a merged blocked Slack follow-up: the second message folds into the queued run", async () => {
+    const t = await seedBlockedSlackConversation(true);
+    const { fixture, heartbeat, conversation, execute } = t;
+    const holdIssueId = randomUUID();
+    await db.insert(issues).values({ id: holdIssueId, companyId: fixture.companyId, title: "Unrelated running fixture",
+      status: "todo", priority: "medium", responsibleUserId: "owner-user", assigneeAgentId: fixture.assignedAgentId });
+    await heartbeat.wakeup(fixture.assignedAgentId, { source: "on_demand", triggerDetail: "manual",
+      reason: "local_hold", contextSnapshot: { issueId: holdIssueId }, payload: { issueId: holdIssueId } });
+    await t.holdStarted;
+    await t.send("merge-one", "first queued question", "subscribed_message");
+    await t.send("merge-two", "second queued question", "subscribed_message");
+    const queued = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, fixture.companyId), eq(heartbeatRuns.status, "queued"),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${conversation.issueId}`));
+    expect(queued).toHaveLength(1);
+    await t.addBlocker();
+    t.releaseHold();
+    await heartbeat.drainActiveRunExecutions();
+    const calls = execute.mock.calls.map(([input]) => input as any).filter((input) => input.runId === queued[0]!.id);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].context).toMatchObject({ dependencyBlockedInteraction: true, unresolvedBlockerIssueIds: [t.blockerId] });
+  }, 45000);
+
   it("answers a Slack follow-up in bounded mode while the conversation issue has an unresolved blocker", async () => {
     const t = await seedBlockedSlackConversation(false);
     const { fixture, heartbeat, endpoint, runtime, service, channel, conversation, execute, blockerId } = t;
