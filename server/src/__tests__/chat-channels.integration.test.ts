@@ -65184,6 +65184,35 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
+  it("keeps a failed Slack chat retry behind an unresolved blocker from running blocked work", async () => {
+    const context = await failedChatRetryFixture("slack");
+    try {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: context.fixture.companyId,
+        title: "Unresolved fixture dependency", status: "todo", priority: "medium", responsibleUserId: "owner-user" });
+      await db.insert(issueRelations).values({ companyId: context.fixture.companyId,
+        issueId: blockerId, relatedIssueId: context.issue.id, type: "blocks" });
+      const staged = await db.transaction((tx) =>
+        context.service.prepareFailedChatRunRetry(tx, {
+          companyId: context.fixture.companyId, issueId: context.issue.id,
+          agentId: context.fixture.assignedAgentId, failedRunId: context.runId,
+          initiatedByUserId: "owner-user",
+        }),
+      );
+      await context.service.processFailedChatRunRetry(staged.actionId);
+      const [retryReceipt] = await readAgentWakeupRequestsById(staged.actionId);
+      const retryRuns = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, context.fixture.assignedAgentId));
+      expect(retryReceipt).toMatchObject({ reason: "retry_failed_run", status: "queued" });
+      expect(retryRuns.filter((r) => r.id !== context.runId)).toHaveLength(0);
+      const relations = await db.select({ id: issueRelations.id }).from(issueRelations)
+        .where(eq(issueRelations.relatedIssueId, context.issue.id));
+      expect(relations).toHaveLength(1);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
   it.each(["slack", "telegram"] as const)(
     "keeps a %s retry's queue, working, and selected final on its own provider identity",
     async (provider) => {
