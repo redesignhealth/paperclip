@@ -208,6 +208,50 @@ describe("ResourceQuota reconciliation", () => {
   });
 });
 
+describe("ensureTenantCached concurrency and keying", () => {
+  const input = {
+    namespace: "paperclip-conc",
+    companyId: "c",
+    paperclipServerNamespace: "paperclip",
+    serviceAccountAnnotations: {},
+    egressMode: "standard" as const,
+    egressAllowFqdns: ["a.example.com"] as string[],
+    egressAllowCidrs: [] as string[],
+    resourceQuota: { pods: "5", requestsCpu: "2", requestsMemory: "4Gi", limitsCpu: "4", limitsMemory: "8Gi" },
+  };
+
+  it("shares one in-flight ensure between concurrent acquires and ignores key order", async () => {
+    invalidateTenantCache();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const exists = vi.fn().mockResolvedValue({});
+    const readNamespace = vi.fn(async () => { await gate; return {}; });
+    const clients = {
+      core: {
+        readNamespace,
+        readNamespacedServiceAccount: exists,
+        readNamespacedLimitRange: exists,
+        readNamespacedResourceQuota: vi.fn().mockResolvedValue({
+          spec: { hard: { pods: "5", "requests.cpu": "2", "requests.memory": "4Gi", "limits.cpu": "4", "limits.memory": "8Gi" } },
+        }),
+      },
+      rbac: { readNamespacedRole: exists, readNamespacedRoleBinding: exists },
+      networking: { readNamespacedNetworkPolicy: exists },
+      custom: { getNamespacedCustomObject: exists },
+    };
+    const reordered = { resourceQuota: input.resourceQuota, egressAllowCidrs: [], egressAllowFqdns: ["a.example.com"],
+      egressMode: input.egressMode, serviceAccountAnnotations: {}, paperclipServerNamespace: "paperclip",
+      companyId: "c", namespace: "paperclip-conc" };
+    const a = ensureTenantCached(clients as never, input);
+    const b = ensureTenantCached(clients as never, reordered as never);
+    release();
+    await Promise.all([a, b]);
+    expect(readNamespace).toHaveBeenCalledTimes(1);
+    await ensureTenantCached(clients as never, reordered as never);
+    expect(readNamespace).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("assertPodCapacity", () => {
   function quotaClients(status: unknown) {
     return { core: { readNamespacedResourceQuota: vi.fn().mockResolvedValue({ status }) } };

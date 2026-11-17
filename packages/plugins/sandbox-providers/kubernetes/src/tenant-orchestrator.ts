@@ -350,17 +350,47 @@ async function createIgnoringAlreadyExists(create: Promise<unknown>): Promise<vo
 // edits the quota out of band.
 const TENANT_ENSURE_TTL_MS = 5 * 60_000;
 const ensuredTenants = new Map<string, { fingerprint: string; expiresAt: number }>();
+// Concurrent acquires for one namespace share a single in-flight ensure.
+const inFlightEnsures = new Map<string, { fingerprint: string; promise: Promise<void> }>();
+
+// Key-order-independent serialization, so the same input always fingerprints
+// the same regardless of how the caller built the object.
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
 
 export async function ensureTenantCached(
   clients: KubeClients,
   input: EnsureTenantInput,
   now: () => number = Date.now,
 ): Promise<void> {
-  const fingerprint = JSON.stringify(input);
+  const fingerprint = stableStringify(input);
   const hit = ensuredTenants.get(input.namespace);
   if (hit && hit.fingerprint === fingerprint && hit.expiresAt > now()) return;
-  await ensureTenant(clients, input);
-  ensuredTenants.set(input.namespace, { fingerprint, expiresAt: now() + TENANT_ENSURE_TTL_MS });
+  const pending = inFlightEnsures.get(input.namespace);
+  if (pending && pending.fingerprint === fingerprint) return pending.promise;
+
+  const promise = ensureTenant(clients, input)
+    .then(() => {
+      // Drop expired entries opportunistically so the map cannot grow without bound.
+      for (const [namespace, entry] of ensuredTenants) {
+        if (entry.expiresAt <= now()) ensuredTenants.delete(namespace);
+      }
+      ensuredTenants.set(input.namespace, { fingerprint, expiresAt: now() + TENANT_ENSURE_TTL_MS });
+    })
+    .finally(() => {
+      if (inFlightEnsures.get(input.namespace)?.promise === promise) inFlightEnsures.delete(input.namespace);
+    });
+  inFlightEnsures.set(input.namespace, { fingerprint, promise });
+  return promise;
 }
 
 /** Drop the cached ensure for a namespace (or all), e.g. after a 404 on use. */
