@@ -1,4 +1,5 @@
 import { forbidden } from "../../errors.js";
+import { logger } from "../../middleware/logger.js";
 import type { SlackObject } from "./slack-client.js";
 
 const TEXT_MAX_BYTES = 256 * 1024;
@@ -6,9 +7,18 @@ const TEXT_MAX_BYTES = 256 * 1024;
 const CONVERTIBLE_MAX_BYTES = 5 * 1024 * 1024;
 const CONVERTED_MAX_CHARS = 200_000;
 const CONVERT_TIMEOUT_MS = 20_000;
+const MAX_CONCURRENT_CONVERSIONS = 2;
 
 const METADATA_ONLY =
   "Metadata only. This file type or size is not available as inline text; do not claim to have read its contents.";
+const NO_CONTENT =
+  "Metadata only. Slack returned no content for this file; do not claim to have read its contents.";
+const CONVERTER_BUSY =
+  "Metadata only. Other documents are being converted right now; try again shortly. Do not claim to have read its contents.";
+
+// Conversions still running, including ones whose caller stopped waiting. The
+// native work cannot be cancelled, so this is what bounds it.
+let activeConversions = 0;
 
 const CONVERTIBLE = [
   { mimetype: "application/pdf", filetype: "pdf", label: "PDF" },
@@ -87,6 +97,15 @@ const CONVERSION_FAILURES: Record<string, string> = {
   timeout: "took too long to convert",
 };
 
+// Errors that mean this document cannot be converted, not that something is wrong here.
+const DOCUMENT_FAILURE_CODES = new Set<unknown>([
+  "needsOcr",
+  "encrypted",
+  "malformed",
+  "unsupported",
+  "missingPart",
+]);
+
 function conversionLimitation(label: string, code: unknown) {
   const reason =
     (typeof code === "string" && CONVERSION_FAILURES[code]) ||
@@ -99,12 +118,19 @@ async function extractText(
   label: string,
   convert: SlackFileConverter,
 ) {
+  if (activeConversions >= MAX_CONCURRENT_CONVERSIONS)
+    return { content: null, limitation: CONVERTER_BUSY };
   let timer: NodeJS.Timeout | undefined;
   try {
-    // The native conversion cannot be cancelled once started; the download cap
-    // bounds how long it can keep running after this stops waiting.
+    activeConversions += 1;
+    // Counted until the conversion itself settles, not until this stops waiting.
+    const conversion = Promise.resolve()
+      .then(() => convert(bytes))
+      .finally(() => {
+        activeConversions -= 1;
+      });
     const markdown = await Promise.race([
-      convert(bytes),
+      conversion,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(Object.assign(new Error("timeout"), { code: "timeout" })),
@@ -114,17 +140,30 @@ async function extractText(
     ]);
     if (markdown.trim() === "")
       return { content: null, limitation: conversionLimitation(label, "empty") };
-    return markdown.length > CONVERTED_MAX_CHARS
-      ? {
-          content: markdown.slice(0, CONVERTED_MAX_CHARS),
-          limitation: `Text truncated at ${CONVERTED_MAX_CHARS} characters.`,
-        }
-      : { content: markdown, limitation: null };
+    if (markdown.length <= CONVERTED_MAX_CHARS)
+      return { content: markdown, limitation: null };
+    // Do not cut between the two halves of a surrogate pair.
+    const cut = markdown.slice(0, CONVERTED_MAX_CHARS);
+    const last = cut.charCodeAt(cut.length - 1);
+    return {
+      content: last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut,
+      limitation: `Text truncated at ${CONVERTED_MAX_CHARS} characters.`,
+    };
   } catch (error) {
     const code =
       error && typeof error === "object" && "code" in error
         ? (error as { code: unknown }).code
         : undefined;
+    // A document that cannot be converted is the caller's business. Anything
+    // else (a missing native binary, an unexpected failure) is ours.
+    if (!DOCUMENT_FAILURE_CODES.has(code))
+      logger.warn(
+        {
+          code,
+          error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+        },
+        "Slack file text extraction failed",
+      );
     return { content: null, limitation: conversionLimitation(label, code) };
   } finally {
     clearTimeout(timer);
@@ -148,7 +187,7 @@ export async function readSlackFileContent(
     const bytes = await download(file, botToken, fetchImpl, TEXT_MAX_BYTES);
     return bytes
       ? { content: bytes.toString("utf8"), limitation: null }
-      : metadataOnly;
+      : { content: null, limitation: NO_CONTENT };
   }
   const kind = convertible(file);
   if (!kind) return metadataOnly;
@@ -157,6 +196,11 @@ export async function readSlackFileContent(
       content: null,
       limitation: `Metadata only. This ${kind.label} is over the ${CONVERTIBLE_MAX_BYTES / 1024 / 1024} MB read limit; do not claim to have read its contents.`,
     };
+  // Checked again once the bytes arrive; this only avoids a download that would be refused.
+  if (activeConversions >= MAX_CONCURRENT_CONVERSIONS)
+    return { content: null, limitation: CONVERTER_BUSY };
   const bytes = await download(file, botToken, fetchImpl, CONVERTIBLE_MAX_BYTES);
-  return bytes ? extractText(bytes, kind.label, convert) : metadataOnly;
+  return bytes
+    ? extractText(bytes, kind.label, convert)
+    : { content: null, limitation: NO_CONTENT };
 }
