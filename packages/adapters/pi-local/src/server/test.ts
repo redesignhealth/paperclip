@@ -1,4 +1,7 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -18,6 +21,7 @@ import {
   ensureAdapterExecutionTargetDirectory,
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
+  prepareAdapterExecutionTargetRuntime,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
 import { discoverPiModelsCached } from "./models.js";
@@ -128,18 +132,15 @@ export async function testEnvironment(
     if (typeof value === "string") env[key] = value;
   }
   const baseRuntimeEnv = normalizeEnv(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env }));
-  // Remote targets get the managed config shipped by execute.ts; here we only validate locally.
-  const prepared = targetIsRemote
-    ? null
-    : await preparePiRuntimeConfig({ env: baseRuntimeEnv }).catch((err) => {
-        checks.push({
-          code: "pi_provider_config_failed",
-          level: "error",
-          message: err instanceof Error ? err.message : "Failed to prepare PAPERCLIP_PI_PROVIDERS config.",
-        });
-        return null;
-      });
-  const runtimeEnv = prepared?.env ?? baseRuntimeEnv;
+  const prepared = await preparePiRuntimeConfig({ env: baseRuntimeEnv }).catch((err) => {
+    checks.push({
+      code: "pi_provider_config_failed",
+      level: "error",
+      message: err instanceof Error ? err.message : "Failed to prepare PAPERCLIP_PI_PROVIDERS config.",
+    });
+    return null;
+  });
+  const runtimeEnv = { ...(prepared?.env ?? baseRuntimeEnv) };
   for (const note of prepared?.notes ?? []) {
     checks.push({
       code: "pi_provider_config",
@@ -147,7 +148,35 @@ export async function testEnvironment(
       message: note,
     });
   }
+  // Like execute.ts, a remote target needs the managed provider config shipped to it,
+  // or the probe's `--provider` cannot resolve a custom provider inside the target.
+  let remoteRuntime: Awaited<ReturnType<typeof prepareAdapterExecutionTargetRuntime>> | null = null;
+  let remoteRuntimeLocalDir: string | null = null;
   try {
+  if (targetIsRemote && prepared?.agentConfigDir && !checks.some((check) => check.code === "pi_cwd_invalid")) {
+    try {
+      remoteRuntimeLocalDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-envtest-"));
+      remoteRuntime = await prepareAdapterExecutionTargetRuntime({
+        runId,
+        target,
+        adapterKey: "pi",
+        workspaceLocalDir: remoteRuntimeLocalDir,
+        workspaceRemoteDir: cwd,
+        syncWorkspace: false,
+        workspaceRestoreRetryDelaysMs: [],
+        assets: [{ key: "agentConfig", localDir: prepared.agentConfigDir }],
+      });
+      const remoteAgentConfigDir = remoteRuntime.assetDirs.agentConfig;
+      if (!remoteAgentConfigDir) throw new Error("The Pi provider config was not staged to the execution target.");
+      runtimeEnv.PI_CODING_AGENT_DIR = remoteAgentConfigDir;
+    } catch (err) {
+      checks.push({
+        code: "pi_provider_config_failed",
+        level: "error",
+        message: `Failed to ship the PAPERCLIP_PI_PROVIDERS config to ${targetLabel}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
 
   const cwdInvalid = checks.some((check) => check.code === "pi_cwd_invalid");
   if (cwdInvalid) {
@@ -358,6 +387,8 @@ export async function testEnvironment(
     testedAt: new Date().toISOString(),
   };
   } finally {
+    await remoteRuntime?.restoreWorkspace().catch(() => {});
+    if (remoteRuntimeLocalDir) await fs.rm(remoteRuntimeLocalDir, { recursive: true, force: true }).catch(() => {});
     await prepared?.cleanup();
   }
 }
