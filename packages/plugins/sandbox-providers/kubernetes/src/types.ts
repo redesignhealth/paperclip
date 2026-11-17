@@ -149,8 +149,8 @@ export interface KubernetesLeaseMetadata {
   nativeFileSyncUnsupported?: boolean;
   /**
    * The lease's remote working dir and native file-sync confinement root. Set at
-   * acquire/resume to the pod's /workspace mount (or a previously realized
-   * workspace dir) and updated by realizeWorkspace.
+   * acquire to the pod's /workspace mount; resume keeps an already-recorded
+   * absolute dir and otherwise uses /workspace.
    */
   remoteCwd?: string;
 }

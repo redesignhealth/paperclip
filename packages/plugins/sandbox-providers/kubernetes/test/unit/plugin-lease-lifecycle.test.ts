@@ -483,7 +483,7 @@ describe("lease remote working dir (TECH-8174: runs that never realize a workspa
     expect(resolveSyncRemoteDir(lease as never)).toBe("/workspace");
   });
 
-  it("keeps a realized workspace dir across resume", async () => {
+  it("keeps an already-recorded remote dir across resume", async () => {
     h.clients = {
       custom: { getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")) },
       core: { readNamespacedPod: vi.fn().mockResolvedValue({ metadata: {}, status: { phase: "Running" } }) },
@@ -502,6 +502,11 @@ describe("lease remote working dir (TECH-8174: runs that never realize a workspa
   it("still refuses to sync a lease with no remote dir at all, and confines runtime assets to the root", () => {
     expect(() => resolveSyncRemoteDir({ providerLeaseId: "x", metadata: {} } as never)).toThrow(/workspace remote dir/);
     expect(leaseRemoteCwd("  ")).toBe("/workspace");
+    // Only a normalized absolute dir below / can become the confinement root.
+    for (const unsafe of ["/", "relative/dir", "/workspace/../etc", "/workspace/", 42]) {
+      expect(leaseRemoteCwd(unsafe)).toBe("/workspace");
+    }
+    expect(leaseRemoteCwd(" /workspace/project ")).toBe("/workspace/project");
     // Runtime assets staged under the lease's working dir are inside the confinement root...
     expect(() =>
       assertConfinedSandboxPath("/workspace", "/workspace/.paperclip-runtime/hermes/hermesHome", "target"),

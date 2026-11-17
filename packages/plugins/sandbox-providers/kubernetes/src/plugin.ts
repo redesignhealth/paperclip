@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import path from "node:path";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -161,21 +162,24 @@ const RESUME_READY_POLL_MS = 1_000;
 // pod-spec-builder). It is the lease's working dir until a workspace is realized.
 export const DEFAULT_WORKSPACE_REMOTE_DIR = "/workspace";
 
-// The lease's remote working dir: an already-recorded one (e.g. a realized
-// workspace's remotePath) is kept; otherwise the pod's /workspace mount. Recorded
-// at acquire/resume time so a run that never realizes a workspace (a plain task
-// with no project) still has a concrete sync root, and the server's execution
-// target uses the same dir (it falls back to /tmp when the lease carries none).
+// The lease's remote working dir: an already-recorded absolute dir is kept;
+// otherwise the pod's /workspace mount. Recorded at acquire/resume time so a run
+// that never realizes a workspace (a plain task with no project) still has a
+// concrete sync root, and the server's execution target uses the same dir (it
+// falls back to /tmp when the lease carries none). The value is the native-sync
+// confinement root, so only a normalized absolute path below / is accepted.
 export function leaseRemoteCwd(existing: unknown): string {
-  return typeof existing === "string" && existing.trim().length > 0
-    ? existing.trim()
-    : DEFAULT_WORKSPACE_REMOTE_DIR;
+  if (typeof existing !== "string") return DEFAULT_WORKSPACE_REMOTE_DIR;
+  const trimmed = existing.trim();
+  const isConfinableRoot =
+    trimmed.startsWith("/") && trimmed !== "/" && path.posix.normalize(trimmed) === trimmed && !trimmed.endsWith("/");
+  return isConfinableRoot ? trimmed : DEFAULT_WORKSPACE_REMOTE_DIR;
 }
 
 // The workspace remote dir is the confinement root for native file sync. It is
-// recorded on the lease metadata (`remoteCwd`) at acquire/resume time and
-// updated at realizeWorkspace time; require it so a sync can never run without a
-// concrete root to confine every sandbox path against.
+// recorded on the lease metadata (`remoteCwd`) at acquire/resume time; require it
+// so a sync can never run without a concrete root to confine every sandbox path
+// against.
 export function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   const remoteCwd = lease.metadata?.remoteCwd;
   if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
@@ -548,7 +552,7 @@ const plugin = definePlugin({
       // exposes one. Flag the job backend so the server keeps the base64 fallback
       // rather than routing its sync to a hook that would reject immediately.
       nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
-      remoteCwd: leaseRemoteCwd(undefined),
+      remoteCwd: DEFAULT_WORKSPACE_REMOTE_DIR,
     };
 
     return {
@@ -628,7 +632,7 @@ const plugin = definePlugin({
       // See acquireLease: only the sandbox-cr backend has a pod-exec channel for
       // native sync, so a resumed job lease must keep the base64 fallback.
       nativeFileSyncUnsupported: leaseBackend !== "sandbox-cr",
-      // Keep a realized workspace's dir across resume; default to the pod mount.
+      // Keep an already-recorded remote dir across resume; default to the pod mount.
       remoteCwd: leaseRemoteCwd(params.leaseMetadata?.remoteCwd),
     };
 
