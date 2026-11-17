@@ -74,7 +74,7 @@ describe("kubernetesProviderConfigSchema", () => {
     expect(parseKubernetesProviderConfig({ inCluster: true }).runnerIdleTimeoutMs).toBe(300_000);
     expect(
       parseKubernetesProviderConfig({ inCluster: true, runnerIdleTimeoutMs: 120_000 }),
-    ).toMatchObject({ runnerIdleTimeoutMs: 120_000, reusableAdapterTypes: ["hermes_local"] });
+    ).toMatchObject({ runnerIdleTimeoutMs: 120_000 });
   });
 
   it("keeps the host-owned reuse flags through parsing (they would otherwise be stripped on save)", () => {

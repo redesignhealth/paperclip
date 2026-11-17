@@ -9,7 +9,10 @@ const h = vi.hoisted(() => ({
 }));
 
 // The between-turn scrub and the exec channel talk to a real pod; mock them.
-vi.mock("../../src/pod-scrub.js", () => ({ scrubPod: h.scrub }));
+vi.mock("../../src/pod-scrub.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/pod-scrub.js")>()),
+  scrubPod: h.scrub,
+}));
 vi.mock("../../src/pod-exec.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/pod-exec.js")>()),
   execInPod: h.execInPod,
@@ -611,6 +614,16 @@ describe("reusable conversation pods", () => {
       },
     } as never);
     expect(isTracked("paperclip-acme", "pc-runner")).toBe(false);
+  });
+
+  it("also scrubs and tracks a kept-running pod of another legacy adapter, so a retained pod can never leak", async () => {
+    h.clients = RESUME_CLIENTS();
+    await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes", companyId: "acme", environmentId: "env-1", config: CONFIG, providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata({ reusableSandboxLease: { version: 1, adapterType: "claude_local" } }),
+    });
+    expect(h.scrub).toHaveBeenCalledWith(expect.anything(), "paperclip-acme", "pc-abc-pod", "/workspace", "claude_local");
+    expect(isTracked("paperclip-acme", "pc-abc")).toBe(true);
   });
 
   it("returns the lease as expired even when destroying an unscrubbable pod fails", async () => {

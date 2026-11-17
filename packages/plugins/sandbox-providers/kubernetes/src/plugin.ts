@@ -54,7 +54,7 @@ import {
   startIdleReaper,
   trackReusableLease,
 } from "./reuse-registry.js";
-import { scrubPod } from "./pod-scrub.js";
+import { runtimeKeyForAdapter, scrubPod } from "./pod-scrub.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -314,18 +314,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * The adapter type of a lease the server marked reusable, when the plugin
- * manages that adapter's pods; otherwise null. Anything else (one-shot leases,
- * paperclip_runner's warm sandboxes) is left exactly as before.
+ * The adapter type of a lease the server kept running for reuse, or null when
+ * the plugin must not manage it. Every adapter's kept-running pod gets the idle
+ * TTL (so a pod the server retains can never leak), the between-turn scrub of
+ * that adapter's own runtime directory, and quota eviction. One-shot leases and
+ * paperclip_runner's warm sandboxes (which own their lifecycle) are left alone.
  */
 function managedReusableAdapter(
   metadata: Record<string, unknown> | null | undefined,
-  config: KubernetesProviderConfig,
+  _config?: KubernetesProviderConfig,
 ): string | null {
   const scope = metadata?.reusableSandboxLease;
   if (!isRecord(scope)) return null;
   const adapterType = typeof scope.adapterType === "string" ? scope.adapterType : null;
-  return adapterType && config.reusableAdapterTypes.includes(adapterType) ? adapterType : null;
+  if (!adapterType || adapterType === "paperclip_runner") return null;
+  try {
+    runtimeKeyForAdapter(adapterType); // rejects anything that is not a plain name
+  } catch {
+    return null;
+  }
+  return adapterType;
 }
 
 /** Wait briefly for evicted pods to leave the quota (terminating pods still count). */

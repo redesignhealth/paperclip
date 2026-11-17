@@ -124,12 +124,6 @@ const manifest: PaperclipPluginManifestV1 = {
             description:
               "How long a kept-running conversation pod may sit idle before the plugin deletes it (default: 300000, 5 minutes).",
           },
-          reusableAdapterTypes: {
-            type: "array",
-            items: { type: "string" },
-            description:
-              "Adapter types whose kept-running pods the plugin manages (idle TTL, scrub between turns, quota eviction). Default: [\"hermes_local\"].",
-          },
           resourceQuota: {
             type: "object",
             description:

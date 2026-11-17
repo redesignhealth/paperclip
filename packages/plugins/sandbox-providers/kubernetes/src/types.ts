@@ -82,14 +82,6 @@ export const kubernetesProviderConfigSchema = z
     reuseLeaseScope: z.enum(["all", "conversations"]).optional(),
 
     /**
-     * Adapter types whose kept-running pods the plugin manages (idle TTL, scrub
-     * between turns, quota eviction). The server decides which runs reuse a pod;
-     * the plugin only touches pods of these adapters, so e.g. paperclip_runner's
-     * warm sandboxes are never scrubbed or reaped. Default: Hermes.
-     */
-    reusableAdapterTypes: z.array(z.string().min(1)).default(["hermes_local"]),
-
-    /**
      * How long a reusable (kept-running) pod may sit idle before the plugin
      * destroys it. Matches the host's `runnerIdleTimeoutMs` (default 5 minutes).
      */
