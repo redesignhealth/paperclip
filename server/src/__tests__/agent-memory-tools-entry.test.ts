@@ -67,7 +67,7 @@ describe("agent-memory-tools spec entry (TECH-8832)", () => {
     expect(dup).toEqual([expect.stringContaining("duplicates agent-memory-tools")]);
     const relative = validateStaticTemplateSpec([{ ...ENTRY, staticTemplate: { ...ENTRY.staticTemplate!, mcpUrl: { env: AGENT_MEMORY_URL_ENV, path: "mcp" } } }]);
     expect(relative).toEqual([expect.stringContaining('must start with "/"')]);
-    // Arcana's own entry needs no staticTemplate; a second one with the same implicit uid is a duplicate.
+    // Arcana's own entry needs no staticTemplate (its uid is implicit).
     const arcana = DEFAULT_MCP_SPEC.find((entry) => entry.key === "arcana-brain")!;
     expect(validateStaticTemplateSpec([arcana])).toEqual([]);
   });

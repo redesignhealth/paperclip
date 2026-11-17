@@ -748,16 +748,22 @@ The token is never logged and is not stored anywhere except the secret.
 
 Existing agents are enrolled by the operator-run missing-entry job (`POST /api/companies/:companyId/default-mcp/missing-entry-enrollment`), which reuses the same hook, so one mechanism serves new and existing agents. It adds `agent-memory` only while `PAPERCLIP_AGENT_MEMORY_BACKFILL_ENABLED=true` with a valid memory configuration, only for agents of a profiled adapter, and only for agents that already hold a default-MCP state (legacy agents with none are enrolled by legacy enrollment first). With the flag off, `keys: ["agent-memory"]` reports every agent as `nothing_missing`. Pass `"keys": ["agent-memory"]` to restrict the run to this entry; without it the job also adds any other missing managed entry, as before.
 
-### `agent-memory-tools` (TECH-8832)
-
-Explicit memory tools for Claude and Codex agents, beside the recall/capture hooks. It is a `templateBootstrap: "static"` dedicated entry (`setupHook: "agent_memory_tools"`, `newAgentsOnly`, `installByDefault`) whose template connection `rh-agent-memory-tools` points at `${PAPERCLIP_AGENT_MEMORY_URL}/mcp` and offers exactly `memory_search` (read), `memory_add` and `memory_delete` (reviewed writes; `memory_delete` removes only the caller's own rows, so it is seeded non-destructive and a live `destructiveHint` does not demote it). `memory_purge_agent` (admin) is never reviewed. The hook mints nothing: it waits (`memory_token_unavailable`) until the agent's own `agent-memory` entry is ready, then binds that same secret (`agent_memory.<agentId>`) to the agent's dedicated gateway connection, so rotation of that secret reaches the connection and the CLI only ever talks to Paperclip's gateway (no proxy or upstream token in the container). Gated by `PAPERCLIP_AGENT_MEMORY_TOOLS_ENABLED` (see the environment variable reference); existing agents are enrolled with `"keys": ["agent-memory-tools"]`.
-
 Run it per company, batch by batch:
 
 1. Dry run (the default): `{ "keys": ["agent-memory"] }`. The report lists `would_add` agents and the reasons for skips (`owner_required` when the agent has no resolvable human owner). Nothing is written or minted.
 2. Real run: `{ "keys": ["agent-memory"], "dryRun": false, "confirm": "add-missing-default-mcp-entries", "limit": 25 }`. Each added agent is set up by the normal hook (mint, secret, config). Pass the returned `nextCursor` as `afterId` to resume; a repeat run skips agents that already have the entry (`nothing_missing`).
 
 The registry is insert-only per sub. An agent whose memory token was minted by hand (`agent-memory-<id>` already registered) ends at `ownership_conflict`; configure those agents manually, as before. Setup output never contains a token.
+
+### `agent-memory-tools` (TECH-8832)
+
+Explicit memory tools for Claude and Codex agents, beside the recall/capture hooks. It is a `templateBootstrap: "static"` dedicated entry (`setupHook: "agent_memory_tools"`, `newAgentsOnly`, `installByDefault`) whose template connection `rh-agent-memory-tools` points at `${PAPERCLIP_AGENT_MEMORY_URL}/mcp` and offers exactly `memory_search` (read), `memory_add` and `memory_delete` (reviewed writes; `memory_delete` removes only the caller's own rows, so it is seeded non-destructive and a live `destructiveHint` does not demote it). `memory_purge_agent` (admin) is never reviewed. The hook mints nothing: it waits (`memory_token_unavailable`) until the agent's own `agent-memory` entry is ready, then binds that same secret (`agent_memory.<agentId>`) to the agent's dedicated gateway connection, so rotation of that secret reaches the connection and the CLI only ever talks to Paperclip's gateway (no proxy or upstream token in the container). 
+
+Flags and enrolment: it needs `PAPERCLIP_AGENT_MEMORY_TOOLS_ENABLED=true` on top of `PAPERCLIP_AGENT_MEMORY_ENABLED`, a valid `PAPERCLIP_AGENT_MEMORY_URL` and `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` (see the environment variable reference). New Claude and Codex agents get it at creation. Existing agents are enrolled with `"keys": ["agent-memory-tools"]`, which also needs `PAPERCLIP_AGENT_MEMORY_BACKFILL_ENABLED=true` and an `agent-memory` entry already present in the agent's metadata (its state is not checked at enrolment; setup waits until it is ready). Because the entry is `installByDefault` and a backfilled entry carries no `installOnReady` marker, the install-reconcile sweep installs the agent's own connection once the entry is ready.
+
+The flag gates creating the template, new-agent provisioning, enrolment and setup. It is not a kill switch for agents that are already ready: their connection stays active, repair keeps healing it and `verifyReady` keeps passing. To take the tools away from an agent, remove its install (or archive its `rh-agent-memory-tools:<agentId>` connection).
+
+
 
 ### Rotation
 
