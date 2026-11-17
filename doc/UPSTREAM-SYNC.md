@@ -48,14 +48,6 @@ Under the direct-to-master model, upstream sync PRs land directly into `master`:
    A heuristic `security`/`breaking` verdict is never downgraded by the model: the category is
    kept and `classified_by = 'heuristic(kept)+llm:<model>'` records that the model only
    supplied the summary.
-   The heuristic reads the PR body sparingly, because every upstream PR body carries
-   "security checks passed" and "Breaking changes: none" boilerplate: `security` needs a
-   title keyword or an advisory id (`CVE-…`/`GHSA-…`) in the body, and `breaking` needs `type!:`,
-   a `BREAKING CHANGE:` footer line, or the phrase in the title. `docs`/`test`/`style` commits
-   are never security from the body, and `perf`/`refactor`/`ci`/`build`/`chore`/`deps`/`docs`/
-   `test`/`style`/`release` commits are never breaking from a body footer. The model may not
-   raise those prefixes to `security`/`breaking` either (`classified_by =
-   'heuristic(overrode)+llm:<model>'`); a title `!:` still pins `breaking`.
 3. **alert** per `feature | breaking | security` row, then **ops alerts**, then flush.
 
 The whole locked section has a run budget (`UPSTREAM_SYNC_RUN_BUDGET_MS`, default 10 min).
