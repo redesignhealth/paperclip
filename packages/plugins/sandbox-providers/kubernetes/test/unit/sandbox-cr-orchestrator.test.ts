@@ -268,3 +268,35 @@ describe("waitForSandboxReady", () => {
     ).rejects.toThrow(/failed.*OOMKilled/i);
   });
 });
+
+describe("waitForSandboxReady quota handling", () => {
+  it("fails fast with an over-capacity error when the controller reports an exceeded quota", async () => {
+    const get = vi.fn().mockResolvedValue({
+      status: {
+        conditions: [
+          {
+            type: "Ready",
+            status: "False",
+            reason: "ReconcilerError",
+            message: 'pods "pc-abc" is forbidden: exceeded quota: paperclip-quota, requested: pods=1, used: pods=20, limited: pods=20',
+          },
+        ],
+      },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    await expect(
+      waitForSandboxReady(clients as never, "ns", "pc-abc", { timeoutMs: 60_000, pollMs: 10 }),
+    ).rejects.toThrow(/Over capacity/);
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it("includes the last controller message in the timeout error", async () => {
+    const get = vi.fn().mockResolvedValue({
+      status: { conditions: [{ type: "Ready", status: "False", message: "pod is Unschedulable" }] },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    await expect(
+      waitForSandboxReady(clients as never, "ns", "pc-abc", { timeoutMs: 30, pollMs: 10 }),
+    ).rejects.toThrow(/Unschedulable/);
+  });
+});

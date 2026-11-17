@@ -23,17 +23,25 @@
 
 import type { KubeClients } from "./kube-client.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
+import { isQuotaExceededMessage, OverCapacityError } from "./tenant-orchestrator.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
 const SANDBOX_VERSION = "v1alpha1";
 const SANDBOX_PLURAL = "sandboxes";
 
+/** Default Ready poll interval. 500ms keeps pod-start latency tight without hammering the API. */
+export const DEFAULT_READY_POLL_MS = 500;
+
 export class SandboxCrTimeoutError extends Error {
-  constructor(namespace: string, name: string, timeoutMs: number) {
+  /** Last not-Ready condition message the controller reported, if any. */
+  readonly lastMessage?: string;
+  constructor(namespace: string, name: string, timeoutMs: number, lastMessage?: string) {
     super(
-      `Sandbox ${namespace}/${name} did not reach Ready phase within ${timeoutMs}ms`,
+      `Sandbox ${namespace}/${name} did not reach Ready phase within ${timeoutMs}ms` +
+        (lastMessage ? ` (last status: ${lastMessage})` : ""),
     );
     this.name = "SandboxCrTimeoutError";
+    this.lastMessage = lastMessage;
   }
 }
 
@@ -250,11 +258,12 @@ export async function waitForSandboxReady(
   name: string,
   opts: { timeoutMs: number; pollMs?: number } = {
     timeoutMs: 120_000,
-    pollMs: 2000,
+    pollMs: DEFAULT_READY_POLL_MS,
   },
 ): Promise<SandboxStatus> {
   const deadline = Date.now() + opts.timeoutMs;
-  const pollMs = opts.pollMs ?? 2000;
+  const pollMs = opts.pollMs ?? DEFAULT_READY_POLL_MS;
+  let lastMessage: string | undefined;
 
   while (Date.now() < deadline) {
     const cr = await clients.custom.getNamespacedCustomObject({
@@ -292,11 +301,18 @@ export async function waitForSandboxReady(
         `Sandbox ${namespace}/${name} is Terminating — cannot wait for Ready`,
       );
     }
-    // Pending — keep polling
+    // Pending — keep polling. If the controller says the pod was refused by the
+    // namespace quota, no amount of waiting helps: fail fast with a clear error.
+    const pendingMessage = [readyCondition?.message, conditions.find((c) => c.type !== "Ready")?.message]
+      .find((m): m is string => typeof m === "string" && m.length > 0);
+    if (pendingMessage) lastMessage = pendingMessage;
+    if (isQuotaExceededMessage(pendingMessage)) {
+      throw new OverCapacityError(namespace, pendingMessage as string);
+    }
     await sleep(pollMs);
   }
 
-  throw new SandboxCrTimeoutError(namespace, name, opts.timeoutMs);
+  throw new SandboxCrTimeoutError(namespace, name, opts.timeoutMs, lastMessage);
 }
 
 /**
