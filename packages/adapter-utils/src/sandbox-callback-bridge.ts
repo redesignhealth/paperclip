@@ -1784,14 +1784,15 @@ export async function startSandboxCallbackBridgeWorker(input: {
     backgroundTasks.add(task);
   };
 
-  // At the end of the drain, give every route request that is still open a
-  // terminal response. A request that started gets a non-retryable 504 (its host
+  // At the end of the drain, give every request that is still open a
+  // terminal response. With route policies every attempt runs in the background,
+  // ordinary ones included, so this covers all of them. A request that started gets a non-retryable 504 (its host
   // operation may have committed). A request still waiting for a lane slot never
   // started: abandon it, so the final pass answers a retry-safe 503.
-  const settleOpenRouteRequests = async (message: string) => {
+  const settleOpenRequests = async (message: string) => {
     const started: Array<Promise<void>> = [];
     for (const [fileName, guard] of inFlightRequestGuards.entries()) {
-      if (!guard.route || guard.finalized) continue;
+      if (guard.finalized) continue;
       if (guard.claim === "unclaimed") {
         guard.claim = "abandon";
         guard.cancelWait?.();
@@ -2027,7 +2028,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           }),
         ]);
         if (timer !== undefined) clearTimeout(timer);
-        await settleOpenRouteRequests("Bridge worker stopped before the request finished.");
+        await settleOpenRequests("Bridge worker stopped before the request finished.");
       }
       await failPendingRequests("Bridge worker stopped before request could be handled.");
     },

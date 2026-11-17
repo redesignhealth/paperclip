@@ -4346,7 +4346,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // with other routes under its own deadline, and the host forward budget, the
   // per-request timeout and the in-pod response deadline all follow that deadline.
   // At teardown the worker drains these requests before the pod goes away. The
-  // default is empty: the bridge then behaves exactly as before.
+  // default is empty: the bridge then behaves exactly as before. File bridge only:
+  // the duplex (HTTP/2) transport ignores route policies and the drain timeout, and
+  // keeps the forward budget above for every route.
   bridgeRoutePolicies?: readonly SandboxCallbackBridgeRoutePolicy[] | null;
   // How long teardown waits for queued and running bridge requests. The default is
   // the longest route deadline when route policies exist, and the earlier 2 s

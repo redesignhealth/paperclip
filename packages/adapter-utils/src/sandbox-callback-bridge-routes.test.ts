@@ -399,6 +399,35 @@ describe("sandbox callback bridge route policies", () => {
       expect(queue.requestPending("stuck")).toBe(false);
     });
 
+    it("settles ordinary requests too: a waiting one is answered 503 and never runs after stop", async () => {
+      vi.useFakeTimers();
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const queue = createMemoryQueue();
+      const started: string[] = [];
+      const worker = await startSandboxCallbackBridgeWorker({
+        client: queue.client,
+        queueDir: QUEUE_DIR,
+        authorizeRequest: async () => null,
+        pollIntervalMs: 50,
+        routePolicies: [MEMORY_ROUTE],
+        handleRequest: async (request) => {
+          started.push(request.path);
+          return new Promise(() => {});
+        },
+      });
+      queue.enqueue("a", "PATCH", "/api/issues/a");
+      await vi.advanceTimersByTimeAsync(200);
+      queue.enqueue("b", "PATCH", "/api/issues/b");
+      await vi.advanceTimersByTimeAsync(300);
+      const stopping = worker.stop({ drainTimeoutMs: 500 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await stopping;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(started).toEqual(["/api/issues/a"]);
+      expect(queue.response("a")?.status).toBe(504);
+      expect(queue.response("b")?.status).toBe(503);
+    });
+
     it("answers a retry-safe 503 for a route request that never started, and never runs it after stop", async () => {
       vi.useFakeTimers();
       vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -479,12 +508,13 @@ describe("sandbox callback bridge gateway per-route response deadline", () => {
         return { status: 200, body: JSON.stringify({ path: request.path }) };
       },
     });
-    cleanups.push(() => worker.stop());
     const gateway = await startSandboxCallbackBridgeServer({
       runner: createExecRunner(), remoteCwd: root, assetRemoteDir: asset.localDir, queueDir, bridgeToken,
       pollIntervalMs: 10, responseTimeoutMs: 600, routePolicies,
     });
     cleanups.push(() => gateway.stop());
+    // Cleanups run last in, first out: the worker stops before the gateway.
+    cleanups.push(() => worker.stop({ drainTimeoutMs: 500 }));
     const headers = { authorization: `Bearer ${bridgeToken}`, "content-type": "application/json" };
 
     const [memory, ordinary] = await Promise.all([
