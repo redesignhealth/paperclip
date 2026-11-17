@@ -91,13 +91,23 @@ function podReadyBudgetMs(config: KubernetesProviderConfig, callerTimeoutMs: num
 async function describePodReadyTimeout(
   clients: ReturnType<typeof makeKubeClients>,
   namespace: string,
+  sandboxName: string,
   err: SandboxCrTimeoutError,
   budgetMs: number,
 ): Promise<string> {
-  try {
-    await assertPodCapacity(clients, namespace);
-  } catch (capacityErr) {
-    if (capacityErr instanceof OverCapacityError) return capacityErr.message;
+  // A full quota only explains the timeout if this sandbox's pod was never
+  // admitted. If the pod exists it is counted in `used`, and a slow start at
+  // the limit is a pod-start timeout, not over capacity.
+  const podExists = await sandboxCrOrchestrator
+    .findPod(clients, namespace, sandboxName)
+    .then((name) => Boolean(name))
+    .catch(() => false);
+  if (!podExists) {
+    try {
+      await assertPodCapacity(clients, namespace);
+    } catch (capacityErr) {
+      if (capacityErr instanceof OverCapacityError) return capacityErr.message;
+    }
   }
   return (
     `Sandbox pod did not become Ready within ${Math.round(budgetMs / 1000)}s` +
@@ -226,7 +236,7 @@ async function resolveSyncPodExec(
       });
     } catch (err) {
       if (err instanceof SandboxCrTimeoutError) {
-        throw new Error(await describePodReadyTimeout(clients, namespace, err, readyBudgetMs));
+        throw new Error(await describePodReadyTimeout(clients, namespace, lease.providerLeaseId, err, readyBudgetMs));
       }
       throw err;
     }
@@ -804,7 +814,7 @@ const plugin = definePlugin({
             };
           }
           if (err instanceof SandboxCrTimeoutError) {
-            const message = await describePodReadyTimeout(clients, namespace, err, readyBudgetMs);
+            const message = await describePodReadyTimeout(clients, namespace, lease.providerLeaseId, err, readyBudgetMs);
             if (message.startsWith("Over capacity")) {
               // The pod never started because the company quota is full: report
               // it the same way as the fail-fast path, not as a run timeout.

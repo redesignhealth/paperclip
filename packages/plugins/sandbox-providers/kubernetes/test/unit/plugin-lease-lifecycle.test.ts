@@ -368,6 +368,43 @@ describe("quota guard and pod-ready budget", () => {
     }
   });
 
+  it("does not call a slow pod start over capacity just because its own pod fills the quota", async () => {
+    vi.useFakeTimers();
+    try {
+      h.clients = {
+        custom: {
+          getNamespacedCustomObject: vi.fn().mockResolvedValue({
+            status: { conditions: [{ type: "Ready", status: "False", message: "ContainerCreating" }] },
+          }),
+        },
+        core: {
+          // The sandbox's pod exists (so it is counted in used) and is just slow.
+          readNamespacedPod: vi.fn().mockResolvedValue({ metadata: { name: "pc-slow" } }),
+          readNamespacedResourceQuota: vi.fn().mockResolvedValue({
+            status: { hard: { pods: "20" }, used: { pods: "20" } },
+          }),
+        },
+      };
+      const pending = plugin.definition.onEnvironmentExecute!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: { ...CONFIG, podReadyTimeoutSec: 2 },
+        lease: { providerLeaseId: "pc-slow", metadata: leaseMetadata({ podName: null }) },
+        command: "true",
+        args: [],
+        timeoutMs: 1_800_000,
+      } as never);
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await pending;
+      expect(result.timedOut).toBe(true);
+      expect(result.stderr).toMatch(/did not become Ready within 2s/);
+      expect(result.stderr).not.toMatch(/Over capacity/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports a Ready timeout against a full company quota as over capacity, not a run timeout", async () => {
     vi.useFakeTimers();
     try {
