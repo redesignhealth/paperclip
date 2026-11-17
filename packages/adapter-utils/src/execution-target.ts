@@ -55,6 +55,7 @@ import {
 import {
   createSandboxBridgeRelay,
   sandboxBridgeRelayRouteRules,
+  sandboxBridgeRelayRoutePolicies,
   SANDBOX_BRIDGE_RELAY_EXTRA_HEADERS,
   SANDBOX_BRIDGE_EXTRA_HEADERS_ENV,
   type SandboxBridgeRelayRoute,
@@ -4447,6 +4448,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   const relay = relayRoutes.length > 0
     ? createSandboxBridgeRelay({ routes: relayRoutes, hostApiUrl, runId: input.runId })
     : null;
+  // Relay routes register their own deadline and lane through the file bridge route policies.
+  const effectiveRoutePolicies: readonly SandboxCallbackBridgeRoutePolicy[] = [
+    ...(input.bridgeRoutePolicies ?? []),
+    ...sandboxBridgeRelayRoutePolicies(relayRoutes),
+  ];
   const extraHeaders: readonly string[] = relay ? SANDBOX_BRIDGE_RELAY_EXTRA_HEADERS : [];
   const bridgeRouteAllowlist = relay
     ? [...HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST, ...sandboxBridgeRelayRouteRules(relayRoutes)]
@@ -4961,7 +4967,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         ? { authorizeRequest: (request: { method: string; path: string }) => authorizeSandboxCallbackBridgeRequestWithRoutes(request, bridgeRouteAllowlist) }
         : {}),
       // The worker encodes binary bodies only at the queue boundary.
-      routePolicies: input.bridgeRoutePolicies,
+      routePolicies: effectiveRoutePolicies,
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
         ...(options?.route ? { forwardTimeoutMs: options.route.forwardTimeoutMs } : {}),
@@ -4977,7 +4983,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
       shellCommand,
-      routePolicies: input.bridgeRoutePolicies,
+      routePolicies: effectiveRoutePolicies,
       extraHeaders,
     });
   } catch (error) {
@@ -5009,7 +5015,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
     runLogTail,
     stop: async () => {
-      if ((input.bridgeRoutePolicies?.length ?? 0) > 0) {
+      if (effectiveRoutePolicies.length > 0) {
         // Drain first. The in-pod gateway stays up while the worker finishes the
         // queued and running route requests, so a relayed call that the agent
         // fired at the end of its last turn still gets its response. Only then

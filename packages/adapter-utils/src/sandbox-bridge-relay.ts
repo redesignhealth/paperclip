@@ -8,7 +8,7 @@
  * The route registration is deliberately generic (`path`, `upstreamUrl`, `token`, `deadlineMs`) so
  * other relays (for example memory) can register their own routes on the same list.
  */
-import type { SandboxCallbackBridgeRouteRule } from "./sandbox-callback-bridge.js";
+import type { SandboxCallbackBridgeRoutePolicy, SandboxCallbackBridgeRouteRule } from "./sandbox-callback-bridge.js";
 
 export const SANDBOX_BRIDGE_RELAY_PATH_PREFIX = "/paperclip-relay/";
 
@@ -33,8 +33,27 @@ export interface SandboxBridgeRelayRoute {
   token: string;
   /** The give-up deadline for one relayed request. */
   deadlineMs: number;
+  /** Concurrent requests this route may run on the file bridge. Defaults to 4, its own lane. */
+  maxConcurrent?: number;
   /** A short label for give-up messages. Never a credential. */
   label?: string;
+}
+
+/**
+ * The file bridge route policies for relay routes. Each route gets its own lane and an in-pod response deadline
+ * a margin above the relay's give-up deadline, so the relay's JSON-RPC 504 reaches the client before the host abort
+ * (counted from when the host reads the request) or the in-pod gateway deadline (counted from enqueue).
+ * The duplex (HTTP/2) transport ignores policies; the relay deadline alone applies there.
+ */
+export const SANDBOX_BRIDGE_RELAY_POLICY_MARGIN_MS = 5_000;
+export function sandboxBridgeRelayRoutePolicies(
+  routes: readonly SandboxBridgeRelayRoute[],
+): SandboxCallbackBridgeRoutePolicy[] {
+  return routes.map((route) => ({
+    path: new RegExp(`^${route.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
+    deadlineMs: route.deadlineMs + SANDBOX_BRIDGE_RELAY_POLICY_MARGIN_MS,
+    maxConcurrent: route.maxConcurrent ?? 4,
+  }));
 }
 
 export interface SandboxBridgeRelayRequest {

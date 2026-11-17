@@ -4,6 +4,7 @@ import {
   buildSandboxBridgeRelayGiveUp,
   createSandboxBridgeRelay,
   sandboxBridgeRelayRouteRules,
+  sandboxBridgeRelayRoutePolicies,
   SANDBOX_BRIDGE_RELAY_EXTRA_HEADERS,
   validateSandboxBridgeRelayRoutes,
   type SandboxBridgeRelayRoute,
@@ -145,5 +146,15 @@ describe("sandbox bridge relay", () => {
     );
     expect(response?.status).toBe(504);
     expect(JSON.parse(response!.body.toString("utf8")).error.data).toMatchObject({ reason: "bridge_response_unreadable", outcome: "indeterminate" });
+  });
+
+  it("registers each relay route as its own file-bridge lane with a deadline above the relay give-up", () => {
+    const other = { ...route, path: "/paperclip-relay/mcp/projects", deadlineMs: 30_000, maxConcurrent: 2 };
+    const policies = sandboxBridgeRelayRoutePolicies([route, other]);
+    expect(policies.map((p) => [p.deadlineMs, p.maxConcurrent])).toEqual([[70_000, 4], [35_000, 2]]);
+    expect(policies[0]!.path.test(route.path)).toBe(true);
+    expect(policies[0]!.path.test(other.path)).toBe(false);
+    expect(policies[0]!.path.test(`${route.path}/x`)).toBe(false);
+    expect(sandboxBridgeRelayRoutePolicies([])).toEqual([]);
   });
 });
