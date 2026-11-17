@@ -266,13 +266,26 @@ export async function waitForSandboxReady(
   let lastMessage: string | undefined;
 
   while (Date.now() < deadline) {
-    const cr = await clients.custom.getNamespacedCustomObject({
-      group: SANDBOX_GROUP,
-      version: SANDBOX_VERSION,
-      namespace,
-      plural: SANDBOX_PLURAL,
-      name,
-    }) as Record<string, unknown>;
+    let cr: Record<string, unknown>;
+    try {
+      cr = await clients.custom.getNamespacedCustomObject({
+        group: SANDBOX_GROUP,
+        version: SANDBOX_VERSION,
+        namespace,
+        plural: SANDBOX_PLURAL,
+        name,
+      }) as Record<string, unknown>;
+    } catch (err) {
+      // The 500 ms poll raises the odds of hitting a throttle or a blip:
+      // ride out 429/5xx until the deadline instead of failing the run.
+      const code = (err as { code?: number; statusCode?: number }).code
+        ?? (err as { code?: number; statusCode?: number }).statusCode;
+      if (typeof code === "number" && (code === 429 || code >= 500)) {
+        await sleep(pollMs);
+        continue;
+      }
+      throw err;
+    }
 
     const status = (cr.status as Record<string, unknown>) ?? {};
     // agent-sandbox v1alpha1 uses status.conditions[type=Ready,status=True],
@@ -303,12 +316,15 @@ export async function waitForSandboxReady(
     }
     // Pending — keep polling. If the controller says the pod was refused by the
     // namespace quota, no amount of waiting helps: fail fast with a clear error.
-    const pendingMessage = [readyCondition?.message, conditions.find((c) => c.type !== "Ready")?.message]
-      .find((m): m is string => typeof m === "string" && m.length > 0);
+    // Scan every condition: the quota rejection may sit on any of them, not
+    // necessarily the Ready one.
+    const messages = conditions
+      .map((c) => c.message)
+      .filter((m): m is string => typeof m === "string" && m.length > 0);
+    const quotaMessage = messages.find((m) => isQuotaExceededMessage(m));
+    if (quotaMessage) throw new OverCapacityError(namespace, quotaMessage);
+    const pendingMessage = (typeof readyCondition?.message === "string" && readyCondition.message) || messages[0];
     if (pendingMessage) lastMessage = pendingMessage;
-    if (isQuotaExceededMessage(pendingMessage)) {
-      throw new OverCapacityError(namespace, pendingMessage as string);
-    }
     await sleep(pollMs);
   }
 

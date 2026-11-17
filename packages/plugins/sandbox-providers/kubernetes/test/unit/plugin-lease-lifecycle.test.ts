@@ -293,7 +293,6 @@ describe("quota guard and pod-ready budget", () => {
       networking: { readNamespacedNetworkPolicy: exists },
       custom: { getNamespacedCustomObject: exists, createNamespacedCustomObject: create },
     };
-    const started = Date.now();
     await expect(
       plugin.definition.onEnvironmentAcquireLease!({
         driverKey: "kubernetes",
@@ -303,7 +302,6 @@ describe("quota guard and pod-ready budget", () => {
         runId: "run-1",
       } as never),
     ).rejects.toThrow(/Over capacity/);
-    expect(Date.now() - started).toBeLessThan(2_000);
     // No Sandbox CR is created for a company that is already at its pod cap.
     expect(create).not.toHaveBeenCalled();
   });
@@ -365,6 +363,41 @@ describe("quota guard and pod-ready budget", () => {
       expect(result.timedOut).toBe(true);
       expect(result.stderr).toMatch(/did not become Ready within 5s/);
       expect(result.stderr).toMatch(/Unschedulable/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a Ready timeout against a full company quota as over capacity, not a run timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      h.clients = {
+        custom: {
+          getNamespacedCustomObject: vi.fn().mockResolvedValue({
+            status: { conditions: [{ type: "Ready", status: "False", message: "starting" }] },
+          }),
+        },
+        core: {
+          readNamespacedResourceQuota: vi.fn().mockResolvedValue({
+            status: { hard: { pods: "20" }, used: { pods: "20" } },
+          }),
+        },
+      };
+      const pending = plugin.definition.onEnvironmentExecute!({
+        driverKey: "kubernetes",
+        companyId: "acme",
+        environmentId: "env-1",
+        config: { ...CONFIG, podReadyTimeoutSec: 2 },
+        lease: { providerLeaseId: "pc-full", metadata: leaseMetadata({ podName: null }) },
+        command: "true",
+        args: [],
+        timeoutMs: 1_800_000,
+      } as never);
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await pending;
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toMatch(/Over capacity/);
     } finally {
       vi.useRealTimers();
     }

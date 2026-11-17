@@ -805,6 +805,23 @@ const plugin = definePlugin({
           }
           if (err instanceof SandboxCrTimeoutError) {
             const message = await describePodReadyTimeout(clients, namespace, err, readyBudgetMs);
+            if (message.startsWith("Over capacity")) {
+              // The pod never started because the company quota is full: report
+              // it the same way as the fail-fast path, not as a run timeout.
+              return {
+                exitCode: 1,
+                timedOut: false,
+                stdout: "",
+                stderr: message,
+                metadata: {
+                  provider: "kubernetes",
+                  backend: "sandbox-cr",
+                  namespace,
+                  sandboxName: lease.providerLeaseId,
+                  overCapacity: true,
+                },
+              };
+            }
             return {
               exitCode: null,
               timedOut: true,

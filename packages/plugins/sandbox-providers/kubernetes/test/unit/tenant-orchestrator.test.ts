@@ -4,6 +4,7 @@ import {
   ensureTenant,
   ensureTenantCached,
   invalidateTenantCache,
+  isQuotaExceededMessage,
   OverCapacityError,
 } from "../../src/tenant-orchestrator.js";
 
@@ -159,6 +160,8 @@ describe("ResourceQuota reconciliation", () => {
     expect(arg.name).toBe("paperclip-quota");
     expect(arg.body.spec.hard.pods).toBe("5");
     expect(arg.body.metadata.resourceVersion).toBe("42");
+    // Minimal body: no status or other server-managed fields echoed back.
+    expect(Object.keys(arg.body).sort()).toEqual(["apiVersion", "kind", "metadata", "spec"]);
   });
 
   it("leaves an already matching quota alone", async () => {
@@ -226,5 +229,14 @@ describe("assertPodCapacity", () => {
   it("never blocks a run when the quota cannot be read", async () => {
     const clients = { core: { readNamespacedResourceQuota: vi.fn().mockRejectedValue({ code: 404 }) } };
     await expect(assertPodCapacity(clients as never, "ns")).resolves.toBeUndefined();
+  });
+});
+
+describe("isQuotaExceededMessage", () => {
+  it("recognizes the Kubernetes quota rejection wordings and nothing else", () => {
+    expect(isQuotaExceededMessage('pods "x" is forbidden: exceeded quota: paperclip-quota, requested: pods=1')).toBe(true);
+    expect(isQuotaExceededMessage("Pod quota exceeded")).toBe(true);
+    expect(isQuotaExceededMessage("0/3 nodes are available: Insufficient cpu")).toBe(false);
+    expect(isQuotaExceededMessage(undefined)).toBe(false);
   });
 });

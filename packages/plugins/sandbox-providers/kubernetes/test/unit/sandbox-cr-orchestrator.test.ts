@@ -300,3 +300,41 @@ describe("waitForSandboxReady quota handling", () => {
     ).rejects.toThrow(/Unschedulable/);
   });
 });
+
+describe("waitForSandboxReady robustness", () => {
+  it("finds a quota rejection on a non-Ready condition", async () => {
+    const get = vi.fn().mockResolvedValue({
+      status: {
+        conditions: [
+          { type: "Ready", status: "False", message: "starting" },
+          { type: "PodScheduled", status: "False", message: "pods is forbidden: exceeded quota: paperclip-quota" },
+        ],
+      },
+    });
+    await expect(
+      waitForSandboxReady({ custom: { getNamespacedCustomObject: get } } as never, "ns", "pc-abc", { timeoutMs: 5_000, pollMs: 10 }),
+    ).rejects.toThrow(/Over capacity/);
+  });
+
+  it("rides out a transient 429 or 5xx from the apiserver while polling", async () => {
+    const get = vi
+      .fn()
+      .mockRejectedValueOnce({ code: 429 })
+      .mockRejectedValueOnce({ statusCode: 503 })
+      .mockResolvedValueOnce(makeCr("Ready"));
+    const status = await waitForSandboxReady(
+      { custom: { getNamespacedCustomObject: get } } as never,
+      "ns",
+      "pc-abc",
+      { timeoutMs: 5_000, pollMs: 10 },
+    );
+    expect(status.phase).toBe("Running");
+  });
+
+  it("still fails on a non-transient API error", async () => {
+    const get = vi.fn().mockRejectedValue({ code: 403 });
+    await expect(
+      waitForSandboxReady({ custom: { getNamespacedCustomObject: get } } as never, "ns", "pc-abc", { timeoutMs: 5_000, pollMs: 10 }),
+    ).rejects.toMatchObject({ code: 403 });
+  });
+});

@@ -195,14 +195,22 @@ async function ensureResourceQuota(clients: KubeClients, input: EnsureTenantInpu
     await clients.core.replaceNamespacedResourceQuota({
       name: RESOURCE_QUOTA_NAME,
       namespace: input.namespace,
+      // Minimal body: only identity, the resourceVersion (optimistic lock) and
+      // the desired hard limits. Never echo status/managedFields back.
       body: {
-        ...existing,
-        spec: { ...existing.spec, hard: { ...current, ...desired } },
+        apiVersion: "v1",
+        kind: "ResourceQuota",
+        metadata: {
+          name: RESOURCE_QUOTA_NAME,
+          namespace: input.namespace,
+          resourceVersion: existing.metadata?.resourceVersion,
+        },
+        spec: { hard: desired },
       } as never,
     });
   } catch (err) {
     console.warn(
-      `[plugin-kubernetes] could not update ResourceQuota ${input.namespace}/${RESOURCE_QUOTA_NAME} to the configured values: ${err instanceof Error ? err.message : String(err)}`,
+      `[plugin-kubernetes] could not update ResourceQuota ${input.namespace}/${RESOURCE_QUOTA_NAME} to the configured values (the server's Kubernetes credentials need "update" on resourcequotas; the old quota stays in force): ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
@@ -379,7 +387,7 @@ export class OverCapacityError extends Error {
 
 /** True when a pod-creation/scheduling message indicates the namespace quota. */
 export function isQuotaExceededMessage(message: string | undefined): boolean {
-  return typeof message === "string" && /exceeded quota|forbidden: exceeded/i.test(message);
+  return typeof message === "string" && /exceeded quota|quota exceeded|forbidden: exceeded/i.test(message);
 }
 
 function parseWholeNumber(value: string | undefined): number | null {
@@ -401,7 +409,15 @@ export async function assertPodCapacity(clients: KubeClients, namespace: string)
       name: RESOURCE_QUOTA_NAME,
       namespace,
     })) as typeof quota;
-  } catch {
+  } catch (err) {
+    // 404 is normal (no quota object yet). Anything else (RBAC, apiserver)
+    // silently disables the pre-check, so say so; Kubernetes still enforces
+    // the quota and the bounded Ready wait still applies.
+    if (!isNotFound(err)) {
+      console.warn(
+        `[plugin-kubernetes] could not read ResourceQuota ${namespace}/${RESOURCE_QUOTA_NAME}; skipping the capacity pre-check: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return;
   }
   const hard = parseWholeNumber(quota.status?.hard?.pods);
