@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
+import { TOOL_QUARANTINE_REASON_REVIEWED_DECLINED } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
@@ -754,6 +755,87 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(rows.profiles).toHaveLength(0);
     expect(rows.catalog.map((entry) => entry.status)).toEqual(["quarantined"]);
     expect((await db.select().from(toolConnections).where(eq(toolConnections.id, bInstance.id)))[0]!.status).toBe("draft");
+  });
+
+  it("an instance admin can review a personal instance's quarantined tools without changing who it is installed on", async () => {
+    const { companyId, userA, userB } = await seededCompanyWithMembers({ roles: { a: "member", b: "member" } });
+    const service = svc();
+    const seed = (await googleSeed(companyId))!;
+    const aInstance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userA);
+    const { writeConnectionCredential } = await import("../services/connection-credentials.js");
+    const { secret } = await writeConnectionCredential(db, {
+      companyId,
+      connectionName: aInstance.name,
+      configPath: "oauth.access_token",
+      label: "a token",
+      value: "token-a",
+      ownerUserId: userA,
+      definitionKey: `test.a.${randomUUID()}`,
+    });
+    await db.insert(connectionGrants).values({
+      companyId,
+      connectionId: aInstance.id,
+      kind: "user",
+      subjectUserId: userA,
+      status: "active",
+      isDefault: false,
+      credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+      createdByUserId: userA,
+    });
+    const agent = await seedAgent(companyId, { state: agentState() });
+    const [readEntry, sendEntry] = await db
+      .insert(toolCatalogEntries)
+      .values(["gmail_search", "gmail_send"].map((name) => ({
+        companyId, applicationId: aInstance.applicationId, connectionId: aInstance.id, entryKind: "tool" as const,
+        name, toolName: name, title: name, riskLevel: "read", isReadOnly: true, status: "quarantined" as const,
+        quarantineReason: "pending_review", versionHash: randomUUID(), schemaHash: randomUUID(),
+      })))
+      .returning();
+    // The owner installs one agent first, as the real first consent does.
+    await service.finishGalleryAppConnection(companyId, aInstance.id, {
+      enabledCatalogEntryIds: [],
+      askFirstCatalogEntryIds: [],
+      access: { agentIds: [agent.id] },
+    }, userActor(userA));
+    const installsBefore = (await toolRowsOf(companyId)).installs.map((install) => install.targetId);
+    expect(installsBefore).toEqual([agent.id]);
+
+    const adminActor = { ...userActor(userB), isInstanceAdmin: true };
+    const review = {
+      enabledCatalogEntryIds: [readEntry!.id],
+      askFirstCatalogEntryIds: [],
+      reviewedCatalogEntryIds: [readEntry!.id, sendEntry!.id],
+    };
+
+    // A non-admin manager is still refused, and so is an admin who tries to change the install set.
+    await expect(
+      service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, preserveExistingAccess: true, access: { agentIds: [] } }, userActor(userB)),
+    ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+    await expect(
+      service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, access: { agentIds: [] } }, adminActor),
+    ).rejects.toMatchObject({ status: 422, details: { code: "personal_instance_install_owner_required" } });
+    await expect(
+      service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, preserveExistingAccess: true, access: "all_agents" }, adminActor),
+    ).rejects.toMatchObject({ status: 422, details: { code: "company_install_not_permitted" } });
+    expect((await toolRowsOf(companyId)).catalog.map((entry) => entry.status).sort()).toEqual(["quarantined", "quarantined"]);
+
+    // The admin's review enables one tool, declines the other, and leaves the owner's install untouched.
+    await service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, preserveExistingAccess: true, access: { agentIds: [] } }, adminActor);
+    const rows = await toolRowsOf(companyId);
+    expect(rows.installs.map((install) => install.targetId)).toEqual(installsBefore);
+    const byName = Object.fromEntries(rows.catalog.map((entry) => [entry.toolName, entry]));
+    expect(byName.gmail_search!.status).toBe("active");
+    expect(byName.gmail_send!.status).toBe("quarantined");
+    expect(byName.gmail_send!.quarantineReason).toBe(TOOL_QUARANTINE_REASON_REVIEWED_DECLINED);
+    const effective = await service.getEffectiveProfilesForAgent(companyId, agent.id);
+    expect(effective.allowedToolNames).toContain("gmail_search");
+    expect(effective.allowedToolNames).not.toContain("gmail_send");
+
+    // Re-enabling the connection stays an owner-only act, admin or not.
+    await service.updateConnection(aInstance.id, { enabled: false }, companyId, userActor(userA));
+    await expect(
+      service.updateConnection(aInstance.id, { enabled: true }, companyId, adminActor),
+    ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
   });
 
   it("finishing a personal instance never saves an access choice that reaches no agent: all-agents is refused loudly, chosen agents are installed and see the tools", async () => {

@@ -4684,9 +4684,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect(catalog.every((entry) => entry.status === "quarantined")).toBe(true);
 
       // "board-user" is the company admin (and the deployment's instance admin): the finish
-      // route's creator-or-manager gate lets it through. The service must still refuse a
-      // non-owner finish: approving Alice's quarantined tools and binding the whole company
-      // is exactly what putConnectionInstalls already refuses with personal_instance_owner_required.
+      // route's creator-or-manager gate lets it through, and an instance admin may review a personal
+      // instance's tools. The service must still refuse a finish that binds the whole company or changes
+      // which agents the instance is installed on: that stays the owner's call.
       stubPublicUrl();
       const managerApp = createActorApp({
         type: "board",
@@ -4720,7 +4720,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
           trusted: { personalSubjectUserId: "board-user", expectNewProfile: false },
         });
       expect(forged.status).not.toBe(200);
-      expect(forged.body.details).toMatchObject({ code: "personal_instance_owner_required" });
+      expect(forged.body.details).toMatchObject({ code: "personal_instance_install_owner_required" });
       // And nothing was enabled or bound regardless of the guard's shape.
       expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, company.id))).toHaveLength(0);
       expect((await catalogOf(instanceId)).every((entry) => entry.status === "quarantined")).toBe(true);
