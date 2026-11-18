@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createGitHubBrokerToken, createRuntimeToolsToken, REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, verifyRuntimeToolsToken } from "./runtime-tools-token.js";
+import { createRuntimeToolsToken, REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, verifyRuntimeToolsToken } from "./runtime-tools-token.js";
 
 describe("runtime connection tools token", () => {
   afterEach(() => {
@@ -58,17 +58,6 @@ describe("runtime connection tools token", () => {
     expect(shorter.exp - now).toBe(600);
     const intents = verifyRuntimeToolsToken(createRuntimeToolsToken({ ...base, scope: undefined, maxTtlSeconds: 7 * 86400 })!.token)!;
     expect(intents.exp - now).toBe(3600);
-  });
-
-  it("mints the GitHub broker token with a 7 day ceiling only for remote targets", () => {
-    vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "test-runtime-tools-secret");
-    vi.setSystemTime(new Date("2026-08-26T12:00:00.000Z"));
-    const now = Math.floor(Date.now() / 1000);
-    const base = { agentId: "agent-1", companyId: "company-1", runId: "run-1", responsibleUserId: "user-1" };
-    const remote = verifyRuntimeToolsToken(createGitHubBrokerToken({ ...base, remoteTarget: true })!.token, "github_credentials")!;
-    expect(remote.exp - now).toBeLessThanOrEqual(7 * 24 * 60 * 60);
-    const local = verifyRuntimeToolsToken(createGitHubBrokerToken({ ...base, remoteTarget: false })!.token, "github_credentials")!;
-    expect(local.exp - now).toBe(30 * 24 * 60 * 60);
   });
 
   it("rejects an invalid cap instead of failing open, and floors a fractional one", () => {

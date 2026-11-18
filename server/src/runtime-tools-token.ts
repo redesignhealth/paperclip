@@ -80,22 +80,6 @@ export function createRuntimeToolsToken(input: {
     : null;
 }
 
-/** GitHub broker capability for one run; bounded to 7 days when it leaves the host (TECH-8988). */
-export function createGitHubBrokerToken(input: {
-  agentId: string;
-  companyId: string;
-  runId: string;
-  responsibleUserId: string;
-  remoteTarget: boolean;
-}) {
-  const { remoteTarget, ...claims } = input;
-  return createRuntimeToolsToken({
-    ...claims,
-    scope: "github_credentials",
-    ...(remoteTarget ? { maxTtlSeconds: REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS } : {}),
-  });
-}
-
 export function verifyRuntimeToolsToken(token: string, scope: RuntimeToolsTokenClaims["scope"] = "connection_intents"): RuntimeToolsTokenClaims | null {
   const parts = token.split(".");
   if (parts.length !== 3) return null;

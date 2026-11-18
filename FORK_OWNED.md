@@ -74,7 +74,7 @@ any new fork patch; remove one when the patch is upstreamed.
 
 - `server/src/runtime-tools-token.ts` GitHub broker token cap for remote targets
 - `server/src/services/heartbeat/runtime-execution.ts` agent identity withheld from remote targets
-- `server/src/services/heartbeat.ts` broker token minted via createGitHubBrokerToken
+- `server/src/services/heartbeat.ts` broker token capped for remote targets
 
 ## Slack file text extraction (TECH-8958)
 
