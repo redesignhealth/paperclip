@@ -121,3 +121,37 @@ hundred ms.
 - If the replay shows request execs dominate, the next step is to fold the size
   and read into the wake exec and the request removal into the response write
   (5 execs per request to 2). Not done here, to keep this change to one concern.
+
+## Follow-up: one exec of its own per request (TECH-8174)
+
+The retest showed the request execs dominate: a task run makes 11-16 bridge
+requests (Hermes sends about 8 MCP requests at startup), and each cost a size
+check, a read, the response write and the request removal, so 45-60 of about
+105 execs per run. Kubernetes only (the same gate as the wait):
+
+- The wait exec returns small request envelopes with the listing. Each file
+  that is not ignored is framed as `B <name>`, its first 32 KiB + 1 bytes in
+  base64, and a `.` line; the host uses a body only when it decodes to 1 to
+  32 KiB. A larger file, an empty or vanished one, a cut frame, or files after
+  the exec's 1 MiB output budget are only listed and take the old size-and-read
+  path, so the 413 envelope limit and the 400 body limit behave as before.
+- An inline body is a snapshot. The host uses it within 2 s of the listing; a
+  sequential pass that runs longer lists again (one exec for the rest of the
+  batch) instead of using an old copy, so a request whose caller gave up (the
+  gateway deletes its file) is still skipped.
+- The response write exec also deletes the request file, after the write
+  decision, and reports `removed`. A failed `rm` never fails the write; the
+  host then removes the file itself. Other providers keep the separate remove.
+- A request is processed at most once. After any terminal response lands
+  (handler response, 504 backstop, recovery 503) the file name is marked
+  answered. An answered file is never processed again, is ignored by the wait,
+  gets no drain 503, and its removal is retried; the mark is dropped when a
+  listing that started after the answer no longer shows the file. Before this,
+  a failed removal dropped the attempt's guard and the re-listed file ran its
+  handler a second time.
+
+Per request: one write exec of its own, plus the wake it shares with any other
+request in the same listing (the wait exec runs every 5 s anyway). About 2 execs
+for an isolated request instead of 5, and about 1 per request in a burst, so a
+task run with 11-16 requests drops from about 45-60 to about 15-30 bridge
+execs.
