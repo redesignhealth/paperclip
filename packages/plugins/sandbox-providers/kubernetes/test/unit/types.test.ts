@@ -68,6 +68,10 @@ describe("kubernetesProviderConfigSchema", () => {
     expect(parseKubernetesProviderConfig({ inCluster: true, resourceQuota: old }).resourceQuota).toEqual({
       pods: "20", requestsCpu: "5", requestsMemory: "10Gi", limitsCpu: "40", limitsMemory: "80Gi",
     });
+    // Only `pods` raised under the old version: the stored old CPU/memory follow pods.
+    expect(
+      parseKubernetesProviderConfig({ inCluster: true, resourceQuota: { ...old, pods: "30" } }).resourceQuota,
+    ).toMatchObject({ pods: "30", limitsCpu: "60", limitsMemory: "120Gi" });
     // A deliberate partial override of the old tuple is still honored.
     expect(
       parseKubernetesProviderConfig({ inCluster: true, resourceQuota: { ...old, limitsCpu: "30" } }).resourceQuota.limitsCpu,

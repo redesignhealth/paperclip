@@ -36,10 +36,11 @@ export const resourceQuotaSchema = z
   .transform((q): QuotaValues => {
     const derived = defaultQuotaForPods(Number(q.pods));
     // Saved configs written by the first plugin version carry its old default
-    // tuple explicitly (20 pods with only 20 CPU / 40Gi of limits, which admits
-    // 10 pods). Nobody chose those values, so treat that exact tuple as unset.
+    // CPU/memory values explicitly (20 CPU / 40Gi of limits, which admits 10
+    // pods). Nobody chose those values, so treat that exact set as unset.
+    // Matched on the four CPU/memory values only: an operator who raised just
+    // `pods` under the old version also stored them untouched.
     if (
-      q.pods === "20" &&
       q.requestsCpu === "10" &&
       q.requestsMemory === "20Gi" &&
       q.limitsCpu === "20" &&

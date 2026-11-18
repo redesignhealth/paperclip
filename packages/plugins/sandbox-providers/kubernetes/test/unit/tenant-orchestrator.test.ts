@@ -314,6 +314,18 @@ describe("assertPodCapacity", () => {
     await expect(assertPodCapacity(reqFull as never, "ns", need)).rejects.toThrow(/requests\.cpu/);
   });
 
+  it("uses spec.hard over a lagging status.hard, so a freshly raised quota admits the run", async () => {
+    const clients = {
+      core: {
+        readNamespacedResourceQuota: vi.fn().mockResolvedValue({
+          spec: { hard: { pods: "20", "limits.cpu": "40" } },
+          status: { hard: { pods: "20", "limits.cpu": "20" }, used: { pods: "10", "limits.cpu": "20" } },
+        }),
+      },
+    };
+    await expect(assertPodCapacity(clients as never, "ns", podQuotaNeed())).resolves.toBeUndefined();
+  });
+
   it("never blocks a run when the quota cannot be read", async () => {
     const clients = { core: { readNamespacedResourceQuota: vi.fn().mockRejectedValue({ code: 404 }) } };
     await expect(assertPodCapacity(clients as never, "ns")).resolves.toBeUndefined();

@@ -808,7 +808,9 @@ const plugin = definePlugin({
     // freeze today's defaults and stop them following `pods` or future defaults.
     const normalized: Record<string, unknown> = { ...cfg };
     const rawQuota = (params.config as Record<string, unknown> | null | undefined)?.resourceQuota;
+    // Persist only what the operator wrote (validated above), never the derived tuple.
     if (rawQuota === undefined || rawQuota === null) delete normalized.resourceQuota;
+    else normalized.resourceQuota = rawQuota;
     return { ok: true, normalizedConfig: normalized, warnings: warnings.length > 0 ? warnings : undefined };
   },
 

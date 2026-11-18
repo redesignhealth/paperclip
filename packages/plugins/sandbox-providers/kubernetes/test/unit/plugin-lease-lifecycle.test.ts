@@ -745,7 +745,7 @@ describe("reusable conversation pods", () => {
     const set = await plugin.definition.onEnvironmentValidateConfig!({
       driverKey: "kubernetes", config: { inCluster: true, resourceQuota: { pods: "30" } },
     });
-    expect(set.normalizedConfig).toMatchObject({ resourceQuota: { pods: "30", limitsCpu: "60" } });
+    expect(set.normalizedConfig?.resourceQuota).toEqual({ pods: "30" });
   });
 
   it("tracks idle time only for leases the server marked reusable, and the reaper deletes them after the TTL", async () => {

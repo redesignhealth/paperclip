@@ -438,7 +438,7 @@ export async function assertPodCapacity(
   namespace: string,
   need?: PodQuotaNeed,
 ): Promise<void> {
-  let quota: { status?: { hard?: Record<string, string>; used?: Record<string, string> } };
+  let quota: { spec?: { hard?: Record<string, string> }; status?: { hard?: Record<string, string>; used?: Record<string, string> } };
   try {
     quota = (await clients.core.readNamespacedResourceQuota({
       name: RESOURCE_QUOTA_NAME,
@@ -455,7 +455,10 @@ export async function assertPodCapacity(
     }
     return;
   }
-  const hard = parseWholeNumber(quota.status?.hard?.pods);
+  // Prefer spec.hard (what reconcile just wrote); status.hard can lag it until the
+  // quota controller catches up, which would reject a run the new quota admits.
+  const hardLimits = { ...quota.status?.hard, ...quota.spec?.hard };
+  const hard = parseWholeNumber(hardLimits.pods);
   const used = parseWholeNumber(quota.status?.used?.pods);
   if (hard !== null && used !== null && used >= hard) {
     throw new OverCapacityError(namespace, `${used} of ${hard} pods in use`);
@@ -470,7 +473,7 @@ export async function assertPodCapacity(
     { key: "requests.memory", parse: parseMemoryBytes, add: need.requestsMemoryBytes, label: "memory requests (bytes)" },
   ];
   for (const { key, parse, add, label } of dimensions) {
-    const dimHard = parse(quota.status?.hard?.[key]);
+    const dimHard = parse(hardLimits[key]);
     const dimUsed = parse(quota.status?.used?.[key]);
     if (add > 0 && Number.isFinite(dimHard) && Number.isFinite(dimUsed) && dimUsed + add > dimHard) {
       throw new OverCapacityError(
