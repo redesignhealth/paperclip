@@ -44,7 +44,7 @@ const manifest: PaperclipPluginManifestV1 = {
           auth: {
             type: "object",
             description:
-              "EKS IAM auth instead of a kubeconfig: the server signs short-lived EKS tokens with its own AWS identity (for example the ECS task role). The cluster must be listed in the deployment's PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS.",
+              "EKS IAM auth instead of a kubeconfig: the server signs short-lived EKS tokens with its own AWS identity (for example the ECS task role). The cluster name and endpoint must match an entry in the deployment's PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS (<clusterName>=<endpoint>, comma-separated).",
             properties: {
               type: { type: "string", enum: ["eks-iam"] },
               clusterName: { type: "string", description: "EKS cluster name." },

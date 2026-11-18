@@ -63,7 +63,7 @@ The plugin worker signs a short-lived EKS token itself (a presigned STS `GetCall
 
 Operator setup:
 
-- Set `PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS` (comma-separated cluster names) on the server. Only those clusters can be used. Only when it is set does the server forward its AWS credential pointers (`AWS_CONTAINER_CREDENTIALS_*`, web identity, region; never static keys) to this plugin's worker.
+- Set `PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS` on the server to comma-separated `<clusterName>=<endpoint>` pairs, e.g. `paperclip-prod-sandbox=https://ABC.gr7.us-east-1.eks.amazonaws.com`. An environment can use eks-iam only with a cluster name and endpoint that match an entry. Only when it is set does the server forward its AWS credential pointers (`AWS_CONTAINER_CREDENTIALS_*`, web identity, region; never static keys) to this plugin's worker.
 - Give the server's IAM role an EKS access entry (type `STANDARD`) mapping it to a Kubernetes group bound to the plugin's RBAC. No IAM policy is needed for `sts:GetCallerIdentity`.
 
 Common optional fields:

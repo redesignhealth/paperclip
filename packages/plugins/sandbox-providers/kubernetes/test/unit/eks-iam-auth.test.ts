@@ -28,7 +28,7 @@ const AUTH = {
   endpoint: "https://ABCDEF0123456789.gr7.us-east-1.eks.amazonaws.com",
   caData: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==",
 };
-const ALLOW_ENV = { PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "paperclip-prod-sandbox" };
+const ALLOW_ENV = { PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: `other=https://x.eks.amazonaws.com, paperclip-prod-sandbox=${AUTH.endpoint}` };
 
 function decodeToken(token: string): URL {
   expect(token.startsWith("k8s-aws-v1.")).toBe(true);
@@ -144,7 +144,17 @@ describe("createKubeConfig with eks-iam auth", () => {
 
   it("refuses a cluster the deployment has not allowed", () => {
     expect(() => createKubeConfig({ auth: AUTH }, { env: {} })).toThrow(/PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS/);
-    expect(() => createKubeConfig({ auth: AUTH }, { env: { PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "other" } })).toThrow();
+    expect(() => createKubeConfig({ auth: AUTH }, { env: { PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "," } })).toThrow();
+    // The name alone is not enough: a same-named cluster at another endpoint is refused.
+    expect(() =>
+      createKubeConfig(
+        { auth: { ...AUTH, endpoint: "https://OTHER.gr7.us-east-1.eks.amazonaws.com" } },
+        { env: ALLOW_ENV },
+      ),
+    ).toThrow(/not enabled/);
+    expect(() =>
+      createKubeConfig({ auth: AUTH }, { env: { PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "paperclip-prod-sandbox" } }),
+    ).toThrow();
   });
 
   it("puts a bearer token on API requests and fetch-based watches, refreshed after expiry", async () => {
@@ -223,7 +233,7 @@ describe("config validation for the eks-iam auth mode", () => {
       expect(denied.ok).toBe(false);
       expect(denied.errors?.[0]).toMatch(/not enabled on this deployment/);
 
-      vi.stubEnv("PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS", "paperclip-prod-sandbox");
+      vi.stubEnv("PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS", ALLOW_ENV.PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS);
       const allowed = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "kubernetes", config: { auth: AUTH } } as never);
       expect(allowed.ok).toBe(true);
       expect(allowed.normalizedConfig?.auth).toEqual(AUTH);

@@ -28,7 +28,7 @@ export function createKubeConfig(
   const kc = new KubeConfig();
   if (input.auth?.type === "eks-iam") {
     const { clusterName, region, endpoint, caData } = input.auth;
-    assertEksIamClusterAllowed(clusterName, deps.env);
+    assertEksIamClusterAllowed(input.auth, deps.env);
     kc.addAuthenticator(new EksIamAuthenticator(deps.tokenSource ?? getEksTokenSource(clusterName, region)));
     kc.loadFromClusterAndUser(
       { name: clusterName, server: endpoint, caData, skipTLSVerify: false },

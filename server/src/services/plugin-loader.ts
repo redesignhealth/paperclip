@@ -206,6 +206,15 @@ const EKS_IAM_ENV_PASSTHROUGH = [
   "AWS_DEFAULT_REGION",
 ];
 
+// Same parse as the plugin (`eksIamAllowedClusters`): at least one
+// `<clusterName>=<endpoint>` entry with both halves non-empty.
+function hasEksIamAllowedCluster(value: string | undefined): boolean {
+  return (value ?? "").split(",").some((entry) => {
+    const eq = entry.indexOf("=");
+    return eq > 0 && entry.slice(0, eq).trim().length > 0 && entry.slice(eq + 1).trim().length > 0;
+  });
+}
+
 export function buildPluginWorkerEnv(input: {
   manifest: Pick<PaperclipPluginManifestV1, "capabilities"> & {
     environmentDrivers?: ReadonlyArray<{ driverKey: string }>;
@@ -246,7 +255,7 @@ export function buildPluginWorkerEnv(input: {
     installOriginTrusted
       && input.packageName === KUBERNETES_PLUGIN_PACKAGE
       && (input.manifest.environmentDrivers ?? []).some((driver) => driver.driverKey === "kubernetes")
-      && (processEnv[EKS_IAM_ALLOWED_CLUSTERS_ENV] ?? "").trim().length > 0
+      && hasEksIamAllowedCluster(processEnv[EKS_IAM_ALLOWED_CLUSTERS_ENV])
       ? EKS_IAM_ENV_PASSTHROUGH
       : [];
   for (const key of [

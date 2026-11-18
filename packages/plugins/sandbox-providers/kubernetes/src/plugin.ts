@@ -26,7 +26,7 @@ import {
   type KubernetesLeaseMetadata,
 } from "./types.js";
 import { createKubeConfig, makeKubeClients } from "./kube-client.js";
-import { eksIamAllowedClusters } from "./eks-iam-auth.js";
+import { eksIamNotAllowedMessage, isEksIamClusterAllowed } from "./eks-iam-auth.js";
 import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./adapter-defaults.js";
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
@@ -794,13 +794,8 @@ const plugin = definePlugin({
     }
     const warnings: string[] = [];
     const cfg = parsed.data;
-    if (cfg.auth && !eksIamAllowedClusters().has(cfg.auth.clusterName)) {
-      return {
-        ok: false,
-        errors: [
-          `EKS IAM auth to cluster "${cfg.auth.clusterName}" is not enabled on this deployment (PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS).`,
-        ],
-      };
+    if (cfg.auth && !isEksIamClusterAllowed(cfg.auth)) {
+      return { ok: false, errors: [eksIamNotAllowedMessage(cfg.auth)] };
     }
     const adapterDefaults = getAdapterDefaults(cfg.adapterType, cfg.adapters);
     const totalFqdns = [...adapterDefaults.allowFqdns, ...cfg.egressAllowFqdns];

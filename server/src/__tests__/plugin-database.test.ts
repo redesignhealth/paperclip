@@ -305,7 +305,7 @@ describe("buildPluginWorkerEnv", () => {
   });
 
   const eksIamProcessEnv = {
-    PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "paperclip-prod-sandbox",
+    PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "paperclip-prod-sandbox=https://abc.gr7.us-east-1.eks.amazonaws.com",
     AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/abc",
     AWS_REGION: "us-east-1",
     AWS_ACCESS_KEY_ID: "static-key",
@@ -338,13 +338,27 @@ describe("buildPluginWorkerEnv", () => {
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
       ...(allowed
         ? {
-            PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "paperclip-prod-sandbox",
+            PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: "paperclip-prod-sandbox=https://abc.gr7.us-east-1.eks.amazonaws.com",
             AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/abc",
             AWS_REGION: "us-east-1",
           }
         : {}),
     });
   });
+
+  it.each([",", " , ", "paperclip-prod-sandbox", "=https://abc.gr7.us-east-1.eks.amazonaws.com", "paperclip-prod-sandbox="])(
+    "does not forward EKS IAM credential pointers when the allow-list has no valid entry: %j",
+    (allowList) => {
+      const env = buildPluginWorkerEnv({
+        packageName: "@paperclipai/plugin-kubernetes",
+        packagePath: null,
+        manifest: { capabilities: ["environment.drivers.register"], environmentDrivers: [{ driverKey: "kubernetes" }] },
+        instanceInfo,
+        processEnv: { ...eksIamProcessEnv, PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS: allowList },
+      });
+      expect(env).toEqual({ PAPERCLIP_DEPLOYMENT_MODE: "authenticated", PAPERCLIP_DEPLOYMENT_EXPOSURE: "public" });
+    },
+  );
 
   it("does not pass a credential when the first-party package omits its expected driver key", () => {
     const env = buildPluginWorkerEnv({

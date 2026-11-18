@@ -241,25 +241,40 @@ export class EksIamAuthenticator implements Authenticator {
 }
 
 /**
- * Cluster names the deployment lets the server's own IAM identity
- * authenticate to, from `PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS`
- * (comma-separated). The environment config is editable by company admins;
- * this operator-set list keeps them from pointing the server's identity at
- * another cluster. Unset means eks-iam auth is off.
+ * Clusters the deployment lets the server's own IAM identity authenticate to,
+ * from `PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS`: comma-separated
+ * `<clusterName>=<endpoint>` pairs. The environment config is editable by
+ * company admins; this operator-set list pins both the cluster name the token
+ * is signed for and the endpoint it is sent to, so an admin cannot point the
+ * server's identity at another cluster, or send its token to a same-named
+ * cluster elsewhere. Unset (or no valid pair) means eks-iam auth is off.
  */
 export function eksIamAllowedClusters(env: NodeJS.ProcessEnv = process.env): Set<string> {
-  return new Set(
-    (env.PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
-  );
+  const allowed = new Set<string>();
+  for (const raw of (env.PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS ?? "").split(",")) {
+    const eq = raw.indexOf("=");
+    if (eq <= 0) continue;
+    const name = raw.slice(0, eq).trim();
+    const endpoint = raw.slice(eq + 1).trim().replace(/\/+$/, "");
+    if (name && endpoint) allowed.add(`${name}=${endpoint}`);
+  }
+  return allowed;
 }
 
-export function assertEksIamClusterAllowed(clusterName: string, env: NodeJS.ProcessEnv = process.env): void {
-  if (!eksIamAllowedClusters(env).has(clusterName)) {
-    throw new Error(
-      `EKS IAM auth to cluster "${clusterName}" is not enabled on this deployment (PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS).`,
-    );
-  }
+export function isEksIamClusterAllowed(
+  auth: { clusterName: string; endpoint: string },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return eksIamAllowedClusters(env).has(`${auth.clusterName}=${auth.endpoint.replace(/\/+$/, "")}`);
+}
+
+export function eksIamNotAllowedMessage(auth: { clusterName: string }): string {
+  return `EKS IAM auth to cluster "${auth.clusterName}" at this endpoint is not enabled on this deployment (PAPERCLIP_K8S_EKS_IAM_ALLOWED_CLUSTERS).`;
+}
+
+export function assertEksIamClusterAllowed(
+  auth: { clusterName: string; endpoint: string },
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!isEksIamClusterAllowed(auth, env)) throw new Error(eksIamNotAllowedMessage(auth));
 }
