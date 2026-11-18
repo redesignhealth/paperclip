@@ -70,4 +70,16 @@ describe("runtime connection tools token", () => {
     const local = verifyRuntimeToolsToken(createGitHubBrokerToken({ ...base, remoteTarget: false })!.token, "github_credentials")!;
     expect(local.exp - now).toBe(30 * 24 * 60 * 60);
   });
+
+  it("rejects an invalid cap instead of failing open, and floors a fractional one", () => {
+    vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "test-runtime-tools-secret");
+    vi.setSystemTime(new Date("2026-08-26T12:00:00.000Z"));
+    const now = Math.floor(Date.now() / 1000);
+    const base = { agentId: "agent-1", companyId: "company-1", runId: "run-1", responsibleUserId: "user-1", scope: "github_credentials" as const };
+    for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => createRuntimeToolsToken({ ...base, maxTtlSeconds: bad })).toThrow();
+    }
+    const claims = verifyRuntimeToolsToken(createRuntimeToolsToken({ ...base, maxTtlSeconds: 12.5 })!.token, "github_credentials")!;
+    expect(claims.exp - now).toBe(12);
+  });
 });

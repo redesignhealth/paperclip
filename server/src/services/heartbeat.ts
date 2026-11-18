@@ -369,7 +369,7 @@ import {
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 
-import { createGitHubBrokerToken, createRuntimeToolsToken } from "../runtime-tools-token.js";
+import { createGitHubBrokerToken } from "../runtime-tools-token.js";
 import {
   parseObject,
 } from "../adapters/utils.js";

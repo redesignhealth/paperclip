@@ -52,6 +52,11 @@ export function createRuntimeToolsToken(input: {
   maxTtlSeconds?: number;
 }) {
   if (!secret()) return null;
+  // A cap can only shorten the lifetime; an invalid cap must never silently disable it.
+  if (input.maxTtlSeconds !== undefined && !(Number.isFinite(input.maxTtlSeconds) && input.maxTtlSeconds >= 1)) {
+    throw new Error("maxTtlSeconds must be a finite number of at least 1");
+  }
+  const maxTtl = input.maxTtlSeconds === undefined ? undefined : Math.floor(input.maxTtlSeconds);
   const now = Math.floor(Date.now() / 1000);
   const instanceId = resolvePaperclipInstanceId();
   const claims: RuntimeToolsTokenClaims = {
@@ -64,7 +69,7 @@ export function createRuntimeToolsToken(input: {
     // Broker tokens remain scoped to a live run, which is rechecked on every use.
     exp: now + Math.min(
       input.scope === "github_credentials" ? GITHUB_CREDENTIALS_TTL_SECONDS : TOKEN_TTL_SECONDS,
-      input.maxTtlSeconds !== undefined && input.maxTtlSeconds > 0 ? input.maxTtlSeconds : Number.POSITIVE_INFINITY,
+      maxTtl ?? Number.POSITIVE_INFINITY,
     ),
     instance_id: instanceId,
   };
