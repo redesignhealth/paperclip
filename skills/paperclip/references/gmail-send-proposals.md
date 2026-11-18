@@ -1,6 +1,6 @@
 # Proposing an email to send as your owner (`gmail_send`)
 
-Use this for any request to send an email as your owner (TECH-8951). You never send mail yourself: you propose it on the comms board, your owner approves it, and the owner's own signed-in Claude session sends it. You have no send tool, and `send_gmail_message` is disabled for agents; never call it or look for a workaround. If `proposals_submit` or `proposals_get` is missing, tell your owner.
+Use this for any request to send an email as your owner (TECH-8951). You never send mail yourself: you propose it on the comms board, your owner approves it, and the approvals service then sends it as your owner. No agent or session has a send tool: `send_gmail_message` is removed server-side for everyone, so never try to call it or work around it. Drafting (`draft_gmail_message`) is not sending. If `proposals_submit` or `proposals_get` is missing, tell your owner.
 
 ## The call
 
@@ -34,12 +34,13 @@ On a 422 the response has `field_errors` (`path` and `code`, for example `to` / 
 ## Lifecycle
 
 - A new `gmail_send` is always `pending`. It is never auto-approved. Only your owner's own decision on the decision page approves it.
-- Approval only records the decision; the board then shows `applied`, but nothing has been sent at that point. The email goes out when your owner's signed-in session runs `send_approved_email` for that proposal id. Tell your owner the proposal id and that it needs approving and sending.
-- Board statuses: `pending`, `approved`, `applying`, `applied`, `rejected`, `apply_failed`, `stale`, `withdrawn`. `proposals_get` shows only this board status. It cannot tell you that the email was actually sent. Do not tell the user "sent" on the strength of `applied`; say "approved, delivery not confirmed" unless the owner confirms.
-- Always call `proposals_get` for the real status before telling anyone what is pending. Never assume.
+- After approval, the board shows `applied` with `apply_result.sent: false`. That is only the recorded decision. A background worker in the approvals service then sends the email once, as your owner, through rh-google-mcp. You never trigger, retry, or confirm that send.
+- Board statuses: `pending`, `approved`, `applying`, `applied`, `rejected`, `apply_failed`, `stale`, `withdrawn`.
+- What you can see: `proposals_get` returns the board status and `apply_result`. What you cannot see: whether the email actually went out. The send result (sent, failed, unconfirmed) lives in the approvals ledger and is shown only on the owner's decision page. `applied` does not mean sent. Say "approved; the send result is on your decision page" and ask the owner, never "sent" or "delivered", unless the owner confirms.
+- Always call `proposals_get` for the real status before telling anyone what is pending. A `rejected`, `apply_failed`, `stale`, `withdrawn` or `applied` proposal is not pending; never report a stale status.
 
 ## One-shot rules
 
 - An open (`pending`/`applying`) `gmail_send` is never edited in place. Resubmitting the identical payload returns the same row. A changed payload is refused with 409 `proposal_immutable`: call `proposals_withdraw` (only works while `pending`), then submit again.
-- A decided proposal (`rejected`, `apply_failed`, `stale`, `withdrawn`, or approved) is finished. To try again, submit a NEW proposal with a new `target_id`.
-- A send the sender could not confirm is never retried automatically (the owner checks their Sent folder), and after 5 definite failures the hold is closed for good. If your owner reports a failed or unconfirmed send, treat the old proposal as final, never as still pending, and offer a new proposal. Do not resubmit before the owner says whether the first one went out, to avoid sending twice.
+- There are no retries. A failed or unconfirmed send is final, and a rejected or otherwise decided proposal is finished. To try again, submit a NEW proposal with a new `target_id`.
+- If your owner tells you the send failed or is unconfirmed, say plainly that the first email did not send (or may not have), that it will not be retried, and offer a new proposal. Before resubmitting after an unconfirmed send, ask the owner to check their Sent folder so the email is not sent twice.
