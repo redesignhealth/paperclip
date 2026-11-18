@@ -101,7 +101,7 @@ On every Kubernetes sandbox environment, **turns of an ongoing agent conversatio
 - **Quota.** Idle pods count against the company pod quota. Before refusing a run as over capacity, the plugin evicts the longest-idle reusable pod (idle at least 30 s, nothing in flight) in that company's namespace.
 - **Limits.** The idle registry lives in the worker process: after a plugin worker restart an idle pod is forgotten until its next turn (quota eviction and the orphan reaper cover it). Agent pause does not release the pod immediately; it expires at the idle TTL. A conversation that reaches a terminal state is released by the server.
 
-**Escape hatch (kill switch).** Set `conversationPodReuse: false` on the environment to give conversation turns a fresh pod per run like any task. It is unset by default, and unset means on. The legacy `reuseLease` / `reuseLeaseScope` / `runnerLifecycleMode` / `runnerIdleTimeoutMs` settings still work and `runnerIdleTimeoutMs` still sets the idle TTL.
+**Escape hatch (kill switch).** Set `conversationPodReuse: false` on the environment to give conversation turns a fresh pod per run like any task. It is unset by default, and unset means on. `runnerLifecycleMode: "per_turn"`, `reuseLease: false` or `reuseLeaseScope: "all"` do not turn it off; only `conversationPodReuse: false` does. The legacy `reuseLease` / `reuseLeaseScope` / `runnerLifecycleMode` / `runnerIdleTimeoutMs` settings still work and `runnerIdleTimeoutMs` still sets the idle TTL.
 
 ### Task-scoped egress grants
 
