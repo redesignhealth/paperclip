@@ -757,7 +757,7 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect((await db.select().from(toolConnections).where(eq(toolConnections.id, bInstance.id)))[0]!.status).toBe("draft");
   });
 
-  it("an instance admin can review a personal instance's quarantined tools without changing who it is installed on", async () => {
+  it("an instance admin can review a personal instance's tools, install it on agents and re-enable it, but never bind the whole company", async () => {
     const { companyId, userA, userB } = await seededCompanyWithMembers({ roles: { a: "member", b: "member" } });
     const service = svc();
     const seed = (await googleSeed(companyId))!;
@@ -807,13 +807,10 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
       reviewedCatalogEntryIds: [readEntry!.id, sendEntry!.id],
     };
 
-    // A non-admin manager is still refused, and so is an admin who tries to change the install set.
+    // A non-admin manager is still refused, and so is an admin who tries to bind the whole company.
     await expect(
       service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, preserveExistingAccess: true, access: { agentIds: [] } }, userActor(userB)),
     ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
-    await expect(
-      service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, access: { agentIds: [] } }, adminActor),
-    ).rejects.toMatchObject({ status: 422, details: { code: "personal_instance_install_owner_required" } });
     await expect(
       service.finishGalleryAppConnection(companyId, aInstance.id, { ...review, preserveExistingAccess: true, access: "all_agents" }, adminActor),
     ).rejects.toMatchObject({ status: 422, details: { code: "company_install_not_permitted" } });
@@ -831,11 +828,17 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(effective.allowedToolNames).toContain("gmail_search");
     expect(effective.allowedToolNames).not.toContain("gmail_send");
 
-    // Re-enabling the connection stays an owner-only act, admin or not.
+    // The admin can also move the install to another agent, as the owner can.
+    const otherAgent = await seedAgent(companyId, { state: agentState() });
+    await service.finishGalleryAppConnection(companyId, aInstance.id, { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [otherAgent.id] } }, adminActor);
+    expect((await toolRowsOf(companyId)).installs.map((install) => install.targetId)).toEqual([otherAgent.id]);
+    // A non-admin manager still cannot install, and re-enabling needs the owner or an admin.
     await service.updateConnection(aInstance.id, { enabled: false }, companyId, userActor(userA));
     await expect(
-      service.updateConnection(aInstance.id, { enabled: true }, companyId, adminActor),
+      service.updateConnection(aInstance.id, { enabled: true }, companyId, userActor(userB)),
     ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+    await service.updateConnection(aInstance.id, { enabled: true }, companyId, adminActor);
+    expect((await db.select().from(toolConnections).where(eq(toolConnections.id, aInstance.id)))[0]!.enabled).toBe(true);
   });
 
   it("finishing a personal instance never saves an access choice that reaches no agent: all-agents is refused loudly, chosen agents are installed and see the tools", async () => {

@@ -366,9 +366,9 @@ type ActorInfo = {
 };
 
 /**
- * Who may review tools and edit the access profile of a personal default-MCP instance: its owner, or an instance
- * admin. The sign-in (OAuth finalize), agent installs and re-enabling stay owner-only, because those act as, or
- * widen reach for, the owner's own identity.
+ * Who may review tools, edit the access profile, install on agents and re-enable a personal default-MCP instance:
+ * its owner, or an instance admin. Only the sign-in (OAuth finalize) stays owner-only, because it stores the
+ * caller's own credential as the grant.
  */
 function canReviewPersonalInstance(
   connection: { createdByUserId?: string | null },
@@ -20687,13 +20687,6 @@ export function toolAccessService(
       if (actor?.actorType === "user") {
         const connection = await getConnectionRow(connectionId, companyId);
         if (isPersonalDefaultMcpInstance(connection) && canReviewPersonalInstance(connection, actor)) {
-          const isOwner = actor.actorId === connection.createdByUserId;
-          if (!isOwner && !input.preserveExistingAccess) {
-            throw unprocessable(
-              "An instance admin can review this personal connection's tools but not change which agents it is installed on. Send preserveExistingAccess: true.",
-              { code: "personal_instance_install_owner_required" },
-            );
-          }
           if (input.access === "all_agents") {
             throw unprocessable(
               "This app runs as one person's own sign-in and cannot be shared with all agents. Choose specific agents instead.",
@@ -22350,8 +22343,8 @@ export function toolAccessService(
         }
         if (additionsToCheck.length > 0) {
           if (isPersonalDefaultMcpInstance(connection)) {
-            if (actor?.actorType !== "user" || !actor.actorId || actor.actorId !== connection.createdByUserId) {
-              throw forbidden("Only the personal connection owner can install this app on agents", {
+            if (!canReviewPersonalInstance(connection, actor)) {
+              throw forbidden("Only the personal connection owner or an instance admin can install this app on agents", {
                 code: "personal_instance_owner_required",
               });
             }
@@ -22574,10 +22567,9 @@ export function toolAccessService(
           );
         }
         if (input.enabled === true) {
-          const isOwner = actor?.actorType === "user" && actor.actorId === existing.createdByUserId;
-          if (!isOwner) {
+          if (!canReviewPersonalInstance(existing, actor)) {
             throw forbidden(
-              "Only the personal connection owner can re-enable this connection",
+              "Only the personal connection owner or an instance admin can re-enable this connection",
               { code: "personal_instance_owner_required" },
             );
           }
