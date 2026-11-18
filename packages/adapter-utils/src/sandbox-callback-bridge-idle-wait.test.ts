@@ -97,25 +97,22 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
     handle?: (request: { id: string; path: string }) => Promise<void>;
     wrapClient?: (client: SandboxCallbackBridgeQueueClient) => SandboxCallbackBridgeQueueClient;
     runnerEnv?: Record<string, string>;
-    runnerShell?: string;
-    maxBodyBytes?: number;
   } = {}) {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-wait-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const queueDir = path.join(root, "queue");
     const directories = sandboxCallbackBridgeDirectories(queueDir);
-    const runner = createLocalRunner(options.runnerEnv, options.runnerShell);
+    const runner = createLocalRunner(options.runnerEnv);
     const baseClient = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000, waitInSandbox: true });
     const client = options.wrapClient ? options.wrapClient(baseClient) : baseClient;
-    const handled: Array<{ id: string; at: number; body: string }> = [];
+    const handled: Array<{ id: string; at: number }> = [];
     const worker = await startSandboxCallbackBridgeWorker({
       client,
       queueDir,
       routePolicies: options.routePolicies,
-      ...(options.maxBodyBytes ? { maxBodyBytes: options.maxBodyBytes } : {}),
       authorizeRequest: () => null,
       handleRequest: async (request) => {
-        handled.push({ id: request.id, at: Date.now(), body: String(request.body) });
+        handled.push({ id: request.id, at: Date.now() });
         await options.handle?.({ id: request.id, path: request.path });
         return { status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ id: request.id }) };
       },
@@ -127,9 +124,9 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
       await worker.stop(drainTimeoutMs === undefined ? {} : { drainTimeoutMs });
     };
     cleanups.push(() => stop(10));
-    const enqueue = async (id: string, requestPath = "/api/agents/me", method = "GET", body = "") => {
+    const enqueue = async (id: string, requestPath = "/api/agents/me", method = "GET") => {
       const file = path.join(directories.requestsDir, `${id}.json`);
-      const payload = { id, method, path: requestPath, query: "", headers: {}, body, createdAt: new Date().toISOString() };
+      const payload = { id, method, path: requestPath, query: "", headers: {}, body: "", createdAt: new Date().toISOString() };
       await writeFile(`${file}.tmp`, `${JSON.stringify(payload)}\n`, "utf8");
       await import("node:fs/promises").then((fsp) => fsp.rename(`${file}.tmp`, file));
     };
@@ -433,7 +430,10 @@ describe("sandbox callback bridge inline bodies and folded removal (TECH-8174)",
     await sleep(200);
     const ids = Array.from({ length: 20 }, (_, index) => `burst-${String(index).padStart(2, "0")}`);
     await Promise.all(ids.map((id) => bridge.enqueue(id, { method: "POST", path: "/api/issues/x/comments", body: JSON.stringify({ id }) })));
-    await waitFor(async () => (await bridge.pendingRequests()).length === 0 && bridge.handled.length === ids.length, 15_000, "burst drained");
+    await waitFor(async () => (await bridge.pendingRequests()).length === 0 && bridge.handled.length === ids.length, 15_000, "burst drained")
+      .catch(async (error) => {
+        throw new Error(`${(error as Error).message}: handled=${JSON.stringify(bridge.handled.map((entry) => entry.id))} pending=${JSON.stringify(await bridge.pendingRequests())} scripts=${bridge.runner.scripts.length}`);
+      });
     expect(bridge.handled.map((entry) => entry.id)).toEqual(ids);
     expect(bridge.handled.map((entry) => entry.body)).toEqual(ids.map((id) => JSON.stringify({ id })));
     for (const id of ids) expect((await bridge.response(id))?.status).toBe(200);
@@ -597,19 +597,23 @@ describe("sandbox queue client inline listing and folded removal (TECH-8174)", {
       const client = createCommandManagedSandboxCallbackBridgeQueueClient({
         runner: createLocalRunner({}, shell), remoteCwd: root, timeoutMs: 30_000, waitInSandbox: true,
       });
-      let writtenAt = 0;
+      let writtenAt = Number.POSITIVE_INFINITY;
       setTimeout(() => {
-        void writeFile(path.join(root, "new.json.tmp"), "{\"id\":\"new\"}\n", "utf8")
-          .then(() => rename(path.join(root, "new.json.tmp"), path.join(root, "new.json")))
-          .then(() => { writtenAt = Date.now(); });
+        void writeFile(path.join(root, "new.json.tmp"), "{\"id\":\"new\"}\n", "utf8").then(() => {
+          // Set before the rename, so the wait cannot return first.
+          writtenAt = Date.now();
+          return rename(path.join(root, "new.json.tmp"), path.join(root, "new.json"));
+        });
       }, 300);
       const result = await client.waitForJsonFiles!(root, { waitMs: 5_000, inlineMaxBytes: 32 * 1024 });
       const returnedAt = Date.now();
       const { files, inline } = result as { files: string[]; inline: ReadonlyMap<string, string> };
       expect(files).toEqual(["new.json"]);
       expect(inline.get("new.json")).toBe("{\"id\":\"new\"}\n");
-      // One 50 ms step plus the shell's exit; the bound leaves room for CI.
-      expect(returnedAt - writtenAt).toBeLessThan(400);
+      // One 50 ms step plus the shell's exit (about 60-100 ms here); the bound
+      // leaves room for a loaded CI host.
+      expect(returnedAt - writtenAt).toBeGreaterThanOrEqual(0);
+      expect(returnedAt - writtenAt).toBeLessThan(1_000);
     });
 
     it(`writes the response and removes the request in one exec (${shell})`, async () => {

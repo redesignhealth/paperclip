@@ -1377,16 +1377,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
     ).catch(() => undefined);
   };
   // Reconcile the answered set with a listing that started when `answerSeq`
-  // was `seqAtListStart`.
-  const reconcileAnsweredFiles = async (fileNames: readonly string[], seqAtListStart: number) => {
+  // was `seqAtListStart`. The removal retry runs in the background, one at a
+  // time per file, so a hung channel never holds up the poll loop.
+  const removingAnswered = new Set<string>();
+  const reconcileAnsweredFiles = (fileNames: readonly string[], seqAtListStart: number) => {
     if (answeredFiles.size === 0) return;
     const listed = new Set(fileNames);
     for (const [fileName, seq] of [...answeredFiles]) {
       if (seq > seqAtListStart) continue;
       if (!listed.has(fileName)) {
         answeredFiles.delete(fileName);
-      } else if (!inFlightRequestGuards.has(fileName)) {
-        await removeRequestFile(fileName);
+      } else if (!inFlightRequestGuards.has(fileName) && !removingAnswered.has(fileName)) {
+        removingAnswered.add(fileName);
+        void removeRequestFile(fileName).finally(() => removingAnswered.delete(fileName));
       }
     }
   };
@@ -1519,7 +1522,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
       // A fresh inline body from the wait exec replaces the size and read
       // execs (TECH-8174). A stale one is dropped: the read below then sees a
-      // file the gateway removed for a caller that gave up, exactly as before.
+      // file the gateway removed for a caller that gave up. This bounds the
+      // snapshot-to-handler window at the freshness limit, like the old
+      // read-to-handler window.
       const inlineRaw = inlineBody && Date.now() - inlineBody.listedAt <= BRIDGE_INLINE_REQUEST_FRESH_MS
         ? inlineBody.raw
         : undefined;
@@ -2219,7 +2224,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // (including the guard's own backstop and abort timers).
         const listedAt = Date.now();
         // Forget answered files that are gone, retry the removal of the rest.
-        await reconcileAnsweredFiles(fileNames, seqAtListStart);
+        reconcileAnsweredFiles(fileNames, seqAtListStart);
         const actionableFileNames = fileNames.filter(
           (fileName) => !inFlightRequestGuards.has(fileName) && !dispatchedFiles.has(fileName) && !answeredFiles.has(fileName),
         );
@@ -2237,6 +2242,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           }
           continue;
         }
+        let startedThisPass = 0;
         for (const fileName of actionableFileNames) {
           if (stopping && Date.now() >= stopDeadline) break;
           const inlineRaw = inline?.get(fileName);
@@ -2245,7 +2251,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
           // bodies are stale. List again instead of reading each remaining
           // file: the next wait returns at once with fresh bodies, one exec
           // for the rest of the batch. Order is kept: the listing is sorted.
-          if (!tracked && inlineBody && Date.now() - listedAt > BRIDGE_INLINE_REQUEST_FRESH_MS) break;
+          // Never break before the first request of a pass, so every pass
+          // makes progress (that one falls back to the normal read).
+          if (!tracked && inlineBody && startedThisPass > 0 && Date.now() - listedAt > BRIDGE_INLINE_REQUEST_FRESH_MS) break;
+          startedThisPass += 1;
           if (tracked) {
             startRequestAttempt(fileName, inlineBody);
             continue;
