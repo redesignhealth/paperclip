@@ -33,11 +33,13 @@ export const MAX_CONCURRENT_SANDBOX_RUNS_ENV = "PAPERCLIP_MAX_CONCURRENT_SANDBOX
 /** A reservation outlives its claim only if the process stalls; it then stops counting. */
 const RESERVATION_TTL_MS = 2 * 60_000;
 /**
- * A waiter that has not been offered a slot recently (for example its agent is
- * paused or at its own run limit) no longer holds its place ahead of others.
- * The periodic queue pass (30 s by default) re-checks live waiters well within this.
+ * A waiter that has not been re-checked recently (for example its agent is
+ * paused or at its own run limit, so its queue pass never reaches the limit
+ * check) no longer holds its place ahead of others. The periodic queue pass
+ * (30 s by default) re-checks every live waiter well within this. Promotion
+ * parks such a waiter at once, so this bound only matters without a promotion.
  */
-const WAITER_STALE_MS = 3 * 60_000;
+const WAITER_STALE_MS = 90_000;
 const PLACEMENT_CACHE_MS = 5_000;
 
 /** Unset or empty: the default. 0 turns the limit off. Anything else invalid: the default. */
@@ -126,6 +128,14 @@ interface Waiter extends SandboxSlotEntry {
   provider: string;
   waitingSinceMs: number;
   lastCheckedAtMs: number;
+  /** Bumped on every limit check; promotion uses it to see which waiters were not re-checked. */
+  checkSeq: number;
+  /**
+   * Its agent's queue pass did not re-check it when a slot was offered (paused,
+   * at its own run limit, ...). A parked waiter does not hold its place ahead
+   * of others until its next limit check.
+   */
+  parked: boolean;
 }
 
 export type SandboxSlotDecision =
@@ -177,6 +187,7 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
   const loadPlacement = options.loadPlacement ?? loadSandboxPlacement;
   const waiters = new Map<string, Waiter>();
   const reservations = new Map<string, { companyId: string; reservedAtMs: number }>();
+  let checkSeq = 0;
   let placementCache: { db: Db; atMs: number; placement: Promise<SandboxPlacement> } | null = null;
   let lockTail: Promise<unknown> = Promise.resolve();
   let promoting: Promise<void> | null = null;
@@ -255,9 +266,11 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
         ...candidate,
         waitingSinceMs: existing?.waitingSinceMs ?? at,
         lastCheckedAtMs: at,
+        checkSeq: ++checkSeq,
+        parked: false,
       };
       const contenders = [...waiters.values()].filter((waiter) =>
-        waiter.runId !== candidate.runId && at - waiter.lastCheckedAtMs <= WAITER_STALE_MS);
+        waiter.runId !== candidate.runId && !waiter.parked && at - waiter.lastCheckedAtMs <= WAITER_STALE_MS);
       const position = rankSandboxSlotEntries([...contenders, entry], heldByCompany)
         .findIndex((waiter) => waiter.runId === candidate.runId);
       if (max - inUse > position) {
@@ -300,9 +313,15 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
           const agentIds = [...new Set(rankSandboxSlotEntries([...waiters.values()], heldByCompany).map((w) => w.agentId))];
           for (const agentId of agentIds) {
             if ((await freeSlots(db)) <= 0) break;
+            const checkedBefore = checkSeq;
             await startAgent(agentId).catch((err) => {
               logger.warn({ err, agentId }, "failed to start a run waiting for a sandbox slot");
             });
+            // The agent's queue pass did not reach these waiters (paused, at
+            // its own limit, ...): stop them holding slots ahead of others.
+            for (const waiter of waiters.values()) {
+              if (waiter.agentId === agentId && waiter.checkSeq <= checkedBefore) waiter.parked = true;
+            }
           }
         } while (promoteAgain && waiters.size > 0);
       } finally {
@@ -320,7 +339,11 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
     freeSlots,
     promoteWaiters,
     /** Test and diagnostics view. */
-    snapshot: () => ({ waiting: [...waiters.keys()], reserved: [...reservations.keys()] }),
+    snapshot: () => ({
+      waiting: [...waiters.keys()],
+      parked: [...waiters.values()].filter((waiter) => waiter.parked).map((waiter) => waiter.runId),
+      reserved: [...reservations.keys()],
+    }),
   };
 }
 

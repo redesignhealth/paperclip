@@ -122,7 +122,7 @@ describe.skipIf(!support.supported)("server-wide sandbox run limit in the run qu
 
   function queueFor(gate: ReturnType<typeof newGate>) {
     const deps = callbacks(db);
-    deps.getAgent.mockImplementation(async (id: string) => agentsById.get(id) ?? null);
+    deps.getAgent.mockImplementation(async (id: string) => (agentsById.get(id) ?? null) as never);
     const queue = createHeartbeatQueue(db, { ...deps, sandboxRunSlots: gate });
     return { deps, queue };
   }
@@ -332,6 +332,27 @@ describe.skipIf(!support.supported)("server-wide sandbox run limit in the run qu
     expect(deps.cancelRunInternal).toHaveBeenCalledWith(blocked.id, "budget exhausted");
     expect(gate.snapshot().reserved).toEqual([]);
     expect(await gate.freeSlots(db)).toBe(1);
+  });
+
+  it("parks a waiter whose agent cannot start it so it does not hold a freed slot", async () => {
+    limit = 1;
+    const paused = await agent((await company("Paused")).id, "Paused agent");
+    const other = await agent((await company("Other")).id, "Other agent");
+    const [holder] = await runs(other, 1, "running");
+    const [stuck] = await runs(paused, 1);
+    const [ready] = await runs(other, 1);
+    const gate = newGate();
+    const { deps, queue } = queueFor(gate);
+    await queue.startNextQueuedRunForAgent(paused.id);
+    await queue.startNextQueuedRunForAgent(other.id);
+    // The paused company holds no slot, so its older run ranks first; then its agent is paused.
+    deps.getAgentInvokability.mockImplementation(async (a) => a?.id === paused.id ? { invokable: false, reason: "paused" } as never : { invokable: true });
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, holder.id));
+    await queue.promoteSandboxSlotWaiters();
+    const status = await statusOf([stuck.id, ready.id]);
+    expect(status.get(stuck.id)).toBe("queued");
+    expect(status.get(ready.id)).toBe("running");
+    expect(gate.snapshot().parked).toEqual([stuck.id]);
   });
 
   it("runs a conversation turn before an older background run", async () => {
