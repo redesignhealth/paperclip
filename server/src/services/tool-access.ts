@@ -6901,6 +6901,8 @@ export function toolAccessService(
     profile: { companyId: string; profileKey: string },
     actor?: ActorInfo,
     dbClient: ToolAccessMutationDb = db,
+    /** Binding target types the caller is about to add to this profile. */
+    addsBindingTargetTypes: readonly string[] = [],
   ) {
     const match = /^app:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(profile.profileKey);
     if (!match) return;
@@ -6932,6 +6934,13 @@ export function toolAccessService(
         throw forbidden("Only the personal connection owner or an instance admin can modify this app's access profile", {
           code: "personal_instance_owner_required",
         });
+      }
+      // A personal instance runs as one person's own sign-in, so it never goes to the whole company, whoever asks.
+      if (addsBindingTargetTypes.includes("company")) {
+        throw unprocessable(
+          "This app runs as one person's own sign-in and cannot be shared with all agents. Choose specific agents instead.",
+          { code: "company_install_not_permitted" },
+        );
       }
     }
   }
@@ -23534,8 +23543,9 @@ export function toolAccessService(
           existing.companyId,
           tx,
         );
-        // Bindings can never be moved onto the managed template's profile either.
-        await assertProfileNotManagedTemplate(target, actor);
+        // Bindings can never be moved onto the managed template's profile either, and a personal
+        // instance's profile never takes a company-wide binding.
+        await assertProfileNotManagedTemplate(target, actor, tx, details.bindings.map((binding) => binding.targetType));
         if (target.status !== "active") {
           throw unprocessable(
             "Tool profile assignments can only be reassigned to an active profile",
@@ -23709,7 +23719,7 @@ export function toolAccessService(
       const db = tx as unknown as Db;
       const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
       if (!profile) throw notFound("Tool profile not found");
-      await assertProfileNotManagedTemplate(profile, actor);
+      await assertProfileNotManagedTemplate(profile, actor, tx, [input.targetType]);
       await assertTargetExists(
         profile.companyId,
         input.targetType,

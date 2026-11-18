@@ -7,7 +7,7 @@ import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, connectionGrants, issueThreadInteractions, toolConnectionInstalls } from "@paperclipai/db";
 import { and, eq, or } from "drizzle-orm";
-import { isArcanaStaticTemplate, isDefaultMcpSeed } from "../services/default-mcp-spec.js";
+import { isArcanaStaticTemplate, isDefaultMcpSeed, isPersonalDefaultMcpInstance } from "../services/default-mcp-spec.js";
 import {
   loadCompanyVisibility,
   withCompanyVisibilityAvailability,
@@ -1622,7 +1622,9 @@ function connectorEnrollmentPrincipal(req: Request): string {
         askFirstPolicyCount: result.policies.length,
         reviewedCatalogEntryCount: req.body.reviewedCatalogEntryIds?.length ?? 0,
         access: req.body.access,
-        instanceAdminReview: Boolean(existing.createdByUserId && req.actor.userId !== existing.createdByUserId),
+        instanceAdminReview: req.actor.isInstanceAdmin === true
+          && isPersonalDefaultMcpInstance(existing)
+          && req.actor.userId !== existing.createdByUserId,
       },
     });
     res.json(result);

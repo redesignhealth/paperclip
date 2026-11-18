@@ -828,11 +828,47 @@ describeEmbeddedPostgres("personal default-MCP instances (TECH-7340)", () => {
     expect(effective.allowedToolNames).toContain("gmail_search");
     expect(effective.allowedToolNames).not.toContain("gmail_send");
 
-    // The admin can also move the install to another agent, as the owner can.
+    // The admin can edit the personal instance's access profile; a non-admin manager cannot.
+    const [profile] = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${aInstance.id}`)));
+    await service.updateProfile(profile!.id, { description: "reviewed by an instance admin" } as never, adminActor);
+    await expect(
+      service.updateProfile(profile!.id, { description: "tampered" } as never, userActor(userB)),
+    ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+
+    // But nobody, admin or owner, can bind the profile to the whole company, directly or by reassigning a
+    // company-wide binding onto it when another profile is deleted.
+    for (const actor of [adminActor, userActor(userA)]) {
+      await expect(
+        service.bindProfile(profile!.id, { targetType: "company", targetId: companyId, priority: 100 } as never, actor),
+      ).rejects.toMatchObject({ status: 422, details: { code: "company_install_not_permitted" } });
+    }
+    const [companyWide] = await db
+      .insert(toolProfiles)
+      .values({ companyId, profileKey: `company-wide-${randomUUID()}`, name: `Company wide ${randomUUID()}`, status: "active", defaultAction: "deny" })
+      .returning();
+    await db.insert(toolProfileBindings).values({ companyId, profileId: companyWide!.id, targetType: "company", targetId: companyId, priority: 100 });
+    await expect(
+      service.deleteProfile(companyWide!.id, { reassignToProfileId: profile!.id } as never, adminActor),
+    ).rejects.toMatchObject({ status: 422, details: { code: "company_install_not_permitted" } });
+    expect((await toolRowsOf(companyId)).bindings.filter((binding) => binding.targetType === "company")).toHaveLength(1);
+
+    // putConnectionInstalls directly: a non-admin manager is refused, the admin is allowed.
     const otherAgent = await seedAgent(companyId, { state: agentState() });
+    await expect(
+      service.putConnectionInstalls(aInstance.id, { installs: [{ targetType: "agent", targetId: otherAgent.id }] }, userActor(userB)),
+    ).rejects.toMatchObject({ status: 403, details: { code: "personal_instance_owner_required" } });
+    // The one-owner-per-agent rule still binds an admin: an agent held by B's own instance cannot be taken.
+    const bInstance = await service.ensurePersonalDefaultMcpInstance(companyId, seed.id, userB);
+    const contested = await seedAgent(companyId, { state: agentState() });
+    await service.putConnectionInstalls(bInstance.id, { installs: [{ targetType: "agent", targetId: contested.id }] }, userActor(userB));
+    await expect(
+      service.putConnectionInstalls(aInstance.id, { installs: [{ targetType: "agent", targetId: contested.id }] }, adminActor),
+    ).rejects.toMatchObject({ status: 409, details: { code: "personal_instance_conflict" } });
+
+    // The admin can also move the install to another agent, as the owner can.
     await service.finishGalleryAppConnection(companyId, aInstance.id, { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [otherAgent.id] } }, adminActor);
-    expect((await toolRowsOf(companyId)).installs.map((install) => install.targetId)).toEqual([otherAgent.id]);
-    // A non-admin manager still cannot install, and re-enabling needs the owner or an admin.
+    expect((await toolRowsOf(companyId)).installs.filter((install) => install.connectionId === aInstance.id).map((install) => install.targetId)).toEqual([otherAgent.id]);
+    // Re-enabling needs the owner or an admin.
     await service.updateConnection(aInstance.id, { enabled: false }, companyId, userActor(userA));
     await expect(
       service.updateConnection(aInstance.id, { enabled: true }, companyId, userActor(userB)),
