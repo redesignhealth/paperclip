@@ -80,6 +80,7 @@ any new fork patch; remove one when the patch is upstreamed.
 
 - `packages/adapter-utils/src/sandbox-callback-bridge.ts` blocking queue wait instead of a 100 ms host poll
 - `packages/adapter-utils/src/sandbox-run-log-stream.ts` run-log tail waits for new output
+- `packages/adapter-utils/src/execution-target.ts` blocking wait enabled for Kubernetes only (TECH-9007 hunk)
 - `packages/adapter-utils/src/sandbox-callback-bridge-idle-wait.test.ts`
 - `doc/plans/2026-11-18-sandbox-bridge-idle-wait.md`
 

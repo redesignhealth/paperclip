@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
   sandboxCallbackBridgeDirectories,
+  sandboxProviderSupportsBlockingBridgeWait,
   startSandboxCallbackBridgeWorker,
 } from "./sandbox-callback-bridge.js";
 import type {
@@ -101,7 +102,7 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
     const queueDir = path.join(root, "queue");
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const runner = createLocalRunner(options.runnerEnv);
-    const baseClient = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000 });
+    const baseClient = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000, waitInSandbox: true });
     const client = options.wrapClient ? options.wrapClient(baseClient) : baseClient;
     const handled: Array<{ id: string; at: number }> = [];
     const worker = await startSandboxCallbackBridgeWorker({
@@ -241,11 +242,17 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
   });
 
   it("recovers after a failed wait exec and loses no request", async () => {
-    let failures = 2;
+    let failures = 1;
+    const calls: string[] = [];
     const bridge = await setup({
       wrapClient: (client) => ({
         ...client,
+        listJsonFiles: async (dir) => {
+          calls.push("list");
+          return client.listJsonFiles(dir);
+        },
         waitForJsonFiles: async (dir, options) => {
+          calls.push("wait");
           if (failures > 0) {
             failures -= 1;
             throw new Error("exec websocket dropped");
@@ -256,8 +263,13 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
     });
     await bridge.enqueue("after-failure");
     await waitFor(async () => (await bridge.response("after-failure")) !== null, 5_000, "request after wait failures");
-    expect(failures).toBe(0);
     expect((await bridge.response("after-failure"))?.status).toBe(200);
+    // One failed wait, then plain listings probe until one succeeds (the old
+    // recovery path), then the loop goes back to waiting.
+    expect(calls[0]).toBe("wait");
+    expect(calls[1]).toBe("list");
+    await waitFor(() => calls.lastIndexOf("wait") > 0, 3_000, "back to waiting after recovery");
+    expect(failures).toBe(0);
   });
 
   it("bounds the wait loop when the sandbox sleep rejects fractions", async () => {
@@ -275,7 +287,7 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
     const requestsDir = path.join(root, "requests");
     await mkdir(requestsDir, { recursive: true });
     const runner = createLocalRunner({ PATH: `${shimDir}:${process.env.PATH ?? ""}` });
-    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000 });
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000, waitInSandbox: true });
     const startedAt = Date.now();
     expect(await client.waitForJsonFiles!(requestsDir, { waitMs: 2_000 })).toEqual([]);
     const elapsed = Date.now() - startedAt;
@@ -289,7 +301,7 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-wait-client-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const runner = createLocalRunner();
-    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000 });
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: root, timeoutMs: 30_000, waitInSandbox: true });
     await writeFile(path.join(root, "known.json"), "{}", "utf8");
     let startedAt = Date.now();
     expect(await client.waitForJsonFiles!(root, { waitMs: 400, ignore: ["known.json"] })).toEqual(["known.json"]);
@@ -298,6 +310,47 @@ describe("sandbox callback bridge blocking wait (TECH-9007)", { timeout: 30_000 
     setTimeout(() => void writeFile(path.join(root, "new.json"), "{}", "utf8"), 150);
     expect(await client.waitForJsonFiles!(root, { waitMs: 3_000, ignore: ["known.json"] })).toEqual(["known.json", "new.json"]);
     expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+});
+
+describe("blocking wait gating (TECH-9007)", () => {
+  it("is enabled for Kubernetes only", () => {
+    expect(sandboxProviderSupportsBlockingBridgeWait("kubernetes")).toBe(true);
+    // Cloudflare runs every bridge command in one named session.
+    expect(sandboxProviderSupportsBlockingBridgeWait("cloudflare")).toBe(false);
+    expect(sandboxProviderSupportsBlockingBridgeWait("daytona")).toBe(false);
+    expect(sandboxProviderSupportsBlockingBridgeWait(null)).toBe(false);
+    expect(sandboxProviderSupportsBlockingBridgeWait(undefined)).toBe(false);
+  });
+
+  it("the command-managed client waits only when asked", () => {
+    const runner = createLocalRunner();
+    expect(createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: "/" }).waitForJsonFiles).toBeUndefined();
+    expect(typeof createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: "/", waitInSandbox: true }).waitForJsonFiles)
+      .toBe("function");
+  });
+
+  it("the run-log tail keeps the plain poll without idleWaitMs and clamps the window", async () => {
+    const scripts: string[] = [];
+    const runner = {
+      execute: async (input: ExecInput): Promise<RunProcessResult> => {
+        scripts.push(input.args?.[1] ?? "");
+        return { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: "" };
+      },
+    };
+    const plain = createSandboxRunLogTailFactory({ runner, remoteCwd: "/", logsDir: "/logs", pollIntervalMs: 1, maxConsecutiveFailures: 1 }).create();
+    plain.start(async () => undefined);
+    await waitFor(() => scripts.length >= 1, 2_000, "plain tick");
+    await plain.abort();
+    expect(scripts[0]).not.toContain("while [");
+    const clamped = createSandboxRunLogTailFactory({
+      runner, remoteCwd: "/", logsDir: "/logs", pollIntervalMs: 1, maxConsecutiveFailures: 1, idleWaitMs: 60_000, tickTimeoutMs: 3_000,
+    }).create();
+    clamped.start(async () => undefined);
+    await waitFor(() => scripts.length >= 2, 2_000, "clamped tick");
+    await clamped.abort();
+    // 1 s (a third of the 3 s tick timeout) at 200 ms per round.
+    expect(scripts[1]).toContain(`while [ "$n" -lt 5 ]`);
   });
 });
 
@@ -313,7 +366,7 @@ describe("sandbox run-log tail blocking wait (TECH-9007)", { timeout: 30_000 }, 
     const logsDir = path.join(root, "logs");
     await mkdir(logsDir, { recursive: true });
     const runner = createLocalRunner();
-    const tail = createSandboxRunLogTailFactory({ runner, remoteCwd: root, logsDir }).create();
+    const tail = createSandboxRunLogTailFactory({ runner, remoteCwd: root, logsDir, idleWaitMs: 5_000, pollIntervalMs: 500 }).create();
     const events: Array<{ stream: string; chunk: string; at: number }> = [];
     const stdoutLog = path.join(logsDir, "run-1-stdout.log");
     await writeFile(stdoutLog, "", "utf8");

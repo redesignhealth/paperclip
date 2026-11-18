@@ -42,7 +42,8 @@ output (the agent is thinking, sleeping, or waiting on the model).
   `requests/<id>.json`. The server-side listing exec can therefore wait in the
   pod: a small `sh` loop checks the directory every 50 ms (a builtin glob, one
   `sleep` fork) and exits as soon as a request file it is not already handling
-  appears, or after the wait window. One exec per 5 s replaces 50 execs.
+  appears, or after the wait window. One exec per 5 s replaces about 15 (the
+  100 ms sleep plus the exec round trip measured on dev).
 - A request that arrives while the run is idle is seen within 50 ms by the pod
   loop, so latency is lower than today's 100 ms server poll, not higher. No
   wake signal or new gateway code is needed. `inotifywait` is not guaranteed in
@@ -51,16 +52,23 @@ output (the agent is thinking, sleeping, or waiting on the model).
 - Nothing about request handling changes: the same files, the same per-request
   read/write/remove, the same guards, lanes, route policies (TECH-8907),
   watchdog and drain. Drivers keep the file transport.
-- It applies to every driver that uses the command-managed queue client, which
-  is the default with no config switch. Pi, Claude and Hermes local runs do not
-  use the sandbox bridge at all, so they are unchanged.
+- It is on by default for Kubernetes, with no config switch. It is gated on the
+  provider, because the wait only helps when each control command is its own
+  exec: Kubernetes opens one exec WebSocket per command. Cloudflare routes every
+  bridge command to one named session, where a 5 s wait could hold up request
+  reads and response writes, so Cloudflare and every other provider keep the
+  list-and-sleep poll unchanged (`sandboxProviderSupportsBlockingBridgeWait`).
+  A provider joins the set once its control commands are known to run
+  independently. Pi, Claude and Hermes local runs do not use the sandbox bridge
+  at all, so they are unchanged.
 
 ### Run-log tail
 
 The same idea: the tail exec waits in the pod (checking every 200 ms) until the
 stdout or stderr log grew past the byte offset the host already has, or the
-status file appears (the command ended), or the wait window ends. The minimum
-spacing between ticks goes from 250 ms to 500 ms. So an idle run does one tail
+status file appears (the command ended), or the wait window ends. For
+Kubernetes the minimum spacing between ticks goes from 250 ms to 500 ms; other
+providers keep the 250 ms poll with no wait. So an idle run does one tail
 exec per 5 s, and a run that prints continuously does at most 2 per second
 (4 today). Live log lines appear within about 0.5 s, as before within a few
 hundred ms.
@@ -68,17 +76,21 @@ hundred ms.
 ## Design details
 
 - New optional queue-client method `waitForJsonFiles(dir, { waitMs, ignore })`.
-  The command-managed client implements it with the pod loop; the result is the
-  same sorted listing `listJsonFiles` returns. A client without it (the local
+  The command-managed client adds it when created with `waitInSandbox: true`
+  (the execution target sets that for Kubernetes) and implements it with the
+  pod loop; the result is the same sorted listing `listJsonFiles` returns. A client without it (the local
   file-system client, external clients, test doubles) keeps the old
   list-and-sleep loop.
 - `ignore` carries the request files that already have an attempt (route
   policies run requests in the background, and their files stay in the queue
   until the response is written). Without it the wait would return at once and
   turn into a busy loop.
-- Wait window: `min(5 s, iteration timeout / 2, watchdog timeout / 4, client
-  timeout / 2)`. With the defaults that is 5 s against the 10 s iteration
-  timeout and the 20 s watchdog, so a healthy wait never trips either.
+- Wait window: the worker asks for `min(5 s, iteration timeout / 2, watchdog
+  timeout / 4)`, and the queue client caps that at half its own exec timeout.
+  With the defaults that is 5 s. The wait exec gets the wait window plus the
+  normal 10 s iteration timeout, so it has the same overhead budget as a plain
+  listing, and a healthy wait (at most about 5 s) never nears the 20 s
+  watchdog.
 - Spin guard: if a wait returns with nothing actionable in under one poll
   interval, the loop sleeps one poll interval (the old behavior is the worst
   case).
@@ -87,7 +99,9 @@ hundred ms.
   plain listings, so the TECH-8907 drain timing is unchanged.
 - Exec failure: a failed or timed-out wait is the same transient poll failure as
   a failed listing today: exponential backoff from 100 ms up to 5 s, the first
-  failure on the run trace, the watchdog as escalation.
+  failure on the run trace, the watchdog as escalation. After a failure the
+  loop probes with plain listings until one succeeds, then waits again, so the
+  recovery and watchdog timing match the old loop.
 - Run-log `finish`/`abort` wake the tail loop at once and drop the pending
   tick's result; `finish` already emits every byte past the streamed offset from
   the final batch, so nothing is lost or duplicated.

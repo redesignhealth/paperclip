@@ -15,14 +15,7 @@ import { shellQuote } from "./ssh.js";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
 const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
 
-// Minimum spacing between two tail execs. A run that prints all the time gets
-// at most two execs per second.
-const DEFAULT_TAIL_POLL_INTERVAL_MS = 500;
-// Blocking wait (TECH-9007). Each tail exec first waits inside the sandbox until
-// a log file grew past the host's offset or the command ended, up to this
-// window, so an idle run costs one exec per 5 s instead of four per second. The
-// window is also capped at a third of the tick timeout.
-const DEFAULT_TAIL_IDLE_WAIT_MS = 5_000;
+const DEFAULT_TAIL_POLL_INTERVAL_MS = 250;
 // How often the in-sandbox wait checks the log sizes. Pod-local work only.
 const TAIL_IN_SANDBOX_WAIT_STEP_MS = 200;
 const DEFAULT_TAIL_MAX_CHUNK_BYTES = 64 * 1024;
@@ -70,7 +63,13 @@ export interface SandboxRunLogTailFactoryOptions {
   maxChunkBytesPerTick?: number | null;
   tickTimeoutMs?: number | null;
   maxConsecutiveFailures?: number | null;
-  /** Longest in-sandbox wait for new output per tail exec; 0 disables it. */
+  /**
+   * Blocking wait (TECH-9007): the longest time each tail exec first waits
+   * inside the sandbox for a log to grow past the streamed offset or for the
+   * command to end. Capped at a third of the tick timeout. Absent or 0 keeps
+   * the plain poll. Set it only for a provider whose control commands run
+   * independently (`sandboxProviderSupportsBlockingBridgeWait`).
+   */
   idleWaitMs?: number | null;
 }
 
@@ -105,12 +104,7 @@ export function createSandboxRunLogTailFactory(
     DEFAULT_TAIL_MAX_CONSECUTIVE_FAILURES,
   );
 
-  const idleWaitMs = Math.min(
-    typeof options.idleWaitMs === "number" && Number.isFinite(options.idleWaitMs) && options.idleWaitMs >= 0
-      ? Math.trunc(options.idleWaitMs)
-      : DEFAULT_TAIL_IDLE_WAIT_MS,
-    Math.floor(tickTimeoutMs / 3),
-  );
+  const idleWaitMs = Math.min(normalizePositiveInt(options.idleWaitMs, 0), Math.floor(tickTimeoutMs / 3));
   const waitRounds = Math.floor(idleWaitMs / TAIL_IN_SANDBOX_WAIT_STEP_MS);
 
   let sequence = 0;
@@ -160,9 +154,9 @@ export function createSandboxRunLogTailFactory(
         "n=0",
         `while [ "$n" -lt ${waitRounds} ]; do`,
         `  [ -f ${shellQuote(statusFile)} ] && break`,
-        `  out_size=$(wc -c < ${shellQuote(streams[0].logFile)} 2>/dev/null || echo 0)`,
+        `  out_size=$(wc -c 2>/dev/null < ${shellQuote(streams[0].logFile)} || echo 0)`,
         `  [ \${out_size:-0} -gt ${streams[0].offset} ] 2>/dev/null && break`,
-        `  err_size=$(wc -c < ${shellQuote(streams[1].logFile)} 2>/dev/null || echo 0)`,
+        `  err_size=$(wc -c 2>/dev/null < ${shellQuote(streams[1].logFile)} || echo 0)`,
         `  [ \${err_size:-0} -gt ${streams[1].offset} ] 2>/dev/null && break`,
         `  if sleep ${step} 2>/dev/null; then n=$((n + 1)); else sleep 1; n=$((n + ${roundsPerSecond})); fi`,
         "done",
