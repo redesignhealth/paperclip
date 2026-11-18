@@ -13,6 +13,9 @@ export interface RuntimeToolsTokenClaims {
 }
 
 const TOKEN_TTL_SECONDS = 60 * 60;
+const GITHUB_CREDENTIALS_TTL_SECONDS = 30 * 24 * 60 * 60;
+/** Ceiling for credentials that leave the host (sandbox pods, remote targets). */
+export const REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 function secret() {
   return process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim()
@@ -45,6 +48,8 @@ export function createRuntimeToolsToken(input: {
   runId: string;
   responsibleUserId: string;
   scope?: RuntimeToolsTokenClaims["scope"];
+  /** Upper bound on the scope's default lifetime; it can only shorten it. */
+  maxTtlSeconds?: number;
 }) {
   if (!secret()) return null;
   const now = Math.floor(Date.now() / 1000);
@@ -57,7 +62,10 @@ export function createRuntimeToolsToken(input: {
     scope: input.scope ?? "connection_intents",
     iat: now,
     // Broker tokens remain scoped to a live run, which is rechecked on every use.
-    exp: now + (input.scope === "github_credentials" ? 30 * 24 * 60 * 60 : TOKEN_TTL_SECONDS),
+    exp: now + Math.min(
+      input.scope === "github_credentials" ? GITHUB_CREDENTIALS_TTL_SECONDS : TOKEN_TTL_SECONDS,
+      input.maxTtlSeconds !== undefined && input.maxTtlSeconds > 0 ? input.maxTtlSeconds : Number.POSITIVE_INFINITY,
+    ),
     instance_id: instanceId,
   };
   const signingInput = `${encode({ alg: "HS256", typ: "JWT" })}.${encode(claims)}`;
@@ -65,6 +73,22 @@ export function createRuntimeToolsToken(input: {
   return signature
     ? { token: `${signingInput}.${signature}`, expiresAt: new Date(claims.exp * 1000).toISOString() }
     : null;
+}
+
+/** GitHub broker capability for one run; bounded to 7 days when it leaves the host (TECH-8988). */
+export function createGitHubBrokerToken(input: {
+  agentId: string;
+  companyId: string;
+  runId: string;
+  responsibleUserId: string;
+  remoteTarget: boolean;
+}) {
+  const { remoteTarget, ...claims } = input;
+  return createRuntimeToolsToken({
+    ...claims,
+    scope: "github_credentials",
+    ...(remoteTarget ? { maxTtlSeconds: REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS } : {}),
+  });
 }
 
 export function verifyRuntimeToolsToken(token: string, scope: RuntimeToolsTokenClaims["scope"] = "connection_intents"): RuntimeToolsTokenClaims | null {
