@@ -174,6 +174,13 @@ describe("rh-mcp service tool set", () => {
     expect(entry!.setupHook).toBeUndefined();
     expect(entry!.reviewedTools?.allow).toEqual(RH_MCP_SERVICE_REVIEWED_TOOLS);
   });
+
+  it("composes one canonical sub per org and refuses anything that is not a UUID", () => {
+    const id = "0B2C7C1E-4F0A-4A4E-9B3E-0D6F0A3C9A11";
+    expect(composeRhMcpServiceSub(id)).toBe(`paperclip-rh-mcp-${id.toLowerCase()}`);
+    expect(composeRhMcpServiceSub("not-a-uuid")).toBeNull();
+    expect(composeRhMcpServiceSub(`${id}::x`)).toBeNull();
+  });
 });
 
 describe("parseReviewedToolsVersion", () => {
@@ -195,13 +202,6 @@ describe("parseReviewedToolsVersion", () => {
     expect(parseReviewedToolsVersion({ [SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY]: "4abc" })).toBeNull();
     expect(parseReviewedToolsVersion({ [SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY]: "4.5" })).toBeNull();
     expect(parseReviewedToolsVersion({ [SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY]: "-1" })).toBeNull();
-  });
-
-  it("composes one canonical sub per org and refuses anything that is not a UUID", () => {
-    const id = "0B2C7C1E-4F0A-4A4E-9B3E-0D6F0A3C9A11";
-    expect(composeRhMcpServiceSub(id)).toBe(`paperclip-rh-mcp-${id.toLowerCase()}`);
-    expect(composeRhMcpServiceSub("not-a-uuid")).toBeNull();
-    expect(composeRhMcpServiceSub(`${id}::x`)).toBeNull();
   });
 });
 
@@ -861,11 +861,20 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     expect(failingListFetchMock.calls.rotates).toHaveLength(1);
     expect(await secretService(db).resolveSecretValue(companyId, secretId, "latest")).toBe(ROTATED_TOKEN);
 
-    // 6. Version was NOT stamped because reconcile failed
+    // 6. Version was NOT stamped because reconcile failed, and activity log reflects the connection's actual stored version (3, not 4)
     const [connectionAfterRotation] = await connectionsOf(companyId);
     expect((connectionAfterRotation!.config as Record<string, unknown>)[SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY]).toBe(3);
     const postRotateTools = await enabledToolNames(originalConnectionId, companyId);
     expect(postRotateTools).not.toContain("decisions_run_grid");
+
+    const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const rotateActivity = activities.find((a) => a.action === "company.shared_org_rh_mcp.rotated");
+    expect(rotateActivity).toBeDefined();
+    expect(rotateActivity!.details).toMatchObject({
+      connectionId: originalConnectionId,
+      installed: 0,
+      version: 3,
+    });
 
     // 7. On a subsequent tick when refresh succeeds, reconciliation retries and succeeds!
     const healthyFetchMock = makeFetch();
@@ -930,6 +939,95 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     const activities = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
     expect(activities.some((a) => a.action === "company.shared_org_rh_mcp.reconciled")).toBe(true);
     expect(activities.some((a) => a.action === "company.shared_org_rh_mcp.rotated")).toBe(true);
+  });
+
+  it("filters out orphaned, terminated, and pending agent installs during reconciliation without crashing", async () => {
+    const companyId = await seedCompany();
+    await seedOwner(companyId);
+    const liveAgentId = await seedAgent(companyId);
+    const terminatedAgentId = await seedAgent(companyId, "terminated");
+    const pendingAgentId = await seedAgent(companyId, "pending_approval");
+    const fetchMock = makeFetch();
+
+    // 1. Initial provisioning creates connection and installs on the live agent
+    await ensureSharedOrgRhMcp(ctxFor(fetchMock), companyId);
+    const [originalConnection] = await connectionsOf(companyId);
+    const originalConnectionId = originalConnection!.id;
+
+    // 2. Simulate pre-upgrade state: connection at version 3, decisions_run_grid missing from catalog/profile
+    const [gridCatalogEntry] = await db
+      .select()
+      .from(toolCatalogEntries)
+      .where(and(eq(toolCatalogEntries.companyId, companyId), eq(toolCatalogEntries.toolName, "decisions_run_grid")));
+    await db.delete(toolProfileEntries).where(and(eq(toolProfileEntries.companyId, companyId), eq(toolProfileEntries.catalogEntryId, gridCatalogEntry!.id)));
+    await db.update(toolCatalogEntries).set({ status: "quarantined", quarantineReason: "reviewed_declined" }).where(eq(toolCatalogEntries.id, gridCatalogEntry!.id));
+
+    await db
+      .update(toolConnections)
+      .set({
+        config: sql`jsonb_set(coalesce(${toolConnections.config}, '{}'::jsonb), ARRAY[${SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY}::text], '3'::jsonb, true)`,
+      })
+      .where(eq(toolConnections.id, originalConnectionId));
+
+    // 3. Inject stale/corrupt install rows: an orphaned agent ID (not in agents table), terminated agent, and pending agent
+    const orphanedAgentId = randomUUID();
+    await db.insert(toolConnectionInstalls).values([
+      {
+        companyId,
+        connectionId: originalConnectionId,
+        targetType: "agent",
+        targetId: orphanedAgentId,
+      },
+      {
+        companyId,
+        connectionId: originalConnectionId,
+        targetType: "agent",
+        targetId: terminatedAgentId,
+      },
+      {
+        companyId,
+        connectionId: originalConnectionId,
+        targetType: "agent",
+        targetId: pendingAgentId,
+      },
+    ]);
+
+    // Verify corrupt install rows exist before reconciliation
+    const preInstalls = await installsOf(originalConnectionId);
+    const preTargetIds = preInstalls.map((row) => row.targetId);
+    expect(preTargetIds).toContain(orphanedAgentId);
+    expect(preTargetIds).toContain(terminatedAgentId);
+    expect(preTargetIds).toContain(pendingAgentId);
+    expect(preTargetIds).toContain(liveAgentId);
+
+    // 4. Run reconciliation - must NOT crash with assertAgentsInCompany throwing unprocessable
+    const reconcileOutcome = await ensureSharedOrgRhMcp(ctxFor(fetchMock), companyId);
+    expect(reconcileOutcome).toEqual({ kind: "reconciled", installed: 0 });
+
+    // 5. Version stamped to 4 and decisions_run_grid enabled
+    const [reconciledConn] = await connectionsOf(companyId);
+    expect((reconciledConn!.config as Record<string, unknown>)[SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY]).toBe(RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION);
+    const enabledTools = await enabledToolNames(originalConnectionId, companyId);
+    expect(enabledTools).toContain("decisions_run_grid");
+
+    // 6. Verify stale installs are excluded from access.agentIds (which populates profile bindings), while live agent install and binding remain intact
+    const [profile] = await db
+      .select({ id: toolProfiles.id })
+      .from(toolProfiles)
+      .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${originalConnectionId}`)));
+    const postBindings = await db
+      .select({ targetId: toolProfileBindings.targetId, targetType: toolProfileBindings.targetType })
+      .from(toolProfileBindings)
+      .where(and(eq(toolProfileBindings.companyId, companyId), eq(toolProfileBindings.profileId, profile!.id)));
+    const postBoundAgentIds = postBindings.filter((b) => b.targetType === "agent").map((b) => b.targetId);
+    expect(postBoundAgentIds).toEqual([liveAgentId]);
+    expect(postBoundAgentIds).not.toContain(orphanedAgentId);
+    expect(postBoundAgentIds).not.toContain(terminatedAgentId);
+    expect(postBoundAgentIds).not.toContain(pendingAgentId);
+
+    const postInstalls = await installsOf(originalConnectionId);
+    const postTargetIds = postInstalls.map((row) => row.targetId);
+    expect(postTargetIds).toContain(liveAgentId);
   });
 
   // ---- sweep --------------------------------------------------------------------------------

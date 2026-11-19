@@ -186,12 +186,10 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
     return "tools_missing";
   }
   const enabled = catalog.filter((entry) => allow.has(entry.toolName));
-  if (enabled.length < allow.size) {
-    logger.warn({ companyId: connection.companyId, listed: enabled.length, reviewed: allow.size }, "rh-mcp service connection lists fewer tools than the reviewed set");
-    return "tools_missing";
-  }
 
-  // Preserve existing agent bindings so reconciliation does not drop agent access
+  // Preserve existing agent bindings so reconciliation does not drop agent access,
+  // filtering out stale/orphaned or non-eligible (e.g. terminated/pending) agent installs
+  // so assertAgentsInCompany does not reject non-existent or ineligible agents.
   const existingAgentInstalls = await ctx.db
     .select({ targetId: toolConnectionInstalls.targetId })
     .from(toolConnectionInstalls)
@@ -203,6 +201,21 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
       ),
     );
   const installedAgentIds = [...new Set(existingAgentInstalls.map((row) => row.targetId))];
+  let liveInstalledAgentIds: string[] = [];
+  if (installedAgentIds.length > 0) {
+    const liveAgents = await ctx.db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(
+        and(
+          eq(agents.companyId, connection.companyId),
+          inArray(agents.id, installedAgentIds),
+          ne(agents.status, "terminated"),
+          ne(agents.status, "pending_approval"),
+        ),
+      );
+    liveInstalledAgentIds = liveAgents.map((a) => a.id);
+  }
 
   try {
     await toolAccessService(ctx.db, ctx.toolAccessOptions).finishGalleryAppConnection(
@@ -213,7 +226,7 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
         askFirstCatalogEntryIds: [],
         // Every currently quarantined action gets a settled review decision: allowlisted tools activate and the rest are recorded as reviewed-declined.
         reviewedCatalogEntryIds: catalog.filter((entry) => entry.status === "quarantined").map((entry) => entry.id),
-        access: { agentIds: installedAgentIds },
+        access: { agentIds: liveInstalledAgentIds },
       },
       ACTOR,
     );
@@ -425,8 +438,15 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
     rotated = true;
   }
 
-  if (reconcileError && !rotated) {
-    return { kind: "error", reason: reconcileError };
+  if (reconcileError) {
+    if (rotated) {
+      logger.warn(
+        { companyId, reason: reconcileError },
+        "shared-org rh-mcp reviewed tools reconciliation failed while token rotation succeeded",
+      );
+    } else {
+      return { kind: "error", reason: reconcileError };
+    }
   }
 
   const installed = await installOnLiveAgents(ctx, connection);
@@ -444,7 +464,7 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
     await logOutcome(ctx.db, companyId, "company.shared_org_rh_mcp.rotated", {
       connectionId: connection.id,
       installed,
-      version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION,
+      version: parseReviewedToolsVersion(connection.config),
     });
   } else if (kind === "provisioned") {
     await logOutcome(ctx.db, companyId, "company.shared_org_rh_mcp.provisioned", {

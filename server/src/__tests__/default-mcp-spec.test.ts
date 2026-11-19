@@ -15,6 +15,7 @@ import {
   COMMS_BOARD_TOKEN_EXPIRES_IN_DAYS,
   COMMS_BOARD_TOKEN_SCOPES,
   COMMS_BOARD_TEMPLATE_TOKEN_SCOPES,
+  RH_MCP_SERVICE_TOKEN_SCOPES_VERSION,
 } from "../services/comms-board-provisioner-client.js";
 import {
   AGENT_MEMORY_TOOL_TIMEOUT_MS,
@@ -640,6 +641,7 @@ describe("rh-mcp-service reviewed tools: comps:run (TECH-8433) and decisions:run
   it("offers decisions_run_grid under the decisions:run scope at reviewed-tools version 4 (TECH-9109)", () => {
     const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp-service")!;
     expect(entry.reviewedTools!.version).toBe(4);
+    expect(RH_MCP_SERVICE_TOKEN_SCOPES_VERSION).toBe(2);
     expect(RH_MCP_SERVICE_TOOLS_BY_SCOPE["decisions:run"]).toEqual(["decisions_run_grid"]);
     expect(entry.reviewedTools!.allow).toContain("decisions_run_grid");
   });
