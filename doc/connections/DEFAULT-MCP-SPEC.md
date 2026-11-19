@@ -710,7 +710,8 @@ connection to rh-mcp named `rh-mcp-service`, so no agent depends on one person's
   (annotations, Granola status, voice guides) are left out because a service identity has no meaningful answer for them.
 - **Lifecycle.** A periodic sweep (startup, then every 5 minutes) mints, connects, enables exactly the reviewed tools and installs
   live agents. New agents get it from `defaultEnabled`. The token is re-issued into a new vault version 60 days before expiry
-  (expiry kept in `config.rhMcpServiceTokenExpiresAt`).
+  (expiry kept in `config.rhMcpServiceTokenExpiresAt`). When `RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION` advances, the sweep reconciles
+  existing active connections (stored in `config.rhMcpServiceReviewedToolsVersion`) to re-apply the reviewed tools set without recreating the connection.
 - **Scope changes do not reach existing orgs automatically.** The token's scopes are the keys of the map, and an issued token
   keeps its scopes until it is re-issued (60 days before expiry, or by hand with `POST /agents/{sub}/rotate` on the ownership
   API). After adding a scope such as `comps:run` or `decisions:run` (TECH-9109), rotate each org's token manually: `POST /agents/paperclip-rh-mcp-<companyId>/rotate` with a JSON body of

@@ -249,6 +249,7 @@ export const RH_MCP_SERVICE_TOOLS_BY_SCOPE = Object.freeze({
 
 /**
  * Version of `RH_MCP_SERVICE_REVIEWED_TOOLS`. Bump it whenever the tool or scope set changes (v2 = + `comps:run`, TECH-8433; v3 = + `voice_apply` under the existing `voice:read` scope; v4 = + `decisions:run`, TECH-9109).
+ * The periodic sweep reconciles existing active connections whenever their stored version is behind this constant.
  * Adding a tool under an existing scope (v3) needs no rotation. Changing the scope set does not re-issue existing org tokens: nothing reads `RH_MCP_SERVICE_TOKEN_SCOPES_VERSION`, and
  * the sweep only rotates a token near expiry. Rotate each org's token by hand (see DEFAULT-MCP-SPEC.md).
  */

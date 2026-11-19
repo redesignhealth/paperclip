@@ -37,7 +37,7 @@ import {
 import { validOAuthSeedEndpoint } from "./default-mcp-oauth-seed.js";
 import { isCompanyVisibilityShared } from "./default-mcp-setup.js";
 import { pickTemplateOwner } from "./default-mcp-template.js";
-import { RH_MCP_SERVICE_REVIEWED_TOOLS, isDefaultMcpSpecEnabled } from "./default-mcp-spec.js";
+import { RH_MCP_SERVICE_REVIEWED_TOOLS, RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION, isDefaultMcpSpecEnabled } from "./default-mcp-spec.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 
@@ -51,6 +51,8 @@ export const SHARED_ORG_RH_MCP_SWEEP_PAGE_SIZE = 50;
 export const SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
 /** Non-secret expiry of the stored token, on the connection's `config`. */
 export const SHARED_ORG_RH_MCP_EXPIRY_CONFIG_KEY = "rhMcpServiceTokenExpiresAt";
+/** Stored reviewed-tools version on the connection's `config`. */
+export const SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY = "rhMcpServiceReviewedToolsVersion";
 
 const ACTOR = { actorType: "system", actorId: "shared-org-rh-mcp" } as const;
 /** `connectGalleryApp`'s credential slot for a pasted-URL connection with `authMode: "bearer"`. */
@@ -74,6 +76,7 @@ export type SharedOrgRhMcpOutcome =
   | { kind: "ready"; installed: number }
   | { kind: "provisioned"; installed: number }
   | { kind: "rotated"; installed: number }
+  | { kind: "reconciled"; installed: number }
   | {
       kind: "error";
       reason:
@@ -102,6 +105,26 @@ function parseExpiry(config: unknown): Date | null {
   if (typeof raw !== "string") return null;
   const parsed = new Date(raw);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function parseReviewedToolsVersion(config: unknown): number | null {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return null;
+  const raw = (config as Record<string, unknown>)[SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY];
+  if (typeof raw === "number" && Number.isInteger(raw)) return raw;
+  if (typeof raw === "string") {
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isInteger(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+async function recordReviewedToolsVersion(db: Db, connectionId: string, version: number): Promise<void> {
+  await db
+    .update(toolConnections)
+    .set({
+      config: sql`jsonb_set(coalesce(${toolConnections.config}, '{}'::jsonb), ARRAY[${SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY}::text], to_jsonb(${version}::int), true)`,
+    })
+    .where(eq(toolConnections.id, connectionId));
 }
 
 async function recordExpiry(db: Db, connectionId: string, expiresAt: string): Promise<void> {
@@ -134,11 +157,24 @@ async function obtainToken(
 
 /** Enable exactly the reviewed tools the connection's catalog lists; every other discovered action stays off. */
 async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connection): Promise<"ok" | "tools_missing" | "finish_failed"> {
-  const catalog = await ctx.db
+  let catalog = await ctx.db
     .select({ id: toolCatalogEntries.id, toolName: toolCatalogEntries.toolName, status: toolCatalogEntries.status })
     .from(toolCatalogEntries)
     .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id)));
   const allow = new Set(RH_MCP_SERVICE_REVIEWED_TOOLS);
+  const haveNames = new Set(catalog.map((entry) => entry.toolName));
+  const missingReviewed = RH_MCP_SERVICE_REVIEWED_TOOLS.filter((name) => !haveNames.has(name));
+  if (missingReviewed.length > 0 && connection.status === "active") {
+    try {
+      await toolAccessService(ctx.db, ctx.toolAccessOptions).refreshCatalog(connection.id, ACTOR);
+      catalog = await ctx.db
+        .select({ id: toolCatalogEntries.id, toolName: toolCatalogEntries.toolName, status: toolCatalogEntries.status })
+        .from(toolCatalogEntries)
+        .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id)));
+    } catch (err) {
+      logger.warn({ companyId: connection.companyId, errorClass: errorClass(err) }, "shared-org rh-mcp refresh catalog failed");
+    }
+  }
   const enabled = catalog.filter((entry) => allow.has(entry.toolName));
   // rh-mcp lists every tool it has. A reviewed tool it does not list (renamed or retired upstream) is a drift to fix in
   // `RH_MCP_SERVICE_TOOLS_BY_SCOPE`, but it never blocks the tools that are there.
@@ -253,7 +289,7 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
 
   const service = toolAccessService(ctx.db, ctx.toolAccessOptions);
   let connection = live[0] ?? null;
-  let kind: "ready" | "provisioned" | "rotated" = "ready";
+  let kind: "ready" | "provisioned" | "rotated" | "reconciled" = "ready";
 
   if (!connection) {
     const owner = await pickTemplateOwner(ctx.db, companyId);
@@ -286,9 +322,22 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
   if (connection.status !== "active" || !connection.enabled) {
     const finished = await finishConnection(ctx, connection);
     if (finished !== "ok") return { kind: "error", reason: finished };
+    await recordReviewedToolsVersion(ctx.db, connection.id, RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION);
     connection = await reloadConnection(ctx.db, connection.id);
     if (kind === "ready") kind = "provisioned";
-  } else if (kind === "ready") {
+  } else {
+    // Healthy and active: check if the reviewed tools set needs reconciliation (TECH-9109).
+    const storedVersion = parseReviewedToolsVersion(connection.config);
+    if (storedVersion === null || storedVersion < RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION) {
+      const finished = await finishConnection(ctx, connection);
+      if (finished !== "ok") return { kind: "error", reason: finished };
+      await recordReviewedToolsVersion(ctx.db, connection.id, RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION);
+      connection = await reloadConnection(ctx.db, connection.id);
+      kind = "reconciled";
+    }
+  }
+
+  if (kind === "ready" || kind === "reconciled") {
     // Healthy and finished: keep the token valid. An unknown expiry (not minted here) is left alone.
     const expiresAt = parseExpiry(connection.config);
     const now = ctx.now?.() ?? new Date();
@@ -325,12 +374,25 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
 
   const installed = await installOnLiveAgents(ctx, connection);
   if (kind !== "ready") {
-    await logOutcome(ctx.db, companyId, kind === "rotated" ? "company.shared_org_rh_mcp.rotated" : "company.shared_org_rh_mcp.provisioned", {
+    const action =
+      kind === "rotated"
+        ? "company.shared_org_rh_mcp.rotated"
+        : kind === "reconciled"
+          ? "company.shared_org_rh_mcp.reconciled"
+          : "company.shared_org_rh_mcp.provisioned";
+    await logOutcome(ctx.db, companyId, action, {
       connectionId: connection.id,
       installed,
+      version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION,
     });
   }
-  return kind === "provisioned" ? { kind, installed } : kind === "rotated" ? { kind, installed } : { kind: "ready", installed };
+  return kind === "provisioned"
+    ? { kind, installed }
+    : kind === "rotated"
+      ? { kind, installed }
+      : kind === "reconciled"
+        ? { kind, installed }
+        : { kind: "ready", installed };
 }
 
 /** Every shared, active/paused company inside the rollout scope, visited in keyset pages so none is starved. */
