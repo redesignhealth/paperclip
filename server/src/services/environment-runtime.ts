@@ -859,14 +859,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * True for a reusable Kubernetes sandbox lease the plugin keeps running for reuse
- * (`metadata.reusableSandboxLease`, not a paperclip_runner sandbox). The plugin
- * reaps such a pod once it has been idle past its TTL, so the server can leave it
- * running after the issue completes instead of destroying it at once.
+ * (`metadata.reusableSandboxLease`, not a paperclip_runner sandbox) and can still
+ * resume (`released` or `retained`). The plugin reaps such a pod once it has been
+ * idle past its TTL, so the server can leave it running after the issue completes
+ * instead of destroying it at once. A `failed` or `pending_cleanup` lease, or a
+ * `job`-backend lease (the plugin only tracks Sandbox-CR pods), is not covered by
+ * that reaper, so it is still destroyed.
  */
-function isIdleReapedReusableLease(leaseRow: { provider?: string | null; metadata?: unknown }): boolean {
+function isIdleReapedReusableLease(leaseRow: {
+  provider?: string | null;
+  status?: string | null;
+  metadata?: unknown;
+}): boolean {
+  if (leaseRow.status !== "released" && leaseRow.status !== "retained") return false;
   const metadata = isRecord(leaseRow.metadata) ? leaseRow.metadata : null;
   const provider = leaseRow.provider ?? (typeof metadata?.provider === "string" ? metadata.provider : null);
   if (provider !== "kubernetes") return false;
+  if (metadata?.backend === "job") return false;
   const scope = metadata?.reusableSandboxLease;
   if (!isRecord(scope)) return false;
   return scope.adapterType !== "paperclip_runner";
