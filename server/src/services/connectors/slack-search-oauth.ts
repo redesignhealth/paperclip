@@ -192,24 +192,33 @@ export function slackSearchOAuthService(
     connection: { credentialSecretRefs: Array<{ configPath: string; secretId: string }> },
     values: { clientId: string; clientSecret: string },
   ) {
-    const [registration] = await db
-      .select({ clientId: chatSlackRegistrations.clientId, secretIds: chatSlackRegistrations.secretIds })
+    const [found] = await db
+      .select({
+        status: chatSlackRegistrations.status,
+        clientId: chatSlackRegistrations.clientId,
+        secretIds: chatSlackRegistrations.secretIds,
+      })
       .from(chatSlackRegistrations)
       .where(and(eq(chatSlackRegistrations.companyId, companyId), eq(chatSlackRegistrations.endpointId, endpointId)));
+    // A removed registration keeps its client_id but no longer describes the app.
+    const registration = found && found.status !== "removed" ? found : undefined;
     if (registration?.clientId && registration.clientId !== values.clientId)
       throw unprocessable(
         "This Client ID does not match the Slack app registered for this connection. Copy it from the app's Basic Information page.",
       );
     const secretIds = new Set<string>();
-    for (const ref of connection.credentialSecretRefs)
+    for (const ref of connection.credentialSecretRefs ?? [])
       if (ref.configPath === "credentials.signingSecret") secretIds.add(ref.secretId);
     if (registration?.secretIds?.signingSecret) secretIds.add(registration.secretIds.signingSecret);
     if (secretIds.size === 0) return;
-    const pasted = createHash("sha256").update(values.clientSecret).digest("hex");
+    // Pasted values often carry a trailing newline or space; check both forms.
+    const pasted = [...new Set([values.clientSecret, values.clientSecret.trim()])].map((value) =>
+      createHash("sha256").update(value).digest("hex"),
+    );
     const [match] = await db
       .select({ id: companySecretVersions.id })
       .from(companySecretVersions)
-      .where(and(inArray(companySecretVersions.secretId, [...secretIds]), eq(companySecretVersions.valueSha256, pasted)))
+      .where(and(inArray(companySecretVersions.secretId, [...secretIds]), inArray(companySecretVersions.valueSha256, pasted)))
       .limit(1);
     if (match)
       throw unprocessable(
