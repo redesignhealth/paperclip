@@ -24,3 +24,25 @@ describe("slackOAuthErrorMessage", () => {
     },
   );
 });
+
+describe("slackSearchOAuthService exchange errors", () => {
+  it("returns a specific 422 for the interactive exchange and a reconnect message for refresh", async () => {
+    const { slackSearchOAuthService } = await import("./slack-search-oauth.js");
+    const respond = (error: unknown) => (async () => Response.json({ ok: false, error })) as unknown as typeof fetch;
+    const exchangeWith = (fetchImpl: typeof fetch, body: Record<string, string>) =>
+      (slackSearchOAuthService({} as never, "https://p.example", fetchImpl) as unknown as {
+        __exchange: (b: Record<string, string>) => Promise<unknown>;
+      }).__exchange(body);
+    await expect(exchangeWith(respond("bad_client_secret"), { code: "c" })).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("Signing Secret"),
+      details: { slackError: "bad_client_secret" },
+    });
+    await expect(exchangeWith(respond("bad_client_secret"), { grant_type: "refresh_token" })).rejects.toMatchObject({
+      message: expect.stringContaining("Reconnect Slack search"),
+    });
+    await expect(exchangeWith(respond("<bad>"), { code: "c" })).rejects.toMatchObject({
+      details: { slackError: undefined },
+    });
+  });
+});

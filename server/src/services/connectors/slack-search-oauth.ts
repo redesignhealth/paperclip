@@ -202,13 +202,19 @@ export function slackSearchOAuthService(
         typeof value.error === "string" && SLACK_ERROR_CODE.test(value.error)
           ? value.error
           : undefined;
+      const refresh = body.grant_type === "refresh_token";
       logger.warn(
-        { slackError: code, grantType: body.grant_type ?? "authorization_code" },
+        { slackError: code ?? "unrecognized", grantType: body.grant_type ?? "authorization_code" },
         "Slack search OAuth exchange rejected",
       );
-      throw unprocessable(slackOAuthErrorMessage(value.error), {
-        slackError: code,
-      });
+      // A background refresh is not an interactive setup step: point at
+      // reconnecting rather than at pasting credentials.
+      throw unprocessable(
+        refresh
+          ? "Slack could not refresh this search authorization. Reconnect Slack search from Access."
+          : slackOAuthErrorMessage(code),
+        { slackError: code },
+      );
     }
     return value;
   }
@@ -297,6 +303,8 @@ export function slackSearchOAuthService(
     };
   }
   return {
+    /** @internal exposed for tests */
+    __exchange: exchange,
     status,
     /** Search-only credential acquisition; no caller may use this token for writes. */
     async accessToken(companyId: string, endpointId: string, userId: string) {
