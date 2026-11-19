@@ -549,6 +549,33 @@ describe("routine routes", () => {
     expect(mockRoutineService.update).not.toHaveBeenCalled();
   });
 
+  it("lets a board user claim a routine as responsible user but not assign another user", async () => {
+    mockRoutineService.update.mockResolvedValue({ id: routineId, companyId });
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const other = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ responsibleUserId: "someone-else" });
+    expect(other.status).toBe(403);
+    expect(mockRoutineService.update).not.toHaveBeenCalled();
+
+    const self = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ responsibleUserId: "board-user" });
+    expect(self.status).toBe(200);
+    expect(mockRoutineService.update).toHaveBeenCalledWith(
+      routineId,
+      { responsibleUserId: "board-user" },
+      expect.objectContaining({ userId: "board-user" }),
+    );
+  });
+
   it("requires tasks:assign permission to reactivate a routine", async () => {
     mockRoutineService.get.mockResolvedValue(pausedRoutine);
     const app = await createApp({
