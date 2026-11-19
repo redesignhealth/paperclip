@@ -904,7 +904,11 @@ describe("termination receipt on release and destroy (user interrupt of a sandbo
       providerLeaseId: "pc-abc",
       state: "destroyed",
     });
-    expect(readPod).toHaveBeenCalledTimes(2);
+    // First poll: the pod named after the Sandbox is still terminating. Second
+    // poll: it and the recorded pod name are both 404.
+    expect(readPod).toHaveBeenCalledTimes(3);
+    expect(readPod).toHaveBeenCalledWith({ namespace: "paperclip-acme", name: "pc-abc" });
+    expect(readPod).toHaveBeenCalledWith({ namespace: "paperclip-acme", name: "pc-abc-pod" });
   });
 
   it("release grants no receipt (and does not throw) when termination cannot be confirmed", async () => {

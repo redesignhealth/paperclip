@@ -794,8 +794,16 @@ async function confirmedSandboxTermination(
       podName: input.podName,
     });
     if (gone) return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
-  } catch {
+    console.warn(
+      `Sandbox ${input.namespace}/${input.providerLeaseId} was still terminating at the deadline; ` +
+        "no termination receipt granted (an interrupted run's queued message waits for recovery).",
+    );
+  } catch (err) {
     // Cannot confirm (API error): grant no continuation authority.
+    console.warn(
+      `Could not confirm termination of sandbox ${input.namespace}/${input.providerLeaseId}: ` +
+        `${err instanceof Error ? err.message : String(err)}. No termination receipt granted.`,
+    );
   }
 }
 
