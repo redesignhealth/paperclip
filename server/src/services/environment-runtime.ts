@@ -857,6 +857,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * True for a reusable Kubernetes sandbox lease the plugin keeps running for reuse
+ * (`metadata.reusableSandboxLease`, not a paperclip_runner sandbox). The plugin
+ * reaps such a pod once it has been idle past its TTL, so the server can leave it
+ * running after the issue completes instead of destroying it at once.
+ */
+function isIdleReapedReusableLease(leaseRow: { provider?: string | null; metadata?: unknown }): boolean {
+  const metadata = isRecord(leaseRow.metadata) ? leaseRow.metadata : null;
+  const provider = leaseRow.provider ?? (typeof metadata?.provider === "string" ? metadata.provider : null);
+  if (provider !== "kubernetes") return false;
+  const scope = metadata?.reusableSandboxLease;
+  if (!isRecord(scope)) return false;
+  return scope.adapterType !== "paperclip_runner";
+}
+
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
@@ -4469,6 +4484,14 @@ export function environmentRuntimeService(
       issueId?: string | null;
       executionWorkspaceId?: string | null;
       failureReason?: string;
+      /**
+       * Leave a lease alone when the provider plugin already owns its lifetime:
+       * a Kubernetes pod kept for reuse is reaped by the plugin once it has been
+       * idle for its TTL, scrubbed between turns, and evicted under quota
+       * pressure, so it cannot leak. A completed issue passes this so a user's
+       * reply within the TTL resumes the same pod instead of paying for a new one.
+       */
+      keepIdleManagedLeases?: boolean;
     }): Promise<EnvironmentRuntimeLeaseRecord[]> {
       const scopeConditions = [
         input.issueId ? eq(environmentLeases.issueId, input.issueId) : undefined,
@@ -4521,6 +4544,7 @@ export function environmentRuntimeService(
         ) {
           continue;
         }
+        if (input.keepIdleManagedLeases && isIdleReapedReusableLease(leaseRow)) continue;
         const environment = leaseRow.environmentId
           ? await environmentsSvc.getById(leaseRow.environmentId)
           : null;
