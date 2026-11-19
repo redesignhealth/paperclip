@@ -163,7 +163,7 @@ export const SLACK_TOOLS = [
     "conversations.replies",
     ["channels:history|groups:history|im:history|mpim:history"],
     "read",
-    "Read a thread including its parent. Call this to read full reply content for a thread found via slack_history, slack_search, or slack_message. Paginate for the complete available thread.",
+    "Read a thread including its parent. Call this to read full reply content for a thread found via slack_history or slack_message. Paginate for the complete available thread.",
     { ...channelPage, ts: timestamp },
   ),
   tool(
