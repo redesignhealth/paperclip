@@ -174,7 +174,9 @@ describe("rh-mcp service tool set", () => {
     expect(entry!.setupHook).toBeUndefined();
     expect(entry!.reviewedTools?.allow).toEqual(RH_MCP_SERVICE_REVIEWED_TOOLS);
   });
+});
 
+describe("composeRhMcpServiceSub", () => {
   it("composes one canonical sub per org and refuses anything that is not a UUID", () => {
     const id = "0B2C7C1E-4F0A-4A4E-9B3E-0D6F0A3C9A11";
     expect(composeRhMcpServiceSub(id)).toBe(`paperclip-rh-mcp-${id.toLowerCase()}`);
@@ -941,7 +943,7 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     expect(activities.some((a) => a.action === "company.shared_org_rh_mcp.rotated")).toBe(true);
   });
 
-  it("filters out orphaned, terminated, and pending agent installs during reconciliation without crashing", async () => {
+  it("retains existing agent installs (including pending_approval) during reconciliation and filters out truly orphaned agent installs without crashing", async () => {
     const companyId = await seedCompany();
     await seedOwner(companyId);
     const liveAgentId = await seedAgent(companyId);
@@ -1010,7 +1012,7 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
     const enabledTools = await enabledToolNames(originalConnectionId, companyId);
     expect(enabledTools).toContain("decisions_run_grid");
 
-    // 6. Verify stale installs are excluded from access.agentIds (which populates profile bindings), while live agent install and binding remain intact
+    // 6. Verify existing agents (including pending_approval and terminated) retain their bindings in access.agentIds, while truly orphaned agent IDs are safely excluded
     const [profile] = await db
       .select({ id: toolProfiles.id })
       .from(toolProfiles)
@@ -1020,14 +1022,16 @@ describeEmbeddedPostgres("shared-org rh-mcp service connection (TECH-8066)", () 
       .from(toolProfileBindings)
       .where(and(eq(toolProfileBindings.companyId, companyId), eq(toolProfileBindings.profileId, profile!.id)));
     const postBoundAgentIds = postBindings.filter((b) => b.targetType === "agent").map((b) => b.targetId);
-    expect(postBoundAgentIds).toEqual([liveAgentId]);
+    expect(postBoundAgentIds).toContain(liveAgentId);
+    expect(postBoundAgentIds).toContain(pendingAgentId);
+    expect(postBoundAgentIds).toContain(terminatedAgentId);
     expect(postBoundAgentIds).not.toContain(orphanedAgentId);
-    expect(postBoundAgentIds).not.toContain(terminatedAgentId);
-    expect(postBoundAgentIds).not.toContain(pendingAgentId);
 
     const postInstalls = await installsOf(originalConnectionId);
     const postTargetIds = postInstalls.map((row) => row.targetId);
     expect(postTargetIds).toContain(liveAgentId);
+    expect(postTargetIds).toContain(pendingAgentId);
+    expect(postTargetIds).toContain(terminatedAgentId);
   });
 
   // ---- sweep --------------------------------------------------------------------------------

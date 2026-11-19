@@ -188,8 +188,11 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
   const enabled = catalog.filter((entry) => allow.has(entry.toolName));
 
   // Preserve existing agent bindings so reconciliation does not drop agent access,
-  // filtering out stale/orphaned or non-eligible (e.g. terminated/pending) agent installs
-  // so assertAgentsInCompany does not reject non-existent or ineligible agents.
+  // filtering out truly orphaned/non-existent install rows (e.g. agent deleted or belongs
+  // to a different company) so assertAgentsInCompany does not reject non-existent agents.
+  // We do not apply any liveness/status policy here: status-based install eligibility is
+  // a decision for the install-granting paths (e.g. installOnLiveAgents, which proactively
+  // grants new installs), not for this preserve-existing-access path.
   const existingAgentInstalls = await ctx.db
     .select({ targetId: toolConnectionInstalls.targetId })
     .from(toolConnectionInstalls)
@@ -210,8 +213,6 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
         and(
           eq(agents.companyId, connection.companyId),
           inArray(agents.id, installedAgentIds),
-          ne(agents.status, "terminated"),
-          ne(agents.status, "pending_approval"),
         ),
       );
     liveInstalledAgentIds = liveAgents.map((a) => a.id);
