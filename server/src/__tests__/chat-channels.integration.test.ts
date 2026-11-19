@@ -11181,6 +11181,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       throw new Error("Unexpected OAuth request");
     });
     const oauth = slackSearchOAuthService(db, "https://paperclip.example", oauthFetch as typeof fetch);
+    // Pasting the app's Signing Secret where the Client Secret belongs is rejected up front.
+    await expect(oauth.configure(fixture.companyId, endpoint.id, "owner-user", { clientId: "123.456", clientSecret: "test-signing-secret" })).rejects.toThrow("Signing Secret");
     await oauth.configure(fixture.companyId, endpoint.id, "owner-user", { clientId: "123.456", clientSecret: "fixture-client-secret" });
     const started = await oauth.start(fixture.companyId, endpoint.id, "owner-user");
     const state = new URL(started.url).searchParams.get("state")!;
