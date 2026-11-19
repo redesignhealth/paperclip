@@ -528,7 +528,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         status: leaseReleaseStatusForRunStatus("cancelled"),
         failureReason: reason,
       });
-      if (release.errors.length > 0) return false;
+      if (release.errors.length > 0) {
+        logger.warn({ runId: run.id, errors: release.errors.length },
+          "remote execution of a cancelled conversation run could not be stopped; keeping the recovery hold");
+        return false;
+      }
     } catch (err) {
       logger.warn({ err, runId: run.id }, "failed to stop remote execution of a cancelled conversation run");
       return false;
@@ -1407,7 +1411,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
 
           // No Stop handle and no host process: stop the sandbox now, so the terminal write below
           // carries the provider's termination receipt (see stopRemoteConversationExecution).
-                const remoteStopProven = !control && !running
+          const remoteStopProven = !control && !running
             ? await stopRemoteConversationExecution(run, reason)
             : false;
           const finishedAt = new Date();

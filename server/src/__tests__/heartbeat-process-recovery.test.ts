@@ -3651,9 +3651,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // the same second, and the user's queued message never started. Local runs got their proof from the
   // killed process. The sandbox must be stopped first so the terminal write carries the proof.
   describe("interrupting a sandbox conversation run (user queued message)", () => {
-    async function interruptSandboxRun(grantReceipt: boolean) {
+    async function interruptSandboxRun(grantReceipt: boolean, adapterReturnsOnStop = false) {
       const f = await seedQueuedIssueRunFixture();
       const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
+      let sandboxStopped!: () => void;
+      const sandboxStoppedPromise = new Promise<void>(resolve => { sandboxStopped = resolve; });
       const release = vi.fn(async (input: { heartbeatRunId: string }) => {
         const [lease] = await db.select().from(environmentLeases)
           .where(eq(environmentLeases.heartbeatRunId, input.heartbeatRunId));
@@ -3662,6 +3664,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           metadata: { ...lease!.metadata, ...(grantReceipt ? { remoteExecutionTermination:
             remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId!, state: "destroyed" }) } : {}) },
         }).where(eq(environmentLeases.id, lease!.id));
+        // The sandbox exec fails the instant the sandbox is destroyed.
+        sandboxStopped();
         return { released: [], errors: [] };
       });
       const factory = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
@@ -3682,7 +3686,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             errorCode: "operator_interrupted", suppressImmediateRecovery: true,
             resultJson: { operatorInterrupted: true, interruptionSource: "issue_comment_interrupt" },
           }).catch(error => error);
-          await new Promise(resolve => setTimeout(resolve, 50));
+          if (adapterReturnsOnStop) await sandboxStoppedPromise;
+          else await new Promise(resolve => setTimeout(resolve, 50));
           return { exitCode: null, signal: "SIGTERM", timedOut: false, errorMessage: "sandbox stopped" };
         });
         await heartbeat.resumeQueuedRuns();
@@ -3702,6 +3707,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toEqual([]);
         const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
         expect(task.status).not.toBe("blocked");
+      });
+    });
+
+    it("still records the interrupt (not a failure) when the adapter returns the instant the sandbox is destroyed", async () => {
+      await withTempPaperclipHome(async () => {
+        const { f, run } = await interruptSandboxRun(true, true);
+        expect(run).toMatchObject({ status: "cancelled", errorCode: "operator_interrupted",
+          resultJson: { executionCancellation: { state: "acknowledged" }, conversationContinuation: "continue_conversation_v1" } });
+        expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toEqual([]);
       });
     });
 
