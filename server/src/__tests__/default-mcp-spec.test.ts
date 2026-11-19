@@ -581,7 +581,7 @@ describe("per-tool timeout (argus-review)", () => {
   it("gives decisions_run_grid the 60 s gateway ceiling on the service entry (TECH-9109)", () => {
     expect(DECISIONS_GRID_TOOL_TIMEOUT_MS).toBe(MAX_TOOL_TIMEOUT_MS);
     expect(defaultToolTimeoutMs("rh-mcp-service", "decisions_run_grid")).toBe(60_000);
-    expect(defaultToolTimeoutMs("rh-mcp", "decisions_run_grid")).toBeUndefined();
+    expect(defaultToolTimeoutMs("rh-mcp-personal", "decisions_run_grid")).toBeUndefined();
   });
 
   it("leaves every other tool and connection on the gateway default (undefined)", () => {
@@ -624,9 +624,8 @@ describe("per-tool timeout (argus-review)", () => {
 });
 
 describe("rh-mcp-service reviewed tools: comps:run (TECH-8433) and decisions:run (TECH-9109)", () => {
-  it("offers voice_apply under the existing voice:read scope (no new scope) at reviewed-tools version 4", () => {
+  it("offers voice_apply under the existing voice:read scope (no new scope)", () => {
     const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp-service")!;
-    expect(entry.reviewedTools!.version).toBe(4);
     expect(RH_MCP_SERVICE_TOOLS_BY_SCOPE["voice:read"]).toEqual(["voice_get_humanizer_checklist", "voice_apply"]);
     expect(entry.reviewedTools!.allow).toContain("voice_apply");
   });
@@ -638,8 +637,9 @@ describe("rh-mcp-service reviewed tools: comps:run (TECH-8433) and decisions:run
     expect(entry.reviewedTools!.allow).not.toContain("comps__run_business_area_comps");
   });
 
-  it("offers decisions_run_grid under the decisions:run scope (TECH-9109)", () => {
+  it("offers decisions_run_grid under the decisions:run scope at reviewed-tools version 4 (TECH-9109)", () => {
     const entry = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === "rh-mcp-service")!;
+    expect(entry.reviewedTools!.version).toBe(4);
     expect(RH_MCP_SERVICE_TOOLS_BY_SCOPE["decisions:run"]).toEqual(["decisions_run_grid"]);
     expect(entry.reviewedTools!.allow).toContain("decisions_run_grid");
   });

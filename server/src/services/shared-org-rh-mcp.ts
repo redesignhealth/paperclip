@@ -20,7 +20,7 @@
  */
 import { tailnetAwareFetch } from "./remote-http-fetch.js";
 import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
-import { agents, companies, companySecrets, toolCatalogEntries, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
+import { agents, companies, companySecrets, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolProfileEntries, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import {
   isCompanyInDefaultMcpTemplateScope,
@@ -107,12 +107,12 @@ function parseExpiry(config: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function parseReviewedToolsVersion(config: unknown): number | null {
+export function parseReviewedToolsVersion(config: unknown): number | null {
   if (!config || typeof config !== "object" || Array.isArray(config)) return null;
   const raw = (config as Record<string, unknown>)[SHARED_ORG_RH_MCP_REVIEWED_TOOLS_VERSION_CONFIG_KEY];
-  if (typeof raw === "number" && Number.isInteger(raw)) return raw;
-  if (typeof raw === "string") {
-    const parsed = Number.parseInt(raw, 10);
+  if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0) return raw;
+  if (typeof raw === "string" && /^\d+$/.test(raw.trim())) {
+    const parsed = Number.parseInt(raw.trim(), 10);
     return Number.isInteger(parsed) ? parsed : null;
   }
   return null;
@@ -162,8 +162,8 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
     .from(toolCatalogEntries)
     .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id)));
   const allow = new Set(RH_MCP_SERVICE_REVIEWED_TOOLS);
-  const haveNames = new Set(catalog.map((entry) => entry.toolName));
-  const missingReviewed = RH_MCP_SERVICE_REVIEWED_TOOLS.filter((name) => !haveNames.has(name));
+  let haveNames = new Set(catalog.map((entry) => entry.toolName));
+  let missingReviewed = RH_MCP_SERVICE_REVIEWED_TOOLS.filter((name) => !haveNames.has(name));
   if (missingReviewed.length > 0 && connection.status === "active") {
     try {
       await toolAccessService(ctx.db, ctx.toolAccessOptions).refreshCatalog(connection.id, ACTOR);
@@ -171,17 +171,39 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
         .select({ id: toolCatalogEntries.id, toolName: toolCatalogEntries.toolName, status: toolCatalogEntries.status })
         .from(toolCatalogEntries)
         .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id)));
+      haveNames = new Set(catalog.map((entry) => entry.toolName));
+      missingReviewed = RH_MCP_SERVICE_REVIEWED_TOOLS.filter((name) => !haveNames.has(name));
     } catch (err) {
       logger.warn({ companyId: connection.companyId, errorClass: errorClass(err) }, "shared-org rh-mcp refresh catalog failed");
+      return "finish_failed";
     }
   }
+  if (missingReviewed.length > 0) {
+    logger.warn(
+      { companyId: connection.companyId, missing: missingReviewed, listed: catalog.length, reviewed: allow.size },
+      "shared-org rh-mcp catalog missing reviewed tools",
+    );
+    return "tools_missing";
+  }
   const enabled = catalog.filter((entry) => allow.has(entry.toolName));
-  // rh-mcp lists every tool it has. A reviewed tool it does not list (renamed or retired upstream) is a drift to fix in
-  // `RH_MCP_SERVICE_TOOLS_BY_SCOPE`, but it never blocks the tools that are there.
-  if (enabled.length === 0) return "tools_missing";
   if (enabled.length < allow.size) {
     logger.warn({ companyId: connection.companyId, listed: enabled.length, reviewed: allow.size }, "rh-mcp service connection lists fewer tools than the reviewed set");
+    return "tools_missing";
   }
+
+  // Preserve existing agent bindings so reconciliation does not drop agent access
+  const existingAgentInstalls = await ctx.db
+    .select({ targetId: toolConnectionInstalls.targetId })
+    .from(toolConnectionInstalls)
+    .where(
+      and(
+        eq(toolConnectionInstalls.companyId, connection.companyId),
+        eq(toolConnectionInstalls.connectionId, connection.id),
+        eq(toolConnectionInstalls.targetType, "agent"),
+      ),
+    );
+  const installedAgentIds = [...new Set(existingAgentInstalls.map((row) => row.targetId))];
+
   try {
     await toolAccessService(ctx.db, ctx.toolAccessOptions).finishGalleryAppConnection(
       connection.companyId,
@@ -191,16 +213,37 @@ async function finishConnection(ctx: SharedOrgRhMcpContext, connection: Connecti
         askFirstCatalogEntryIds: [],
         // Every currently quarantined action gets a settled review decision: allowlisted tools activate and the rest are recorded as reviewed-declined.
         reviewedCatalogEntryIds: catalog.filter((entry) => entry.status === "quarantined").map((entry) => entry.id),
-        // Per-agent installs below are what turn it on; no company-wide binding.
-        access: { agentIds: [] },
+        access: { agentIds: installedAgentIds },
       },
       ACTOR,
     );
-    return "ok";
   } catch (err) {
     logger.warn({ companyId: connection.companyId, errorClass: errorClass(err) }, "shared-org rh-mcp finish failed");
     return "finish_failed";
   }
+
+  // Verify post-finish that every tool currently in RH_MCP_SERVICE_REVIEWED_TOOLS is actually present and enabled in toolProfileEntries
+  const profileEntries = await ctx.db
+    .select({ toolName: toolCatalogEntries.toolName, effect: toolProfileEntries.effect })
+    .from(toolProfileEntries)
+    .innerJoin(toolCatalogEntries, eq(toolCatalogEntries.id, toolProfileEntries.catalogEntryId))
+    .where(
+      and(
+        eq(toolProfileEntries.companyId, connection.companyId),
+        eq(toolProfileEntries.connectionId, connection.id),
+      ),
+    );
+  const enabledNames = new Set(profileEntries.filter((p) => p.effect === "include").map((p) => p.toolName));
+  const stillMissing = RH_MCP_SERVICE_REVIEWED_TOOLS.filter((name) => !enabledNames.has(name));
+  if (stillMissing.length > 0) {
+    logger.warn(
+      { companyId: connection.companyId, missing: stillMissing },
+      "shared-org rh-mcp reviewed tools missing from profile after finish",
+    );
+    return "tools_missing";
+  }
+
+  return "ok";
 }
 
 /** Installs the connection on every live agent that does not have it yet. Returns how many were added. */
@@ -289,7 +332,10 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
 
   const service = toolAccessService(ctx.db, ctx.toolAccessOptions);
   let connection = live[0] ?? null;
-  let kind: "ready" | "provisioned" | "rotated" | "reconciled" = "ready";
+  let kind: "ready" | "provisioned" = "ready";
+  let reconciled = false;
+  let reconcileError: "finish_failed" | "tools_missing" | null = null;
+  let previousVersion: number | null = null;
 
   if (!connection) {
     const owner = await pickTemplateOwner(ctx.db, companyId);
@@ -329,70 +375,95 @@ export async function ensureSharedOrgRhMcp(ctx: SharedOrgRhMcpContext, companyId
     // Healthy and active: check if the reviewed tools set needs reconciliation (TECH-9109).
     const storedVersion = parseReviewedToolsVersion(connection.config);
     if (storedVersion === null || storedVersion < RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION) {
+      previousVersion = storedVersion;
       const finished = await finishConnection(ctx, connection);
-      if (finished !== "ok") return { kind: "error", reason: finished };
-      await recordReviewedToolsVersion(ctx.db, connection.id, RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION);
-      connection = await reloadConnection(ctx.db, connection.id);
-      kind = "reconciled";
+      if (finished !== "ok") {
+        reconcileError = finished;
+      } else {
+        await recordReviewedToolsVersion(ctx.db, connection.id, RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION);
+        connection = await reloadConnection(ctx.db, connection.id);
+        reconciled = true;
+        logger.info(
+          { companyId, previousVersion, version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION },
+          "shared-org rh-mcp reconciled reviewed tools",
+        );
+      }
     }
   }
 
-  if (kind === "ready" || kind === "reconciled") {
-    // Healthy and finished: keep the token valid. An unknown expiry (not minted here) is left alone.
-    const expiresAt = parseExpiry(connection.config);
-    const now = ctx.now?.() ?? new Date();
-    if (expiresAt && expiresAt.getTime() - now.getTime() < SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS) {
-      const rotated = await rotateRhMcpServiceCredential(provisioner.config, { companyId }, ctx.fetchImpl ?? tailnetAwareFetch);
-      if (!rotated.ok) return { kind: "error", reason: "rotate_failed" };
-      const secretId = connection.credentialSecretRefs?.[0]?.secretId;
-      if (!secretId) return { kind: "error", reason: "secret_store_failed" };
-      try {
-        const [secret] = await ctx.db
-          .select({ latestVersion: companySecrets.latestVersion })
-          .from(companySecrets)
-          .where(and(eq(companySecrets.id, secretId), eq(companySecrets.companyId, companyId)))
-          .limit(1);
-        if (!secret) return { kind: "error", reason: "secret_store_failed" };
-        const owner = await pickTemplateOwner(ctx.db, companyId);
-        await secretService(ctx.db).rotate(
-          secretId,
-          { value: rotated.boardToken, expectedLatestVersion: secret.latestVersion },
-          { userId: owner?.userId ?? null },
-        );
-      } catch (err) {
-        logger.warn({ companyId, errorClass: errorClass(err) }, "shared-org rh-mcp token storage failed");
-        return { kind: "error", reason: "secret_store_failed" };
-      }
-      await recordExpiry(
-        ctx.db,
-        connection.id,
-        rotated.tokenExpiresAt ?? new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+  // Keep the token valid (runs even if reconciliation was skipped or failed, so a reconcile failure does not block rotation).
+  let rotated = false;
+  const expiresAt = parseExpiry(connection.config);
+  const now = ctx.now?.() ?? new Date();
+  if (expiresAt && expiresAt.getTime() - now.getTime() < SHARED_ORG_RH_MCP_REFRESH_WINDOW_MS) {
+    const rotateResult = await rotateRhMcpServiceCredential(provisioner.config, { companyId }, ctx.fetchImpl ?? tailnetAwareFetch);
+    if (!rotateResult.ok) return { kind: "error", reason: "rotate_failed" };
+    const secretId = connection.credentialSecretRefs?.[0]?.secretId;
+    if (!secretId) return { kind: "error", reason: "secret_store_failed" };
+    try {
+      const [secret] = await ctx.db
+        .select({ latestVersion: companySecrets.latestVersion })
+        .from(companySecrets)
+        .where(and(eq(companySecrets.id, secretId), eq(companySecrets.companyId, companyId)))
+        .limit(1);
+      if (!secret) return { kind: "error", reason: "secret_store_failed" };
+      const owner = await pickTemplateOwner(ctx.db, companyId);
+      await secretService(ctx.db).rotate(
+        secretId,
+        { value: rotateResult.boardToken, expectedLatestVersion: secret.latestVersion },
+        { userId: owner?.userId ?? null },
       );
-      kind = "rotated";
+    } catch (err) {
+      logger.warn({ companyId, errorClass: errorClass(err) }, "shared-org rh-mcp token storage failed");
+      return { kind: "error", reason: "secret_store_failed" };
     }
+    await recordExpiry(
+      ctx.db,
+      connection.id,
+      rotateResult.tokenExpiresAt ?? new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+    );
+    rotated = true;
+  }
+
+  if (reconcileError && !rotated) {
+    return { kind: "error", reason: reconcileError };
   }
 
   const installed = await installOnLiveAgents(ctx, connection);
-  if (kind !== "ready") {
-    const action =
-      kind === "rotated"
-        ? "company.shared_org_rh_mcp.rotated"
-        : kind === "reconciled"
-          ? "company.shared_org_rh_mcp.reconciled"
-          : "company.shared_org_rh_mcp.provisioned";
-    await logOutcome(ctx.db, companyId, action, {
+
+  if (reconciled) {
+    await logOutcome(ctx.db, companyId, "company.shared_org_rh_mcp.reconciled", {
+      connectionId: connection.id,
+      installed,
+      previousVersion,
+      version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION,
+    });
+  }
+
+  if (rotated) {
+    await logOutcome(ctx.db, companyId, "company.shared_org_rh_mcp.rotated", {
+      connectionId: connection.id,
+      installed,
+      version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION,
+    });
+  } else if (kind === "provisioned") {
+    await logOutcome(ctx.db, companyId, "company.shared_org_rh_mcp.provisioned", {
       connectionId: connection.id,
       installed,
       version: RH_MCP_SERVICE_REVIEWED_TOOLS_VERSION,
     });
   }
-  return kind === "provisioned"
-    ? { kind, installed }
-    : kind === "rotated"
-      ? { kind, installed }
-      : kind === "reconciled"
-        ? { kind, installed }
-        : { kind: "ready", installed };
+
+  if (rotated) {
+    return { kind: "rotated", installed };
+  }
+  if (reconciled) {
+    return { kind: "reconciled", installed };
+  }
+  if (kind === "provisioned") {
+    return { kind: "provisioned", installed };
+  }
+  return { kind: "ready", installed };
 }
 
 /** Every shared, active/paused company inside the rollout scope, visited in keyset pages so none is starved. */
