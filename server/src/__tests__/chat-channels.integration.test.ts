@@ -11192,6 +11192,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       clientId: "999.999", createdByUserId: "owner-user",
     });
     await expect(oauth.configure(fixture.companyId, endpoint.id, "owner-user", { clientId: "123.456", clientSecret: "fixture-client-secret" })).rejects.toMatchObject({ status: 422, message: expect.stringContaining("Client ID") });
+    await db.update(chatSlackRegistrations).set({ status: "failed" }).where(eq(chatSlackRegistrations.endpointId, endpoint.id));
+    await expect(oauth.configure(fixture.companyId, endpoint.id, "owner-user", { clientId: "123.456", clientSecret: "test-signing-secret" })).rejects.toMatchObject({ status: 422, message: expect.stringContaining("Signing Secret") });
     await db.update(chatSlackRegistrations).set({ status: "removed" }).where(eq(chatSlackRegistrations.endpointId, endpoint.id));
     await oauth.configure(fixture.companyId, endpoint.id, "owner-user", { clientId: "123.456", clientSecret: "fixture-client-secret" });
     await db.delete(chatSlackRegistrations).where(eq(chatSlackRegistrations.endpointId, endpoint.id));

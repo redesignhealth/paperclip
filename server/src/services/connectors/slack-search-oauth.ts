@@ -200,8 +200,10 @@ export function slackSearchOAuthService(
       })
       .from(chatSlackRegistrations)
       .where(and(eq(chatSlackRegistrations.companyId, companyId), eq(chatSlackRegistrations.endpointId, endpointId)));
-    // A removed registration keeps its client_id but no longer describes the app.
-    const registration = found && found.status !== "removed" ? found : undefined;
+    // Only a registration whose app exists describes it. Removed rows keep their
+    // client_id, and creating/uncertain/failed ones may never have produced an app.
+    const registration =
+      found && ["install", "credentials_saved", "configured"].includes(found.status) ? found : undefined;
     if (registration?.clientId && registration.clientId !== values.clientId)
       throw unprocessable(
         "This Client ID does not match the Slack app registered for this connection. Copy it from the app's Basic Information page.",
