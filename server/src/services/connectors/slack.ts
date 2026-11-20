@@ -33,6 +33,9 @@ import {
 } from "./slack-client.js";
 import {
   authorizeSlackChannel,
+  personalDmReadsAllowed,
+  personalDmPrivacy,
+  recordSlackPersonalDmRead,
   recordSlackPrivateRead,
 } from "./slack-access.js";
 import {
@@ -244,11 +247,22 @@ export async function executeSlackTool(
     try {
       channel = object((await client("conversations.info", { channel: id })).channel);
     } catch (error) {
-      if (error instanceof HttpError && error.status === 422) throw denied;
+      // Only a definite "not found / not a member" answer is a denial; outages must stay visible.
+      if (
+        error instanceof HttpError &&
+        error.status === 422 &&
+        ["slack_channel_not_found", "slack_not_in_channel"].includes(String(object(error.details).code))
+      )
+        throw denied;
       throw error;
     }
     // Slack only answers for conversations the person belongs to; still require a DM or group DM.
     if (channel.id !== id || (channel.is_im !== true && channel.is_mpim !== true)) throw denied;
+    // A reply in a channel conversation would reach that whole audience, so personal DMs are not read there.
+    // Checked only once the channel is confirmed to be a personal DM, so other denials keep their own message.
+    if (!personalDmReadsAllowed(authority)) throw personalDmPrivacy();
+    // Recorded before any content is returned, so later Slack writes in this task stay private.
+    await recordSlackPersonalDmRead(db, authority, channel);
     personalDmChannels.add(id);
     return channel;
   };
@@ -297,7 +311,8 @@ export async function executeSlackTool(
           throw error;
       }
     }
-    const personal = await personalDm();
+    // First page only: the person's own DMs are appended once, not on every cursor request.
+    const personal = personalDmReadsAllowed(authority) && !args.cursor ? await personalDm() : null;
     if (personal) {
       const dms = await personal("users.conversations", {
         types: "im,mpim",

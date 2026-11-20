@@ -494,8 +494,8 @@ export function slackSearchOAuthService(
           userId,
         );
       } catch (error) {
-        // Denials (not connected, reconnect needed) mean no DM access. Outages must stay visible.
-        if (error instanceof HttpError && error.status === 403) return null;
+        // Denials, conflicts and a rejected refresh (not connected, reconnect needed) mean no DM access.
+        if (error instanceof HttpError && [403, 409, 422].includes(error.status)) return null;
         throw error;
       }
       return slackScopesAllowDmReads(grant.scopes) ? { token: grant.token } : null;
