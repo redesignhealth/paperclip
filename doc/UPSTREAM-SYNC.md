@@ -207,6 +207,15 @@ backlog load, at most `UPSTREAM_SYNC_ALERT_MAX_PER_RUN` (default 10) per-row ale
 are collapsed into one digest and marked `alert_state = 'suppressed'` (still visible in the view).
 In P1 the alert moves from classification time to merge time.
 
+The `paperclip-comment` sink is made idempotent on top of that: each comment ends with an
+invisible `<!-- upstream-sync-alert:<dedup_key> -->` marker, and a flush lists the alert issue's
+latest 500 comments first and marks an alert delivered (`delivery_ref =
+paperclip-comment:<id>:existing`) instead of re-posting when its marker is already there. This
+closes the case where a request timed out client-side after the server stored the comment (the
+comments API only dedups `clientRequestId` for user actors, not agents), and the next run resent
+it. If the list cannot be read, nothing is posted that run and the alerts stay undelivered.
+Comments posted before this marker existed have none; they are not matched.
+
 Ops alerts are edge-triggered (one alert when a condition starts, re-armed when it clears):
 queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` older than
 `UPSTREAM_SYNC_OLDEST_PENDING_HOURS_MAX` (default 48).
