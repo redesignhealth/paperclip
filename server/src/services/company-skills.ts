@@ -35,7 +35,7 @@ import {
 import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames,
   resolveLegacyPaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
 import { REPOSITORY_CONTENT_DIR, repositorySkillProjection } from "./skill-repository-package.js";
-import { SHARED_SKILLS_KEY_PREFIX, SHARED_SKILLS_SOURCE_KIND, resolveSharedSkillsRoot } from "./shared-skills-source.js";
+import { SHARED_SKILLS_KEY_PREFIX, SHARED_SKILLS_SOURCE_KIND, readSharedSkillsConfig, resolveSharedSkillsRoot } from "./shared-skills-source.js";
 import { runVersionSnapshotFlight } from "./skill-version-retention.js";
 import type { PaperclipDesiredSkillEntry, PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 import type {
@@ -3062,6 +3062,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
    * until the first snapshot exists. Skills removed from the shared repository are dropped here once no agent uses them.
    */
   async function ensureSharedSkills(companyId: string) {
+    if (!readSharedSkillsConfig()) return;
     const root = await resolveSharedSkillsRoot();
     if (!root) return;
     const imported = await readLocalSkillImports(companyId, root).catch(() => [] as ImportedSkill[]);

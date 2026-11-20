@@ -40,6 +40,7 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
     home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-skills-home-"));
     process.env.PAPERCLIP_HOME = home;
     process.env.PAPERCLIP_INSTANCE_ID = "default";
+    Object.assign(process.env, env);
     db = createDb(tempDb.connectionString);
     svc = companySkillService(db);
   }, 20_000);
@@ -54,7 +55,8 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
   afterAll(async () => {
     if (oldHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = oldHome;
     if (oldInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = oldInstance;
-    await fs.rm(home, { recursive: true, force: true });
+    for (const key of Object.keys(env)) delete process.env[key];
+    if (home) await fs.rm(home, { recursive: true, force: true });
     await tempDb?.cleanup();
   });
 
@@ -65,6 +67,19 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
   }
   const sharedKeys = async (companyId: string) =>
     (await svc.list(companyId)).map((skill) => skill.key).filter((key) => key.startsWith("shared/")).sort();
+
+  it("adds nothing when the feature is unset, even with an old snapshot on disk", async () => {
+    await refreshSharedSkills({ env, openSnapshot: async () => snapshot("a".repeat(40), ["alpha"]) });
+    const id = await company();
+    const saved = { ...env };
+    for (const key of Object.keys(env)) delete process.env[key];
+    try {
+      expect(await sharedKeys(id)).toEqual([]);
+    } finally {
+      Object.assign(process.env, saved);
+    }
+    expect(await sharedKeys(id)).toEqual(["shared/alpha"]);
+  });
 
   it("adds nothing before the first download", async () => {
     const id = await company();
@@ -84,7 +99,7 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
     expect(await resolveManagedGitHubIdentitySelection(db, one, { agentId: randomUUID() })).toMatchObject({ configured: false });
   });
 
-  it("drops a skill removed from the shared repository unless an agent still uses it", async () => {
+  it("drops a skill removed from the shared repository", async () => {
     const id = await company();
     await refreshSharedSkills({ env, openSnapshot: async () => snapshot("a".repeat(40), ["alpha", "beta"]) });
     expect(await sharedKeys(id)).toEqual(["shared/alpha", "shared/beta"]);

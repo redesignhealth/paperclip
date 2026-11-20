@@ -171,6 +171,7 @@ export function startSharedSkillsSync(options: RefreshSharedSkillsOptions & { in
     refreshSharedSkills(options)
       .then((outcome) => {
         if (outcome.status === "updated") logger.info({ commitSha: outcome.commitSha, skills: outcome.skills }, "shared skills updated");
+        else if (outcome.status === "error") logger.warn({ reason: outcome.reason }, "shared skills sync did not publish a snapshot");
       })
       .catch((error) => logger.warn({ errorClass: error instanceof Error ? error.constructor.name : typeof error }, "shared skills sync failed"))
       .finally(() => {

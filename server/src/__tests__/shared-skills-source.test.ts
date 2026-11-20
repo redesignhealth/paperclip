@@ -2,8 +2,12 @@ import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const warn = vi.hoisted(() => vi.fn());
+vi.mock("../middleware/logger.js", () => ({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 import {
   SHARED_SKILLS_REPOSITORY_ENV,
+  startSharedSkillsSync,
   SHARED_SKILLS_TOKEN_ENV,
   readSharedSkillsConfig,
   refreshSharedSkills,
@@ -99,16 +103,23 @@ describe("refreshSharedSkills", () => {
   });
 
   it("reports a failed download without leaking the token", async () => {
-    const warn = vi.fn();
-    vi.doMock("../middleware/logger.js", () => ({ logger: { warn, info: vi.fn() } }));
+    warn.mockClear();
     const result = await refreshSharedSkills({ env, directory: await tmp(), openSnapshot: async () => { throw new Error("denied for test-token-value"); } });
     expect(result).toEqual({ status: "error", reason: "download_failed" });
     expect(JSON.stringify(result)).not.toContain("test-token-value");
+    expect(warn).toHaveBeenCalled();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("test-token-value");
   });
 
   it("reports no_skills when the folder holds none", async () => {
     const result = await refreshSharedSkills({ env, directory: await tmp(), openSnapshot: async () => snapshot(SHA_A, [{ path: "skills/README.md", content: "x" }]) });
     expect(result).toEqual({ status: "error", reason: "no_skills" });
     expect(await resolveSharedSkillsRoot(path.join(os.tmpdir(), "does-not-exist-shared"))).toBeNull();
+  });
+
+  it("starts no sync loop when unconfigured", () => {
+    const stop = startSharedSkillsSync({ env: {} });
+    expect(typeof stop).toBe("function");
+    stop();
   });
 });
