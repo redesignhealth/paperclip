@@ -140,8 +140,24 @@ describe("shared skills token capture", () => {
     expect(readSharedSkillsToken()).toBe("boot-token");
   });
 
-  it("is off when no token was captured, even if the repository is set", () => {
+  it("reads the token from the boot snapshot, never from the live environment", () => {
+    const saved = { token: process.env[SHARED_SKILLS_TOKEN_ENV], repository: process.env[SHARED_SKILLS_REPOSITORY_ENV] };
+    process.env[SHARED_SKILLS_REPOSITORY_ENV] = "example/skills-repo";
+    process.env[SHARED_SKILLS_TOKEN_ENV] = "live-env-token";
+    try {
+      __resetSharedSkillsTokenForTests(null);
+      expect(readSharedSkillsConfig()).toBeNull(); // repository set, snapshot empty: a live env token is ignored
+      __resetSharedSkillsTokenForTests("boot-token");
+      expect(readSharedSkillsConfig()).toMatchObject({ token: "boot-token", repositoryUrl: "https://github.com/example/skills-repo" });
+    } finally {
+      if (saved.token === undefined) delete process.env[SHARED_SKILLS_TOKEN_ENV]; else process.env[SHARED_SKILLS_TOKEN_ENV] = saved.token;
+      if (saved.repository === undefined) delete process.env[SHARED_SKILLS_REPOSITORY_ENV]; else process.env[SHARED_SKILLS_REPOSITORY_ENV] = saved.repository;
+    }
+  });
+
+  it("reports not configured for an absent or blank token", () => {
     __resetSharedSkillsTokenForTests(null);
-    expect(readSharedSkillsConfig()).toBeNull();
+    expect(captureAndScrubSharedSkillsToken({})).toEqual({ configured: false });
+    expect(readSharedSkillsToken()).toBeNull();
   });
 });
