@@ -7,13 +7,29 @@ export const CATEGORIES = ["feature", "fix", "perf", "security", "infra", "break
 // no nested quantifiers and no alternation whose branches overlap under a repeat.
 // They are also linear, not just sub-exponential: every unanchored pattern either
 // starts with a literal that a failed attempt cannot re-scan (`\b(cve-…)`,
-// `breaking change`, `\(#`) or is `^`-anchored. The one pattern that was not —
+// `BREAKING`, `\(#`) or is `^`-anchored. The one pattern that was not —
 // the PR-suffix strip `/\s*\(#\d+\)\s*$/` — retried its leading `\s*` from every
 // whitespace position and was O(n^2) on a long run of spaces; it is now
 // `/\(#\d+\)\s*$/` plus trimEnd(). Do not reintroduce a leading unanchored
 // quantifier.
 const INFRA_FILE_RE = /^(\.github\/|docker\/|Dockerfile|scripts\/|pnpm-lock\.yaml|pnpm-workspace\.yaml|package\.json|tsconfig|vitest\.config|\.dockerignore|releases\/|tests\/)/;
+// Conventional-commit breaking-change footer. Anchored to a line start (`m`), so it is
+// linear. Case-sensitive on purpose: the spec requires upper case, and a lower-case
+// "breaking change" in prose (or a `**Breaking changes**` PR-template heading) is not a footer.
+const BREAKING_FOOTER_RE = /^BREAKING[ -]CHANGE:[ \t]*([^\n]*)/gm;
+// A footer whose value says there is nothing to act on ("BREAKING CHANGE: none").
+const NEGATED_VALUE_RE = /^(none|n\/a|na|nil|no|not applicable|no breaking changes?)\b[\s.!]*$/i;
 const TEST_OR_DOC_RE = /(^|\/)(__tests__|tests?)\/|\.test\.|\.spec\.|\.md$|^doc(s)?\//;
+
+// True for `type!:` / `type(scope)!:` titles and for a `BREAKING CHANGE:` /
+// `BREAKING-CHANGE:` footer in the body, unless the footer is negated ("none", "N/A").
+export function isBreaking(c) {
+  if (/^[a-z]+(\([^)]*\))?!:/.test(c.title.toLowerCase())) return true;
+  for (const m of (c.body || "").matchAll(BREAKING_FOOTER_RE)) {
+    if (!NEGATED_VALUE_RE.test(m[1].trim())) return true;
+  }
+  return false;
+}
 
 // Deterministic fallback. Also used as the safety net when the LLM is unavailable,
 // so rows never stay unclassified and feature alerts are not silently skipped.
@@ -21,9 +37,8 @@ export function heuristicClassify(c) {
   const t = c.title.toLowerCase();
   const text = `${c.title}\n${c.body || ""}`.toLowerCase();
   const prefix = (t.match(/^([a-z]+)(\([^)]*\))?(!)?:/) || [])[1];
-  const bang = /^[a-z]+(\([^)]*\))?!:/.test(t) || /breaking change/.test(text);
   let category;
-  if (bang) category = "breaking";
+  if (isBreaking(c)) category = "breaking";
   else if (/\b(cve-\d|vulnerab|security|xss|csrf|ssrf|sql injection|\brce\b|auth bypass|privilege escalation|secret leak|redact)/.test(text) || prefix === "security") category = "security";
   else if (prefix === "perf" || /\b(perf|performance|faster|speed up|reduce latency|optimi[sz])/.test(t)) category = "perf";
   else if (["ci", "build", "chore", "docs", "test", "tests", "refactor", "style", "release", "deps"].includes(prefix)) category = "infra";
