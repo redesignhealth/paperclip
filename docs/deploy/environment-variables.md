@@ -75,6 +75,7 @@ receives the token. The feature is off unless both the token and the repository 
 | `PAPERCLIP_SHARED_SKILLS_PATH` | `skills` | Folder in the repository whose subfolders (each with a `SKILL.md`) are the skills. |
 | `PAPERCLIP_SHARED_SKILLS_REF` | `main` | Branch or ref to track. |
 
+The token is read once at startup and removed from the process environment, so agent processes the server starts never inherit it.
 Unsetting the token or repository stops further imports; skills already in a library remain until removed.
 
 ### Default MCP OAuth endpoint readiness

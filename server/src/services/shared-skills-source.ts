@@ -15,10 +15,11 @@ import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "no
 import path from "node:path";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
+import { SHARED_SKILLS_TOKEN_ENV, readSharedSkillsToken } from "../secrets/shared-skills-token.js";
 import { MAX_REPOSITORY_BYTES, MAX_REPOSITORY_FILES } from "./skill-repository-package.js";
 import { openGitSkillSnapshot, type GitSkillSnapshot } from "./skill-source-git-snapshot.js";
 
-export const SHARED_SKILLS_TOKEN_ENV = "PAPERCLIP_SHARED_SKILLS_GITHUB_TOKEN";
+export { SHARED_SKILLS_TOKEN_ENV };
 export const SHARED_SKILLS_REPOSITORY_ENV = "PAPERCLIP_SHARED_SKILLS_REPOSITORY";
 export const SHARED_SKILLS_PATH_ENV = "PAPERCLIP_SHARED_SKILLS_PATH";
 export const SHARED_SKILLS_REF_ENV = "PAPERCLIP_SHARED_SKILLS_REF";
@@ -45,13 +46,17 @@ export type SharedSkillsRefreshOutcome =
   | { status: "updated"; commitSha: string; skills: number }
   | { status: "error"; reason: "download_failed" | "no_skills" | "too_large" | "write_failed" };
 
-/** Reads the closed configuration, or null when the feature is off or the settings are malformed. */
-export function readSharedSkillsConfig(env: NodeJS.ProcessEnv = process.env): SharedSkillsConfig | null {
-  const token = env[SHARED_SKILLS_TOKEN_ENV]?.trim();
-  const repository = env[SHARED_SKILLS_REPOSITORY_ENV]?.trim();
+/**
+ * Reads the closed configuration, or null when the feature is off or the settings are malformed. Without an injected
+ * `env` the token is the boot snapshot (the variable itself is scrubbed from `process.env` at startup).
+ */
+export function readSharedSkillsConfig(env?: NodeJS.ProcessEnv): SharedSkillsConfig | null {
+  const token = env ? env[SHARED_SKILLS_TOKEN_ENV]?.trim() : readSharedSkillsToken();
+  const source = env ?? process.env;
+  const repository = source[SHARED_SKILLS_REPOSITORY_ENV]?.trim();
   if (!token || !repository || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) return null;
-  const subpath = (env[SHARED_SKILLS_PATH_ENV]?.trim() || "skills").replace(/^\/+|\/+$/g, "");
-  const ref = env[SHARED_SKILLS_REF_ENV]?.trim() || "main";
+  const subpath = (source[SHARED_SKILLS_PATH_ENV]?.trim() || "skills").replace(/^\/+|\/+$/g, "");
+  const ref = source[SHARED_SKILLS_REF_ENV]?.trim() || "main";
   if (!subpath || subpath.split("/").some((segment) => !segment || segment === "." || segment === "..")) return null;
   if (!/^[A-Za-z0-9._/-]+$/.test(ref) || ref.includes("..") || ref.startsWith("-")) return null;
   return { token, repositoryUrl: `https://github.com/${repository}`, subpath, ref };
@@ -101,7 +106,7 @@ export interface RefreshSharedSkillsOptions {
 
 /** Downloads the configured folder once and publishes it as the current snapshot. Idempotent per commit. */
 export async function refreshSharedSkills(options: RefreshSharedSkillsOptions = {}): Promise<SharedSkillsRefreshOutcome> {
-  const config = readSharedSkillsConfig(options.env ?? process.env);
+  const config = readSharedSkillsConfig(options.env);
   if (!config) return { status: "not_configured" };
   const directory = options.directory ?? sharedSkillsDirectory();
   const open = options.openSnapshot ?? openGitSkillSnapshot;
@@ -164,7 +169,7 @@ async function writePointer(directory: string, commitSha: string): Promise<void>
 
 /** Startup plus every few minutes, unref'd, cleared on shutdown. A no-op when unconfigured. */
 export function startSharedSkillsSync(options: RefreshSharedSkillsOptions & { intervalMs?: number } = {}): () => void {
-  if (!readSharedSkillsConfig(options.env ?? process.env)) return () => {};
+  if (!readSharedSkillsConfig(options.env)) return () => {};
   let active = true;
   let timer: NodeJS.Timeout | null = null;
   const tick = () => {

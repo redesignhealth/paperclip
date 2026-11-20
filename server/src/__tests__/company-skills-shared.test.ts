@@ -9,6 +9,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { companySkillService } from "../services/company-skills.ts";
 import { resolveManagedGitHubIdentitySelection } from "../services/git-credentials.js";
 import { SHARED_SKILLS_REPOSITORY_ENV, SHARED_SKILLS_TOKEN_ENV, refreshSharedSkills } from "../services/shared-skills-source.js";
+import { __resetSharedSkillsTokenForTests } from "../secrets/shared-skills-token.js";
 import type { GitSkillSnapshot } from "../services/skill-source-git-snapshot.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -32,6 +33,7 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
   let home: string;
   let oldHome: string | undefined;
   let oldInstance: string | undefined;
+  let oldEnv: { token: string | undefined; repository: string | undefined } = { token: undefined, repository: undefined };
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-shared-skills-");
@@ -40,7 +42,9 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
     home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-skills-home-"));
     process.env.PAPERCLIP_HOME = home;
     process.env.PAPERCLIP_INSTANCE_ID = "default";
-    Object.assign(process.env, env);
+    oldEnv = { token: process.env[SHARED_SKILLS_TOKEN_ENV], repository: process.env[SHARED_SKILLS_REPOSITORY_ENV] };
+    process.env[SHARED_SKILLS_REPOSITORY_ENV] = env[SHARED_SKILLS_REPOSITORY_ENV];
+    __resetSharedSkillsTokenForTests(env[SHARED_SKILLS_TOKEN_ENV]);
     db = createDb(tempDb.connectionString);
     svc = companySkillService(db);
   }, 20_000);
@@ -55,7 +59,8 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
   afterAll(async () => {
     if (oldHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = oldHome;
     if (oldInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = oldInstance;
-    for (const key of Object.keys(env)) delete process.env[key];
+    __resetSharedSkillsTokenForTests(null);
+    if (oldEnv.repository === undefined) delete process.env[SHARED_SKILLS_REPOSITORY_ENV]; else process.env[SHARED_SKILLS_REPOSITORY_ENV] = oldEnv.repository;
     if (home) await fs.rm(home, { recursive: true, force: true });
     await tempDb?.cleanup();
   });
@@ -71,12 +76,11 @@ describeEmbeddedPostgres("shared skills in the company library", () => {
   it("adds nothing when the feature is unset, even with an old snapshot on disk", async () => {
     await refreshSharedSkills({ env, openSnapshot: async () => snapshot("a".repeat(40), ["alpha"]) });
     const id = await company();
-    const saved = { ...env };
-    for (const key of Object.keys(env)) delete process.env[key];
+    __resetSharedSkillsTokenForTests(null);
     try {
       expect(await sharedKeys(id)).toEqual([]);
     } finally {
-      Object.assign(process.env, saved);
+      __resetSharedSkillsTokenForTests(env[SHARED_SKILLS_TOKEN_ENV]);
     }
     expect(await sharedKeys(id)).toEqual(["shared/alpha"]);
   });

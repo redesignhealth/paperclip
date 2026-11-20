@@ -13,6 +13,7 @@ import {
   refreshSharedSkills,
   resolveSharedSkillsRoot,
 } from "../services/shared-skills-source.js";
+import { __resetSharedSkillsTokenForTests, captureAndScrubSharedSkillsToken, readSharedSkillsToken } from "../secrets/shared-skills-token.js";
 import type { GitSkillSnapshot } from "../services/skill-source-git-snapshot.js";
 
 const SHA_A = "a".repeat(40);
@@ -121,5 +122,26 @@ describe("refreshSharedSkills", () => {
     const stop = startSharedSkillsSync({ env: {} });
     expect(typeof stop).toBe("function");
     stop();
+  });
+});
+
+describe("shared skills token capture", () => {
+  afterEach(() => __resetSharedSkillsTokenForTests(null));
+
+  it("captures the token once and scrubs it from the environment on every call", () => {
+    __resetSharedSkillsTokenForTests(null);
+    const environment: NodeJS.ProcessEnv = { [SHARED_SKILLS_TOKEN_ENV]: "  boot-token  " };
+    expect(captureAndScrubSharedSkillsToken(environment)).toEqual({ configured: true });
+    expect(environment[SHARED_SKILLS_TOKEN_ENV]).toBeUndefined();
+    expect(readSharedSkillsToken()).toBe("boot-token");
+    environment[SHARED_SKILLS_TOKEN_ENV] = "later-value";
+    captureAndScrubSharedSkillsToken(environment);
+    expect(environment[SHARED_SKILLS_TOKEN_ENV]).toBeUndefined();
+    expect(readSharedSkillsToken()).toBe("boot-token");
+  });
+
+  it("is off when no token was captured, even if the repository is set", () => {
+    __resetSharedSkillsTokenForTests(null);
+    expect(readSharedSkillsConfig()).toBeNull();
   });
 });
