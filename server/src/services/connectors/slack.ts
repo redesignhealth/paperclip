@@ -319,6 +319,9 @@ export async function executeSlackTool(
         limit: args.limit ?? 50,
         exclude_archived: true,
       });
+      // The listing exposes private metadata (who the person talks to), so it counts as a personal DM read.
+      if (objects(dms.channels).length > 0)
+        await recordSlackPersonalDmRead(db, authority, { id: "directory" });
       const known = new Set(channels.map((channel) => channel.id));
       for (const channel of objects(dms.channels)) {
         if (!channel.id || known.has(channel.id)) continue;

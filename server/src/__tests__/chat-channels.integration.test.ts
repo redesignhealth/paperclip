@@ -11025,6 +11025,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       nextCursor: "older",
       hasMore: true,
     });
+    // A personal DM read is visible across every Slack connection of the company, so a task cannot read
+    // through one connection and post through another.
+    {
+      const { resolveSlackTaskAuthority: resolveAuthority } = await import("../services/connectors/slack-authority.js");
+      const { recordSlackPersonalDmRead, personalDmReaders } = await import("../services/connectors/slack-access.js");
+      const taskAuthority = await resolveAuthority(db, binding);
+      const isolatedIssue = { ...taskAuthority, issueId: randomUUID() };
+      await recordSlackPersonalDmRead(db, isolatedIssue, { id: "DFRIEND" });
+      await expect(personalDmReaders(db, isolatedIssue)).resolves.toEqual([taskAuthority.slackUserId]);
+      const otherConnection = { endpoint: { ...taskAuthority.endpoint, id: randomUUID() }, issueId: isolatedIssue.issueId };
+      await expect(personalDmReaders(db, otherConnection)).resolves.toEqual([taskAuthority.slackUserId]);
+      await expect(personalDmReaders(db, { ...otherConnection, issueId: randomUUID() })).resolves.toEqual([]);
+    }
     vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "slack-tools-integration-signing-secret");
     onTestFinished(() => vi.unstubAllEnvs());
     const originalFetch = globalThis.fetch;

@@ -39,10 +39,10 @@ describe("Slack DM reads with the person's own token", () => {
   const authority = makeAuthority();
 
   /** `readDms` makes the database report that this task already read the requester's DMs. */
-  function mockDb(options: { readDms?: boolean } = {}) {
+  function mockDb(options: { readDms?: boolean; reader?: string } = {}) {
     const inserted: any[] = [];
     const rows = options.readDms
-      ? [{ id: "inv-1", status: "executing", approvalState: "approved", providerActionId: "slack-private-dm:issue:DFRIEND:U1" }]
+      ? [{ id: "inv-1", status: "executing", approvalState: "approved", providerActionId: `slack-private-dm:issue:DFRIEND:${options.reader ?? "U1"}` }]
       : [{ id: "inv-1", status: "executing", approvalState: "approved" }];
     const tx = {
       execute: vi.fn(async () => undefined),
@@ -222,6 +222,28 @@ describe("Slack DM reads with the person's own token", () => {
       } finally {
         unregister();
       }
+    });
+
+    it("only allows the DM with the person whose DMs were read", async () => {
+      // Someone else's DMs were read in this task: even the current requester's own DM is off limits.
+      const db = mockDb({ readDms: true, reader: "U9" });
+      const unregister = registerSlackTaskAuthority(db, async () => authority);
+      try {
+        await expect(authorizeSlackWrite(db, authority, writeApi(channels), "DREQ", SLACK_OTHER_USER_DM_OPTIONS))
+          .rejects.toMatchObject({ status: 403, details: { code: "slack_personal_dm_private" } });
+        await expect(authorizeSlackWrite(db, authority, writeApi(channels), "DOTHER", SLACK_OTHER_USER_DM_OPTIONS))
+          .resolves.toMatchObject({ id: "DOTHER" });
+      } finally {
+        unregister();
+      }
+    });
+
+    it("records listing the person's DMs as a personal DM read", async () => {
+      dmAccessToken.mockResolvedValue({ token: "xoxp-person" });
+      await withAuthority(async (db) => {
+        await executeSlackTool(db, binding, "slack_channels", {}, slackFetch() as unknown as typeof fetch);
+        expect(db.inserted.some((row) => String(row.providerActionId).startsWith("slack-private-dm:issue:directory:U1"))).toBe(true);
+      });
     });
 
     it("does not restrict writes when no personal DM was read", async () => {
