@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { buildSlackAppManifest, defaultSlackAppConfiguration, slackRegistrationSchema, slackAccountStateSchema, slackConfigurationCredentialSaveSchema, slackRegistrationErrorMessage, SLACK_CHAT_BOT_SCOPES } from "./slack-app-manifest.js";
-import { isSlackOptInScopeGroup, SLACK_ALL_BOT_SCOPES, SLACK_DEFAULT_BOT_SCOPES, SLACK_OPT_IN_SCOPE_GROUPS, slackBotScopes, slackManifestBotScopes, slackOptInGroupsChanged, slackOptInGroupsForSetup, slackOptInGroupsFromScopes, slackOptInScopeGroupsSchema, slackOptInScopes, slackRequestedOptInGroups, slackSearchRedirectUri } from "./slack-scopes.js";
+import { isSlackOptInScopeGroup, SLACK_ALL_BOT_SCOPES, SLACK_DEFAULT_BOT_SCOPES, SLACK_OPT_IN_SCOPE_GROUPS, slackBotScopes, slackManifestBotScopes, slackOptInGroupsChanged, slackOptInGroupsForSetup, slackOptInGroupsFromScopes, slackOptInScopeGroupsSchema, slackOptInScopes, slackRequestedOptInGroups, slackScopesAllowDmReads, slackSearchRedirectUri } from "./slack-scopes.js";
 import { SLACK_BOT_TOOL_SCOPES } from "./slack-tools.js";
 import { createChatEndpointSchema, slackAppConfigurationSchema } from "./validators/chat-channels.js";
 
 describe("Slack app manifest", () => {
+  it("allows DM reads only when all four DM user scopes were granted", () => {
+    const search = ["search:read.public", "search:read.private", "search:read.files"];
+    const dms = ["im:history", "im:read", "mpim:history", "mpim:read"];
+    expect(slackScopesAllowDmReads(undefined)).toBe(false);
+    expect(slackScopesAllowDmReads(null)).toBe(false);
+    expect(slackScopesAllowDmReads([])).toBe(false);
+    expect(slackScopesAllowDmReads(search)).toBe(false);
+    expect(slackScopesAllowDmReads([...search, "im:history", "mpim:history"])).toBe(false);
+    expect(slackScopesAllowDmReads([...search, ...dms])).toBe(true);
+  });
   it("declares the personal-search redirect URL and user scopes only when asked, keeping the install redirect first", () => {
     const common = { app: defaultSlackAppConfiguration("Maya"), agentName: "Maya", webhookUrl: "https://p.example/w", redirectUri: "https://p.example/api/chat-slack/oauth/callback" };
     const plain = buildSlackAppManifest(common);

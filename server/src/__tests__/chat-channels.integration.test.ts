@@ -11218,8 +11218,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     holdExchange = false;
     const defaultStart = await oauth.start(fixture.companyId, endpoint.id, "owner-user");
     expect(new URL(defaultStart.url).searchParams.get("user_scope")).not.toContain("im:history");
-    grantedScope = "search:read.public,im:history,mpim:history";
-    await expect(oauth.complete(new URL(defaultStart.url).searchParams.get("state")!, "dm-code-1", "owner-user")).rejects.toThrow("unexpected search grant");
+    // Slack may return scopes from an earlier opt-in. The default connect still succeeds, but records only what
+    // was requested, so DM reading stays off; a refresh never widens it either.
+    grantedScope = "search:read.public,search:read.private,search:read.files,im:history,im:read,mpim:history,mpim:read";
+    await oauth.complete(new URL(defaultStart.url).searchParams.get("state")!, "dm-code-1", "owner-user");
+    await expect(oauth.status(fixture.companyId, endpoint.id, "owner-user")).resolves.toMatchObject({ connected: true, dmAccess: false });
+    await expect(oauth.accessToken(fixture.companyId, endpoint.id, "owner-user")).resolves.toMatchObject({ scopes: ["search:read.public", "search:read.private", "search:read.files"] });
+    await expect(oauth.status(fixture.companyId, endpoint.id, "owner-user")).resolves.toMatchObject({ dmAccess: false });
+    // A scope outside the personal set is still refused.
+    const strayStart = await oauth.start(fixture.companyId, endpoint.id, "owner-user");
+    grantedScope = "search:read.public,chat:write";
+    await expect(oauth.complete(new URL(strayStart.url).searchParams.get("state")!, "dm-code-stray", "owner-user")).rejects.toThrow("unexpected search grant");
+    grantedScope = "search:read.public,search:read.private,search:read.files,im:history,im:read,mpim:history,mpim:read";
     const dmStart = await oauth.start(fixture.companyId, endpoint.id, "owner-user", { includeDms: true });
     expect(new URL(dmStart.url).searchParams.get("user_scope")).toBe("search:read.public,search:read.private,search:read.files,im:history,im:read,mpim:history,mpim:read");
     grantedScope = "search:read.public,search:read.private,search:read.files,im:history,im:read,mpim:history,mpim:read";

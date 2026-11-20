@@ -307,8 +307,9 @@ export function slackOptInGroupsForSetup(
 
 /**
  * User scopes for personal Slack search (a separate per-user OAuth flow, not
- * the bot install). Shared so the app manifest can request them alongside the
- * search redirect URL; `apps.manifest.update` replaces both wholesale.
+ * the bot install). The app manifest declares these together with the optional
+ * DM scopes (see `SLACK_ALL_PERSONAL_USER_SCOPES`) and the search redirect URL;
+ * `apps.manifest.update` replaces them wholesale.
  */
 export const SLACK_SEARCH_USER_SCOPES = [
   "search:read.public",
@@ -334,9 +335,9 @@ export const SLACK_ALL_PERSONAL_USER_SCOPES = [
   ...SLACK_DM_USER_SCOPES,
 ] as const;
 
-/** True when granted scopes cover reading the person's DMs and group DMs. */
+/** True when granted scopes cover reading and listing the person's DMs and group DMs (all four DM scopes). */
 export function slackScopesAllowDmReads(scopes: readonly string[] | null | undefined): boolean {
-  return !!scopes && scopes.includes("im:history") && scopes.includes("mpim:history");
+  return !!scopes && SLACK_DM_USER_SCOPES.every((scope) => scopes.includes(scope));
 }
 
 export const SLACK_SEARCH_CALLBACK_PATH = "/api/slack/search/callback";
