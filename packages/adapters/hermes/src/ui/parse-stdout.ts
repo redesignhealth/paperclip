@@ -24,7 +24,7 @@ function stripAnsi(text: string): string {
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
 import { escapeRegExp } from "@paperclipai/adapter-utils/regex";
 
-import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
+import { TOOL_OUTPUT_PREFIX, HERMES_TOOL_REPAIR_NOTICE_RE } from "../shared/constants.js";
 
 // ── Kaomoji / noise stripping ──────────────────────────────────────────────
 
@@ -197,6 +197,13 @@ export function parseHermesStdoutLine(
 ): TranscriptEntry[] {
   const trimmed = stripAnsi(line).trim();
   if (!trimmed) return [];
+
+  // ── Hermes tool-name auto-repair notice (TECH-8974) ───────────────────
+  // A bare print() in Hermes's turn_tool_validation.py that survives -Q. It is an operator
+  // notice, not model output — dropped unconditionally before other classifiers.
+  if (HERMES_TOOL_REPAIR_NOTICE_RE.test(trimmed)) {
+    return [];
+  }
 
   // ── System/adapter messages ────────────────────────────────────────────
   if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
