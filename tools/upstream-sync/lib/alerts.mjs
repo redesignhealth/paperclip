@@ -47,7 +47,10 @@ export function formatRowAlert(row) {
   if (row.fork_owned_hits?.length) flags.push(`touches fork-owned files (${row.fork_owned_hits.length})`);
   if (row.touches_migrations) flags.push("touches Drizzle migrations/schema");
   const parts = {
-    icon: { feature: "NEW", breaking: "BREAKING", security: "SECURITY" }[row.category],
+    // A migration-touching row outside ALERT_CATEGORIES (e.g. perf) leads with MIGRATIONS so the
+    // alert is not read as a routine note; alert categories keep their icon plus a suffix.
+    icon: { feature: "NEW", breaking: "BREAKING", security: "SECURITY" }[row.category] ?? (row.touches_migrations ? "MIGRATIONS" : String(row.category).toUpperCase()),
+    note: row.touches_migrations && ALERT_CATEGORIES.includes(row.category) ? " (touches migrations)" : "",
     summary: String(row.summary ?? ""),
     title: String(row.title ?? ""),
     link: row.upstream_pr ? prUrl(row.upstream_pr) : upstreamUrl(row.upstream_sha),
@@ -68,7 +71,7 @@ export function renderAlert(payload, style = "raw") {
     return clean(p.text ?? "");
   }
   return (
-    `[upstream-sync ${p.icon}] ${clean(p.summary)}\n` +
+    `[upstream-sync ${p.icon}] ${clean(p.summary)}${p.note ?? ""}\n` +
     `${clean(p.title)}\n${p.link}` +
     (p.flags?.length ? `\nFlags: ${p.flags.join("; ")}` : "") +
     `\nLedger status: ${p.status}`
@@ -169,14 +172,16 @@ export async function flushAlerts(db, cfg, { fetchImpl = fetch, log = console.er
   return { delivered, failed, deferred };
 }
 
-// One alert per classified feature/breaking/security row. Each run caps the number of
+// One alert per classified feature/breaking/security row, plus any row that touches
+// migrations whatever its category (a perf commit can still collide with the fork's
+// Drizzle journal). Each run caps the number of
 // individual alerts; the remainder is collapsed into one overflow digest so a 390-commit
 // backlog load does not spam the channel. Overflowed rows are marked 'suppressed'
 // (still visible in the ledger view), never silently dropped.
 export async function alertForClassifiedRows(db, cfg, { log = console.error, budget = null } = {}) {
   const { rows } = await db.query(
     `SELECT * FROM upstream_sync_log
-     WHERE category = ANY($1) AND alert_state IS NULL
+     WHERE (category = ANY($1) OR (category IS NOT NULL AND touches_migrations IS TRUE)) AND alert_state IS NULL
      ORDER BY id`,
     [ALERT_CATEGORIES],
   );
@@ -205,7 +210,7 @@ export async function alertForClassifiedRows(db, cfg, { log = console.error, bud
   if (overflow.length && !budget?.expired()) {
     const shown = overflow.slice(0, 25);
     const lines = shown.map((r) => `- ${r.category}: ${r.summary} (${r.upstream_pr ? "#" + r.upstream_pr : r.upstream_sha.slice(0, 9)})`);
-    const digest = `[upstream-sync] ${overflow.length} more feature/breaking/security rows (per-row alerts capped at ${max} per run):\n${lines.join("\n")}${overflow.length > shown.length ? `\n- ... and ${overflow.length - shown.length} more (see upstream_sync_log_view)` : ""}`;
+    const digest = `[upstream-sync] ${overflow.length} more feature/breaking/security/migration rows (per-row alerts capped at ${max} per run):\n${lines.join("\n")}${overflow.length > shown.length ? `\n- ... and ${overflow.length - shown.length} more (see upstream_sync_log_view)` : ""}`;
     const key = `overflow:${overflow[0].upstream_sha}`;
     if (await enqueueAlert(db, cfg, { dedupKey: key, kind: "overflow", payload: { text: digest } })) queued++;
     await db.query(`UPDATE upstream_sync_log SET alert_state='suppressed', alerted_at=now() WHERE upstream_sha = ANY($1)`, [overflow.map((r) => r.upstream_sha)]);
