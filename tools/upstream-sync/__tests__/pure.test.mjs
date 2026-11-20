@@ -8,7 +8,7 @@ import { buildForkOwnedMatcher, parseForkOwned, touchesMigrations } from "../lib
 import { extractPr, extractRevertSha, gitInput, listCommitsAfter, parseLog, parseNameList } from "../lib/upstreamGit.mjs";
 import { createBudget } from "../lib/budget.mjs";
 import { escapeMarkdownCell, renderOutboxText } from "../lib/alerts.mjs";
-import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse } from "../lib/classify.mjs";
+import { buildPrompt, heuristicClassify, mergeClassification, parseLlmResponse, SYSTEM } from "../lib/classify.mjs";
 import { escapeSlack, formatRowAlert, neutralizeMentions, renderAlert } from "../lib/alerts.mjs";
 import { loadConfig, resolveWorkerRefs } from "../lib/config.mjs";
 
@@ -601,4 +601,66 @@ test("report cells escape backslash, pipe, CR and newline", () => {
   assert.equal(escapeMarkdownCell("one\r\ntwo\rthree\nfour"), "one two three four");
   assert.ok(!escapeMarkdownCell("[@D](user://u1)").includes("user://"));
   assert.equal(escapeMarkdownCell(null), "");
+});
+
+// ---- RED-1631: noisy categories ----------------------------------------------
+
+// Real PR-template boilerplate: every upstream body has these sections.
+const TEMPLATE_BODY = [
+  "## Thinking Path", "> - fix the thing", "## What Changed", "- stuff",
+  "## Verification", "- CI, security, and exact-head review gates passed; secret redaction unchanged.",
+  "## Risks", "Low risk.", "**Breaking changes** none. No schema or API change.",
+].join("\n");
+
+test("docs/test/CI/perf commits are not security or breaking because of PR-body boilerplate", () => {
+  const f = (title, body = TEMPLATE_BODY, files = ["server/src/x.ts"]) => heuristicClassify({ title, body, files }).category;
+  assert.equal(f("docs(connections): Google Workspace approval checklist and code-fix plan (#21996)"), "infra");
+  assert.equal(f("test(restart-chaos): long mid-tool outages (#20711)"), "infra");
+  assert.equal(f("chore(ci): remove the Docker dependency cache check (#21331)"), "infra");
+  assert.equal(f("perf(db): reuse dedicated connections instead of opening one per call (#21567)"), "perf");
+  assert.equal(f("perf(ci): stop printing Postgres TRUNCATE notices (#21903)"), "perf");
+  assert.equal(f("refactor(runner): rename codex-runtime-adapter (#20938)"), "infra");
+  // A plain fix whose body only says "security checks passed" is a fix.
+  assert.equal(f("fix(runner): retry stalled Pi Node archive downloads (#18126)"), "fix");
+});
+
+test("real security and breaking signals still win", () => {
+  const f = (title, body = "", files = ["server/src/x.ts"]) => heuristicClassify({ title, body, files }).category;
+  // Title vocabulary, any prefix.
+  assert.equal(f("fix(auth): close auth bypass on invite accept (#1)"), "security");
+  assert.equal(f("docs: security advisory for CVE-2026-1234 (#2)"), "security");
+  assert.equal(f("test: add XSS regression for comments (#3)"), "security");
+  // Advisory identifiers in the body count for product commits, not for docs/tests.
+  assert.equal(f("fix(deps): bump better-auth (#4)", "Fixes CVE-2026-12345 and GHSA-abcd-1234-efgh."), "security");
+  assert.equal(f("docs: changelog (#5)", "mentions CVE-2026-12345"), "infra");
+  // Breaking: bang, title phrase, and a real footer on a product commit.
+  assert.equal(f("feat(api)!: drop v1 routes (#6)"), "breaking");
+  assert.equal(f("docs!: rewrite upgrade notes (#7)"), "breaking");
+  assert.equal(f("fix(config): rename env var (#8)", "Rename.\n\nBREAKING CHANGE: PAPERCLIP_X is now PAPERCLIP_Y"), "breaking");
+  // ...but a perf commit with that footer is not auto-pinned, and the lowercase
+  // template heading never matches.
+  assert.equal(f("perf(db): index lookups (#9)", "BREAKING CHANGE: none"), "perf");
+  assert.equal(f("fix(ui): tidy (#10)", "**Breaking changes** none"), "fix");
+});
+
+test("the model cannot raise docs/test to security or perf/refactor/CI to breaking", () => {
+  const llm = (category) => ({ category, summary: "s" });
+  const docs = commit({ title: "docs(connections): approval checklist (#1)", body: TEMPLATE_BODY });
+  const r1 = mergeClassification(docs, llm("security"), "m");
+  assert.equal(r1.category, "infra");
+  assert.equal(r1.by, "heuristic(overrode)+llm:m");
+  const perf = commit({ title: "perf(db): reuse connections (#2)", body: TEMPLATE_BODY });
+  assert.equal(mergeClassification(perf, llm("breaking"), "m").category, "perf");
+  // A product commit can still be raised by the model, and perf stays reachable.
+  const fix = commit({ title: "fix(auth): stop leaking session ids (#3)" });
+  assert.equal(mergeClassification(commit({ title: "fix(runner): foo (#4)" }), llm("security"), "m").category, "security");
+  assert.equal(mergeClassification(fix, llm("security"), "m").category, "security");
+  // Other model verdicts on docs/perf commits are untouched.
+  assert.equal(mergeClassification(docs, llm("fix"), "m").category, "fix");
+});
+
+test("classifier prompt tells the model to ignore PR-body headings and keep perf/docs out of breaking/security", () => {
+  assert.match(SYSTEM, /not from words in the PR body/);
+  assert.match(SYSTEM, /Documentation, test-only, CI, build, lint and pure-refactor commits are infra/);
+  assert.match(SYSTEM, /performance improvement is perf, not breaking/);
 });
