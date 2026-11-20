@@ -26,6 +26,7 @@ vi.mock("../../src/kube-client.js", () => ({
 import plugin, { DEFAULT_WORKSPACE_REMOTE_DIR, leaseRemoteCwd, resolveSyncRemoteDir } from "../../src/plugin.js";
 import { assertConfinedSandboxPath } from "../../src/file-sync.js";
 import { isTracked, reapIdleLeases, resetReuseRegistry } from "../../src/reuse-registry.js";
+import { invalidateTenantCache } from "../../src/tenant-orchestrator.js";
 
 const CONFIG = { inCluster: true, backend: "sandbox-cr" };
 
@@ -62,6 +63,9 @@ function readySandboxCr(podName: string): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  // Successful acquires are cached per namespace for 5 minutes at module level;
+  // clear it so a test never skips the ownership check because of an earlier one.
+  invalidateTenantCache();
   h.clients = {};
   h.scrub.mockReset();
   h.scrub.mockResolvedValue({ ok: true, detail: "" });
@@ -557,9 +561,12 @@ describe("lease remote working dir (TECH-8174: runs that never realize a workspa
   function permissiveClients(): Record<string, unknown> {
     const group = (overrides: Record<string, unknown> = {}) =>
       new Proxy({}, {
-        get: (_target, prop) =>
-          (typeof prop === "string" && overrides[prop]) ||
-          vi.fn().mockResolvedValue({ metadata: { uid: "uid-1", name: "x" }, items: [], status: {} }),
+        get: (_target, prop) => {
+          // Not thenable: an awaited client group must not look like a promise.
+          if (prop === "then" || typeof prop !== "string") return undefined;
+          if (prop in overrides) return overrides[prop];
+          return vi.fn().mockResolvedValue({ metadata: { uid: "uid-1", name: "x" }, items: [], status: {} });
+        },
       });
     // The tenant namespace already exists and belongs to this company.
     const core = group({ readNamespace: vi.fn().mockResolvedValue(namespaceOwnedBy("acme")) });

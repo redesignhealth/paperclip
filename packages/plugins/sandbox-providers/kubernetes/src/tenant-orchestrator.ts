@@ -148,8 +148,8 @@ async function ensureNamespace(clients: KubeClients, input: EnsureTenantInput): 
       // enabled, which is an operator decision, not something to retry.
       throw new TenantNamespaceError(
         `Namespace ${input.namespace} does not exist, and this server cannot create namespaces. ` +
-          `This org is not enabled for Kubernetes sandboxes. An operator must create the namespace ` +
-          `(labelled ${COMPANY_ID_LABEL}=${input.companyId}) with the namespace provisioning script, then retry.`,
+          `This org is not enabled for Kubernetes sandboxes. An operator must create the namespace, ` +
+          `labelled ${COMPANY_ID_LABEL}=${input.companyId}, then retry.`,
         "not_enabled",
       );
     }
