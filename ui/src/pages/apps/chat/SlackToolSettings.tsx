@@ -193,6 +193,9 @@ export function SlackSearchView({
           </div>
           <p className="text-xs text-muted-foreground">
             Changing this sends you to Slack to approve the new permissions.
+            Turning it off stops Paperclip from reading your DMs; to remove
+            the permission from Slack itself, revoke the app’s access in your
+            Slack account.
           </p>
         </div>
       ) : (
@@ -211,6 +214,9 @@ export function SlackSearchView({
               <span className="block text-xs text-muted-foreground">
                 Off by default. Agents working on your tasks could read any of
                 your DMs, and what they read is kept in their run records.
+                Only in tasks you start from a DM with the bot or from
+                Paperclip, never from a channel. After reading your DMs, an
+                agent can reply in Slack only in your own DM with the bot.
                 Slack asks you to approve this separately. You can turn it off
                 any time.
               </span>
