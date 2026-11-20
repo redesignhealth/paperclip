@@ -316,6 +316,29 @@ export const SLACK_SEARCH_USER_SCOPES = [
   "search:read.files",
 ] as const;
 
+/**
+ * Optional user scopes for reading the person's own direct messages and group
+ * DMs. Never requested by default: a person turns them on when connecting
+ * personal Slack, and the bot token still cannot see these conversations.
+ */
+export const SLACK_DM_USER_SCOPES = [
+  "im:history",
+  "im:read",
+  "mpim:history",
+  "mpim:read",
+] as const;
+
+/** Every user scope the personal Slack connection may ever hold. */
+export const SLACK_ALL_PERSONAL_USER_SCOPES = [
+  ...SLACK_SEARCH_USER_SCOPES,
+  ...SLACK_DM_USER_SCOPES,
+] as const;
+
+/** True when granted scopes cover reading the person's DMs and group DMs. */
+export function slackScopesAllowDmReads(scopes: readonly string[] | null | undefined): boolean {
+  return !!scopes && scopes.includes("im:history") && scopes.includes("mpim:history");
+}
+
 export const SLACK_SEARCH_CALLBACK_PATH = "/api/slack/search/callback";
 
 /** The personal-search redirect URL on the same public origin as `baseUrl`. */

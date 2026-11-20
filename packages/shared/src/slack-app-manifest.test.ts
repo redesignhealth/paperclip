@@ -12,7 +12,7 @@ describe("Slack app manifest", () => {
     expect("user" in plain.oauth_config.scopes).toBe(false);
     const search = buildSlackAppManifest({ ...common, searchRedirectUri: "https://p.example/api/slack/search/callback" });
     expect(search.oauth_config.redirect_urls).toEqual([common.redirectUri, "https://p.example/api/slack/search/callback"]);
-    expect((search.oauth_config.scopes as { user?: string[] }).user).toEqual(["search:read.public", "search:read.private", "search:read.files"]);
+    expect((search.oauth_config.scopes as { user?: string[] }).user).toEqual(["search:read.public", "search:read.private", "search:read.files", "im:history", "im:read", "mpim:history", "mpim:read"]);
     expect(slackSearchRedirectUri("https://p.example/some/base?x=1")).toBe("https://p.example/api/slack/search/callback");
   });
   it("preserves older account setup state and validates optional verification delivery state", () => {

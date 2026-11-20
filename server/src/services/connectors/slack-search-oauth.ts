@@ -1,4 +1,10 @@
-import { SLACK_SEARCH_USER_SCOPES as _SLACK_SEARCH_USER_SCOPES, slackSearchConfigSchema } from "@paperclipai/shared";
+import {
+  SLACK_ALL_PERSONAL_USER_SCOPES,
+  SLACK_DM_USER_SCOPES,
+  SLACK_SEARCH_USER_SCOPES as _SLACK_SEARCH_USER_SCOPES,
+  slackScopesAllowDmReads,
+  slackSearchConfigSchema,
+} from "@paperclipai/shared";
 import { SLACK_NATIVE_SEARCH_LIMITATION } from "./slack-native-search.js";
 import { syncConnectionCredentialBindings } from "../connection-credential-bindings.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -31,6 +37,8 @@ import { logger } from "../../middleware/logger.js";
 
 // Defined in @paperclipai/shared so the app manifest can request the same scopes.
 export const SLACK_SEARCH_USER_SCOPES: string[] = [..._SLACK_SEARCH_USER_SCOPES];
+/** Every scope a personal connection may hold; DM scopes only when the person opted in. */
+const ALLOWED_PERSONAL_SCOPES: string[] = [...SLACK_ALL_PERSONAL_USER_SCOPES];
 const SLACK_ERROR_CODE = /^[a-z_]{1,64}$/;
 const SLACK_OAUTH_ERROR_MESSAGES: Record<string, string> = {
   bad_client_secret:
@@ -299,6 +307,14 @@ export function slackSearchOAuthService(
           ))
       ),
       nativeSearchAvailable: false,
+      // True only when this person opted in to DM reading and Slack granted the DM scopes.
+      dmAccess: !!(
+        binding &&
+        binding.endpointId === endpointId &&
+        config.success &&
+        binding.clientRevision === config.data.revision &&
+        slackScopesAllowDmReads(grant?.providerTenant?.oauth?.scopes)
+      ),
       limitation: SLACK_NATIVE_SEARCH_LIMITATION,
     };
   }
@@ -415,7 +431,7 @@ export function slackSearchOAuthService(
             ? user.scope.split(",")
             : (grant.providerTenant?.oauth?.scopes ?? []);
         if (
-          scopes.some((scope) => !SLACK_SEARCH_USER_SCOPES.includes(scope)) ||
+          scopes.some((scope) => !ALLOWED_PERSONAL_SCOPES.includes(scope)) ||
           !scopes.includes("search:read.public")
         )
           throw forbidden(
@@ -553,7 +569,15 @@ export function slackSearchOAuthService(
       });
       return status(companyId, endpointId, userId);
     },
-    async start(companyId: string, endpointId: string, userId: string) {
+    async start(
+      companyId: string,
+      endpointId: string,
+      userId: string,
+      options: { includeDms?: boolean } = {},
+    ) {
+      const requestedScopes = options.includeDms === true
+        ? [...SLACK_SEARCH_USER_SCOPES, ...SLACK_DM_USER_SCOPES]
+        : SLACK_SEARCH_USER_SCOPES;
       const row = await linked(companyId, endpointId, userId);
       const config = configSchema.parse(
         object(row.connection.config).slackSearch,
@@ -574,13 +598,13 @@ export function slackSearchOAuthService(
         createdByActorType: "user",
         createdByActorId: userId,
         subjectUserId: userId,
-        requestedScopes: SLACK_SEARCH_USER_SCOPES,
+        requestedScopes,
         expiresAt: new Date(Date.now() + 10 * 60_000),
       });
       const url = new URL("https://slack.com/oauth/v2/authorize");
       url.search = new URLSearchParams({
         client_id: config.clientId,
-        user_scope: SLACK_SEARCH_USER_SCOPES.join(","),
+        user_scope: requestedScopes.join(","),
         state,
         redirect_uri: redirect,
         team: row.endpoint.providerAccountId!,
@@ -644,8 +668,15 @@ export function slackSearchOAuthService(
           "Authorize the same Slack user and workspace that you linked in Paperclip",
         );
       const scopes = String(user.scope ?? "").split(",");
+      const requested = Array.isArray(pending.requestedScopes)
+        ? (pending.requestedScopes as string[])
+        : SLACK_SEARCH_USER_SCOPES;
       if (
-        scopes.some((scope) => !SLACK_SEARCH_USER_SCOPES.includes(scope)) ||
+        scopes.some(
+          (scope) =>
+            !ALLOWED_PERSONAL_SCOPES.includes(scope) ||
+            !requested.includes(scope),
+        ) ||
         !scopes.includes("search:read.public")
       )
         throw forbidden("Slack returned an unexpected search grant");
