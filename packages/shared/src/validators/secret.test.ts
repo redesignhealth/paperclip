@@ -75,6 +75,18 @@ describe("secret validators", () => {
     ).toThrow();
   });
 
+  it("accepts only a positive integer expectedLatestVersion on secret rotation", () => {
+    expect(rotateSecretSchema.parse({ value: "v", expectedLatestVersion: 3 })).toEqual({
+      value: "v",
+      expectedLatestVersion: 3,
+    });
+    expect(rotateSecretSchema.parse({ value: "v" })).toEqual({ value: "v" });
+    for (const bad of [0, -1, 1.5, "2", null]) {
+      expect(() => rotateSecretSchema.parse({ value: "v", expectedLatestVersion: bad })).toThrow();
+    }
+    expect(rotateUserSecretValueSchema.parse({ value: "v", expectedLatestVersion: 3 })).toEqual({ value: "v" });
+  });
+
   it("requires secret rotation payloads to include rotation input", () => {
     expect(() => rotateSecretSchema.parse({})).toThrow(/requires value, externalRef/);
     expect(() => rotateUserSecretValueSchema.parse({})).toThrow(/requires value, externalRef/);
