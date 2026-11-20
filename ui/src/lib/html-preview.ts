@@ -26,3 +26,14 @@ export function htmlPreviewDocument(html: string) {
   // artifact in the host document (even detached DOMs can load resources).
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${HTML_PREVIEW_CSP}"><meta name="referrer" content="no-referrer"></head><body>${html}</body></html>`;
 }
+
+/**
+ * Issue documents are stored as "markdown" and their keys cannot carry an
+ * extension, so detect HTML documents by their leading markup: a doctype or a
+ * root <html> element (optionally after whitespace, a BOM, or HTML comments).
+ */
+export function isHtmlDocumentBody(body: string | null | undefined) {
+  if (!body) return false;
+  const head = body.replace(/^\uFEFF/, "").replace(/^(?:\s|<!--[\s\S]*?-->)+/, "");
+  return /^<!doctype\s+html[\s>]/i.test(head) || /^<html[\s>]/i.test(head);
+}

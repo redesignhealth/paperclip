@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HTML_PREVIEW_CSP, htmlPreviewDocument, isHtmlPreview } from "./html-preview";
+import { HTML_PREVIEW_CSP, htmlPreviewDocument, isHtmlDocumentBody, isHtmlPreview } from "./html-preview";
 import { isTextAttachment } from "./issue-attachments";
 
 describe("HTML artifact previews", () => {
@@ -21,5 +21,17 @@ describe("HTML artifact previews", () => {
     expect(doc).toContain("frame-src 'none'");
     expect(doc).not.toContain("script-src 'self'");
     expect(doc).not.toContain("unsafe-eval");
+  });
+});
+
+describe("isHtmlDocumentBody", () => {
+  it("detects doctype / html root documents", () => {
+    expect(isHtmlDocumentBody("<!DOCTYPE html><html></html>")).toBe(true);
+    expect(isHtmlDocumentBody("\n  <!-- c -->\n<html lang=en>")).toBe(true);
+  });
+  it("ignores markdown and inline html snippets", () => {
+    expect(isHtmlDocumentBody("# Title\n<html>")).toBe(false);
+    expect(isHtmlDocumentBody("<div>hi</div>")).toBe(false);
+    expect(isHtmlDocumentBody("")).toBe(false);
   });
 });
