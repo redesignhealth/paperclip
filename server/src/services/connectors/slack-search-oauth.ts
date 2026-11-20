@@ -211,21 +211,8 @@ export function slackSearchOAuthService(
     },
   ) {
     const { companyId, endpointId, workspaceId, userId, slackUserId } = input;
-    const [member] = await tx
-      .select({ status: companyMemberships.status, role: companyMemberships.membershipRole })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, "user"),
-          eq(companyMemberships.principalId, userId),
-        ),
-      )
-      .for("update");
-    if (member?.status !== "active" || member.role === "viewer")
-      throw forbidden(
-        "Only an active company operator can connect Slack search and link their Slack account",
-      );
+    // Lock order matches the confirmation flow (principal advisory lock, then the link row, then the
+    // membership row), so a link and a confirmation for the same Slack user cannot deadlock.
     await tx.execute(
       sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity-user:${companyId}:${endpointId}:${userId}`}, 0))`,
     );
@@ -257,6 +244,31 @@ export function slackSearchOAuthService(
     await tx.execute(
       sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${companyId}:${principal.id}`}, 0))`,
     );
+    const [existing] = await tx
+      .select({ status: chatIdentityLinks.status, paperclipUserId: chatIdentityLinks.paperclipUserId })
+      .from(chatIdentityLinks)
+      .where(
+        and(
+          eq(chatIdentityLinks.endpointId, endpointId),
+          eq(chatIdentityLinks.principalId, principal.id),
+        ),
+      )
+      .for("update");
+    const [member] = await tx
+      .select({ status: companyMemberships.status, role: companyMemberships.membershipRole })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, userId),
+        ),
+      )
+      .for("update");
+    if (member?.status !== "active" || member.role === "viewer")
+      throw forbidden(
+        "Only an active company operator can connect Slack search and link their Slack account",
+      );
     const [otherIdentity] = await tx
       .select({ id: chatIdentityLinks.id })
       .from(chatIdentityLinks)
@@ -275,16 +287,6 @@ export function slackSearchOAuthService(
         "Your Paperclip account is already linked to a different Slack user on this connection",
         { code: "chat_identity_user_already_linked" },
       );
-    const [existing] = await tx
-      .select({ status: chatIdentityLinks.status, paperclipUserId: chatIdentityLinks.paperclipUserId })
-      .from(chatIdentityLinks)
-      .where(
-        and(
-          eq(chatIdentityLinks.endpointId, endpointId),
-          eq(chatIdentityLinks.principalId, principal.id),
-        ),
-      )
-      .for("update");
     if (existing?.status === "linked") {
       if (existing.paperclipUserId !== userId)
         throw conflict(
