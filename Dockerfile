@@ -202,7 +202,8 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 # uv: official multi-arch image, pinned by tag and index digest; keep >= the services' required-version.
 COPY --from=ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d /uv /uvx /usr/local/bin/
 # pnpm: corepack is enabled in the base stage; pre-activate the version this repo pins (packageManager) into a
-# root-owned, world-readable COREPACK_HOME so user 1000 resolves it offline.
+# world-readable COREPACK_HOME owned by node, so user 1000 resolves it offline and can still cache a
+# different pnpm version (a repo pinning another packageManager) wherever the fs is writable.
 # UV_LINK_MODE=copy: uv's default hardlink/clone fails across the cache and project volumes in a pod.
 ENV COREPACK_HOME=/usr/local/share/corepack \
   COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
@@ -210,6 +211,7 @@ ENV COREPACK_HOME=/usr/local/share/corepack \
 COPY package.json /tmp/pm/package.json
 RUN PNPM_VERSION="$(node -p "require('/tmp/pm/package.json').packageManager.replace(/^pnpm@/, '').split('+')[0]")" \
   && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+  && chown -R node:node "$COREPACK_HOME" \
   && chmod -R a+rX "$COREPACK_HOME" \
   && rm -rf /tmp/pm \
   && uv --version | grep -q '^uv 0\.13\.9' \
