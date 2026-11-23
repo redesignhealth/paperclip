@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fake pi adapter: no model call. Reads task.txt, writes result.txt, and leaves
+# runtime state behind so the test can prove the between-turn scrub removes it.
+set -eu
+[ "${1:-}" = "--version" ] && { echo "pi-stub 0.0.0"; exit 0; }
+task="$(cat /workspace/task.txt)"
+mkdir -p /workspace/.paperclip-runtime/pi
+echo "state" > /workspace/.paperclip-runtime/pi/state
+echo "scratch" > /tmp/pi-scratch
+echo "scratch" > /home/paperclip/pi-home-file
+echo "pi-stub-done: ${task}" > /workspace/result.txt
+echo "pi-stub: finished"

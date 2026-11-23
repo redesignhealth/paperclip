@@ -1,0 +1,74 @@
+# VENDORED from redesignhealth/rh-paperclip scripts/prod-eks/company-rbac.yaml (main). Keep byte-identical below this line.
+# kind-ci.sh substitutes __NAMESPACE__ and __COMPANY_ID__ the way company-namespace.sh does.
+# Per-company namespace and the Paperclip server's Role in it (TECH-8822 interim). Do not apply this
+# file directly: company-namespace.sh replaces __NAMESPACE__ and __COMPANY_ID__ after validating them.
+#
+# Labels match what the sandbox plugin itself sets when it creates a tenant namespace
+# (tenant-orchestrator.ts ensureNamespace in redesignhealth/paperclip), including restricted Pod
+# Security. The plugin only creates the namespace when it is missing; here it exists first, because
+# the server's group may not create namespaces.
+#
+# Role verbs are the dev proof's (scripts/dev-eks/paperclip-rbac.yaml), which the plugin was measured
+# with: no batch verbs (the "job" backend fails closed), update only on resourcequotas (the plugin
+# reconciles the per-company ResourceQuota with a replace call on acquire, TECH-8902).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+  labels:
+    paperclip.io/company-id: __COMPANY_ID__
+    paperclip.io/managed-by: paperclip-k8s-plugin
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: paperclip-server
+  namespace: __NAMESPACE__
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "limitranges"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create"]
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["get", "create"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: paperclip-server
+  namespace: __NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: paperclip-server
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: paperclip-server
