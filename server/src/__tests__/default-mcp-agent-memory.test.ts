@@ -493,6 +493,22 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     expect(((await rowOf(first.id)).adapterConfig as Record<string, any>).env).toEqual({ KEEP_ME: { type: "plain", value: "yes" } });
   });
 
+  it("a Claude agent switched to Pi loses its memory token, URL, proxy and capture keys from the env", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    vi.stubGlobal("fetch", downstreamFetch());
+    const agent = await createAgent(companyId, ownerId, { adapterType: "claude_local", adapterConfig: { model: "some-model" }, runner: "legacy" });
+    expect(Object.keys(((await rowOf(agent.id)).adapterConfig as Record<string, any>).env)).toContain("RH_MEMORY_TOKEN");
+    const [secret] = await secretsFor(companyId, agent.id);
+    const current = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+    await agentService(db).update(agent.id, { adapterType: "pi_local", adapterConfig: { ...current, env: { ...current.env, KEEP_ME: "yes" } } });
+    expect(await applyAgentMemoryAdapterConfig(db, { companyId, agentId: agent.id, secretId: secret!.id, config: { url: MEMORY_URL, proxy: null } })).toBe(true);
+    const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+    expect(Object.keys(config.env).sort()).toEqual(["KEEP_ME"]);
+    expect(config.memoryExtension).toBe(true);
+  });
+
   it("a default native-runner agent is stored as provider codex and gets the Codex profile", async () => {
     enable();
     const companyId = await seedCompany();

@@ -246,6 +246,14 @@ export async function applyAgentMemoryAdapterConfig(
   const current = asRecord(row.adapterConfig);
   const currentEnv = asRecord(current.env);
   const env: Record<string, unknown> = { ...currentEnv };
+  // A pod-safe profile (no token env key) removes the other profiles' memory keys, so an agent that was Claude, Codex or
+  // Hermes before it became Pi does not carry a memory token into its pod.
+  if (!profile.tokenEnvKey) {
+    for (const other of Object.values(AGENT_MEMORY_ADAPTER_PROFILES)) {
+      for (const key of [other.tokenEnvKey, other.urlEnvKey, other.proxyEnvKey, other.userIdEnvKey]) if (key) delete env[key];
+    }
+    delete env[RH_MEMORY_CAPTURE_KEY];
+  }
   if (profile.tokenEnvKey) env[profile.tokenEnvKey] = { type: "secret_ref", secretId: input.secretId, version: "latest" };
   if (profile.urlEnvKey) env[profile.urlEnvKey] = { type: "plain", value: input.config.url };
   if (profile.userIdEnvKey) env[profile.userIdEnvKey] = { type: "plain", value: input.agentId };
