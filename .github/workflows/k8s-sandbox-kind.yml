@@ -6,7 +6,7 @@ name: Kubernetes sandbox (kind)
 # finding out in EKS.
 #
 # The job always reports a result on pull requests (so it can be a required check) and skips its work
-# unless the PR is an upstream sync (branch upstream-sync/*, chore/sync-upstream*, label
+# unless the PR is an upstream sync (a branch containing upstream-sync/ or sync-upstream, label
 # `upstream-sync`) or touches the provider, its RBAC fixtures or this workflow.
 #
 # Not covered, by design: EKS IAM auth, Cilium egress rules (the plugin's standard egress mode creates
@@ -21,6 +21,7 @@ on:
     paths:
       - .github/workflows/k8s-sandbox-kind.yml
       - packages/plugins/sandbox-providers/kubernetes/**
+      - packages/plugins/sdk/**
   workflow_dispatch:
 
 permissions:
@@ -29,7 +30,8 @@ permissions:
 
 concurrency:
   group: k8s-sandbox-kind-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Never cancel a master run: it may be about to save the image cache.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   kind:
@@ -55,19 +57,24 @@ jobs:
           run=false; why=""
           if [ "$EVENT" != "pull_request" ]; then
             run=true; why="$EVENT"
-          elif [[ "$HEAD_REF" == upstream-sync/* || "$HEAD_REF" == chore/sync-upstream* ]]; then
+          elif [[ "$HEAD_REF" == *upstream-sync/* || "$HEAD_REF" == *sync-upstream* ]]; then
             run=true; why="upstream sync branch"
           elif jq -e 'index("upstream-sync") != null' <<<"$LABELS" >/dev/null; then
             run=true; why="label upstream-sync"
-          elif gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' \
-              | grep -qE '^(packages/plugins/sandbox-providers/kubernetes/|\.github/workflows/k8s-sandbox-kind\.yml$)'; then
-            run=true; why="touches the Kubernetes sandbox provider"
+          else
+            # Capture first: grep -q closing the pipe early can SIGPIPE gh under pipefail.
+            files="$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')"
+            if grep -qE '^(packages/plugins/sandbox-providers/kubernetes/|packages/plugins/sdk/|scripts/link-plugin-dev-sdk\.mjs$|\.github/workflows/k8s-sandbox-kind\.yml$)' <<<"$files"; then
+              run=true; why="touches the Kubernetes sandbox provider, the plugin SDK or this workflow"
+            fi
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "Run: $run ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: steps.decide.outputs.run == 'true'
+        with:
+          persist-credentials: false
 
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         if: steps.decide.outputs.run == 'true'
@@ -138,7 +145,8 @@ jobs:
 
       - name: Mint the non-admin server kubeconfig
         if: steps.decide.outputs.run == 'true'
-        run: $KIND_CI_DIR/kind-ci.sh kubeconfig
+        run: |
+          "$KIND_CI_DIR/kind-ci.sh" kubeconfig
 
       - name: Run one agent run through the Kubernetes provider
         if: steps.decide.outputs.run == 'true'
