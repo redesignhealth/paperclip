@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const svc = vi.hoisted(() => ({
   enrolCommsWakeAgents: vi.fn(),
   listCommsWakeStatus: vi.fn(),
+  rotateCommsWakeSecret: vi.fn(),
+  unsubscribeCommsWakeAgent: vi.fn(),
 }));
 vi.mock("../services/comms-wake-admin.js", async () => ({
   ...(await vi.importActual<typeof import("../services/comms-wake-admin.js")>("../services/comms-wake-admin.js")),
@@ -36,11 +38,15 @@ describe("comms wake admin routes (TECH-9914)", () => {
     vi.clearAllMocks();
     svc.enrolCommsWakeAgents.mockResolvedValue({ dryRun: true, scanned: 0, outcomes: [], counts: {}, nextCursor: null });
     svc.listCommsWakeStatus.mockResolvedValue({ companyId: COMPANY, agents: [] });
+    svc.rotateCommsWakeSecret.mockResolvedValue({ agentId: AGENT, result: "rotated", board: "new_secret", secretVersion: 2 });
+    svc.unsubscribeCommsWakeAgent.mockResolvedValue({ agentId: AGENT, result: "unsubscribed", board: "removed", registration: "removed", secret: "removed" });
   });
 
   const endpoints: Array<[string, "get" | "post", string]> = [
     ["status", "get", `${base}/status`],
     ["enrol", "post", `${base}/enrol`],
+    ["unsubscribe", "post", `${base}/agents/${AGENT}/unsubscribe`],
+    ["rotate", "post", `${base}/agents/${AGENT}/rotate-secret`],
   ];
 
   it.each(endpoints)("%s: refuses a company owner who is not an instance admin, an agent key and an anonymous caller", async (_name, method, url) => {
@@ -73,6 +79,20 @@ describe("comms wake admin routes (TECH-9914)", () => {
     const { CommsWakeConfirmationError } = await import("../services/comms-wake-admin.js");
     svc.enrolCommsWakeAgents.mockRejectedValueOnce(new CommsWakeConfirmationError());
     expect((await request(app).post(`${base}/enrol`).send({ dryRun: false })).status).toBe(400);
+  });
+
+  it("unsubscribe and rotate map their results to status codes, and reject a malformed agent id", async () => {
+    const app = await createApp(admin);
+    expect((await request(app).post(`${base}/agents/${AGENT}/unsubscribe`)).status).toBe(200);
+    expect(svc.unsubscribeCommsWakeAgent).toHaveBeenCalledWith(expect.anything(), { companyId: COMPANY, agentId: AGENT, actorUserId: "user-1" }, expect.anything());
+    svc.unsubscribeCommsWakeAgent.mockResolvedValueOnce({ result: "board_remove_failed" });
+    expect((await request(app).post(`${base}/agents/${AGENT}/unsubscribe`)).status).toBe(502);
+    expect((await request(app).post(`${base}/agents/${AGENT}/rotate-secret`)).status).toBe(200);
+    svc.rotateCommsWakeSecret.mockResolvedValueOnce({ result: "board_failed" });
+    expect((await request(app).post(`${base}/agents/${AGENT}/rotate-secret`)).status).toBe(502);
+    svc.rotateCommsWakeSecret.mockResolvedValueOnce({ result: "not_registered" });
+    expect((await request(app).post(`${base}/agents/${AGENT}/rotate-secret`)).status).toBe(409);
+    expect((await request(app).post(`${base}/agents/not-a-uuid/rotate-secret`)).status).toBe(400);
   });
 
   it("status passes paging through and rejects a bad cursor", async () => {

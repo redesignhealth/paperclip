@@ -407,13 +407,13 @@ describeEmbeddedPostgres("comms-board wake registration at agent creation (TECH-
       expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId))).toHaveLength(0);
     });
 
-    it("purging the agent removes its registration (cascade); the vault secret is left for the removal work in TECH-9914", async () => {
+    it("purging the agent removes its registration (cascade) and, since TECH-9914, its vault secret (board cleanup is in comms-wake-admin.test.ts)", async () => {
       const { companyId, agent, registration } = await registered();
       await terminate(agent.id);
       await agentService(db).remove(agent.id);
       expect(await db.select().from(agents).where(eq(agents.id, agent.id))).toHaveLength(0);
       expect(await db.select().from(commsWakeRegistrations)).toHaveLength(0);
-      expect(await db.select().from(companySecrets).where(eq(companySecrets.id, registration.signingSecretId))).toHaveLength(1);
+      expect(await db.select().from(companySecrets).where(eq(companySecrets.id, registration.signingSecretId))).toHaveLength(0);
       expect(companyId).toBeTruthy();
     });
 

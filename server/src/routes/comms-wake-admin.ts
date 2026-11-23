@@ -7,6 +7,8 @@ import {
   CommsWakeConfirmationError,
   enrolCommsWakeAgents,
   listCommsWakeStatus,
+  rotateCommsWakeSecret,
+  unsubscribeCommsWakeAgent,
   type CommsWakeAdminContext,
 } from "../services/comms-wake-admin.js";
 import { assertCompanyAccess, assertInstanceAdmin } from "./authz.js";
@@ -65,6 +67,37 @@ export function commsWakeAdminRoutes(db: Db, ctx: CommsWakeAdminContext = {}) {
       if (err instanceof CommsWakeConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       throw err;
     }
+  });
+
+  // Board address, registration and signing secret of one agent. 502 when the board could not remove the address: nothing
+  // was changed in that case, so the call can be repeated.
+  router.post("/companies/:companyId/comms-wake/agents/:agentId/unsubscribe", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    authorize(req, companyId);
+    const report = await unsubscribeCommsWakeAgent(
+      db,
+      { companyId, agentId: uuidParam(req.params.agentId, "agentId"), actorUserId: req.actor.userId ?? null },
+      ctx,
+    );
+    const status = report.result === "board_remove_failed" ? 502 : report.result === "board_not_configured" ? 503 : 200;
+    res.status(status).json(report);
+  });
+
+  // New signing secret version AND the board, in one step. Anything but `rotated` leaves the old secret in force.
+  router.post("/companies/:companyId/comms-wake/agents/:agentId/rotate-secret", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    authorize(req, companyId);
+    const report = await rotateCommsWakeSecret(
+      db,
+      { companyId, agentId: uuidParam(req.params.agentId, "agentId"), actorUserId: req.actor.userId ?? null },
+      ctx,
+    );
+    const status =
+      report.result === "rotated" ? 200
+      : report.result === "board_failed" || report.result === "vault_failed" ? 502
+      : report.result === "board_not_configured" || report.result === "public_base_url_unavailable" ? 503
+      : 409;
+    res.status(status).json(report);
   });
 
   return router;

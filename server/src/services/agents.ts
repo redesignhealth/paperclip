@@ -17,11 +17,12 @@ import {
   configPatchFromSnapshot,
 } from "../lib/agent-records.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { cleanupCommsWakeAfterDeletion, readCommsWakeCleanupTargets, type CommsWakeAdminContext } from "./comms-wake-admin.js";
 import type { CreateAgentData, CreateAgentOptions } from "../lib/agent-records.js";
 
 export { hasAgentShortnameCollision, deduplicateAgentName } from "../lib/agent-records.js";
 
-export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
+export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}, commsWakeCleanup: CommsWakeAdminContext = {}) {
   const {
     normalizeAgentRows,
     listCompanyAgentRows,
@@ -291,7 +292,14 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
     // service); the fork's default-MCP specs and routes still create agents here.
     create: (companyId: string, data: CreateAgentData, options?: CreateAgentOptions) =>
       createAgentLifecycle(db, budgetHooks).requestHire(companyId, data, options),
-    remove: (id: string) => createAgentLifecycle(db, budgetHooks).purgeAgent(id),
+    remove: async (id: string) => {
+      // The wake registration cascades away with the agent, so its board address and vault secret are read first and
+      // removed after the purge (TECH-9914). Neither can block or undo the deletion.
+      const wakeTargets = await readCommsWakeCleanupTargets(db, { agentId: id });
+      const purged = await createAgentLifecycle(db, budgetHooks).purgeAgent(id);
+      if (purged) await cleanupCommsWakeAfterDeletion(db, wakeTargets, { removeSecret: true, recordActivity: true }, commsWakeCleanup);
+      return purged;
+    },
     clearError: (id: string) => createAgentLifecycle(db, budgetHooks).clearError(id),
   };
 }
