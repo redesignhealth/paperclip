@@ -237,7 +237,7 @@ queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` 
 ## Production deployment: Scheduled ECS Fargate Task (TECH-9777)
 
 The hourly upstream-sync detector runs as a scheduled ECS Fargate task in AWS,
-defined and managed in [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397).
+defined and managed in [redesignhealth/rh-paperclip#397](https://github.com/redesignhealth/rh-paperclip/pull/397).
 The earlier in-agent Kubernetes sandbox pod routine was retired because sandbox
 pods lack egress to public npm registries and Amazon RDS CA host truststores.
 
@@ -256,7 +256,7 @@ directly against the ledger DB using the restricted `upstream_sync_runner` DB ro
 ### 1. Credentials and Environment Configuration
 
 Task credentials and configuration are provisioned in AWS Secrets Manager / SSM
-Parameter Store via [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397),
+Parameter Store via [redesignhealth/rh-paperclip#397](https://github.com/redesignhealth/rh-paperclip/pull/397),
 injected directly into the container definition. No Paperclip company secrets or
 sandbox routines are required.
 
@@ -311,10 +311,11 @@ If Amazon rotates the global root CA bundle:
 
 ### 3. Safe Rollout with Disabled Schedule
 
-In [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397), the EventBridge
-schedule rule is deployed **disabled** (`state = "DISABLED"`). This prevents the task from firing
-automatically before the one-off backlog load is verified, preventing mass alert spam across hundreds
-of older commits. Enable the schedule only after the backlog load verifies below.
+In [redesignhealth/rh-paperclip#397](https://github.com/redesignhealth/rh-paperclip/pull/397), both the
+scheduled ECS task and EventBridge schedule rule default to disabled
+(`upstream_sync_task_enabled = false` and `upstream_sync_schedule_enabled = false` in both `dev` and `prod`).
+This ensures applying Terraform does not auto-schedule the task before the one-off backlog load is verified,
+preventing mass alert spam across hundreds of older commits. Enable the schedule only after the backlog load verifies below.
 
 ## Backlog load (one-off runbook)
 
@@ -378,7 +379,7 @@ alert spam.
    category is empty where it should not be, stop and investigate before enabling
    the schedule.
 
-5. **Enable the schedule trigger** in [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397) (set EventBridge rule state to ENABLED) only after step 4 verifies.
+5. **Enable the schedule trigger** in [redesignhealth/rh-paperclip#397](https://github.com/redesignhealth/rh-paperclip/pull/397) (set `upstream_sync_task_enabled = true` and `upstream_sync_schedule_enabled = true`) only after step 4 verifies.
 
 ## Day-to-day runbook
 
