@@ -95,6 +95,15 @@ describe("guard: deny list", () => {
     ["git push origin :feature/x", "deleting a remote branch"],
     ["git push --delete origin x", "destructive"],
     ["git checkout main && git push", "default branch"],
+    ["git push --all origin", "not limited"],
+    ["git push --repo origin main", "not limited"],
+    ["git clone https://github.com/o/r /tmp/work && cd /tmp/work && git push origin HEAD", "cannot be verified"],
+    ["cd /tmp/does-not-exist && git push", "cannot be verified"],
+    ["echo ${X:-$(printenv)}", "environment"],
+    ["cat <<EOF\n$(printenv)\nEOF", "environment"],
+    ["echo \"$(echo \"a)\" ; printenv)\"", "environment"],
+    ["git -c core.sshCommand='sh -c evil' fetch", "git -c"],
+    ["git push origin feature/x:release", "default branch"],
     ["terraform apply -auto-approve", "terraform apply"],
     ["terraform -chdir=infra destroy", "terraform destroy"],
     ["tofu apply", "terraform apply"],
@@ -159,7 +168,7 @@ describe("guard: deny list", () => {
 });
 
 describe("guard: everything else fails fast", () => {
-  it.each(["docker run alpine", "kubectl get pods", "aws s3 ls", "bash", "ssh host", "unknowntool --x", "gh release create v1"])(
+  it.each(["gh api -XPOST repos/o/r/issues", "gh api --method=DELETE repos/o/r", "docker run alpine", "kubectl get pods", "aws s3 ls", "bash", "ssh host", "unknowntool --x", "gh release create v1"])(
     "marks %s unlisted",
     (command) => {
       expect(bash(command)?.kind).toBe("unlisted");

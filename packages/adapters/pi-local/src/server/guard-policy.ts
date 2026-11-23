@@ -79,7 +79,7 @@ const SHARED_SECRET_ENV_NAMES = [
 const SHARED_DENY_PATTERNS: PiGuardPolicy["denyCommandPatterns"] = [
   { pattern: String.raw`\|\s*(sudo\s+)?(ba|z|da)?sh\b`, why: "piping a download into a shell" },
   { pattern: String.raw`/pulls/\d+/merge\b`, why: "merging a pull request" },
-  { pattern: String.raw`/git/refs/heads/(main|master|trunk|develop)\b`, why: "writing a default branch ref through the API" },
+  { pattern: String.raw`/git/refs/heads/(main|master|trunk|develop|release)\b`, why: "writing a default branch ref through the API" },
 ];
 
 const BASE_COMMANDS = [
@@ -129,6 +129,14 @@ export const BUILDER_GUARD_POLICY: PiGuardPolicy = {
 /** Plan-only infrastructure builder: no package managers, no language runtimes, no downloads. */
 export const INFRASTRUCTURE_GUARD_POLICY: PiGuardPolicy = {
   ...BUILDER_GUARD_POLICY,
+  allowedGit: [...BUILDER_GUARD_POLICY.allowedGit],
+  defaultBranches: [...BUILDER_GUARD_POLICY.defaultBranches],
+  secretPathPatterns: [...BUILDER_GUARD_POLICY.secretPathPatterns],
+  secretEnvNames: [...BUILDER_GUARD_POLICY.secretEnvNames],
+  safeEnvNames: [...BUILDER_GUARD_POLICY.safeEnvNames],
+  denyCommandPatterns: [...BUILDER_GUARD_POLICY.denyCommandPatterns],
+  denyMcpToolPatterns: [...BUILDER_GUARD_POLICY.denyMcpToolPatterns],
+  writeRoots: [...BUILDER_GUARD_POLICY.writeRoots],
   profile: "infrastructure",
   allowedCommands: [...BASE_COMMANDS.filter((name) => name !== "curl" && name !== "wget"), "terraform", "tofu"],
   allowedGh: {

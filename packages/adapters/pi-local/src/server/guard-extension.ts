@@ -62,11 +62,22 @@ function readParen(src, open) {
     const c = src[i];
     if (c === "\\") { i += 2; continue; }
     if (c === "'") { const j = src.indexOf("'", i + 1); i = j === -1 ? src.length : j + 1; continue; }
+    if (c === '"') { let j = i + 1; while (j < src.length && src[j] !== '"') { if (src[j] === "\\") j++; j++; } i = j + 1; continue; }
     if (c === "(") depth++;
     else if (c === ")") { depth--; if (depth === 0) return { inner: src.slice(open + 1, i), next: i + 1 }; }
     i++;
   }
   return { inner: src.slice(open + 1), next: src.length };
+}
+
+// Command substitutions inside text the shell would expand (unquoted heredoc bodies, parameter defaults).
+function scanSubst(text, nested) {
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "$" && text[i + 1] === "(") { const r = readParen(text, i + 1); nested.push(r.inner); i = r.next; continue; }
+    if (text[i] === BT) { const j = text.indexOf(BT, i + 1); const end = j === -1 ? text.length : j; nested.push(text.slice(i + 1, end)); i = end + 1; continue; }
+    i++;
+  }
 }
 
 // A small shell reader: simple commands as word lists, plus the text of every nested command substitution.
@@ -100,19 +111,20 @@ export function parseShell(src) {
       i++; continue;
     }
     if (c === "$" && src[i + 1] === "(") { const r = readParen(src, i + 1); nested.push(r.inner); cur += "$()"; has = true; i = r.next; continue; }
-    if (c === "$" && src[i + 1] === "{") { const j = src.indexOf("}", i); const end = j === -1 ? n : j + 1; cur += src.slice(i, end); has = true; i = end; continue; }
+    if (c === "$" && src[i + 1] === "{") { const j = src.indexOf("}", i); const end = j === -1 ? n : j + 1; const braced = src.slice(i, end); scanSubst(braced, nested); cur += braced; has = true; i = end; continue; }
     if (c === BT) { const j = src.indexOf(BT, i + 1); const end = j === -1 ? n : j; nested.push(src.slice(i + 1, end)); cur += "$()"; has = true; i = end + 1; continue; }
     if ((c === "<" || c === ">") && src[i + 1] === "(") { const r = readParen(src, i + 1); nested.push(r.inner); i = r.next; continue; }
     if (c === "#" && !has) { while (i < n && src[i] !== "\n") i++; continue; }
     if (c === "\n") {
       pushCommand(); i++;
       while (heredocs.length > 0) {
-        const delimiter = heredocs.shift();
+        const heredoc = heredocs.shift();
         while (i < n) {
           const end = src.indexOf("\n", i);
           const line = src.slice(i, end === -1 ? n : end);
           i = end === -1 ? n : end + 1;
-          if (line.trim() === delimiter) break;
+          if (line.trim() === heredoc.delimiter) break;
+          if (!heredoc.quoted) scanSubst(line, nested);
         }
       }
       continue;
@@ -129,7 +141,7 @@ export function parseShell(src) {
         let k = i;
         while (k < n && src[k] === " ") k++;
         const m = /^(['"]?)([A-Za-z0-9_.-]+)\1/.exec(src.slice(k));
-        if (m) { heredocs.push(m[2]); i = k + m[0].length; }
+        if (m) { heredocs.push({ delimiter: m[2], quoted: m[1] !== "" }); i = k + m[0].length; }
         continue;
       }
       if (op.includes("&") && /^[0-9-]/.test(src[i] || "")) { while (i < n && /[0-9-]/.test(src[i])) i++; continue; }
@@ -164,8 +176,9 @@ function checkGitPush(args, cwd, state) {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "-f" || arg === "--force" || arg.startsWith("--force-with-lease") || arg === "--force-if-includes" || /^-[a-zA-Z]*f[a-zA-Z]*$/.test(arg)) return deny("force-pushing");
+    if (arg === "--all" || arg === "--branches" || arg === "--repo" || arg.startsWith("--repo=")) return deny("a push that is not limited to one named non-default branch (" + arg + ")");
     if (arg === "--mirror" || arg === "--delete" || arg === "-d" || arg === "--prune") return deny("a destructive push (" + arg + ")");
-    if (arg === "-o" || arg === "--push-option" || arg === "--repo" || arg === "--receive-pack" || arg === "--exec") { i++; continue; }
+    if (arg === "-o" || arg === "--push-option" || arg === "--receive-pack" || arg === "--exec") { i++; continue; }
     if (arg.startsWith("-")) continue;
     if (remote === null) remote = arg; else refspecs.push(arg);
   }
@@ -195,7 +208,12 @@ function checkGit(words, cwd, state) {
   while (i < words.length && words[i].startsWith("-")) {
     const w = words[i];
     if (w === "-C") { dir = path.resolve(dir, words[i + 1] || "."); i += 2; continue; }
-    if (w === "-c" || w === "--exec-path" || w === "--namespace") { i += 2; continue; }
+    if (w === "-c") {
+      if (/^(core\.(sshcommand|pager|editor|fsmonitor|hookspath|askpass)|alias\.|credential\.|protocol\.|url\.|http\.|include)/i.test(words[i + 1] || "")) return deny("git -c with a setting that can run commands or redirect credentials");
+      i += 2; continue;
+    }
+    if (w === "--exec-path" || w.startsWith("--exec-path=") || w.startsWith("--config-env")) return deny("git options that can run other programs");
+    if (w === "--namespace") { i += 2; continue; }
     i++;
   }
   const sub = words[i];
@@ -221,7 +239,8 @@ function checkGh(words) {
   if (group === "api") {
     for (let i = idx + 1; i < words.length; i++) {
       const w = words[i];
-      if ((w === "-X" || w === "--method") && !/^get$/i.test(words[i + 1] || "")) {
+      const inline = /^-X(.+)$/.exec(w) || /^--method=(.+)$/.exec(w);
+      if ((inline && !/^get$/i.test(inline[1])) || ((w === "-X" || w === "--method") && !/^get$/i.test(words[i + 1] || ""))) {
         if (/merge/.test(words.join(" "))) return deny("merging a pull request");
         return unlisted("gh api with a write method");
       }
@@ -259,7 +278,8 @@ function relativeScript(word) {
   return !path.isAbsolute(word) && !word.startsWith("~") && !word.split("/").includes("..") && (word.startsWith("./") || word.includes("/"));
 }
 
-function checkSimple(input, cwd, state) {
+function checkSimple(input, _cwd, state) {
+  const cwd = state.cwd;
   let words = input.slice();
   for (let guard = 0; guard < 20 && words.length > 0; guard++) {
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) { words.shift(); continue; }
@@ -270,6 +290,12 @@ function checkSimple(input, cwd, state) {
   if (SKIP_COMMANDS.has(words[0])) return null;
   const first = words[0];
   const base = first.includes("/") && !relativeScript(first) ? path.basename(first) : first;
+  if (base === "cd" || base === "pushd") {
+    const target = words.slice(1).find((w) => !w.startsWith("-"));
+    // An unknown or computed directory means later branch lookups cannot be trusted, so they fail closed.
+    state.cwd = target && !/[$~]|\$\(/.test(target) ? path.resolve(state.cwd, target) : path.join(path.sep, "paperclip-unknown-directory");
+    return null;
+  }
   if (base === "sudo" || base === "su" || base === "doas") return deny("privilege escalation");
   if (WRAPPERS.has(base)) {
     let rest = words.slice(1);
@@ -339,7 +365,7 @@ export function evaluateBash(command, cwd) {
   if (secretVar) return deny("reading the secret environment variable " + secretVar);
   if (secretPathIn(command)) return deny("touching a secret path or credential file");
   for (const entry of DENY_RAW) if (entry.re.test(command)) return deny(entry.why);
-  return evaluateBashSource(command, cwd, { onDefaultBranch: false }, 0);
+  return evaluateBashSource(command, cwd, { onDefaultBranch: false, cwd }, 0);
 }
 
 function insideAllowedWriteRoot(target, cwd) {
