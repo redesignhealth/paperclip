@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PLUGIN_CAPABILITIES } from "../constants.js";
 import { resolveDeclaredSandboxCapabilities } from "../environment-support.js";
-import { pluginManagedRoutineDeclarationSchema, pluginManifestV1Schema, pluginUiSlotDeclarationSchema } from "./plugin.js";
+import { pluginApiRouteDeclarationSchema, pluginManagedRoutineDeclarationSchema, pluginManifestV1Schema, pluginUiSlotDeclarationSchema } from "./plugin.js";
 
 function buildSandboxProviderManifest(driver: Record<string, unknown>) {
   return {
@@ -458,5 +458,50 @@ describe("login pty transport capability and legacy alias", () => {
     );
 
     expect(rejected.success).toBe(false);
+  });
+});
+
+describe("plugin WebSocket company resolution", () => {
+  const route = { routeKey: "channel.connect", method: "GET", path: "/channels/:channelId", auth: "board", capability: "api.routes.register" };
+
+  it("rejects body resolution only for WebSocket routes", () => {
+    const companyResolution = { from: "body", key: "companyId" };
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, companyResolution }).success).toBe(true);
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, companyResolution, transport: "websocket" }).success).toBe(false);
+  });
+
+  it("requires GET method and board authentication for WebSocket routes", () => {
+    // fork(TECH-8283 Material 6): Explicitly test GET and board auth requirements
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, transport: "websocket" }).success).toBe(true);
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, method: "POST", transport: "websocket" }).success).toBe(false);
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, auth: "agent", transport: "websocket" }).success).toBe(false);
+  });
+
+  it("rejects empty agent param", () => {
+    // fork(TECH-8283 Material 6): Empty agent param rejected
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, companyResolution: { from: "agent", param: "" } }).success).toBe(false);
+  });
+
+  it("requires http.outbound capability when manifest declares WebSocket routes", () => {
+    // fork(TECH-8283 Material 6): Missing http.outbound rejected
+    const validManifest = {
+      id: "test.ws", apiVersion: 1, version: "1.0.0", displayName: "Test",
+      description: "Test", author: "RH", categories: ["automation"],
+      capabilities: ["api.routes.register", "http.outbound"],
+      entrypoints: { worker: "dist/worker.js" },
+      apiRoutes: [{ ...route, transport: "websocket" }],
+    };
+    expect(pluginManifestV1Schema.safeParse(validManifest).success).toBe(true);
+    const missingOutbound = { ...validManifest, capabilities: ["api.routes.register"] };
+    expect(pluginManifestV1Schema.safeParse(missingOutbound).success).toBe(false);
+  });
+
+  it.each([
+    undefined,
+    { from: "query", key: "companyId" },
+    { from: "issue", param: "issueId" },
+    { from: "agent", param: "agentId" },
+  ])("accepts body-free resolution %j", (companyResolution) => {
+    expect(pluginApiRouteDeclarationSchema.safeParse({ ...route, companyResolution, transport: "websocket" }).success).toBe(true);
   });
 });
