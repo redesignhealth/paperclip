@@ -4,8 +4,9 @@ import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 
-// Ignore the user and system git config for anything that feeds a digest.
-export const PINNED_ENV = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+// Nothing to change in the environment: the digest is pinned by `-c` flags, which beat every config file. The global
+// and system config must stay readable, because that is where `safe.directory` lives on a pod or a CI runner.
+export const PINNED_ENV = undefined;
 
 export class GitError extends Error {
   constructor(args, result) {
@@ -84,7 +85,9 @@ export function syncPoint(cwd, master, upstream) {
  */
 export function mergeTree(cwd, ours, theirs, { pin = false } = {}) {
   // `pin` fixes the merge settings that change the marker tree, so every machine builds the same one.
-  const config = pin ? ["-c", "merge.conflictStyle=merge", "-c", "merge.renormalize=false", "-c", "merge.renames=true"] : [];
+  const config = pin
+    ? ["-c", "merge.conflictStyle=merge", "-c", "merge.renormalize=false", "-c", "merge.renames=true", "-c", "diff.algorithm=default", "-c", "diff.renames=true"]
+    : [];
   const r = git(cwd, [...config, "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", ours, theirs], {
     allowFail: true,
     env: pin ? PINNED_ENV : undefined,

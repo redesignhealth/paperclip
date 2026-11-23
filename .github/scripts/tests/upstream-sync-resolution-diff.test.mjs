@@ -114,6 +114,8 @@ test('judgeVerdict accepts only a verdict bound to this head, kind and digest', 
   assert.equal(judgeVerdict({ ...ok, review_kind: undefined, diff_digest: undefined, status: 'halted', halt_reason: 'scope_split' }, ctx).exit, 7);
   assert.equal(judgeVerdict({ ...ok, review_kind: undefined, diff_digest: undefined, status: 'failed', error_class: 'timeout' }, ctx).exit, 8);
   assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'patch_apply_error' }, ctx).exit, 8);
+  assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'invalid_scope' }, ctx).exit, 8);
+  assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'diff_size_exceeded' }, ctx).exit, 7);
   assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'budget' }, ctx).exit, 8);
   assert.equal(judgeVerdict({ ...ok, status: 'failed', error_class: 'timeout' }, ctx).exit, 8);
 });

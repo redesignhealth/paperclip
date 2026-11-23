@@ -10,7 +10,7 @@
 //     own work; nothing in it is summarized.
 // Every git call here must succeed: a failed call would otherwise yield a valid-looking digest of a partial diff.
 import { createHash } from "node:crypto";
-import { git, gitOut, mergeTree, PINNED_ENV } from "./git.mjs";
+import { git, gitOut, mergeTree } from "./git.mjs";
 import { classifyFile } from "./mechanical.mjs";
 
 export const FORMAT = "upstream-sync-resolution-diff v1";
@@ -26,6 +26,7 @@ const PIN = [
   "-c", "diff.algorithm=default",
   "-c", "diff.indentHeuristic=true",
   "-c", "diff.noprefix=false",
+  "-c", "diff.suppressBlankEmpty=false",
   "-c", "diff.mnemonicPrefix=false",
   "-c", "diff.interHunkContext=0",
   "-c", "diff.context=3",
@@ -37,7 +38,7 @@ const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-rename
 const isSummarized = (cls) => cls.kind === "mechanical" && cls.action !== "needs-generator";
 
 function treeDiff(cwd, from, to, { summarize }) {
-  const raw = git(cwd, [...PIN, "diff-tree", "-r", "-z", "--no-renames", "--raw", "--full-index", from, to], { env: PINNED_ENV }).stdout;
+  const raw = git(cwd, [...PIN, "diff-tree", "-r", "-z", "--no-renames", "--raw", "--full-index", from, to]).stdout;
   const parts = raw.split("\0");
   const changes = [];
   for (let i = 0; i + 1 < parts.length; i += 2) {
@@ -55,7 +56,7 @@ function treeDiff(cwd, from, to, { summarize }) {
   mechanical.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   let diffText = "";
   if (hunkPaths.length > 0) {
-    diffText = git(cwd, ["--literal-pathspecs", ...PIN, "diff", ...DIFF_FLAGS, from, to, "--", ...hunkPaths], { env: PINNED_ENV }).stdout;
+    diffText = git(cwd, ["--literal-pathspecs", ...PIN, "diff", ...DIFF_FLAGS, from, to, "--", ...hunkPaths]).stdout;
   }
   return { mechanical, diffText };
 }
@@ -64,7 +65,7 @@ const isChangedLine = (line) => (line.startsWith("+") || line.startsWith("-")) &
 
 /** Build the document for `head` against `base`. Returns { document, digest, files, changed_lines, chars, ... }. */
 export function buildResolutionDiff(cwd, { head, base }) {
-  const chain = gitOut(cwd, ["rev-list", "--first-parent", "--reverse", `${base}..${head}`], { env: PINNED_ENV }).split("\n").filter(Boolean);
+  const chain = gitOut(cwd, ["rev-list", "--first-parent", "--reverse", `${base}..${head}`]).split("\n").filter(Boolean);
   const emptyTree = gitOut(cwd, ["hash-object", "-t", "tree", "/dev/null"]);
   const out = [`format: ${FORMAT}`, `base: ${base}`, `head: ${head}`];
   let files = 0;

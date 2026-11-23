@@ -20,7 +20,7 @@ import { computeResolutionDiff } from "./resolution-diff.mjs";
 
 export const NOTES_REF = "refs/notes/upstream-sync-review";
 export const DEFAULT_MAX_ROUNDS = 3; // TECH-9804
-const SIZE_HALTS = /scope|too_large|input_chars|input_size|size_limit/i;
+const SIZE_HALTS = /^scope_|too_large|input_chars|input_size|diff_size|size_limit/i;
 
 /** Submitted heads on the first-parent chain base..head, from the notes ref. */
 export function submittedRounds(cwd, base, head) {
@@ -135,7 +135,7 @@ export async function submit(cwd, opts) {
     recordRound(cwd, result.head, result.digest, round);
     if (opts.sync !== false && hasOrigin) git(cwd, ["push", "-q", "origin", `${NOTES_REF}:${NOTES_REF}`], { allowFail: true });
   }
-  return { ...summary, ...judged, status: judged.exit === 0 ? "approved" : judged.exit === 1 ? "blocking" : "stopped", round, payload: payloadPath };
+  return { ...summary, ...judged, status: judged.exit === 0 ? "approved" : judged.exit === 1 ? "blocking" : "stopped", round, ...(opts.verdict ? {} : { payload: payloadPath }) };
 }
 
 export function formatSubmit(r) {
