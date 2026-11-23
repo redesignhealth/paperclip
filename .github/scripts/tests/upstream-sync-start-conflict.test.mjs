@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Fixture } from './upstream-sync-fixture.mjs';
 import { startConflict, regenerate } from '../upstream-sync/commands/start-conflict.mjs';
-import { gatherContext, oursRanges, formatContext } from '../upstream-sync/commands/context.mjs';
+import { gatherContext, oursBlocks, locateOurs, formatContext } from '../upstream-sync/commands/context.mjs';
 import { planRenumber, mergeJournal } from '../upstream-sync/lib/migrations.mjs';
 import { conflictLogFor } from '../upstream-sync/lib/conflictlog.mjs';
 
@@ -99,7 +99,7 @@ test('start-conflict refuses a commit that is not the next one, and a clean one 
   try {
     await assert.rejects(startConflict(fx.dir, NO_NET, upstreamShas[1]), /not the next upstream commit/);
     await assert.rejects(startConflict(fx.dir, NO_NET, upstreamShas[0]), /merges cleanly/);
-    assert.equal(fx.git('rev-parse', '--abbrev-ref', 'HEAD') !== '', true);
+    assert.equal(fx.git('rev-parse', '--abbrev-ref', 'HEAD'), 'master'); // the failed start left the checkout alone
     const forced = await startConflict(fx.dir, { ...NO_NET, allowClean: true }, upstreamShas[0]);
     assert.equal(forced.kind, 'committed');
   } finally {
@@ -107,20 +107,26 @@ test('start-conflict refuses a commit that is not the next one, and a clean one 
   }
 });
 
-test('regenerate runs affected generators and stages their output', () => {
-  const gen = 'packages/paperclip-runner/scripts/generate-acpx-profiles.mjs';
-  const out = 'packages/paperclip-runner/src/drivers/acpx/generated-profiles.ts';
+test('regenerate writes the generated file with its generator and stages it, and not untracked scratch files', () => {
+  const gen = 'scripts/ingest-app-definitions.mjs';
+  const out = 'packages/shared/src/app-definitions.generated.ts';
   const { fx } = Fixture.scenario({
-    base: { [gen]: "import { writeFileSync } from 'node:fs';\nwriteFileSync('src/drivers/acpx/generated-profiles.ts', 'fresh\\n');\n", [out]: 'old\n' },
-    upstream: [[{ [out]: 'upstream hand edit\n' }, 'touch generated (#1)']],
+    base: {
+      [gen]: "import { writeFileSync } from 'node:fs';\nwriteFileSync('packages/shared/src/app-definitions.generated.ts', 'fresh\\n');\n",
+      [out]: 'old\n',
+      'packages/shared/src/app-definitions/a.json': '{}\n',
+    },
+    upstream: [[{ 'packages/shared/src/app-definitions/b.json': '{}\n', [out]: 'upstream hand edit\n' }, 'add app (#1)']],
   });
   try {
     fx.git('merge', '-q', '--no-commit', '--no-ff', 'upstream');
-    const outcome = regenerate(fx.dir, { buildCmd: 'true' }, 'origin/master', new Set(['acpx-profiles']));
-    // the other runner generators have no script in this fixture, so the run reports them; the acpx one still wrote its file
+    fx.write('scratch.log', 'noise\n');
+    const outcome = regenerate(fx.dir, { buildCmd: 'true' }, 'origin/master');
+    assert.equal(outcome.ok, true, outcome.problems.join('\n'));
+    assert.deepEqual(outcome.generators, ['app-definitions']);
     assert.equal(fx.read(out), 'fresh\n');
-    assert.equal(outcome.ok, false);
-    assert.ok(outcome.generators.includes('acpx-profiles'));
+    assert.match(fx.git('diff', '--cached', '--name-only'), /app-definitions\.generated\.ts/);
+    assert.ok(!fx.git('diff', '--cached', '--name-only').includes('scratch.log'));
   } finally {
     fx.cleanup();
   }
@@ -135,6 +141,10 @@ test('planRenumber and mergeJournal', () => {
   const merged = JSON.parse(mergeJournal(journal('0000_a', '0001_b'), journal('0000_a', '0001_c'), [{ from: '0001_c.sql', to: '0002_c.sql' }]));
   assert.deepEqual(merged.entries.map((e) => e.tag), ['0000_a', '0001_b', '0002_c']);
   assert.equal(merged.entries[2].idx, 2);
+  // the real journal skips numbers: the new idx continues from the highest idx, not from the entry count
+  const gapped = JSON.stringify({ version: '7', dialect: 'postgresql', entries: [{ idx: 0, tag: '0000_a', when: 1 }, { idx: 5, tag: '0005_b', when: 2 }, { idx: 6, tag: '0006_c', when: 3 }] });
+  const withGap = JSON.parse(mergeJournal(gapped, journal('0000_a', '0001_x'), [{ from: '0001_x.sql', to: '0007_x.sql' }]));
+  assert.deepEqual(withGap.entries.map((e) => e.idx), [0, 5, 6, 7]);
 });
 
 test('context lists the upstream commit, our commits and tickets on the conflicting lines, and settled files', () => {
@@ -156,9 +166,27 @@ test('context lists the upstream commit, our commits and tickets on the conflict
   }
 });
 
-test('oursRanges maps conflict blocks to our line numbers', () => {
+test('oursBlocks reads the fork side of each conflict block, and locateOurs finds it in the fork file', () => {
   const text = 'a\n<<<<<<< ours\nx1\nx2\n=======\ny\n>>>>>>> theirs\nb\n<<<<<<< ours\nz\n||||||| base\nq\n=======\nw\n>>>>>>> theirs\n';
-  assert.deepEqual(oursRanges(text), [[2, 3], [5, 5]]);
+  assert.deepEqual(oursBlocks(text), [['x1', 'x2'], ['z']]);
+  // the merged file has two extra upstream lines at the top, so its line numbers drift from the fork file's
+  assert.deepEqual(locateOurs('a\nx1\nx2\nb\nz\n', oursBlocks(text)), [[2, 3], [5, 5]]);
+  assert.deepEqual(locateOurs('a\n', [[]]), []);
+});
+
+test('context attributes the right fork commits even when upstream edits earlier lines cleanly', () => {
+  const head = Array.from({ length: 5 }, (_, i) => `h${i}`).join('\n');
+  const { fx } = Fixture.scenario({
+    base: { 'f.ts': `${head}\nmid\ntail\n` },
+    fork: [[{ 'f.ts': `${head}\nmid FORK\ntail\n` }, 'fork edits mid (TECH-777)']],
+    upstream: [[{ 'f.ts': `new1\nnew2\nnew3\n${head}\nmid UP\ntail\n` }, 'up (#5)']],
+  });
+  try {
+    const c = gatherContext(fx.dir, NO_NET, undefined);
+    assert.deepEqual(c.files[0].ours.map((o) => o.ids), [['TECH-777']]);
+  } finally {
+    fx.cleanup();
+  }
 });
 
 test('the conflict log is recomputed from git for a committed sync merge', async () => {

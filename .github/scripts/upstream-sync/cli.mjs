@@ -28,7 +28,7 @@ const invokedDirectly = (() => {
   try {
     return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
   } catch {
-    return false;
+    return true; // cannot tell (for example argv[1] is not a path): run rather than exit 0 doing nothing
   }
 })();
 

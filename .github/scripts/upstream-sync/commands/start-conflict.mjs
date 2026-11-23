@@ -8,8 +8,8 @@
 // A generated file that no generator is registered for is reported, set to the fork's copy, and never left to the model.
 import { parseArgs } from "../lib/args.mjs";
 import { changedAgainst, runGenerators } from "../lib/generate.mjs";
-import { blobAt, git, gitOut, isWorkingTreeClean, resolveRefs, syncPoint } from "../lib/git.mjs";
-import { GENERATORS, LOCKFILE_RE, classifyFile, generatorIsAffected, splitConflicts } from "../lib/mechanical.mjs";
+import { blobAt, git, gitOut, isWorkingTreeClean, mergeTree, resolveRefs, revParse, syncPoint } from "../lib/git.mjs";
+import { GENERATORS, LOCKFILE_RE, classifyFile, generatorIsAffected, isMechanicalPath, splitConflicts } from "../lib/mechanical.mjs";
 import { settleMigrations } from "../lib/migrations.mjs";
 import { listSteps, shortSha } from "../lib/walk.mjs";
 import { computeNext, NEXT_FLAGS, branchName } from "./next.mjs";
@@ -28,7 +28,7 @@ function restoreFromMaster(cwd, master, path) {
   }
 }
 
-/** Exit codes: 0 started, 1 error, 6 nothing to start (not conflicting / wrong order). */
+/** Exit codes: 0 started or committed, 1 error or generators did not finish (a nothing-to-start case throws). */
 export async function startConflict(cwd, opts, positional) {
   if (!isWorkingTreeClean(cwd)) throw new Error("tracked files have uncommitted changes; commit or stash them first");
   const refs = resolveRefs(cwd, opts);
@@ -48,13 +48,34 @@ export async function startConflict(cwd, opts, positional) {
   }
 
   const branch = branchName(sha);
+  const original = gitOut(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const originalRef = original === "HEAD" ? gitOut(cwd, ["rev-parse", "HEAD"]) : original;
+  const leave = () => {
+    // Put the checkout back and drop the branch this call made.
+    git(cwd, ["merge", "--abort"], { allowFail: true });
+    git(cwd, ["checkout", "-q", originalRef]);
+    git(cwd, ["branch", "-D", branch], { allowFail: true });
+  };
   git(cwd, ["checkout", "-q", "-B", branch, refs.master]);
   const merge = git(cwd, ["merge", "--no-commit", "--no-ff", sha], { allowFail: true });
-  const unmerged = unmergedPaths(cwd);
+  if (merge.status !== 0 && merge.status !== 1) {
+    leave();
+    throw new Error(`git merge failed to start: ${merge.stderr.trim()}`);
+  }
   if (merge.status === 0 && !opts.allowClean) {
-    git(cwd, ["merge", "--abort"], { allowFail: true });
+    leave();
     throw new Error(`${shortSha(sha)} merges cleanly; use merge-clean (or --allow-clean to start it anyway)`);
   }
+  try {
+    return await settleStartedMerge(cwd, { opts, refs, sha, branch });
+  } catch (error) {
+    leave(); // never leave a half-settled merge behind
+    throw error;
+  }
+}
+
+async function settleStartedMerge(cwd, { opts, refs, sha, branch }) {
+  const unmerged = unmergedPaths(cwd);
 
   const settled = [];
   const attention = [];
@@ -100,20 +121,35 @@ export async function startConflict(cwd, opts, positional) {
   const outcome = regenerate(cwd, opts, refs.master, pendingGenerators);
   const result = { ...done("mechanical-only"), regenerated: outcome.ok, regenerateProblems: outcome.problems };
   if (outcome.ok && opts.commit !== false) {
-    git(cwd, ["add", "-A", "--", "."]);
+    stageMechanical(cwd);
     git(cwd, ["commit", "-q", "-m", `Merge upstream ${shortSha(sha)}`, "-m", `Upstream commit ${sha}`]);
     result.kind = "committed";
   }
   return result;
 }
 
+/** Stage tracked changes plus new files a script settled. Untracked scratch files are never staged. */
+function stageMechanical(cwd) {
+  git(cwd, ["add", "-u"]);
+  const fresh = git(cwd, ["ls-files", "-o", "--exclude-standard", "-z"]).stdout.split("\0").filter(Boolean).filter(isMechanicalPath);
+  if (fresh.length > 0) git(cwd, ["add", "--", ...fresh]);
+}
+
 /** Run the generators affected by the change, plus any in `pending`, and stage their output. */
 export function regenerate(cwd, opts, master, pending = new Set()) {
+  // Mid-merge, also rerun every generator whose output conflicted, even if no input changed.
+  const mergeHead = revParse(cwd, "MERGE_HEAD");
+  if (mergeHead) {
+    for (const f of mergeTree(cwd, master, mergeHead).files) {
+      const c = classifyFile(f);
+      if (c.action === "regenerate") pending = new Set([...pending, c.generator]);
+    }
+  }
   const changed = changedAgainst(cwd, master);
   const generators = GENERATORS.filter((g) => pending.has(g.id) || generatorIsAffected(g, changed));
   const results = runGenerators(cwd, generators, { buildCmd: opts.buildCmd });
   const problems = results.filter((r) => !r.ok).map((r) => r.output);
-  if (problems.length === 0) git(cwd, ["add", "-A", "--", "."]);
+  if (problems.length === 0) stageMechanical(cwd);
   return { ok: problems.length === 0, problems, generators: generators.map((g) => g.id) };
 }
 

@@ -47,11 +47,14 @@ export function mergeJournal(masterJournalText, theirsJournalText, plan) {
   const theirs = JSON.parse(theirsJournalText);
   const tagMap = new Map(plan.map((p) => [p.from.replace(/\.sql$/, ""), p.to.replace(/\.sql$/, "")]));
   const entries = [...ours.entries];
+  // idx is not the array position: the real journal has gaps (and one repeated idx), so continue from the highest.
+  let idx = Math.max(-1, ...entries.map((e) => e.idx ?? -1));
   let when = Math.max(0, ...entries.map((e) => e.when ?? 0));
   for (const entry of theirs.entries) {
     if (!tagMap.has(entry.tag)) continue;
     when = Math.max(when + 1, entry.when ?? 0);
-    entries.push({ ...entry, idx: entries.length, tag: tagMap.get(entry.tag), when });
+    idx += 1;
+    entries.push({ ...entry, idx, tag: tagMap.get(entry.tag), when });
   }
   return `${JSON.stringify({ ...ours, entries }, null, 2)}\n`;
 }

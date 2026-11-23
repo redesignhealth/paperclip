@@ -5,26 +5,47 @@ import { git, gitOut, mergeTree, resolveRefs, syncPoint } from "../lib/git.mjs";
 import { splitConflicts } from "../lib/mechanical.mjs";
 import { runArgv } from "../lib/shell.mjs";
 import { shortSha } from "../lib/walk.mjs";
+import { computeNext } from "./next.mjs";
 
-const TICKET_RE = /\b[A-Z][A-Z0-9]{1,7}-\d+\b/g;
+const TICKET_RE = /\b(?!(?:UTF|SHA|ISO|MD|CVE|RFC)-)[A-Z][A-Z0-9]{1,7}-\d+\b/g;
 const PR_RE = /\(#(\d+)\)/g;
 
-/** Our-side line ranges of each conflict block in a merged text (default or diff3 markers). */
-export function oursRanges(text) {
-  const ranges = [];
-  let oursLine = 0;
+/** The text of each conflict block's fork side, in order (default or diff3 markers). */
+export function oursBlocks(text) {
+  const blocks = [];
   let state = "outside";
-  let start = null;
+  let current = null;
   for (const line of text.split("\n")) {
-    if (line.startsWith("<<<<<<< ")) {
+    if (state === "outside" && line.startsWith("<<<<<<< ")) {
       state = "ours";
-      start = oursLine + 1;
+      current = [];
     } else if (state === "ours" && line.startsWith("||||||| ")) state = "base";
     else if ((state === "ours" || state === "base") && line.startsWith("=======")) {
       state = "theirs";
-      ranges.push([start, Math.max(start, oursLine)]);
+      blocks.push(current);
     } else if (state === "theirs" && line.startsWith(">>>>>>> ")) state = "outside";
-    else if (state === "outside" || state === "ours") oursLine++;
+    else if (state === "ours") current.push(line);
+  }
+  return blocks;
+}
+
+/**
+ * Where each conflict block's fork side sits in the fork's own file. Line numbers in the merged blob drift from the
+ * fork file whenever upstream changed earlier lines cleanly, so find the text instead. Returns [from, to] ranges.
+ */
+export function locateOurs(masterText, blocks) {
+  const lines = masterText.split("\n");
+  const ranges = [];
+  let cursor = 0;
+  for (const block of blocks) {
+    if (block.length === 0) continue; // the fork added nothing here
+    for (let i = cursor; i + block.length <= lines.length; i++) {
+      if (block.every((l, k) => lines[i + k] === l)) {
+        ranges.push([i + 1, i + block.length]);
+        cursor = i + block.length;
+        break;
+      }
+    }
   }
   return ranges;
 }
@@ -44,7 +65,11 @@ export function blameCommits(cwd, rev, file, [from, to]) {
 export function gatherContext(cwd, opts, step) {
   const refs = resolveRefs(cwd, { ...opts, fetch: false });
   const base = syncPoint(cwd, refs.master, refs.upstream);
-  const sha = step ?? gitOut(cwd, ["rev-list", "--first-parent", "--reverse", refs.upstream, `^${base}`]).split("\n")[0];
+  // Without an explicit commit, the next one that conflicts (the one start-conflict would take), else the first.
+  const sha =
+    step ??
+    computeNext(cwd, { ...opts, fetch: false }).next?.sha ??
+    gitOut(cwd, ["rev-list", "--first-parent", "--reverse", refs.upstream, `^${base}`]).split("\n")[0];
   const merged = mergeTree(cwd, refs.master, sha);
   const { mechanical, real } = splitConflicts(merged.files);
   const subject = gitOut(cwd, ["log", "-1", "--format=%s", sha]);
@@ -57,14 +82,15 @@ export function gatherContext(cwd, opts, step) {
       try {
         upstreamPr = JSON.parse(r.output);
       } catch {
-        /* leave null */
+        upstreamPr = null; // gh answered with something that is not JSON (a warning, an auth prompt): show no description
       }
     }
   }
 
   const files = real.map(({ path }) => {
     const blob = git(cwd, ["cat-file", "-p", `${merged.tree}:${path}`], { allowFail: true }).stdout;
-    const ranges = oursRanges(blob);
+    const masterText = git(cwd, ["show", `${refs.master}:${path}`], { allowFail: true }).stdout;
+    const ranges = locateOurs(masterText, oursBlocks(blob));
     const ours = ranges.flatMap((range) => blameCommits(cwd, refs.master, path, range));
     const uniqueOurs = [...new Map(ours.map((c) => [c.sha, c])).values()];
     const theirs = gitOut(cwd, ["log", "--format=%h %s", `${base}..${sha}`, "--", path], { allowFail: true })
