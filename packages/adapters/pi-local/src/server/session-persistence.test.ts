@@ -119,3 +119,17 @@ describe("remote Pi session persistence", () => {
     expect(redactSessionText("a abcdefgh-long b abcdefgh", collectSessionSecrets({ X_TOKEN: "abcdefgh-long" }, ["abcdefgh"]))).toBe("a [REDACTED] b [REDACTED]");
   });
 });
+
+describe("redaction of JSON-escaped secrets", () => {
+  it("redacts a multi-line secret as it appears escaped inside a JSONL line", () => {
+    const pem = "-----BEGIN KEY-----\nabcdef\n-----END KEY-----";
+    const line = JSON.stringify({ type: "message", text: pem });
+    const secrets = collectSessionSecrets({ AGENT_PRIVATE_KEY: pem });
+    const out = redactSessionText(line, secrets);
+    expect(out).not.toContain("abcdef");
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+  it("does not treat key ids and paths as secrets", () => {
+    expect(collectSessionSecrets({ PAPERCLIP_AGENT_KEY_ID: "key-id-12345678", SSH_KEY_PATH: "/home/x/.ssh/idrsa" })).toEqual([]);
+  });
+});

@@ -620,7 +620,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           graceSec: 5,
           onLog,
         });
-        if (remoteSessionExec) await protectRemoteSessionDir(remoteSessionExec, sessionPath).catch(() => undefined);
+        if (remoteSessionExec) await protectRemoteSessionDir(remoteSessionExec, sessionPath).catch((err) => onLog("stderr", `[paperclip] Could not protect the Pi session dir from Git: ${err instanceof Error ? err.message : String(err)}\n`));
       } else {
         try {
           await fs.writeFile(sessionPath, "", { flag: "wx" });
@@ -830,7 +830,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Copy the session off the pod before the between-turn scrub deletes it.
       if (remoteSessionExec) {
         try {
-          await saveRemoteSession({ exec: remoteSessionExec, storeDir: PAPERCLIP_SESSIONS_DIR, sessionPath: sessionFile, secrets: sessionSecrets });
+          const saved = await saveRemoteSession({ exec: remoteSessionExec, storeDir: PAPERCLIP_SESSIONS_DIR, sessionPath: sessionFile, secrets: sessionSecrets });
+          if (!saved) await onLog("stderr", "[paperclip] Pi session was not saved to the server; the next wake may start cold.\n");
         } catch (err) {
           await onLog("stderr", `[paperclip] Could not save the Pi session to the server: ${err instanceof Error ? err.message : String(err)}\n`);
         }
@@ -952,7 +953,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             graceSec: 5,
             onLog,
           });
-          if (remoteSessionExec) await protectRemoteSessionDir(remoteSessionExec, newSessionPath).catch(() => undefined);
+          if (remoteSessionExec) await protectRemoteSessionDir(remoteSessionExec, newSessionPath).catch((err) => onLog("stderr", `[paperclip] Could not protect the Pi session dir from Git: ${err instanceof Error ? err.message : String(err)}\n`));
         } else {
           try {
             await fs.writeFile(newSessionPath, "", { flag: "wx" });

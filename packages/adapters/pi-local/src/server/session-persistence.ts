@@ -23,6 +23,8 @@ export type RemoteSessionExec = (script: string, stdin?: string) => Promise<{
 }>;
 
 const SECRET_KEY_PATTERN = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i;
+// Identifiers and paths, not secrets; redacting them could corrupt the resume header.
+const NON_SECRET_KEY_PATTERN = /(KEY_ID|PUBLIC_KEY|KEY_PATH|KEY_FILE|_PATH$|_DIR$)/i;
 const MIN_SECRET_LENGTH = 8;
 const RUNTIME_DIR_NAME = ".paperclip-runtime";
 
@@ -34,7 +36,7 @@ export function serverSessionCopyPath(storeDir: string, remoteSessionPath: strin
 export function collectSessionSecrets(env: Record<string, string>, extra: Array<string | null | undefined> = []): string[] {
   const values = new Set<string>();
   for (const [key, value] of Object.entries(env)) {
-    if (typeof value === "string" && value.length >= MIN_SECRET_LENGTH && SECRET_KEY_PATTERN.test(key)) values.add(value);
+    if (typeof value === "string" && value.length >= MIN_SECRET_LENGTH && SECRET_KEY_PATTERN.test(key) && !NON_SECRET_KEY_PATTERN.test(key)) values.add(value);
   }
   for (const value of extra) if (typeof value === "string" && value.length >= MIN_SECRET_LENGTH) values.add(value);
   // Longest first so a secret that contains another is replaced whole.
@@ -43,7 +45,12 @@ export function collectSessionSecrets(env: Record<string, string>, extra: Array<
 
 export function redactSessionText(text: string, secrets: string[]): string {
   let out = text;
-  for (const secret of secrets) out = out.split(secret).join("[REDACTED]");
+  for (const secret of secrets) {
+    out = out.split(secret).join("[REDACTED]");
+    // Session lines are JSON, so a multi-line or quoted secret appears escaped.
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    if (escaped !== secret) out = out.split(escaped).join("[REDACTED]");
+  }
   return out;
 }
 
@@ -84,17 +91,21 @@ export async function restoreRemoteSession(input: {
 }): Promise<boolean> {
   const { exec, storeDir, sessionPath } = input;
   const present = await exec(`[ -s ${shellQuote(sessionPath)} ] && echo present || echo absent`);
-  if (present.exitCode === 0 && present.stdout.includes("present") && !present.stdout.includes("absent")) return false;
+  // Only a clean "absent" answer triggers a restore; a failed or timed-out probe leaves the pod alone.
+  if (present.timedOut || present.exitCode !== 0 || present.stdout.trim() !== "absent") return false;
   let saved: string;
   try {
     saved = await fs.readFile(serverSessionCopyPath(storeDir, sessionPath), "utf8");
-  } catch {
-    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
   }
   if (!isValidJsonl(saved)) return false;
   const quoted = shellQuote(sessionPath);
+  // Write to a temp name under umask 077 and rename, so a failed or timed-out write never leaves a torn file at sessionPath.
+  const tmp = shellQuote(`${sessionPath}.restoring`);
   const written = await exec(
-    `${buildSessionGitIgnoreScript(sessionPath)} && base64 -d > ${quoted} && chmod 600 ${quoted}`,
+    `${buildSessionGitIgnoreScript(sessionPath)} && ( umask 077; base64 -d > ${tmp} ) && mv ${tmp} ${quoted} || { rm -f ${tmp}; exit 1; }`,
     Buffer.from(saved, "utf8").toString("base64"),
   );
   return written.exitCode === 0 && !written.timedOut;
@@ -115,7 +126,7 @@ export async function saveRemoteSession(input: {
   if (!isValidJsonl(text)) return false;
   const target = serverSessionCopyPath(storeDir, sessionPath);
   await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.${process.pid}.tmp`;
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(temporary, redactSessionText(text, secrets), { mode: 0o600 });
   await fs.rename(temporary, target);
   return true;
