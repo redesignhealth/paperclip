@@ -108,6 +108,39 @@ test('next stops the stretch at --max-steps', () => {
   }
 });
 
+test('a stretch that uses every step but leaves upstream ahead reports limit, not end', () => {
+  const { fx } = Fixture.scenario({
+    base: { 'a.txt': 'a\n' },
+    upstream: [[{ 'b.txt': '1\n' }, 'b (#1)'], [{ 'c.txt': '1\n' }, 'c (#2)']],
+  });
+  try {
+    const report = computeNext(fx.dir, { ...NO_FETCH, maxSteps: 5, window: 1 });
+    assert.equal(report.stretch.count, 1);
+    assert.equal(report.stretch.limitedBy, 'limit');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('structural detection counts fork edits against fork master, not the merged stretch', () => {
+  const big = lines(400, 'code');
+  const { fx } = Fixture.scenario({
+    base: { 'big.ts': big, 'x.txt': 'x\n' },
+    upstream: [
+      [{ 'big.ts': big.split('\n').map((l, i) => (i >= 20 && i < 170 ? `${l} // upstream edit` : l)).join('\n') }, 'upstream edits big (#1)'],
+      [{ 'big.ts': lines(50, 'rest'), 'extracted.ts': big.split('\n').slice(0, 350).join('\n') + '\n', 'x.txt': 'y\n' }, 'extract (#2)'],
+    ],
+    fork: [[{ 'x.txt': 'fork\n' }, 'fork edits x only']],
+  });
+  try {
+    const report = computeNext(fx.dir, NO_FETCH);
+    assert.equal(report.next.files.some((f) => f.path === 'x.txt'), true);
+    assert.equal(report.next.structural.structural, false); // the fork never touched big.ts
+  } finally {
+    fx.cleanup();
+  }
+});
+
 test('next says up to date when upstream has nothing new', () => {
   const { fx } = Fixture.scenario({ base: { 'a.txt': 'a\n' }, fork: [[{ 'b.txt': 'b\n' }, 'fork only']] });
   try {

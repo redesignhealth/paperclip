@@ -12,6 +12,7 @@ export class Fixture {
     this.git("config", "user.name", "Test");
     this.git("config", "user.email", "test@example.com");
     this.git("config", "commit.gpgsign", "false");
+    this.git("config", "merge.conflictStyle", "merge");
   }
 
   git(...args) {

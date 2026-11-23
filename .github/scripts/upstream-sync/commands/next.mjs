@@ -1,5 +1,6 @@
 // `next`: fetch upstream, walk forward from the sync point, and report how far the walk merges cleanly and which
-// upstream commit conflicts next. Read-only: it writes commit objects to the object store and nothing else.
+// upstream commit conflicts next. It writes commit objects (and a throwaway index file) to the git directory and
+// refreshes the remote-tracking refs when it fetches; the work tree, index and local branches are never touched.
 import { parseArgs } from "../lib/args.mjs";
 import { resolveRefs, syncPoint } from "../lib/git.mjs";
 import { splitConflicts } from "../lib/mechanical.mjs";
@@ -32,22 +33,25 @@ export function computeNext(cwd, opts = {}) {
   const walk = walkCleanStretch(cwd, { head: refs.master, master: refs.master, steps, maxSteps });
   if (walk.clean.length > 0) {
     const last = walk.clean[walk.clean.length - 1];
+    // A walk that ran out of steps while upstream is still ahead stopped on the window or the step limit, not on the end.
+    const stoppedBy = walk.stoppedBy === "end" && total > walk.clean.length ? "limit" : walk.stoppedBy;
     report.kind = "clean-stretch";
     report.branch = branchName(last.sha);
     report.stretch = {
       count: walk.clean.length,
-      limitedBy: walk.stoppedBy, // conflict | limit | end
+      limitedBy: stoppedBy, // conflict | limit | end
       from: walk.clean[0].sha,
       to: last.sha,
       result: walk.tip,
-      steps: walk.clean.map(({ sha, pr, subject }) => ({ sha, pr, subject })),
+      steps: walk.clean.map(({ sha, pr, subject, restoredLockfiles }) => ({ sha, pr, subject, restoredLockfiles })),
     };
   }
 
   if (walk.conflict) {
     const { step, files, tree } = walk.conflict;
     const { mechanical, real } = splitConflicts(files);
-    const structure = analyzeStep(cwd, { step, base, head: walk.tip, markerTree: tree, files });
+    // Fork edits are measured against fork master: the clean stretch ahead of this step is upstream code.
+    const structure = analyzeStep(cwd, { step, base, head: refs.master, markerTree: tree, files });
     report.next = {
       sha: step.sha,
       pr: step.pr,
