@@ -124,6 +124,7 @@ import {
   SANDBOX_RUN_SLOT_PROVIDERS,
   sandboxRunSlots,
 } from "./services/heartbeat/sandbox-run-slots.js";
+import { RUNTIME_METRICS_SERVICE_ENV, startRuntimeMetrics } from "./services/runtime-metrics.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
@@ -1211,6 +1212,12 @@ async function startServerWithDatabaseTeardown(
     });
   });
   startupListenerBound = true;
+
+  const runtimeMetricsService = process.env[RUNTIME_METRICS_SERVICE_ENV]?.trim();
+  if (runtimeMetricsService) {
+    startRuntimeMetrics({ service: runtimeMetricsService, slotMetrics: () => sandboxRunSlots.metrics() });
+    logger.info({ service: runtimeMetricsService }, "emitting server runtime metrics (event loop, sandbox slot queue) to stdout as CloudWatch EMF");
+  }
 
   try {
     const result = await workspaceOperationService(db as any)
