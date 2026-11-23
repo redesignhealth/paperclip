@@ -70,6 +70,7 @@ export {
   shouldQueueFollowupForRunningIssueWake,
 } from "./heartbeat/queue.js";
 import {
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
   isProcessAlive,
   createHeartbeatRecovery,
 } from "./heartbeat/recovery.js";
@@ -315,6 +316,7 @@ import {
   and,
   eq,
   exists,
+  gt,
   inArray,
   isNull,
   notInArray,
@@ -3948,13 +3950,26 @@ export function heartbeatService(
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string) {
     await cancelInvocationsForAgentsInternal(agentIds, reason);
-    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
       .where(and(inArray(heartbeatRuns.agentId, agentIds),
         or(and(eq(heartbeatRuns.status, "cancelled"), inArray(environmentLeases.status, ["active", "pending_cleanup"])),
           and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed")))));
     const needsRelease = new Set(leasesToRelease.map(lease => lease.runId));
+    // An agent can own hundreds of runs. Only a run that is not settled, is
+    // executing in this process, or still needs lease cleanup can change this
+    // outcome, so read only those, without the jsonb columns.
+    const releaseRunIds = [...needsRelease].filter((id): id is string => Boolean(id));
+    const inProcessRunIds = [...new Set([...runningProcesses.keys(), ...activeRunExecutions,
+      ...adapterExecutionControls.keys(), ...processRunCancellationSettlements.keys()])];
+    const runs = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt })
+      .from(heartbeatRuns).where(and(inArray(heartbeatRuns.agentId, agentIds), or(
+        notInArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        gt(heartbeatRuns.controllerLeaseExpiresAt, new Date()),
+        releaseRunIds.length ? inArray(heartbeatRuns.id, releaseRunIds) : undefined,
+        inProcessRunIds.length ? inArray(heartbeatRuns.id, inProcessRunIds) : undefined,
+      )));
     for (const run of runs) {
       if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||

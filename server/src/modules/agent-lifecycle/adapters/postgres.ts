@@ -27,7 +27,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     if (agent.lifecycleOperation?.leaseUntil && Date.parse(agent.lifecycleOperation.leaseUntil) > Date.now()) return agent;
     await effects.notifyWork(tx);
     const [updated] = await tx.update(agents).set({ lifecycleError: null,
-      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'leaseOwner' - 'leaseUntil'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
+      lifecycleOperation: sql`(${agents.lifecycleOperation} - 'retryAt' - 'leaseOwner' - 'leaseUntil') || '{"attempts":0}'::jsonb`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
     return updated;
   }
   if (command === "resume" && !["ready", "paused", "pausing", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
@@ -167,11 +167,11 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
     },
-    async defer(agent, owner, error, now) {
+    async defer(agent, owner, error, now, retryAfterMs) {
       const rows = await db.update(agents).set({
         lifecycleError: error,
         lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil')
-          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()}::text)`,
+          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (retryAfterMs ?? (error ? 60_000 : 2_000))).toISOString()}::text)`,
         updatedAt: now,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });

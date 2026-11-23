@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.js";
 import { isLifecycleWorkPending } from "../domain/policy.js";
-import { lifecycleFailureMessage } from "./failure.js";
+import { lifecycleFailureMessage, lifecycleStuckMessage } from "./failure.js";
+import { isStuckStop, pendingRetryDelayMs, STUCK_RETRY_MS } from "./backoff.js";
 
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
@@ -12,6 +13,14 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
   async function attempt<T>(context: LifecycleFailure, work: () => Promise<T>): Promise<T> {
     try { return await work(); }
     catch (error) { reportFailure(context, error); throw error; }
+  }
+
+  /** Pending work backs off per attempt. A stop that never settles is flagged. */
+  function deferPending(agent: Parameters<LifecycleStore["defer"]>[0], owner: string) {
+    const attempts = agent.lifecycleOperation?.attempts ?? 1;
+    const stuck = isStuckStop(agent.lifecycleState, attempts);
+    return store.defer(agent, owner, stuck ? lifecycleStuckMessage(agent.lifecycleState) : null, new Date(),
+      stuck ? STUCK_RETRY_MS : pendingRetryDelayMs(attempts));
   }
 
   async function process(id: string) {
@@ -41,7 +50,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         if (!operation.hostComplete) {
           if (!await runStep("renew", () => store.renew(agent, owner, new Date()))) continue;
           if (await runStep("host", () => driver.runHost(agent)) === "pending") {
-            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date()))) continue;
+            if (!await runStep("defer", () => deferPending(agent, owner))) continue;
             return;
           }
           if (!await runStep("complete_host", () => store.completeHost(agent, owner))) continue;
@@ -54,7 +63,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           }
           if (!await runStep("renew", () => store.renew(agent, owner, new Date()))) continue phase;
           if (await runStep("plugin", () => driver.runPlugin(agent, pluginId), pluginId) === "pending") {
-            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date()))) continue phase;
+            if (!await runStep("defer", () => deferPending(agent, owner))) continue phase;
             return;
           }
           if (!await runStep("complete_plugin", () => store.completePlugin(agent, owner, pluginId), pluginId)) continue phase;

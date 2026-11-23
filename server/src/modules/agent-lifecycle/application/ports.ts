@@ -20,7 +20,8 @@ export interface LifecycleStore {
   setRequiredPlugins(agent: LifecycleAgent, owner: string, pluginIds: string[]): Promise<boolean>;
   completeHost(agent: LifecycleAgent, owner: string): Promise<boolean>;
   completePlugin(agent: LifecycleAgent, owner: string, pluginId: string): Promise<boolean>;
-  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date): Promise<boolean>;
+  /** `retryAfterMs` overrides the default delay (2s, or 60s with an error). */
+  defer(agent: LifecycleAgent, owner: string, error: string | null, now: Date, retryAfterMs?: number): Promise<boolean>;
   pending(limit: number, now: Date): Promise<string[]>;
 }
 
