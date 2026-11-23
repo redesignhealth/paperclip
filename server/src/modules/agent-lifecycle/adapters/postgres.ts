@@ -167,11 +167,11 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
     },
-    async defer(agent, owner, error, now) {
+    async defer(agent, owner, error, now, retryAfterMs) {
       const rows = await db.update(agents).set({
         lifecycleError: error,
         lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil')
-          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()}::text)`,
+          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (retryAfterMs ?? (error ? 60_000 : 2_000))).toISOString()}::text)`,
         updatedAt: now,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });

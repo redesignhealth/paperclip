@@ -38,3 +38,9 @@ export function lifecycleFailureMessage(context: LifecycleFailure, error: unknow
     : "Paperclip could not complete this step. It will retry automatically. If this continues, contact your instance administrator.";
   return `${step} failed. ${reason}`;
 }
+
+/** Set when a stop has stayed pending far longer than any run needs to end. */
+export function lifecycleStuckMessage(state: LifecycleFailure["phase"]): string {
+  const action = state === "pausing" ? "Pausing" : state === "terminating" ? "Stopping" : "Cleaning up";
+  return `${action} this agent is taking longer than expected. A run, lease or process has not confirmed it stopped. Paperclip is checking less often. Check the agent's runs and environment leases, or contact your instance administrator.`;
+}
