@@ -10,7 +10,7 @@ import { secretService } from "../services/secrets.js";
  * A sandbox pod cannot reach the tailnet and holds no credentials. The pod's package installer (uv or pip) points an
  * extra index at the sandbox bridge, which forwards here with the run JWT. This server adds the Gitea read token, so the
  * credential never enters the pod. Fixed surface, GET only: `simple/:package/` and `files/:package/:version/:filename`.
- * The upstream is ONLY the server's configured `PAPERCLIP_PACKAGE_RELAY_GITEA_URL`, and only for packages named in
+ * The relay answers 404 when it is not configured. The upstream is ONLY the server's configured `PAPERCLIP_PACKAGE_RELAY_GITEA_URL`, and only for packages named in
  * `PAPERCLIP_PACKAGE_RELAY_GITEA_PACKAGES`; nothing in a request can choose the host, the path or another package.
  * Only agents that opt in (adapterConfig env `PAPERCLIP_PACKAGE_RELAY` lists `gitea`) may use it, so the registry is not
  * opened to every sandbox agent. The token is the company secret `package_relay.gitea`.
@@ -80,6 +80,7 @@ function parseOptIn(value: unknown): string[] {
 
 export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
   const router = Router();
+  let warnedUnconfigured = false;
   const env = deps.env ?? process.env;
   const fetchImpl = deps.fetchImpl ?? tailnetAwareFetch;
   const isOptedIn = deps.isOptedIn ?? (async (agentId: string, relay: string) => {
@@ -120,7 +121,13 @@ export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
     }
     const config = giteaConfig();
     if (!config) {
-      fail(res, 503, "package_relay_unavailable");
+      // Not configured (or invalid). Answer 404, not 5xx: the installer treats the relay as its first index and falls
+      // through to the default index on 404, but fails the whole install on a 5xx.
+      if (!warnedUnconfigured) {
+        warnedUnconfigured = true;
+        logger.warn("package relay is not configured or its settings are invalid; answering 404 for every package");
+      }
+      fail(res, 404, "not_found");
       return null;
     }
     const normalized = normalizePackageName(pkg);
