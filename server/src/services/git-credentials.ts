@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import { and, eq, inArray, or } from "drizzle-orm";
 import { isGitHubDotCom } from "./github-fetch.js";
+import { mintGitHubAppInstallationToken } from "./github-app-installation.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 
@@ -232,7 +233,7 @@ export function createGitRemoteAuthProvider(
     // always supplies a real DB and therefore always checks managed identities before
     // considering legacy secrets or process environment credentials.
     const managed = db
-      ? await resolveManagedGitHubCredential(db, secrets, companyId, context ?? {})
+      ? await resolveManagedGitHubCredential(db, secrets, companyId, context ?? {}, env)
       : { configured: false as const };
     if (managed.configured) {
       if (!managed.credential) throw new Error(managed.error ?? "Managed GitHub connection is unavailable");
@@ -291,6 +292,11 @@ export function createGitRemoteAuthProvider(
     if (!credential) return null;
     return buildGitAuthInvocation(credential);
   };
+}
+
+/** A dedicated agent grant backed by the server's GitHub App installation (no OAuth token). */
+export function isGitHubAppInstallationGrant(grant: typeof connectionGrants.$inferSelect): boolean {
+  return grant.kind === "agent" && grant.providerTenant?.github?.appInstallation === true;
 }
 
 export async function resolveManagedGitHubIdentitySelection(
@@ -392,6 +398,7 @@ export async function resolveManagedGitHubIdentitySelection(
       ))
     : [];
   const hasCredentialRecord = (grant: typeof connectionGrants.$inferSelect) => {
+    if (isGitHubAppInstallationGrant(grant)) return (grant.providerTenant?.github?.repositories?.length ?? 0) > 0;
     if (candidates.length === 1) return true;
     const github = grant.providerTenant?.github;
     const ref = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
@@ -454,7 +461,9 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
     agentId: input.agentId,
     responsibleUserId: input.responsibleUserId ?? null,
   });
-  const selectedConnectionId = selection.grant?.connectionId ?? null;
+  // App installation grants serve managed git/gh only; offering GitHub MCP tools would always fail.
+  const selectedConnectionId = selection.grant && !isGitHubAppInstallationGrant(selection.grant)
+    ? selection.grant.connectionId : null;
   const githubIds = new Set(githubConnections.map((connection) => connection.id));
   return input.connections.filter((connection) =>
     !githubIds.has(connection.id) || connection.id === selectedConnectionId,
@@ -472,6 +481,7 @@ export async function resolveManagedGitHubCredential(
     agentId?: string | null;
     allowStandingDelegation?: boolean;
   },
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
   if (!selection.configured) return { configured: false };
@@ -486,6 +496,27 @@ export async function resolveManagedGitHubCredential(
         eq(companyMemberships.status, "active"),
       )).limit(1);
       if (!membership || membership.role === "viewer") return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity owner is not an authorized company member" };
+    }
+    if (isGitHubAppInstallationGrant(grant)) {
+      // Minted per credential request from the repositories on this grant; no OAuth token is
+      // read or refreshed, and the minted token is never persisted.
+      const minted = await mintGitHubAppInstallationToken({
+        repositories: grant.providerTenant?.github?.repositories?.map((repository) => repository.fullName),
+        env,
+      });
+      if (!minted.ok) return { configured: true, identitySource: selection.identitySource, error: minted.error };
+      return {
+        configured: true, identitySource: selection.identitySource,
+        credential: {
+          token: minted.value.token,
+          source: "managed_connection" as const,
+          secretName: null,
+          githubIdentity: minted.value.identity,
+          identitySource: "dedicated" as const,
+          connectionId: grant.connectionId,
+          grantId: grant.id,
+        },
+      };
     }
     const expiresAt = grant.providerTenant?.oauth?.accessTokenExpiresAt;
     const refreshedAt = grant.providerTenant?.oauth?.refreshedAt;

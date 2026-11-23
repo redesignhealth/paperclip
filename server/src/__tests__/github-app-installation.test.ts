@@ -1,0 +1,177 @@
+import { generateKeyPairSync } from "node:crypto";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  GITHUB_APP_TOKEN_PERMISSIONS,
+  mintGitHubAppInstallationToken,
+  normalizeAppRepositories,
+  readGitHubAppConfig,
+  resetGitHubAppCachesForTest,
+} from "../services/github-app-installation.js";
+
+// Throwaway key generated at test time; never written to disk.
+const { privateKey } = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+});
+const env = {
+  PAPERCLIP_GITHUB_APP_ID: "12345",
+  PAPERCLIP_GITHUB_APP_INSTALLATION_ID: "678",
+  PAPERCLIP_GITHUB_APP_PRIVATE_KEY: privateKey,
+} as NodeJS.ProcessEnv;
+
+const T0 = Date.parse("2026-01-01T00:00:00Z");
+const MINUTE = 60_000;
+let repoOwner = "redesignhealth";
+
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+function makeFetch(tokens: string[] = ["ghs_test_token_1", "ghs_test_token_2"]) {
+  let n = 0;
+  const calls: Array<{ url: string; method: string; body: unknown; auth: string | null }> = [];
+  const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string>;
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+    calls.push({ url: String(url), method: init?.method ?? "GET", body, auth: headers?.authorization ?? null });
+    if (String(url).endsWith("/app")) return json({ slug: "rh-code-factory" });
+    return json({
+      token: tokens[n++ % tokens.length],
+      expires_at: new Date(T0 + 60 * MINUTE).toISOString(),
+      repositories: (body.repositories as string[]).map((name) => ({ full_name: `${repoOwner}/${name}` })),
+    }, 201);
+  });
+  return { fetchImpl: fetchImpl as unknown as typeof fetch, calls };
+}
+
+const mints = (calls: Array<{ url: string }>) => calls.filter((call) => call.url.endsWith("/access_tokens")).length;
+
+describe("GitHub App installation credentials", () => {
+  beforeEach(() => {
+    repoOwner = "redesignhealth";
+    resetGitHubAppCachesForTest();
+  });
+
+  it("requests exactly the scoped repositories and contents/pull_requests write", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const result = await mintGitHubAppInstallationToken({
+      repositories: ["redesignhealth/zeta", "redesignhealth/alpha"], env, fetchImpl, now: () => T0,
+    });
+    expect(result).toMatchObject({ ok: true, value: { token: "ghs_test_token_1", identity: { userId: "12345", login: "rh-code-factory[bot]" } } });
+    const mint = calls.find((call) => call.url.endsWith("/access_tokens"))!;
+    expect(mint.url).toBe("https://api.github.com/app/installations/678/access_tokens");
+    expect(mint.method).toBe("POST");
+    expect(mint.body).toEqual({
+      repositories: ["alpha", "zeta"],
+      permissions: { contents: "write", pull_requests: "write" },
+    });
+    expect(GITHUB_APP_TOKEN_PERMISSIONS).toEqual({ contents: "write", pull_requests: "write" });
+    expect(mint.auth).toMatch(/^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
+  });
+
+  it.each([
+    ["empty list", []],
+    ["missing list", undefined],
+    ["non-array", "redesignhealth/repo"],
+    ["non-string entry", ["redesignhealth/ok", 42]],
+    ["blank entry", ["redesignhealth/ok", "  "]],
+    ["owner only", ["redesignhealth/"]],
+    ["bare name without owner", ["alpha"]],
+    ["same name, different owners", ["a/repo", "b/repo"]],
+    ["path traversal", ["redesignhealth/.."]],
+  ])("refuses to mint an unscoped token: %s", async (_label, repositories) => {
+    const { fetchImpl } = makeFetch();
+    const result = await mintGitHubAppInstallationToken({ repositories, env, fetchImpl, now: () => T0 });
+    expect(result.ok).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(normalizeAppRepositories(repositories)).toBeNull();
+  });
+
+  it.each([
+    ["no env", {}],
+    ["no key", { ...env, PAPERCLIP_GITHUB_APP_PRIVATE_KEY: "" }],
+    ["no installation id", { ...env, PAPERCLIP_GITHUB_APP_INSTALLATION_ID: undefined }],
+    ["no app id", { ...env, PAPERCLIP_GITHUB_APP_ID: undefined }],
+  ])("is unavailable with a redacted reason when env is missing: %s", async (_label, badEnv) => {
+    const { fetchImpl } = makeFetch();
+    const result = await mintGitHubAppInstallationToken({
+      repositories: ["redesignhealth/r"], env: badEnv as NodeJS.ProcessEnv, fetchImpl, now: () => T0,
+    });
+    expect(result).toEqual({ ok: false, error: "The GitHub App installation is not configured on this server" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-numeric, zero, and negative ids", () => {
+    for (const bad of ["abc", "0", "-5"]) {
+      expect(readGitHubAppConfig({ ...env, PAPERCLIP_GITHUB_APP_ID: bad })).toBeNull();
+      expect(readGitHubAppConfig({ ...env, PAPERCLIP_GITHUB_APP_INSTALLATION_ID: bad })).toBeNull();
+    }
+  });
+
+  it("tolerates a PEM with literal \\n sequences", () => {
+    const flat = privateKey.trim().replace(/\n/g, "\\n");
+    const config = readGitHubAppConfig({ ...env, PAPERCLIP_GITHUB_APP_PRIVATE_KEY: flat });
+    expect(config?.privateKey).toBe(privateKey.trim());
+  });
+
+  it("caches per repo set and re-mints within 5 minutes of expiry", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const mint = (repositories: string[], now: number) =>
+      mintGitHubAppInstallationToken({ repositories, env, fetchImpl, now: () => now });
+    const first = await mint(["redesignhealth/a"], T0);
+    expect(await mint(["redesignhealth/a"], T0 + 54 * MINUTE)).toEqual(first);
+    expect(mints(calls)).toBe(1);
+    // Different repo set is a different cache entry.
+    const other = await mint(["redesignhealth/b"], T0 + 54 * MINUTE);
+    expect(other).toMatchObject({ ok: true, value: { token: "ghs_test_token_2" } });
+    expect(mints(calls)).toBe(2);
+    // 55 minutes in: within 5 minutes of expiry, so mint again.
+    await mint(["redesignhealth/a"], T0 + 55 * MINUTE);
+    expect(mints(calls)).toBe(3);
+  });
+
+  it("discards the token when GitHub scopes it to a different owner than the grant names", async () => {
+    repoOwner = "someone-else";
+    const { fetchImpl } = makeFetch();
+    const result = await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/alpha"], env, fetchImpl, now: () => T0 });
+    expect(result.ok).toBe(false);
+    // Nothing was cached: the next call with a correct response succeeds.
+    repoOwner = "redesignhealth";
+    const retry = await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/alpha"], env, fetchImpl, now: () => T0 });
+    expect(retry.ok).toBe(true);
+  });
+
+  it("coalesces concurrent cache misses into one mint", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const run = () => mintGitHubAppInstallationToken({ repositories: ["redesignhealth/alpha"], env, fetchImpl, now: () => T0 });
+    await Promise.all([run(), run(), run()]);
+    expect(mints(calls)).toBe(1);
+    expect(calls.filter((call) => call.url.endsWith("/app"))).toHaveLength(1);
+  });
+
+  it("logs the GitHub status category, not the response", async () => {
+    const { logger } = await import("../middleware/logger.js");
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const unauthorized = vi.fn(async () => json({ message: "nope" }, 401)) as unknown as typeof fetch;
+    await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/r"], env, fetchImpl: unauthorized, now: () => T0 });
+    expect(warn).toHaveBeenCalledWith({ reason: "github_http_401" }, expect.any(String));
+    warn.mockRestore();
+  });
+
+  it("never leaks the key, JWT, or token through failures", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    // 403 makes the client read the response body, so the secret is actually in play.
+    const failing = vi.fn(async () => json({ message: "Bad credentials ghs_secret_in_body" }, 403)) as unknown as typeof fetch;
+    const result = await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/r"], env, fetchImpl: failing, now: () => T0 });
+    expect(result).toEqual({ ok: false, error: "GitHub App installation credentials are temporarily unavailable" });
+    const bad = await mintGitHubAppInstallationToken({
+      repositories: ["redesignhealth/r"], env: { ...env, PAPERCLIP_GITHUB_APP_PRIVATE_KEY: "not-a-key-SENTINEL" }, fetchImpl: failing, now: () => T0,
+    });
+    const text = JSON.stringify([result, bad, spy.mock.calls, log.mock.calls]);
+    expect(text).not.toMatch(/ghs_secret|SENTINEL|BEGIN|Bearer/);
+    spy.mockRestore();
+    log.mockRestore();
+  });
+});

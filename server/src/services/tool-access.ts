@@ -13689,7 +13689,8 @@ export function toolAccessService(
       if (
         config.sourceTemplateKey !== "github" ||
         oauth.connectorProfile !== "github.code" ||
-        !grant.providerTenant?.github
+        !grant.providerTenant?.github ||
+        grant.providerTenant.github.appInstallation === true
       )
         return false;
       const expiresAt = grant.providerTenant.oauth?.accessTokenExpiresAt;
@@ -21930,6 +21931,101 @@ export function toolAccessService(
           kind: grant.kind,
           isDefault: grant.isDefault,
         },
+      });
+      return toConnectionGrant(grant);
+    },
+
+    /**
+     * Dedicated agent grant backed by the server's GitHub App installation (TECH-9803). No
+     * credential is stored: tokens are minted per credential request, scoped to `repositories`.
+     * Re-posting for the same agent replaces that agent's repository list.
+     */
+    addGitHubAppAgentGrant: async (
+      idOrUid: string,
+      input: { agentId: string; repositories: string[] },
+      actor?: ActorInfo,
+    ) => {
+      const connection = await getConnectionRow(idOrUid);
+      await assertConnectionAvailableInCompany(db, connection);
+      if (connection.config?.sourceTemplateKey !== "github") {
+        throw unprocessable("GitHub App grants require a GitHub connection", { code: "github_app_grant_requires_github" });
+      }
+      const repositories = [...new Set(input.repositories.map((value) => value.trim()))];
+      if (repositories.length === 0 || repositories.length > 50
+        || repositories.some((value) => !/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(value) || value.endsWith("/.") || value.endsWith("/.."))) {
+        throw unprocessable("Provide 1-50 repositories as owner/name", { code: "github_app_grant_invalid_repositories" });
+      }
+      const [agent] = await db.select({ id: agents.id }).from(agents).where(and(
+        eq(agents.id, input.agentId), eq(agents.companyId, connection.companyId),
+      )).limit(1);
+      if (!agent) throw badRequest("Dedicated identity requires an agent in this company");
+      const [install] = await db.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+        eq(toolConnectionInstalls.companyId, connection.companyId),
+        eq(toolConnectionInstalls.connectionId, connection.id),
+        or(
+          and(eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, connection.companyId)),
+          and(eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, input.agentId)),
+        ),
+      )).limit(1);
+      if (!install) {
+        throw unprocessable("Install the GitHub connection for this company or agent first", { code: "github_app_grant_not_installed" });
+      }
+      const providerTenant = {
+        name: "GitHub App installation",
+        github: {
+          userId: "github-app", login: "github-app", installationCount: 1,
+          repositoryCount: repositories.length, repositorySelection: "selected" as const,
+          installationIds: [], installationOwnerLogins: [],
+          repositories: repositories.map((fullName) => ({ id: fullName, fullName, installationId: "app" })),
+          appInstallation: true,
+        },
+      };
+      const binding = actorBinding(actor);
+      // connection_grants is unique on (connection, agent), so reuse any prior row for this pair.
+      const [existing] = await db.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, connection.companyId),
+        eq(connectionGrants.connectionId, connection.id),
+        eq(connectionGrants.subjectAgentId, input.agentId),
+      )).limit(1);
+      if (existing && existing.status === "active" && existing.providerTenant?.github?.appInstallation !== true) {
+        throw conflict("This agent already has a dedicated grant on this connection; revoke it first", {
+          code: "github_app_grant_existing_grant",
+        });
+      }
+      const otherGrants = await db.select({ id: connectionGrants.id, config: toolConnections.config }).from(connectionGrants)
+        .innerJoin(toolConnections, and(
+          eq(toolConnections.id, connectionGrants.connectionId),
+          eq(toolConnections.companyId, connectionGrants.companyId),
+        )).where(and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.kind, "agent"),
+          eq(connectionGrants.subjectAgentId, input.agentId),
+          eq(connectionGrants.status, "active"),
+          ne(connectionGrants.connectionId, connection.id),
+        ));
+      if (otherGrants.some((row) => row.config?.sourceTemplateKey === "github")) {
+        throw conflict("This agent already has an active dedicated grant on another connection; revoke it first", {
+          code: "github_app_grant_existing_grant",
+        });
+      }
+      const [grant] = existing
+        ? await db.update(connectionGrants).set({
+            providerTenant, credentialSecretRefs: [], status: "active", revokedAt: null,
+            revokedByAgentId: null, revokedByUserId: null, updatedAt: new Date(),
+          }).where(eq(connectionGrants.id, existing.id)).returning()
+        : await db.insert(connectionGrants).values({
+            companyId: connection.companyId, connectionId: connection.id, kind: "agent",
+            subjectAgentId: input.agentId, providerTenant, credentialSecretRefs: [], status: "active",
+            createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
+            createdByUserId: binding.actorType === "user" ? binding.actorId : null,
+          }).returning();
+      if (!grant) throw new Error("Failed to create GitHub App grant");
+      await db.insert(toolAccessAuditEvents).values({
+        companyId: connection.companyId, connectionId: connection.id,
+        actorType: binding.actorType ?? "system", actorId: binding.actorId,
+        action: existing ? "connection_grant.updated" : "connection_grant.created",
+        outcome: "success", reasonCode: "github_app_grant",
+        details: { grantId: grant.id, kind: grant.kind, subjectAgentId: input.agentId, repositories },
       });
       return toConnectionGrant(grant);
     },

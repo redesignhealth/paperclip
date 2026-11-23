@@ -266,6 +266,7 @@ export interface ConnectionGrant {
       lastAccessRefreshAt?: string;
       lastWebhookAt?: string;
       webhookHealth?: "pending" | "healthy" | "unhealthy";
+      appInstallation?: boolean;
     };
   } | null;
   credentialSecretRefs: ToolCredentialSecretRef[];
