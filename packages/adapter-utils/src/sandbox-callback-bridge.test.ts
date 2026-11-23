@@ -367,6 +367,8 @@ describe("sandbox callback bridge", () => {
     expect(basicDenied.status).toBe(401);
     const basicNoPassword = await fetch(`${bridge.baseUrl}/api/agents/me`, { headers: { authorization: `Basic ${Buffer.from("no-colon").toString("base64")}` } });
     expect(basicNoPassword.status).toBe(401);
+    const basicEmptyPassword = await fetch(`${bridge.baseUrl}/api/agents/me`, { headers: { authorization: basic("") } });
+    expect(basicEmptyPassword.status).toBe(401);
 
     const githubResponse = await fetch(`${bridge.baseUrl}/runtime-tools/github/credentials`, {
       method: "POST",

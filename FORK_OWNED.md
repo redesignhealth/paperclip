@@ -180,3 +180,5 @@ any new fork patch; remove one when the patch is upstreamed.
 
 - `server/src/routes/package-relay.ts` read-only relay to the private Gitea PyPI registry for opted-in builder agents
 - `server/src/__tests__/package-relay.test.ts`
+- `packages/adapter-utils/src/package-relay-env.ts` opt-in uv index settings and bridge route policy for the package relay
+- `packages/adapter-utils/src/package-relay-env.test.ts`

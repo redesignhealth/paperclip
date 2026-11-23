@@ -3231,12 +3231,17 @@ function renderPaperclipWakePromptBody(
   return lines.join("\n").trim();
 }
 
+/** Masks `user:password@` in any URL inside a value (for example `UV_EXTRA_INDEX_URL`), keeping the rest. */
+function redactUrlCredentials(value: string): string {
+  return value.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED_LOG_VALUE}@`);
+}
+
 export function redactEnvForLogs(
   env: Record<string, string>,
 ): Record<string, string> {
   const redacted: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
-    redacted[key] = SENSITIVE_ENV_KEY.test(key) ? REDACTED_LOG_VALUE : value;
+    redacted[key] = SENSITIVE_ENV_KEY.test(key) ? REDACTED_LOG_VALUE : redactUrlCredentials(value);
   }
   return redacted;
 }
