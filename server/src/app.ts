@@ -925,7 +925,7 @@ export async function createApp(
   api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
-  api.use(commsWakeRoutes(db));
+  api.use(commsWakeRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(
     environmentRoutes(db, {
       pluginWorkerManager: workerManager,

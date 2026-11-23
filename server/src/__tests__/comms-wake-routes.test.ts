@@ -60,7 +60,7 @@ describeEmbeddedPostgres("comms board wake route", () => {
       (req as any).actor = { type: "none", source: "none" };
       next();
     });
-    app.use("/api", commsWakeRoutes(db));
+    app.use("/api", commsWakeRoutes(db, { heartbeat: { wakeup: async () => ({ id: randomUUID() }) } }));
     app.use(errorHandler);
     return app;
   }
@@ -164,7 +164,8 @@ describeEmbeddedPostgres("comms board wake route", () => {
 
     const first = await deliver(app, agentId, key, body);
     expect(first.status).toBe(200);
-    expect(first.body).toEqual({ status: "accepted", sessionRef: null });
+    expect(first.body).toMatchObject({ status: "accepted" });
+    const issueId = first.body.sessionRef as string;
 
     const rows = await storedEvents();
     expect(rows).toHaveLength(1);
@@ -177,15 +178,15 @@ describeEmbeddedPostgres("comms board wake route", () => {
       seq: 4,
       messageType: "task_assign",
       boardSessionRef: "board-session-1",
-      issueId: null,
-      commentId: null,
-      outcome: null,
-      sessionRef: null,
+      issueId,
+      outcome: "accepted",
+      sessionRef: issueId,
     });
+    expect(rows[0]!.commentId).toBeTruthy();
 
     const second = await deliver(app, agentId, key, body);
     expect(second.status).toBe(200);
-    expect(second.body).toEqual({ status: "duplicate", sessionRef: null });
+    expect(second.body).toEqual({ status: "duplicate", sessionRef: issueId });
     expect(await storedEvents()).toHaveLength(1);
   });
 
