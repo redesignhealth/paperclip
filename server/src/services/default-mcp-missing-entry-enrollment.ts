@@ -74,7 +74,7 @@ function agentMemoryBackfillSpec(
 }
 
 /**
- * The memory tools entry (TECH-8832) is `newAgentsOnly` too: it joins the missing set only for a Claude or Codex agent,
+ * The memory tools entry (TECH-8832) is `newAgentsOnly` too: it joins the missing set only for a Claude, Codex or Pi agent,
  * while the tools flag is on and the backfill flag is on, both with a valid memory configuration. An agent whose
  * `agent-memory` entry is absent gets nothing here (its setup would wait for a token that nothing provisions).
  */

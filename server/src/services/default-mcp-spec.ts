@@ -523,7 +523,7 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     newAgentsOnly: true,
   },
   {
-    // Explicit memory tools for Claude and Codex agents (TECH-8832). A per-agent gateway connection to the memory
+    // Explicit memory tools for Claude, Codex and Pi agents (TECH-8832, TECH-9795). A per-agent gateway connection to the memory
     // service's MCP endpoint, authenticated with the SAME `agent-memory-<agentId>` token the recall/capture hooks use
     // (one secret, one rotation); the agent only ever sees Paperclip's gateway, never the token or the service URL.
     // `newAgentsOnly` keeps it out of every generic backfill: the missing-entry route adds it per agent behind

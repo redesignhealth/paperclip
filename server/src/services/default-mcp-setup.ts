@@ -1454,7 +1454,7 @@ export const arcanaBrainHook: DefaultMcpSetupHook = async (input) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Gives a Claude or Codex agent explicit memory tools: its own dedicated gateway connection to the memory service's MCP
+ * Gives a Claude, Codex or Pi agent explicit memory tools: its own dedicated gateway connection to the memory service's MCP
  * endpoint. The token is the one the `agent-memory` entry already minted and stored (`agent_memory.<agentId>`), so
  * nothing is minted here, the secret stays single and rotation (which rewrites that secret in place) reaches the gateway
  * connection too. The hook waits until that entry is ready, then runs the same local stage as the other dedicated entries.

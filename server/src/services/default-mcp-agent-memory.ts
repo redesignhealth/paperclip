@@ -22,6 +22,9 @@ import { secretService } from "./secrets.js";
  *                 in-process mem0 route and this one)
  *   claude_local  env.RH_MEMORY_TOKEN (secret reference), env.RH_MEMORY_URL, env.RH_MEMORY_PROXY (optional)
  *   codex_local   the same RH_MEMORY_* keys as claude_local (the image-baked Codex hook reads them)
+ *   pi_local      no env keys at all (TECH-9795): the memory token never goes in the pod. The agent's memory tools reach
+ *                 the service through the MCP relay (`agent-memory-tools` entry), which holds the token on the server.
+ *                 The profile only mints and stores `agent_memory.<agentId>` and marks the agent `memoryExtension`.
  *
  * Disabled unless `PAPERCLIP_AGENT_MEMORY_ENABLED=true` and a valid `PAPERCLIP_AGENT_MEMORY_URL` is set.
  *
@@ -56,12 +59,12 @@ export const AGENT_MEMORY_TOOLS_ENABLED_ENV = "PAPERCLIP_AGENT_MEMORY_TOOLS_ENAB
 
 /** The harness-specific part of the provisioning: which keys the agent's adapterConfig receives. */
 export interface AgentMemoryAdapterProfile {
-  /** env key holding the secret reference to the agent's memory token. */
-  tokenEnvKey: string;
-  /** env key for the memory service base URL. */
-  urlEnvKey: string;
+  /** env key holding the secret reference to the agent's memory token. Absent: the token stays out of the agent's env. */
+  tokenEnvKey?: string;
+  /** env key for the memory service base URL. Absent: the URL stays out of the agent's env. */
+  urlEnvKey?: string;
   /** env key for the optional proxy URL. */
-  proxyEnvKey: string;
+  proxyEnvKey?: string;
   /** env key for the agent id, when the harness wants one. */
   userIdEnvKey?: string;
   /** Extra top-level adapterConfig keys, merged as is. */
@@ -87,6 +90,10 @@ export const AGENT_MEMORY_ADAPTER_PROFILES: Readonly<Record<string, AgentMemoryA
     urlEnvKey: "RH_MEMORY_URL",
     proxyEnvKey: "RH_MEMORY_PROXY",
   },
+  // Pod-safe: no token, URL or proxy in the agent's env (TECH-9795). Memory reaches a Pi agent through the MCP relay.
+  pi_local: {
+    adapterConfig: { memoryExtension: true },
+  },
 });
 
 /**
@@ -106,6 +113,8 @@ export function agentMemoryProfileFor(adapterType: string | null | undefined, ad
   // "hermes_local") would borrow that harness's profile. Only the providers that select Claude or Codex may match.
   if (adapterType === "paperclip_runner" && ![undefined, "codex", "acpx"].includes(config.provider as string | undefined)) return null;
   const harness = agentHarnessType(adapterType, config);
+  // Pi is enrolled as its own adapter type only. A native runner driving Pi over ACP has no Pi memory extension.
+  if (adapterType === "paperclip_runner" && harness === "pi_local") return null;
   return Object.prototype.hasOwnProperty.call(AGENT_MEMORY_ADAPTER_PROFILES, harness) ? AGENT_MEMORY_ADAPTER_PROFILES[harness]! : null;
 }
 
@@ -179,11 +188,11 @@ export function agentMemoryToolsEnabled(env: NodeJS.ProcessEnv = process.env): b
   return env[AGENT_MEMORY_TOOLS_ENABLED_ENV]?.trim().toLowerCase() === "true" && resolveAgentMemoryConfig(env).ok;
 }
 
-/** Claude and Codex harnesses only: Hermes agents use the mem0 provider's own tools. */
+/** Claude, Codex and Pi harnesses: Hermes agents use the mem0 provider's own tools. */
 export function agentMemoryToolsHarness(adapterType: string | null | undefined, adapterConfig?: unknown): boolean {
   if (agentMemoryProfileFor(adapterType, adapterConfig) === null) return false;
   const harness = agentHarnessType(adapterType!, asRecord(adapterConfig));
-  return harness === "claude_local" || harness === "codex_local";
+  return harness === "claude_local" || harness === "codex_local" || harness === "pi_local";
 }
 
 /** Whether a NEW agent of this adapter type gets the memory tools entry at creation. */
@@ -236,14 +245,20 @@ export async function applyAgentMemoryAdapterConfig(
   if (!profile) return false;
   const current = asRecord(row.adapterConfig);
   const currentEnv = asRecord(current.env);
-  const env: Record<string, unknown> = {
-    ...currentEnv,
-    [profile.tokenEnvKey]: { type: "secret_ref", secretId: input.secretId, version: "latest" },
-    [profile.urlEnvKey]: { type: "plain", value: input.config.url },
-  };
+  const env: Record<string, unknown> = { ...currentEnv };
+  // A pod-safe profile (no token env key) removes the other profiles' memory keys, so an agent that was Claude, Codex or
+  // Hermes before it became Pi does not carry a memory token into its pod.
+  if (!profile.tokenEnvKey) {
+    for (const other of Object.values(AGENT_MEMORY_ADAPTER_PROFILES)) {
+      for (const key of [other.tokenEnvKey, other.urlEnvKey, other.proxyEnvKey, other.userIdEnvKey]) if (key) delete env[key];
+    }
+    delete env[RH_MEMORY_CAPTURE_KEY];
+  }
+  if (profile.tokenEnvKey) env[profile.tokenEnvKey] = { type: "secret_ref", secretId: input.secretId, version: "latest" };
+  if (profile.urlEnvKey) env[profile.urlEnvKey] = { type: "plain", value: input.config.url };
   if (profile.userIdEnvKey) env[profile.userIdEnvKey] = { type: "plain", value: input.agentId };
   // No configured proxy leaves whatever the agent already has: every other key is kept.
-  if (input.config.proxy) env[profile.proxyEnvKey] = { type: "plain", value: input.config.proxy };
+  if (profile.proxyEnvKey && input.config.proxy) env[profile.proxyEnvKey] = { type: "plain", value: input.config.proxy };
 
   const harness = agentHarnessType(row.adapterType, current);
   if (harness === "claude_local" || harness === "codex_local") {

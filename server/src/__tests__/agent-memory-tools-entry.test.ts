@@ -110,13 +110,17 @@ describe("agent memory tools eligibility", () => {
     expect(agentMemoryToolsEnabled({})).toBe(false);
   });
 
-  it("applies to Claude and Codex harnesses only, never Hermes or an unprofiled adapter", () => {
+  it("applies to Claude, Codex and Pi harnesses only, never Hermes or an unprofiled adapter", () => {
+    expect(agentMemoryToolsHarness("pi_local", {})).toBe(true);
+    expect(agentMemoryToolsHarness("paperclip_runner", { provider: "acpx", acpxAgent: "pi" })).toBe(false);
     expect(agentMemoryToolsHarness("claude_local", {})).toBe(true);
     expect(agentMemoryToolsHarness("codex_local", {})).toBe(true);
     expect(agentMemoryToolsHarness("hermes_local", {})).toBe(false);
     expect(agentMemoryToolsHarness("process", {})).toBe(false);
     expect(agentMemoryToolsHarness(null, {})).toBe(false);
     expect(agentMemoryToolsEligibleForNewAgent("claude_local", {}, ON)).toBe(true);
+    expect(agentMemoryToolsEligibleForNewAgent("pi_local", {}, ON)).toBe(true);
+    expect(agentMemoryToolsEligibleForNewAgent("pi_local", {}, {})).toBe(false);
     expect(agentMemoryToolsEligibleForNewAgent("hermes_local", {}, ON)).toBe(false);
     expect(agentMemoryToolsEligibleForNewAgent("claude_local", {}, {})).toBe(false);
   });
@@ -139,9 +143,10 @@ describe("missing-entry enrollment of the memory tools", () => {
     expect(missingEntryEligibleSpec().map((entry) => entry.key)).not.toContain(AGENT_MEMORY_TOOLS_ENTRY_KEY);
   });
 
-  it("joins the missing set for a Claude or Codex agent that already has agent-memory, with both flags and the backfill flag", () => {
+  it("joins the missing set for a Claude, Codex or Pi agent that already has agent-memory, with both flags and the backfill flag", () => {
     expect(agentMemoryToolsBackfillSpec(ON, claude, raw).map((entry) => entry.key)).toEqual([AGENT_MEMORY_TOOLS_ENTRY_KEY]);
     expect(agentMemoryToolsBackfillSpec(ON, { adapterType: "codex_local", adapterConfig: {} }, raw)).toHaveLength(1);
+    expect(agentMemoryToolsBackfillSpec(ON, { adapterType: "pi_local", adapterConfig: {} }, raw)).toHaveLength(1);
   });
 
   it("is empty for Hermes, without an agent-memory entry, or when any flag is off", () => {
