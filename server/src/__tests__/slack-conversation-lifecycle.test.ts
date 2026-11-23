@@ -12,7 +12,7 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { settleSlackConversation } from "../services/slack-conversation-lifecycle.js";
-import { externalConversationStateSql, resumeExternalConversation } from "../services/slack-conversation-state.js";
+import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeExternalConversation } from "../services/slack-conversation-state.js";
 import { executionIssueCondition } from "../services/issue-visibility.js";
 import { dashboardService } from "../services/dashboard.js";
 import { attentionService } from "../services/attention.js";
@@ -88,6 +88,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(results.results.find((result) => result.issue?.id === f.issueId)?.issue?.externalConversationState).toBe("waiting");
     expect((await issueService(db).list(f.companyId, { q: "you there" }))[0]?.externalConversationState).toBe("waiting");
     expect((await issueService(db).listReviewAttention(f.companyId, [{ id: f.issueId, companyId: f.companyId, status: "in_review" }])).get(f.issueId)?.state).toBe("none");
+  });
+
+  it("nonIdleSlackIssueCondition excludes only a waiting in_review issue", async () => {
+    const visible = async (f: Awaited<ReturnType<typeof fixture>>) =>
+      (await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, f.issueId), nonIdleSlackIssueCondition()))).length;
+    const active = await fixture();
+    expect(await visible(active)).toBe(1); // in_progress with an active conversation
+    const waiting = await fixture();
+    await settle(waiting);
+    expect(await visible(waiting)).toBe(0); // in_review + waiting conversation
+    await db.update(chatConversations).set({ state: "active" }).where(eq(chatConversations.id, waiting.conversationId));
+    expect(await visible(waiting)).toBe(1); // in_review but the conversation is not waiting
+    const plain = await fixture();
+    await db.delete(chatConversations).where(eq(chatConversations.id, plain.conversationId));
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, plain.issueId));
+    expect(await visible(plain)).toBe(1); // in_review with no conversation at all
   });
 
   it("settles and resumes Speko-owned tasks without adopting existing task lifecycles", async () => {

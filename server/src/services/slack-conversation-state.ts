@@ -38,7 +38,12 @@ export function externalConversationStateSql() {
 }
 
 export function nonIdleSlackIssueCondition() {
-  return sql`${externalConversationStateSql()} is distinct from 'waiting'`;
+  // Only an in_review issue can be 'waiting'. Test that first so list and queue
+  // queries skip the correlated state subquery for every other issue. Postgres
+  // evaluates OR operands left to right, so the subquery runs only for
+  // in_review rows. The result is unchanged: non-in_review rows are never
+  // 'waiting', so they were always "distinct from 'waiting'".
+  return sql`("issues"."status" <> 'in_review' or ${externalConversationStateSql()} is distinct from 'waiting')`;
 }
 
 /** Called inside message admission while its transaction owns the issue lock. */
