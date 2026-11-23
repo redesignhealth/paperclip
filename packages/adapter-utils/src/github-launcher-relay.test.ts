@@ -33,10 +33,11 @@ async function run(extra: Record<string, string>) {
 describe("github launcher keeps the git relay rules (TECH-9786)", () => {
   it("appends the relay insteadOf rules after the launcher's own entries", async () => {
     const env = await run({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: RELAY_KEY, GIT_CONFIG_VALUE_0: "https://github.com/redesignhealth/rh-maiea" });
-    expect(env.GIT_CONFIG_COUNT).toBe("6");
+    expect(env.GIT_CONFIG_COUNT).toBe("7");
     expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
     expect(env.GIT_CONFIG_KEY_5).toBe(RELAY_KEY);
     expect(env.GIT_CONFIG_VALUE_5).toBe("https://github.com/redesignhealth/rh-maiea");
+    expect([env.GIT_CONFIG_KEY_6, env.GIT_CONFIG_VALUE_6]).toEqual(["safe.directory", "/workspace"]);
   });
 
   it("still drops any other GIT_CONFIG_* an agent supplies, and relay-shaped rules for another host or token", async () => {
@@ -46,12 +47,12 @@ describe("github launcher keeps the git relay rules (TECH-9786)", () => {
       GIT_CONFIG_KEY_1: `url.http://paperclip:${TOKEN}@evil.example.com:1/api/package-relay/github/x/y.insteadOf`, GIT_CONFIG_VALUE_1: "https://github.com/x/y",
       GIT_CONFIG_KEY_2: "url.http://paperclip:other-token@127.0.0.1:41234/api/package-relay/github/x/y.insteadOf", GIT_CONFIG_VALUE_2: "https://github.com/x/y",
     });
-    expect(env.GIT_CONFIG_COUNT).toBe("5");
+    expect(env.GIT_CONFIG_COUNT).toBe("6");
     expect(Object.values(env).join("\n")).not.toMatch(/evil|other-token/);
   });
 
   it("refuses a relay-shaped rule that rewrites something other than a github.com URL", async () => {
     const env = await run({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: RELAY_KEY, GIT_CONFIG_VALUE_0: "https://evil.example.com/x" });
-    expect(env.GIT_CONFIG_COUNT).toBe("5");
+    expect(env.GIT_CONFIG_COUNT).toBe("6");
   });
 });
