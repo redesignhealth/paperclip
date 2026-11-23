@@ -123,6 +123,13 @@ describe("package relay (TECH-9786)", () => {
     expect(off.fetchImpl).not.toHaveBeenCalled();
     const httpOnly = build({ env: { ...env, [PACKAGE_RELAY_GITEA_URL_ENV]: "http://gitea.example.com/pypi" } as NodeJS.ProcessEnv });
     await request(httpOnly.app).get(`${BASE}/simple/rh-auth/`).expect(503);
+    // One bad entry invalidates the whole list; it is never dropped silently. Both routes fail closed.
+    for (const packages of ["rh-auth,rh lib", "rh-auth;rh-lib", ""]) {
+      const bad = build({ env: { ...env, [PACKAGE_RELAY_GITEA_PACKAGES_ENV]: packages } as NodeJS.ProcessEnv });
+      await request(bad.app).get(`${BASE}/simple/rh-auth/`).expect(503);
+      await request(bad.app).get(`${BASE}/files/rh-auth/1.0/rh_auth-1.0.whl`).expect(503);
+      expect(bad.fetchImpl).not.toHaveBeenCalled();
+    }
     const noToken = build({ token: null });
     await request(noToken.app).get(`${BASE}/simple/rh-auth/`).expect(403);
     expect(noToken.fetchImpl).not.toHaveBeenCalled();

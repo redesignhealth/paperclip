@@ -11,7 +11,8 @@ import { secretService } from "../services/secrets.js";
  * extra index at the sandbox bridge, which forwards here with the run JWT. This server adds the Gitea read token, so the
  * credential never enters the pod. Fixed surface, GET only: `simple/:package/` and `files/:package/:version/:filename`.
  * The relay answers 503 (fail closed) when it is not configured, and 404 for a package name not on the allowlist, so
- * the installer falls through to the public index only for names that are not private. The upstream is ONLY the server's configured `PAPERCLIP_PACKAGE_RELAY_GITEA_URL`, and only for packages named in
+ * the installer reaches the public index only for names that are not on the allowlist. (A 404 that Gitea itself returns
+ * for an allowlisted name, for example a package not yet published, is passed through.) The upstream is ONLY the server's configured `PAPERCLIP_PACKAGE_RELAY_GITEA_URL`, and only for packages named in
  * `PAPERCLIP_PACKAGE_RELAY_GITEA_PACKAGES`; nothing in a request can choose the host, the path or another package.
  * Only agents that opt in (adapterConfig env `PAPERCLIP_PACKAGE_RELAY` lists `gitea`) may use it, so the registry is not
  * opened to every sandbox agent. The token is the company secret `package_relay.gitea`.
@@ -100,8 +101,11 @@ export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
 
   function giteaConfig(): { base: string; packages: Set<string>; user: string } | null {
     const url = env[PACKAGE_RELAY_GITEA_URL_ENV]?.trim().replace(/\/+$/, "");
-    const packages = (env[PACKAGE_RELAY_GITEA_PACKAGES_ENV] ?? "").split(",").map((p) => normalizePackageName(p.trim())).filter((p) => NAME_RE.test(p));
-    if (!url || packages.length === 0) return null;
+    const entries = (env[PACKAGE_RELAY_GITEA_PACKAGES_ENV] ?? "").split(",").map((p) => p.trim()).filter(Boolean);
+    const packages = entries.map(normalizePackageName);
+    // Any invalid entry makes the whole configuration invalid. Silently dropping one would turn that private name into
+    // a 404, which sends the installer to the public index.
+    if (!url || packages.length === 0 || !packages.every((p) => NAME_RE.test(p))) return null;
     let parsed: URL;
     try {
       parsed = new URL(url);
