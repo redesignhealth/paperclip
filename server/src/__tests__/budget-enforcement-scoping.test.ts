@@ -223,22 +223,31 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(reserveRunBudget(db, f.companyId, await f.queuedRun(), otherProject.id)).resolves.toMatchObject({ reused: false });
   });
 
-  it("keeps missing-price terminal work held until accounting evidence arrives", async () => {
-    const f = await fixture();
+  it("does not block or pause on a finished run whose cost accounting is still pending", async () => {
+    const f = await fixture({ amount: 50000 });
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
-    expect(await budgetService(db).getInvocationBlock(f.companyId, f.agentId, { projectId: f.projectId })).not.toBeNull();
+    expect(await budgetService(db).getInvocationBlock(f.companyId, f.agentId, { projectId: f.projectId })).toBeNull();
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agent.lifecycleHolds).not.toContain("budget");
+    expect(await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, f.policy.id)).then(rows => rows[0].hardStopEnabled)).toBe(true);
     expect(await f.exposure()).toMatchObject({ pendingTerminalRunCount: 1, ledgerCents: "0.0000000", liveObservedCents: "0.0000000" });
     expect(await accountRunCost(db, f.runId)).toBe(false);
     expect((await f.readRun()).costAccountingPending).toBe(true);
     expect(await db.select().from(costEvents).where(and(eq(costEvents.companyId, f.companyId), eq(costEvents.heartbeatRunId, f.runId)))).toHaveLength(0);
   });
 
-  it.each(["pre-provider release", "stale pending marker"])("releases accounting-induced holds after %s", async kind => {
+  it("blocks on actual spend over the limit even while another run is pending", async () => {
+    const f = await fixture({ amount: 100 });
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, provider: "test", biller: "test", billingType: "metered_api",
+      model: "budget-fixture", inputTokens: 1, outputTokens: 1, costCents: 150, occurredAt: new Date() });
+    expect(await budgetService(db).getInvocationBlock(f.companyId, f.agentId, { projectId: f.projectId })).not.toBeNull();
+  });
+
+  it.each(["pre-provider release", "stale pending marker"])("clears the pending marker after %s without a budget hold", async kind => {
     const f = await fixture();
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
-    expect(await budgetService(db).getInvocationBlock(f.companyId, f.agentId, { projectId: f.projectId })).not.toBeNull();
-    const [held] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    expect(held.lifecycleHolds).toContain("budget");
+    expect(await budgetService(db).getInvocationBlock(f.companyId, f.agentId, { projectId: f.projectId })).toBeNull();
     await db.update(heartbeatRuns).set(kind === "pre-provider release"
       ? { resultJson: { executionRecovery: { providerWorkStarted: false } } }
       : { costAccountedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));

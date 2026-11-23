@@ -186,7 +186,9 @@ function unpricedUsageBlocks(policy: PolicyRow, observed: ObservedSpend) {
 
 function observedBlocks(policy: PolicyRow, observed: Awaited<ReturnType<typeof computeObservedSpend>>) {
   if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
-  return compareCents(observed.totalExact, policy.amount) >= 0 || (observed.pendingRunCount - observed.recoveringRunCount) > 0 || unpricedUsageBlocks(policy, observed);
+  // Runs still awaiting cost accounting are not spend: they neither count as
+  // over the limit nor block. A stale pending run must not trip a new hard stop.
+  return compareCents(observed.totalExact, policy.amount) >= 0 || unpricedUsageBlocks(policy, observed);
 }
 export async function policyBlocks(db: Db, policy: PolicyRow) {
   if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
@@ -586,9 +588,6 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         await createIncidentIfNeeded(policy, "hard", observed);
         await pauseAndCancelScopeForBudget(policy, !scope.budgetHeld);
         const title = scopeType === "company" ? "Company" : scopeType === "agent" ? "Agent" : "Project";
-        if (observed.pendingRunCount > 0) {
-          return { scopeType, scopeId, scopeName: scope.name, reason: `${title} cannot start work while completed runs await accounting.` };
-        }
         if (unpricedUsageBlocks(policy, observed)) {
           return { scopeType, scopeId, scopeName: scope.name, reason: `${title} cannot start work because recorded usage has no reliable price.` };
         }
@@ -917,7 +916,6 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         if (unpricedUsageBlocks(policy, observed)) {
           throw unprocessable("Resolve unpriced usage or explicitly allow it in the budget policy before resuming");
         }
-        if (observed.pendingRunCount > 0) throw unprocessable("Completed runs must finish accounting before resuming");
         if (compareCents(observed.totalExact, nextAmount) >= 0) {
           throw unprocessable("New budget must exceed current observed spend");
         }
