@@ -81,6 +81,8 @@ own policy and access review.
 
 Gaps: Read API exists; no agent-write path for budget policies, including agents with
 ordinary company access.
+The sandbox callback bridge allowlists only `GET .../budgets/overview` (not
+`/budgets/policies`); company and cost-read checks stay server-side.
 
 ## `incidents`
 

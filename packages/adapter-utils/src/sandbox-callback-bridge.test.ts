@@ -1623,6 +1623,9 @@ describe("sandbox callback bridge", () => {
     { method: "GET", path: "/api/heartbeat-runs/run-1/provider-trace" },
     { method: "GET", path: "/api/companies/co-1/provider-traces" },
     { method: "GET", path: "/api/companies/co-1/execution-workspaces" },
+    { method: "POST", path: "/api/companies/co-1/budgets/overview" },
+    { method: "GET", path: "/api/companies/co-1/budgets/policies" },
+    { method: "GET", path: "/api/companies/co-1/budgets/overview/extra" },
   ])("keeps execution control and unrelated reads denied: $method $path", (request) => {
     expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request))
       .toBe(`Route not allowed: ${request.method} ${request.path}`);
@@ -1641,6 +1644,7 @@ describe("sandbox callback bridge", () => {
       { method: "PATCH", path: "/api/agents/agent-1/instructions-path" },
       { method: "GET", path: "/api/companies/co-1" },
       { method: "GET", path: "/api/companies/co-1/dashboard" },
+      { method: "GET", path: "/api/companies/co-1/budgets/overview" },
       { method: "GET", path: "/api/companies/co-1/agents" },
       { method: "GET", path: "/api/companies/co-1/issues" },
       { method: "GET", path: "/api/companies/co-1/projects" },
