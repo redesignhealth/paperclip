@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Fixture } from './upstream-sync-fixture.mjs';
 import { computeResolutionDiff } from '../upstream-sync/commands/resolution-diff.mjs';
 import { LIMITS, countChangedLines, buildResolutionDiff as buildResolutionDiffDirect } from '../upstream-sync/lib/resolutiondiff.mjs';
-import { submit, judgeVerdict, NOTES_REF } from '../upstream-sync/commands/submit.mjs';
+import { submit, judgeVerdict, submittedRounds, NOTES_REF } from '../upstream-sync/commands/submit.mjs';
 
 const CLI = fileURLToPath(new URL('../upstream-sync/cli.mjs', import.meta.url));
 
@@ -279,27 +279,76 @@ test('countChangedLines counts lines that start with ++ or -- inside hunks', () 
   assert.equal(countChangedLines(diff), 3);
 });
 
-test('a rejected notes push is reported, and rounds recorded here survive the next fetch', async () => {
-  const { fx } = syncBranch();
+function remoteWithHook(fx, rejectNotes) {
   const remote = mkdtempSync(join(tmpdir(), 'upstream-sync-remote-'));
-  try {
-    execFileSync('git', ['init', '-q', '--bare', remote]);
-    fx.git('remote', 'add', 'origin', remote);
-    fx.git('push', '-q', 'origin', 'sync', 'master');
-    // a pre-receive hook that rejects the notes ref, so the push fails
+  execFileSync('git', ['init', '-q', '--bare', remote]);
+  fx.git('remote', 'add', 'origin', remote);
+  fx.git('push', '-q', 'origin', 'sync', 'master');
+  if (rejectNotes) {
     writeFileSync(join(remote, 'hooks', 'pre-receive'), '#!/bin/sh\nwhile read a b ref; do case "$ref" in refs/notes/*) exit 1;; esac; done\n', { mode: 0o755 });
+  }
+  return remote;
+}
+
+test('a rejected notes push is reported, and retried on the next submit', async () => {
+  const { fx } = syncBranch();
+  let remote;
+  let v;
+  try {
+    remote = remoteWithHook(fx, true);
     const first = await submit(fx.dir, {});
-    const v = writeVerdict(fx, first);
+    v = writeVerdict(fx, first);
     const done = await submit(fx.dir, { verdict: v });
     assert.equal(done.exit, 0);
     assert.match(done.warning, /could not be pushed/);
-    // the next submit merges remote notes in rather than replacing the local ones
+    // the round is still known locally, and the next submit warns again rather than staying silent
     const again = await submit(fx.dir, { verdict: v });
     assert.equal(again.round, 1);
-    assert.match(fx.git('notes', `--ref=${NOTES_REF}`, 'show', first.head), /"round":1/);
-    rmSync(v, { force: true });
+    assert.match(again.warning, /could not be pushed/);
+    // once origin accepts notes, the next submit pushes the stored round
+    rmSync(join(remote, 'hooks', 'pre-receive'));
+    const healed = await submit(fx.dir, { verdict: v });
+    assert.equal(healed.warning, undefined);
+    assert.match(execFileSync('git', ['--git-dir', remote, 'notes', `--ref=${NOTES_REF}`, 'show', first.head], { encoding: 'utf8' }), /"round":1/);
   } finally {
-    rmSync(remote, { recursive: true, force: true });
+    if (v) rmSync(v, { force: true });
+    if (remote) rmSync(remote, { recursive: true, force: true });
+    fx.cleanup();
+  }
+});
+
+test('rounds recorded on another pod are merged in, never replaced, and concurrent notes on one commit both count', async () => {
+  const { fx } = syncBranch();
+  const other = mkdtempSync(join(tmpdir(), 'upstream-sync-other-'));
+  let remote;
+  let v;
+  try {
+    remote = remoteWithHook(fx, false);
+    const head = fx.git('rev-parse', 'HEAD');
+    const base = fx.git('merge-base', 'HEAD', 'origin/master');
+    // another pod already used a round on this very head, with a different diff, and pushed it
+    execFileSync('git', ['clone', '-q', remote, other]);
+    execFileSync('git', ['-C', other, 'notes', `--ref=${NOTES_REF}`, 'append', '-m', JSON.stringify({ round: 1, digest: 'sha256:other-pod' }), head], {
+      env: { ...process.env, GIT_COMMITTER_NAME: 'x', GIT_COMMITTER_EMAIL: 'x@x', GIT_AUTHOR_NAME: 'x', GIT_AUTHOR_EMAIL: 'x@x' },
+    });
+    execFileSync('git', ['-C', other, 'push', '-q', 'origin', `${NOTES_REF}:${NOTES_REF}`]);
+    // this pod records its own round on the same head
+    const mine = await submit(fx.dir, { maxRounds: 3 });
+    assert.equal(mine.round, 2, 'the other pod\'s round is counted');
+    v = writeVerdict(fx, mine);
+    assert.equal((await submit(fx.dir, { verdict: v, maxRounds: 3 })).exit, 0);
+    const rounds = submittedRounds(fx.dir, base, head);
+    assert.deepEqual(rounds.map((r) => r.digest).sort(), ['sha256:other-pod', mine.digest].sort());
+    // a note nobody can parse still uses a round
+    fx.git('notes', `--ref=${NOTES_REF}`, 'append', '-m', 'garbage', head);
+    assert.equal(submittedRounds(fx.dir, base, head).length, 3);
+    // an unreachable origin fails closed instead of reading as "no rounds"
+    fx.git('remote', 'set-url', 'origin', '/nonexistent/remote');
+    await assert.rejects(submit(fx.dir, { maxRounds: 3 }), /cannot read the round state from origin/);
+  } finally {
+    if (v) rmSync(v, { force: true });
+    rmSync(other, { recursive: true, force: true });
+    if (remote) rmSync(remote, { recursive: true, force: true });
     fx.cleanup();
   }
 });

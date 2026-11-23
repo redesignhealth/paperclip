@@ -22,19 +22,31 @@ export const NOTES_REF = "refs/notes/upstream-sync-review";
 export const DEFAULT_MAX_ROUNDS = 3; // TECH-9804
 const SIZE_HALTS = /^scope_|too_large|input_chars|input_size|diff_size|size_limit/i;
 
-/** Submitted heads on the first-parent chain base..head, from the notes ref. */
+/**
+ * Submitted rounds on the first-parent chain base..head, from the notes ref. A note holds one JSON object per line
+ * (concurrent pods that note the same commit are union-merged, which concatenates lines). Returns one entry per
+ * distinct (commit, digest).
+ */
 export function submittedRounds(cwd, base, head) {
-  const chain = new Set(gitOut(cwd, ["rev-list", "--first-parent", `${base}..${head}`], { allowFail: true }).split("\n").filter(Boolean));
+  const chain = new Set(gitOut(cwd, ["rev-list", "--first-parent", `${base}..${head}`]).split("\n").filter(Boolean));
   const listed = git(cwd, ["notes", `--ref=${NOTES_REF}`, "list"], { allowFail: true }).stdout.split("\n").filter(Boolean);
   const rounds = [];
+  const seen = new Set();
   for (const line of listed) {
     const [, commit] = line.split(" ");
     if (!chain.has(commit)) continue;
-    const text = git(cwd, ["notes", `--ref=${NOTES_REF}`, "show", commit], { allowFail: true }).stdout;
-    try {
-      rounds.push({ commit, ...JSON.parse(text) });
-    } catch {
-      rounds.push({ commit });
+    const text = git(cwd, ["notes", `--ref=${NOTES_REF}`, "show", commit]).stdout;
+    for (const entryLine of text.split("\n").filter(Boolean)) {
+      let entry;
+      try {
+        entry = JSON.parse(entryLine);
+      } catch {
+        entry = { malformed: true }; // an unreadable line still counts as a used round: fail closed
+      }
+      const key = `${commit}:${entry.digest ?? entryLine}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rounds.push({ commit, ...entry });
     }
   }
   return rounds;
@@ -76,26 +88,49 @@ export function judgeVerdict(verdict, { head, digest }) {
 
 const NOTES_REMOTE_REF = "refs/notes/upstream-sync-review-remote";
 const NOTES_ENV = { GIT_COMMITTER_NAME: "upstream-sync", GIT_COMMITTER_EMAIL: "upstream-sync@localhost", GIT_AUTHOR_NAME: "upstream-sync", GIT_AUTHOR_EMAIL: "upstream-sync@localhost" };
+const refSha = (cwd, ref) => {
+  const r = git(cwd, ["rev-parse", "--verify", "-q", ref], { allowFail: true });
+  return r.status === 0 ? r.stdout.trim() : null;
+};
 
-/** Fold origin's notes into the local ones (union, so no round is ever dropped). */
+/**
+ * Fold origin's notes into the local ones (union, so no round is dropped). Fails closed: only "origin has no notes
+ * ref" counts as an empty remote. Any other fetch or merge failure throws, because the cap needs the real count.
+ */
 function mergeRemoteNotes(cwd) {
   const fetched = git(cwd, ["fetch", "-q", "origin", `+${NOTES_REF}:${NOTES_REMOTE_REF}`], { allowFail: true });
-  if (fetched.status !== 0) return; // origin has no notes yet
-  const local = git(cwd, ["rev-parse", "--verify", "-q", NOTES_REF], { allowFail: true }).status === 0;
-  if (!local) git(cwd, ["update-ref", NOTES_REF, NOTES_REMOTE_REF]);
-  else git(cwd, ["notes", `--ref=${NOTES_REF}`, "merge", "-s", "union", NOTES_REMOTE_REF], { allowFail: true, env: NOTES_ENV });
+  if (fetched.status !== 0) {
+    if (/couldn't find remote ref/i.test(fetched.stderr)) return;
+    throw new Error(`cannot read the round state from origin: ${fetched.stderr.trim()}`);
+  }
+  try {
+    if (!refSha(cwd, NOTES_REF)) git(cwd, ["update-ref", NOTES_REF, NOTES_REMOTE_REF]);
+    else git(cwd, ["notes", `--ref=${NOTES_REF}`, "merge", "-s", "union", NOTES_REMOTE_REF], { env: NOTES_ENV });
+  } finally {
+    git(cwd, ["update-ref", "-d", NOTES_REMOTE_REF], { allowFail: true });
+  }
 }
 
-/** Push the notes without force; on a race, merge and push once more. Returns whether origin has them. */
+/** Push the notes without force. A race (non-fast-forward) is merged and retried once; anything else is reported. */
 function pushNotes(cwd) {
-  const push = () => git(cwd, ["push", "-q", "origin", `${NOTES_REF}:${NOTES_REF}`], { allowFail: true }).status === 0;
-  if (push()) return true;
+  const push = () => git(cwd, ["push", "-q", "origin", `${NOTES_REF}:${NOTES_REF}`], { allowFail: true });
+  const first = push();
+  if (first.status === 0) return true;
+  if (!/non-fast-forward|fetch first|\(fetch first\)/i.test(first.stderr)) return false;
   mergeRemoteNotes(cwd);
-  return push();
+  return push().status === 0;
+}
+
+/** After merging, push any local rounds origin does not have yet (a failed push is retried on the next submit). */
+function ensureNotesPushed(cwd) {
+  const local = refSha(cwd, NOTES_REF);
+  if (!local) return true;
+  const remote = git(cwd, ["ls-remote", "origin", NOTES_REF], { allowFail: true }).stdout.split("\t")[0].trim();
+  return remote === local ? true : pushNotes(cwd);
 }
 
 function recordRound(cwd, head, digest, round) {
-  git(cwd, ["notes", `--ref=${NOTES_REF}`, "add", "-f", "-m", JSON.stringify({ round, digest, at: new Date().toISOString() }), head], {
+  git(cwd, ["notes", `--ref=${NOTES_REF}`, "append", "-m", JSON.stringify({ round, digest, at: new Date().toISOString() }), head], {
     env: NOTES_ENV,
   });
 }
@@ -113,7 +148,11 @@ export async function submit(cwd, opts) {
   const syncing = opts.sync !== false && hasOrigin;
   // Rounds live in git notes so a fresh pod sees them. Merge the remote notes in (union) before counting: a plain
   // fetch would replace rounds that are recorded here but not pushed yet.
-  if (syncing) mergeRemoteNotes(cwd);
+  let notesSynced = true;
+  if (syncing) {
+    mergeRemoteNotes(cwd);
+    notesSynced = ensureNotesPushed(cwd);
+  }
   const history = submittedRounds(cwd, result.base, result.head);
   const already = history.find((r) => r.commit === result.head && r.digest === result.digest);
   const round = already ? already.round : history.length + 1;
@@ -154,7 +193,6 @@ export async function submit(cwd, opts) {
     return { ...summary, exit: 9, status: "bad-verdict", round, reason: "the verdict is not JSON", payload: payloadPath };
   }
   const judged = judgeVerdict(verdict, { head: result.head, digest: result.digest });
-  let notesSynced = true;
   if (judged.counted && !already) {
     recordRound(cwd, result.head, result.digest, round);
     if (syncing) notesSynced = pushNotes(cwd);
