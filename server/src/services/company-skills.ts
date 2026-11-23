@@ -2995,6 +2995,8 @@ async function listLastEditorsBySkillId(
   return editors;
 }
 
+const RUNTIME_SKILL_RESOLVE_CONCURRENCY = 8;
+
 export function companySkillService(db: Db, options: { actor?: AuthorizationActor } = {}) {
   const visibility = (database: DbOrTransaction = db) => skillAccessService(database as Db, options.actor);
   const folderSvc = folderService(db);
@@ -6253,6 +6255,13 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     if (options.onlyKeys?.size === 0 || (!options.onlyKeys && options.selectionConfig && !options.includeLegacy
       && readPaperclipSkillSyncPreference(options.selectionConfig).desiredSkills.length === 0)) return consume([]);
     await ensureSkillInventoryCurrent(companyId);
+    if (options.materializeMissing === false && !options.snapshotLatest) {
+      // Pure read path: resolution only lstat/reads and the cache check does
+      // not materialize, so nothing is written. A race with retention can at
+      // worst report a skill as missing. Skipping the exclusive per-company
+      // lock keeps listings from queuing behind a long-running sync (TECH-9904).
+      return consume(await listRuntimeSkillEntriesLocked(companyId, options));
+    }
     return withSkillVersionCacheLock(db, companyId, async () => consume(await listRuntimeSkillEntriesLocked(companyId, options)));
   }
 
@@ -6266,9 +6275,8 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
         options.selectionConfig, skills.map(skill => ({ key: skill.key, runtimeName: buildSkillRuntimeName(skill.key, skill.slug) }))),
     ) : null);
 
-    const out: PaperclipSkillEntry[] = [];
-    for (let skill of skills) {
-      if (selectedKeys && !selectedKeys.has(skill.key)) continue;
+    const resolveEntry = async (initialSkill: (typeof skills)[number]): Promise<PaperclipSkillEntry | null> => {
+      let skill = initialSkill;
       let installedResolution: RuntimeSkillSourceResolution | null = null;
       const unpinned = !options.versionSelections?.get(skill.key);
       const installedDirectory = options.snapshotLatest && unpinned && (skill.sourceType === "local_path" || skill.sourceType === "catalog")
@@ -6294,9 +6302,9 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       const sourceResolution = installedResolution ?? await resolveRuntimeSkillSource(companyId, skill, {
         ...options, ...(options.snapshotLatest ? { materializeMissing: false } : {}),
       });
-      if (!sourceResolution) continue;
+      if (!sourceResolution) return null;
 
-      out.push({
+      return {
         key: skill.key,
         runtimeName: buildSkillRuntimeName(skill.key, skill.slug),
         source: sourceResolution.source,
@@ -6304,8 +6312,26 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
         currentVersionId: skill.currentVersionId,
         sourceStatus: sourceResolution.status,
         missingDetail: sourceResolution.status === "missing" ? sourceResolution.detail : null,
-      });
+      };
+    };
+
+    const selectedSkills = skills.filter(skill => !selectedKeys || selectedKeys.has(skill.key));
+    const resolved: Array<PaperclipSkillEntry | null> = [];
+    if (options.snapshotLatest) {
+      // Snapshotting creates versions; keep it strictly serial.
+      for (const skill of selectedSkills) resolved.push(await resolveEntry(skill));
+    } else {
+      resolved.length = selectedSkills.length;
+      let next = 0;
+      const worker = async () => {
+        while (next < selectedSkills.length) {
+          const index = next++;
+          resolved[index] = await resolveEntry(selectedSkills[index]!);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(RUNTIME_SKILL_RESOLVE_CONCURRENCY, selectedSkills.length) }, worker));
     }
+    const out = resolved.filter((entry): entry is PaperclipSkillEntry => entry !== null);
 
     out.sort((left, right) => left.key.localeCompare(right.key));
     return out;

@@ -86,6 +86,7 @@ import {
 import {
   isForbiddenConfigEnvKey,
   normalizePaperclipRunnerAdapterConfig,
+  PAPERCLIP_FEEDBACK_SKILL_KEYS,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   parseObject,
   resolvePaperclipInstanceRootForAdapter,
@@ -2946,12 +2947,33 @@ export function agentRoutes(
     // Runtime materialization + version selection only ever consider final
     // assignments that resolve to the company library; stale keys remain
     // persisted and explicitly removable without reaching adapter runtimes.
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
-      materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
-      versionSelections: skillVersionSelectionMap(
-        desiredSkillEntries.filter((entry) => resolvedKeys.has(entry.key)),
-      ),
+    const versionSelections = skillVersionSelectionMap(
+      desiredSkillEntries.filter((entry) => resolvedKeys.has(entry.key)),
+    );
+    let runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+      materializeMissing: false,
+      versionSelections,
     });
+    if (shouldMaterializeRuntimeSkillsForAdapter(adapterType)) {
+      // Only the skills this agent will actually mount need their files on
+      // disk. Materializing the whole company library under the exclusive
+      // skill-cache lock stalled every other skills call (TECH-9904).
+      const libraryKeys = new Set(runtimeSkillEntries.map((entry) => entry.key));
+      const keysToMaterialize = new Set([
+        ...desiredSkillEntries.filter((entry) => resolvedKeys.has(entry.key)).map((entry) => entry.key),
+        ...[PAPERCLIP_OPERATIONAL_SKILL_KEY, ...PAPERCLIP_FEEDBACK_SKILL_KEYS],
+      ].filter((key) => libraryKeys.has(key)));
+      if (keysToMaterialize.size > 0) {
+        const materialized = new Map(
+          (await companySkills.listRuntimeSkillEntries(companyId, {
+            materializeMissing: true,
+            onlyKeys: keysToMaterialize,
+            versionSelections,
+          })).map((entry) => [entry.key, entry]),
+        );
+        runtimeSkillEntries = runtimeSkillEntries.map((entry) => materialized.get(entry.key) ?? entry);
+      }
+    }
 
     return {
       adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, desiredSkillEntries),
@@ -3869,12 +3891,14 @@ export function agentRoutes(
       buildActorSecretContext(req, { consumerType: "agent", consumerId: agent.id }),
       { adapterType: agent.adapterType, skipUserSecrets: true },
     );
+    const listStartedAt = Date.now();
     const runtimeSkillConfig = await buildRuntimeSkillConfig(
       agent.companyId,
       agent.adapterType,
       runtimeConfig,
       { materializeMissing: false },
     );
+    const runtimeSkillsMs = Date.now() - listStartedAt;
     const connectorAssignments = await resolveConnectorAssignments(db, { companyId: agent.companyId, agentId: agent.id });
     const connectorConfig = await applyConnectorSkills(runtimeSkillConfig, runtimeSkillConfig.paperclipRuntimeSkills, connectorAssignments);
     const snapshot = await adapter.listSkills({
@@ -3883,6 +3907,17 @@ export function agentRoutes(
       adapterType: agent.adapterType,
       config: connectorConfig,
     });
+    logger.info(
+      {
+        agentId: agent.id,
+        companyId: agent.companyId,
+        adapterType: agent.adapterType,
+        runtimeSkillsMs,
+        totalMs: Date.now() - listStartedAt,
+        runtimeSkillCount: runtimeSkillConfig.paperclipRuntimeSkills.length,
+      },
+      "agent skills list completed",
+    );
     res.json(annotateConnectorSkills(withAssignedSkillVersions(snapshot, agent.adapterConfig as Record<string, unknown>), connectorAssignments));
   });
 
@@ -3896,6 +3931,7 @@ export function agentRoutes(
       if (!agent) return;
       await assertCanUpdateAgent(req, agent);
 
+      const syncStartedAt = Date.now();
       const requestedSkills = normalizeDesiredSkillSelections(req.body.desiredSkills);
       const {
         adapterConfig: nextAdapterConfig,
@@ -3916,6 +3952,7 @@ export function agentRoutes(
       if (!desiredSkills || !desiredSkillEntries || !runtimeSkillEntries) {
         throw unprocessable("Skill sync requires desiredSkills.");
       }
+      const resolvedAssignmentMs = Date.now() - syncStartedAt;
       const actor = getActorInfo(req);
       const updated = await svc.update(agent.id, {
         adapterConfig: nextAdapterConfig,
@@ -3983,6 +4020,17 @@ export function agentRoutes(
         },
       });
 
+      logger.info(
+        {
+          agentId: updated.id,
+          companyId: updated.companyId,
+          adapterType: updated.adapterType,
+          resolveAssignmentMs: resolvedAssignmentMs,
+          totalMs: Date.now() - syncStartedAt,
+          runtimeSkillCount: runtimeSkillEntries.length,
+        },
+        "agent skills sync completed",
+      );
       res.json(annotateConnectorSkills(withAssignedSkillVersions(snapshot, nextAdapterConfig), connectorAssignments));
     },
   );
