@@ -22,6 +22,7 @@ const apiPrefixes: Record<string, string> = {
   "agents.ts": "/api",
   "agent-commentary.ts": "/api",
   "agent-memory-relay.ts": "/api",
+  "package-relay.ts": "/api",
   "agent-avatars.ts": "/api",
   "agent-profile-avatar.ts": "/api",
   "announcements.ts": "/api",
@@ -124,6 +125,9 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   "POST /api/agent-memory-relay/memories",
   "PUT /api/agent-memory-relay/memories/{id}",
   "DELETE /api/agent-memory-relay/memories/{id}",
+  // The package relay is an internal bridge surface for the package installer in a builder pod (run-JWT only).
+  "GET /api/package-relay/gitea/simple/{package}/",
+  "GET /api/package-relay/gitea/files/{package}/{version}/{filename}",
   "GET /api/customer-success/v1/run-authority",
   "POST /api/customer-success/v1/read",
   // OAuth discovery and protocol endpoints have their own metadata contract;

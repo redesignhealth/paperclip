@@ -175,3 +175,8 @@ any new fork patch; remove one when the patch is upstreamed.
 - `FORK_OWNED.md`
 - `tools/upstream-sync/`
 - `doc/UPSTREAM-SYNC.md`
+
+## Package registry relay for builder pods (TECH-9786)
+
+- `server/src/routes/package-relay.ts` read-only relay to the private Gitea PyPI registry for opted-in builder agents
+- `server/src/__tests__/package-relay.test.ts`
