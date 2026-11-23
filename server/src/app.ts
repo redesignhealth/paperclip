@@ -224,6 +224,7 @@ import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { startDefaultMcpSetupSweep } from "./services/default-mcp-setup.js";
+import { setCommsWakePublicBaseUrl } from "./services/comms-wake-registration.js";
 import { startDefaultMcpOAuthSeedSweep } from "./services/default-mcp-oauth-seed.js";
 import { startSharedOrgRhMcpSweep } from "./services/shared-org-rh-mcp.js";
 import { startSharedSkillsSync } from "./services/shared-skills-source.js";
@@ -1439,6 +1440,8 @@ export async function createApp(
     trustedLocalStdioRuntimeHost,
   };
   configureDefaultMcpTemplateRuntime({ toolAccessOptions: defaultMcpToolAccessOptions });
+  // The instance's own public base URL (`auth.publicBaseUrl`), from which comms-board wake URLs are built (TECH-9912).
+  setCommsWakePublicBaseUrl(opts.authPublicBaseUrl);
   const stopDefaultMcpSetupSweep = startDefaultMcpSetupSweep(db, { toolAccessOptions: defaultMcpToolAccessOptions });
   const stopDefaultMcpOAuthSeedSweep = startDefaultMcpOAuthSeedSweep(db);
   // Per-org rh-mcp service token for shared orgs (TECH-8066): flag-gated no-op, same cadence pattern as the seed sweep.

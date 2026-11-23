@@ -3,6 +3,7 @@ import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  commsWakeRegistrations,
   companies,
   companySecretBindings,
   companySecretProviderConfigs,
@@ -3524,6 +3525,18 @@ export function secretService(db: Db | DbTransaction) {
   async function removeSecretUnlocked(secretId: string) {
     const secret = await getById(secretId);
     if (!secret) return null;
+    // The signing secret of a comms wake registration cannot be removed (the foreign key restricts it). Refuse BEFORE
+    // anything is renamed or deleted at the provider, so the secret is never left half-removed (TECH-9912).
+    const [wakeRegistration] = await db
+      .select({ id: commsWakeRegistrations.id })
+      .from(commsWakeRegistrations)
+      .where(eq(commsWakeRegistrations.signingSecretId, secretId))
+      .limit(1);
+    if (wakeRegistration) {
+      throw conflict("Secret is the signing secret of a comms board wake registration and cannot be removed", {
+        code: "secret_in_use_by_comms_wake",
+      });
+    }
     const versionRow = await getSecretVersion(secret.id, secret.latestVersion);
     const providerId = secret.provider as SecretProvider;
     const provider = getSecretProvider(providerId);

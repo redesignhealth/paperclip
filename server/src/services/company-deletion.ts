@@ -46,6 +46,7 @@ import {
   companyMemberships,
   companySkills,
   cases,
+  commsWakeRegistrations,
   documents,
   routineRuns,
   routineTriggers,
@@ -217,6 +218,8 @@ export async function deleteCompany(db: Db, id: string) {
       await tx.delete(issueComments).where(eq(issueComments.companyId, id));
       await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
       await tx.delete(approvals).where(eq(approvals.companyId, id));
+      // A wake registration references its signing secret with ON DELETE RESTRICT (TECH-9912), so it goes first.
+      await tx.delete(commsWakeRegistrations).where(eq(commsWakeRegistrations.companyId, id));
       await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
       await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
       await tx.delete(invites).where(eq(invites.companyId, id));

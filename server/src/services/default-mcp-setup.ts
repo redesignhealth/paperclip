@@ -39,6 +39,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { AGENT_MEMORY_ENTRY_KEY, agentMemoryHook, agentMemoryToolsEnabled, agentMemoryToolsHarness } from "./default-mcp-agent-memory.js";
+import { commsWakeRegistrationHook } from "./comms-wake-registration.js";
 import { sweepAgentMemoryRotation } from "./agent-memory-rotation.js";
 import { ownerEmailFor } from "./default-mcp-owner.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
@@ -1528,6 +1529,8 @@ export const DEFAULT_MCP_SETUP_HOOKS: Partial<Record<DefaultMcpSetupHookKey, Def
   // binding eagerly here could hit it before initialization when agent-hiring loads first.
   agent_memory: (input) => agentMemoryHook(input),
   agent_memory_tools: agentMemoryToolsHook,
+  // Deferred for the same reason: the wake module imports `resolveCommsBoardBinding` from this one.
+  comms_wake: (input) => commsWakeRegistrationHook(input),
 };
 
 /** The wiring a READY comms entry depends on, checked against the real rows (local reads only). */

@@ -17,7 +17,7 @@ import { badRequest } from "../errors.js";
 /** `managed_token`: Paperclip provisions + stores a per-agent token. `oauth`/`none`: no provisioning. */
 export type DefaultMcpAuthKind = "managed_token" | "oauth" | "none";
 
-export type DefaultMcpSetupHookKey = "comms_board_identity" | "arcana_brain" | "agent_memory" | "agent_memory_tools";
+export type DefaultMcpSetupHookKey = "comms_board_identity" | "arcana_brain" | "agent_memory" | "agent_memory_tools" | "comms_wake";
 
 /** One reviewed tool of a static-catalog template, for entries that need more than the read-only Arcana defaults. */
 export interface DefaultMcpStaticToolSpec {
@@ -523,6 +523,19 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     newAgentsOnly: true,
   },
   {
+    // Comms-board wake subscription (TECH-9912). Not an MCP connection: once the agent's own `comms-board` identity is
+    // ready, the hook stores a signing secret, records the wake registration and tells the board where to deliver wake
+    // events. `connectionName` names no real connection (no template, no install). New agents only, and only written
+    // for a company whose `commsBoardWakeEnabled` setting is on (the entry is otherwise absent, see agent-hiring).
+    key: "comms-wake",
+    displayName: "Comms Board Wake",
+    connectionName: "rh-comms-wake",
+    authKind: "managed_token",
+    defaultEnabled: false,
+    setupHook: "comms_wake",
+    newAgentsOnly: true,
+  },
+  {
     // Explicit memory tools for Claude, Codex and Pi agents (TECH-8832, TECH-9795). A per-agent gateway connection to the memory
     // service's MCP endpoint, authenticated with the SAME `agent-memory-<agentId>` token the recall/capture hooks use
     // (one secret, one rotation); the agent only ever sees Paperclip's gateway, never the token or the service URL.
@@ -868,6 +881,10 @@ export type DefaultMcpSetupReason =
   | "adapter_unsupported"
   // Agent memory tools (TECH-8832): the agent's own `agent-memory` entry has no ready token yet; retried automatically.
   | "memory_token_unavailable"
+  // Comms-board wake (TECH-9912): the agent's own comms-board identity is not ready yet, or this instance has no https
+  // public base URL; retried automatically.
+  | "board_not_ready"
+  | "public_base_url_unavailable"
   // Token lost after a successful mint, or its vault secret was deleted/disabled: terminal, never re-minted.
   | "secret_store_failed"
   | "secret_unavailable"
