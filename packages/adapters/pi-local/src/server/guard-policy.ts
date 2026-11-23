@@ -45,7 +45,7 @@ export interface PiGuardPolicy {
 }
 
 const SHARED_SECRET_PATHS = [
-  String.raw`/proc/[^\s/]+/environ`,
+  String.raw`/proc/[^\s]*/environ`,
   String.raw`(^|[/\s"'=:~])\.ssh(/|$|[\s"'])`,
   String.raw`(^|[/\s"'=:~])\.aws(/|$|[\s"'])`,
   String.raw`(^|[/\s"'=:~])\.kube(/|$|[\s"'])`,
@@ -119,7 +119,7 @@ export const BUILDER_GUARD_POLICY: PiGuardPolicy = {
   defaultBranches: ["main", "master", "trunk", "develop", "release"],
   secretPathPatterns: SHARED_SECRET_PATHS,
   secretEnvNames: SHARED_SECRET_ENV_NAMES,
-  secretEnvSuffixPattern: String.raw`(_API_KEY|_TOKEN|_SECRET|_PASSWORD|_PRIVATE_KEY)$`,
+  secretEnvSuffixPattern: String.raw`(_API_KEY|_TOKEN|_SECRET|_PASSWORD|_PRIVATE_KEY|_ACCESS_KEY|_JWT)$`,
   safeEnvNames: ["PAPERCLIP_API_KEY"],
   denyCommandPatterns: SHARED_DENY_PATTERNS,
   denyMcpToolPatterns: ["merge_pull", "merge_pr", "delete_repo", "delete_branch", "force_push"],
@@ -130,6 +130,7 @@ export const BUILDER_GUARD_POLICY: PiGuardPolicy = {
 export const INFRASTRUCTURE_GUARD_POLICY: PiGuardPolicy = {
   ...BUILDER_GUARD_POLICY,
   allowedGit: [...BUILDER_GUARD_POLICY.allowedGit],
+  allowedTerraform: [...IR_TERRAFORM],
   defaultBranches: [...BUILDER_GUARD_POLICY.defaultBranches],
   secretPathPatterns: [...BUILDER_GUARD_POLICY.secretPathPatterns],
   secretEnvNames: [...BUILDER_GUARD_POLICY.secretEnvNames],

@@ -98,6 +98,7 @@ export function parseShell(src) {
   const pushCommand = () => { pushWord(); if (words.length > 0) commands.push(words); words = []; };
   while (i < n) {
     const c = src[i];
+    if (c === "\\" && src[i + 1] === "\n") { i += 2; continue; }
     if (c === "\\") { if (i + 1 < n) { cur += src[i + 1]; has = true; } i += 2; continue; }
     if (c === "'") { const j = src.indexOf("'", i + 1); const end = j === -1 ? n : j; cur += src.slice(i + 1, end); has = true; i = end + 1; continue; }
     if (c === '"') {
@@ -274,7 +275,13 @@ function checkRm(words) {
   return null;
 }
 
+// Skills are staged into the pod at an absolute path under the runtime root; their scripts are the agent's own tools.
+function stagedSkillScript(word) {
+  return /\/\.paperclip-runtime\/pi\/skills\/[^\s]+$/.test(word) && !word.split("/").includes("..");
+}
+
 function relativeScript(word) {
+  if (stagedSkillScript(word)) return true;
   return !path.isAbsolute(word) && !word.startsWith("~") && !word.split("/").includes("..") && (word.startsWith("./") || word.includes("/"));
 }
 
@@ -434,7 +441,9 @@ export function piGuardExtensionSource(policy: PiGuardPolicy): string {
 export function readPiGuardProfile(envConfig: Record<string, unknown> | null | undefined): string {
   const raw = envConfig?.[PI_GUARD_PROFILE_ENV];
   const value = raw && typeof raw === "object" && "value" in raw ? (raw as { value: unknown }).value : raw;
-  return typeof value === "string" ? value : "";
+  if (value === undefined || value === null || value === "") return "";
+  // A binding or any other non-string value is not a profile name: resolve to the stricter policy.
+  return typeof value === "string" ? value : "invalid";
 }
 
 export async function preparePiGuardExtension(profile: string | null | undefined) {

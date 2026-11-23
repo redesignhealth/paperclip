@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { preparePiGuardExtension, PI_GUARD_MAX_BLOCKS } from "./guard-extension.js";
+import { preparePiGuardExtension, readPiGuardProfile, PI_GUARD_MAX_BLOCKS } from "./guard-extension.js";
 import { BUILDER_GUARD_POLICY, resolvePiGuardPolicy } from "./guard-policy.js";
 
 type Verdict = { kind: "deny"; why: string } | { kind: "unlisted"; what: string } | null;
@@ -53,8 +53,8 @@ describe("guard: pre-approved builder flow", () => {
     "set -euo pipefail; cd packages/x && npm test 2>&1 | tail -20",
     "git add -A && git commit -m \"fix: thing\"",
     "git commit -m \"$(cat <<'EOF'\nfix: heredoc body with rm -rf / and sudo inside\n\nCo-Authored-By: x\nEOF\n)\"",
-    "git push -u origin feature/x",
-    "git push origin HEAD",
+    "git push -u origin feature/x", // paperclip:allow-git-push: guard test fixture, never executed
+    "git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
     "gh pr create --title t --body b",
     "gh pr view 12 --json state",
     "gh api repos/o/r/pulls/12/comments",
@@ -68,6 +68,8 @@ describe("guard: pre-approved builder flow", () => {
     "bash scripts/test.sh",
     "./scripts/test.sh --fast",
     "git -C packages/x status",
+    "/workspace/.paperclip-runtime/pi/skills/paperclip/bin/paperclip-update-issue --status done",
+    "bash /workspace/.paperclip-runtime/pi/skills/paperclip/scripts/upload.sh f.png",
   ])("allows %s", (command) => {
     expect(bash(command)).toBeNull();
   });
@@ -85,25 +87,25 @@ describe("guard: pre-approved builder flow", () => {
 
 describe("guard: deny list", () => {
   it.each([
-    ["git push --force origin feature/x", "force-pushing"],
-    ["git push -f", "force-pushing"],
-    ["git push --force-with-lease origin x", "force-pushing"],
-    ["git push origin +feature/x", "force-pushing"],
-    ["git push origin main", "default branch"],
-    ["git push origin HEAD:master", "default branch"],
-    ["git push origin feature/x:refs/heads/main", "default branch"],
-    ["git push origin :feature/x", "deleting a remote branch"],
-    ["git push --delete origin x", "destructive"],
-    ["git checkout main && git push", "default branch"],
-    ["git push --all origin", "not limited"],
-    ["git push --repo origin main", "not limited"],
-    ["git clone https://github.com/o/r /tmp/work && cd /tmp/work && git push origin HEAD", "cannot be verified"],
-    ["cd /tmp/does-not-exist && git push", "cannot be verified"],
+    ["git push --force origin feature/x", "force-pushing"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push -f", "force-pushing"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push --force-with-lease origin x", "force-pushing"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push origin +feature/x", "force-pushing"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push origin main", "default branch"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push origin HEAD:master", "default branch"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push origin feature/x:refs/heads/main", "default branch"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push origin :feature/x", "deleting a remote branch"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push --delete origin x", "destructive"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git checkout main && git push", "default branch"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push --all origin", "not limited"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git push --repo origin main", "not limited"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["git clone https://github.com/o/r /tmp/work && cd /tmp/work && git push origin HEAD", "cannot be verified"], // paperclip:allow-git-push: guard test fixture, never executed
+    ["cd /tmp/does-not-exist && git push", "cannot be verified"], // paperclip:allow-git-push: guard test fixture, never executed
     ["echo ${X:-$(printenv)}", "environment"],
     ["cat <<EOF\n$(printenv)\nEOF", "environment"],
     ["echo \"$(echo \"a)\" ; printenv)\"", "environment"],
     ["git -c core.sshCommand='sh -c evil' fetch", "git -c"],
-    ["git push origin feature/x:release", "default branch"],
+    ["git push origin feature/x:release", "default branch"], // paperclip:allow-git-push: guard test fixture, never executed
     ["terraform apply -auto-approve", "terraform apply"],
     ["terraform -chdir=infra destroy", "terraform destroy"],
     ["tofu apply", "terraform apply"],
@@ -118,6 +120,9 @@ describe("guard: deny list", () => {
     ["export -p", "environment"],
     ["set", "environment"],
     ["cat /proc/self/environ", "secret"],
+    ["cat /proc/self/task/12/environ", "secret"],
+    ["echo $AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"],
+    ["git push --for\\\nce origin feature/x", "force"], // paperclip:allow-git-push: guard test fixture, never executed
     ["cat /proc/1/environ | tr '\\0' '\\n'", "secret"],
     ["echo $RAMP_ROUTER_API_KEY", "RAMP_ROUTER_API_KEY"],
     ["echo \"${PAPERCLIP_GITHUB_BROKER_TOKEN}\"", "PAPERCLIP_GITHUB_BROKER_TOKEN"],
@@ -158,12 +163,12 @@ describe("guard: deny list", () => {
     const onMain = path.join(workDir, "on-main");
     await fs.mkdir(path.join(onMain, ".git"), { recursive: true });
     await fs.writeFile(path.join(onMain, ".git", "HEAD"), "ref: refs/heads/main\n");
-    expect(guard.evaluateToolCall("bash", { command: "git push origin HEAD" }, onMain)?.kind).toBe("deny");
-    expect(guard.evaluateToolCall("bash", { command: "git push" }, onMain)?.kind).toBe("deny");
+    expect(guard.evaluateToolCall("bash", { command: "git push origin HEAD" }, onMain)?.kind).toBe("deny"); // paperclip:allow-git-push: guard test fixture, never executed
+    expect(guard.evaluateToolCall("bash", { command: "git push" }, onMain)?.kind).toBe("deny"); // paperclip:allow-git-push: guard test fixture, never executed
   });
 
   it("refuses a push it cannot verify", () => {
-    expect(guard.evaluateToolCall("bash", { command: "git push origin HEAD" }, workDir)?.kind).toBe("deny");
+    expect(guard.evaluateToolCall("bash", { command: "git push origin HEAD" }, workDir)?.kind).toBe("deny"); // paperclip:allow-git-push: guard test fixture, never executed
   });
 });
 
@@ -207,7 +212,7 @@ describe("guard: tool_call handler", () => {
     const unlistedResult = await handler({ toolName: "bash", input: { command: "docker ps" } }, ctx) as { block: boolean; reason: string };
     expect(unlistedResult.block).toBe(true);
     expect(unlistedResult.reason).toContain("Post a question on your Paperclip issue");
-    const denied = await handler({ toolName: "bash", input: { command: "git push --force" } }, ctx) as { reason: string };
+    const denied = await handler({ toolName: "bash", input: { command: "git push --force" } }, ctx) as { reason: string }; // paperclip:allow-git-push: guard test fixture, never executed
     expect(denied.reason).toContain("never allowed");
     expect(stderr).toHaveBeenCalledWith(expect.stringContaining("[paperclip-guard] blocked bash"));
     expect(ctx.abort).not.toHaveBeenCalled();
@@ -225,5 +230,14 @@ describe("guard: tool_call handler", () => {
     expect(last.terminate).toBe(true);
     expect(ctx.abort).toHaveBeenCalledTimes(1);
     stderr.mockRestore();
+  });
+});
+
+describe("readPiGuardProfile", () => {
+  it("reads plain and wrapped strings, and treats any other value as the strict profile", () => {
+    expect(readPiGuardProfile({})).toBe("");
+    expect(readPiGuardProfile({ PAPERCLIP_PI_GUARD_PROFILE: "builder" })).toBe("builder");
+    expect(readPiGuardProfile({ PAPERCLIP_PI_GUARD_PROFILE: { type: "plain", value: "infrastructure" } })).toBe("infrastructure");
+    expect(resolvePiGuardPolicy(readPiGuardProfile({ PAPERCLIP_PI_GUARD_PROFILE: { type: "secret_ref", secretId: "x" } })).profile).toBe("infrastructure");
   });
 });
