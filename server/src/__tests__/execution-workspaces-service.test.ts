@@ -627,6 +627,78 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     } finally { scan.mockRestore(); }
   });
 
+  async function seedPlainTerminalWorkspaces(count: number) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issuePrefix = `P${companyId.slice(0, 8).toUpperCase()}`;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-plain-"));
+    tempDirs.add(root);
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Plain workspaces", status: "in_progress" });
+    const rows = [];
+    for (let i = 0; i < count; i += 1) {
+      const dir = path.join(root, `w${i}`);
+      await fs.mkdir(dir);
+      rows.push({ id: randomUUID(), issueId: randomUUID(), dir, i });
+    }
+    await db.insert(executionWorkspaces).values(rows.map(({ id, dir, i }) => ({
+      id, companyId, projectId, mode: "isolated_workspace", strategyType: "project_primary",
+      name: `plain-${i}`, status: "active", cwd: dir, providerRef: dir, providerType: "local_fs",
+      updatedAt: new Date("2020-01-01T00:00:00Z"),
+    })));
+    await db.insert(issues).values(rows.map(({ id, issueId, i }) => ({
+      id: issueId, companyId, projectId, identifier: `${issuePrefix}-${i + 1}`, title: `Plain ${i}`,
+      status: "done", priority: "medium", executionWorkspaceId: id,
+    })));
+    await db.update(executionWorkspaces).set({ sourceIssueId: sql`(select id from issues where issues.execution_workspace_id = execution_workspaces.id)` })
+      .where(eq(executionWorkspaces.companyId, companyId));
+    return { root };
+  }
+
+  it("never spawns git for plain directories and keeps them cached across rotations beyond 256 workspaces", async () => {
+    const count = 300;
+    const { root } = await seedPlainTerminalWorkspaces(count);
+    // A fake `git` on PATH records every spawn. A plain directory must never reach it.
+    const bin = path.join(root, "bin");
+    const log = path.join(root, "git-spawns.log");
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(bin, "git"), `#!/bin/sh\necho "$@" >> "${log}"\nexit 128\n`, { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath}`;
+    const clock = Date.now();
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0, terminalWorkspaceInspectionBackoffMs: 300_000,
+      now: () => new Date(clock),
+    });
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      expect(await service.sweepTerminalWorkspaces(count + 1)).toMatchObject({ checked: count, skippedUndelivered: count });
+      expect(await service.sweepTerminalWorkspaces(count + 1)).toMatchObject({ checked: count, skippedBackoff: count });
+      expect(scan).not.toHaveBeenCalled();
+      await expect(fs.access(log)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      process.env.PATH = originalPath;
+      scan.mockRestore();
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("still inspects git and archives a delivered git workspace while plain directories are skipped", async () => {
+    const seed = await seedTerminalWorkspace({ mergedPr: true });
+    const { root } = await seedPlainTerminalWorkspaces(3);
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0, terminalWorkspaceInspectionBackoffMs: 300_000,
+      resolvePullRequestDetails: async () => ({ state: "merged", headRef: "PAP-16015-delivery", headSha: seed.headSha }),
+    });
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      expect(await service.sweepTerminalWorkspaces(10)).toMatchObject({ archived: 1, skippedUndelivered: 3 });
+      const scanned = scan.mock.calls.map(([input]) => input.workspacePath);
+      expect(scanned).toContain(seed.worktreePath);
+      expect(scanned.filter((workspacePath) => workspacePath.startsWith(root))).toHaveLength(0);
+      await expect(fs.access(seed.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { scan.mockRestore(); }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
   it("invalidates a candidate backoff after its real PR producer commits", async () => {
     const seed = await seedTerminalWorkspace();
     const service = executionWorkspaceService(db, {
