@@ -47,7 +47,6 @@ export {
   providerResourceDispositionForTerminalRun,
   cancelHeartbeatNativeRun,
 } from "./heartbeat/run-control.js";
-import { HEARTBEAT_RUN_TERMINAL_STATUSES } from "./heartbeat/recovery.js";
 import {
   isHeartbeatRunTerminalStatus,
   decorateHeartbeatRunRuntimeStatus,
@@ -71,6 +70,7 @@ export {
   shouldQueueFollowupForRunningIssueWake,
 } from "./heartbeat/queue.js";
 import {
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
   isProcessAlive,
   createHeartbeatRecovery,
 } from "./heartbeat/recovery.js";
@@ -3959,6 +3959,7 @@ export function heartbeatService(
     // An agent can own hundreds of runs. Only a run that is not settled, is
     // executing in this process, or still needs lease cleanup can change this
     // outcome, so read only those, without the jsonb columns.
+    const releaseRunIds = [...needsRelease].filter((id): id is string => Boolean(id));
     const inProcessRunIds = [...new Set([...runningProcesses.keys(), ...activeRunExecutions,
       ...adapterExecutionControls.keys(), ...processRunCancellationSettlements.keys()])];
     const runs = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
@@ -3966,7 +3967,7 @@ export function heartbeatService(
       .from(heartbeatRuns).where(and(inArray(heartbeatRuns.agentId, agentIds), or(
         notInArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
         gt(heartbeatRuns.controllerLeaseExpiresAt, new Date()),
-        needsRelease.size ? inArray(heartbeatRuns.id, [...needsRelease].filter((id): id is string => Boolean(id))) : undefined,
+        releaseRunIds.length ? inArray(heartbeatRuns.id, releaseRunIds) : undefined,
         inProcessRunIds.length ? inArray(heartbeatRuns.id, inProcessRunIds) : undefined,
       )));
     for (const run of runs) {

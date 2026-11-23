@@ -79,5 +79,10 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await store.pending(100, new Date(now.getTime() + 15_000))).not.toContain(agent.id);
     expect(await store.claim(agent.id, "other", new Date(now.getTime() + 15_000))).toBeNull();
     expect(await store.pending(100, new Date(now.getTime() + 16_001))).toContain(agent.id);
+    // An operator Retry starts the backoff over so a flagged agent is checked at once.
+    await store.change(agent.id, "retry");
+    const [retried] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect(retried!.lifecycleOperation).toMatchObject({ attempts: 0 });
+    expect(retried!.lifecycleOperation!.retryAt).toBeUndefined();
   });
 });

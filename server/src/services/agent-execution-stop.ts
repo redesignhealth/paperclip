@@ -5,6 +5,7 @@ import { and, asc, eq, gt, inArray, isNotNull, isNull, notInArray, or, sql } fro
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { HEARTBEAT_RUN_TERMINAL_STATUSES } from "./heartbeat/recovery.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
 /** Written by the legacy executor when it settles a cancelled run without
@@ -19,7 +20,6 @@ function beforeHostBoot(at: Date | null) {
   return Boolean(at && at.getTime() < Date.now() - os.uptime() * 1000 - HOST_BOOT_MARGIN_MS);
 }
 
-const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 /** Upper bound on run rows any one query loads while proving a stop. */
 export const STOP_PROOF_PAGE_SIZE = 50;
 
@@ -32,7 +32,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   const now = new Date();
   const agentRuns = inArray(heartbeatRuns.agentId, agentIds);
   const [blockingRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-    .where(and(agentRuns, or(notInArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
+    .where(and(agentRuns, or(notInArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
       gt(heartbeatRuns.controllerLeaseExpiresAt, now)))).limit(1);
   if (blockingRun) return false;
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(agentRuns);
