@@ -29,6 +29,7 @@ export interface Company {
   spentMonthlyCents: number;
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
+  commsBoardWakeEnabled: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;

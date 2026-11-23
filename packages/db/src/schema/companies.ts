@@ -29,6 +29,11 @@ export const companies = pgTable(
     requireBoardApprovalForNewAgents: boolean("require_board_approval_for_new_agents")
       .notNull()
       .default(false),
+    /**
+     * Rollout setting (TECH-9912), not a feature flag: when true, NEW agents of this company are subscribed to comms-board
+     * wake events at creation. Changed only by an instance admin. Off for every company until switched on.
+     */
+    commsBoardWakeEnabled: boolean("comms_board_wake_enabled").notNull().default(false),
     interactionResolverGovernance: jsonb("interaction_resolver_governance")
       .$type<InteractionResolverGovernance>()
       .notNull()
