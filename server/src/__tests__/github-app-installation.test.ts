@@ -147,6 +147,16 @@ describe("GitHub App installation credentials", () => {
     const run = () => mintGitHubAppInstallationToken({ repositories: ["redesignhealth/alpha"], env, fetchImpl, now: () => T0 });
     await Promise.all([run(), run(), run()]);
     expect(mints(calls)).toBe(1);
+    expect(calls.filter((call) => call.url.endsWith("/app"))).toHaveLength(1);
+  });
+
+  it("logs the GitHub status category, not the response", async () => {
+    const { logger } = await import("../middleware/logger.js");
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const unauthorized = vi.fn(async () => json({ message: "nope" }, 401)) as unknown as typeof fetch;
+    await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/r"], env, fetchImpl: unauthorized, now: () => T0 });
+    expect(warn).toHaveBeenCalledWith({ reason: "github_http_401" }, expect.any(String));
+    warn.mockRestore();
   });
 
   it("never leaks the key, JWT, or token through failures", async () => {

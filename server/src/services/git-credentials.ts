@@ -461,7 +461,9 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
     agentId: input.agentId,
     responsibleUserId: input.responsibleUserId ?? null,
   });
-  const selectedConnectionId = selection.grant?.connectionId ?? null;
+  // App installation grants serve managed git/gh only; offering GitHub MCP tools would always fail.
+  const selectedConnectionId = selection.grant && !isGitHubAppInstallationGrant(selection.grant)
+    ? selection.grant.connectionId : null;
   const githubIds = new Set(githubConnections.map((connection) => connection.id));
   return input.connections.filter((connection) =>
     !githubIds.has(connection.id) || connection.id === selectedConnectionId,

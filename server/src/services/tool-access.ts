@@ -21992,14 +21992,18 @@ export function toolAccessService(
           code: "github_app_grant_existing_grant",
         });
       }
-      const [otherGrant] = await db.select({ id: connectionGrants.id }).from(connectionGrants).where(and(
-        eq(connectionGrants.companyId, connection.companyId),
-        eq(connectionGrants.kind, "agent"),
-        eq(connectionGrants.subjectAgentId, input.agentId),
-        eq(connectionGrants.status, "active"),
-        ne(connectionGrants.connectionId, connection.id),
-      )).limit(1);
-      if (otherGrant) {
+      const otherGrants = await db.select({ id: connectionGrants.id, config: toolConnections.config }).from(connectionGrants)
+        .innerJoin(toolConnections, and(
+          eq(toolConnections.id, connectionGrants.connectionId),
+          eq(toolConnections.companyId, connectionGrants.companyId),
+        )).where(and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.kind, "agent"),
+          eq(connectionGrants.subjectAgentId, input.agentId),
+          eq(connectionGrants.status, "active"),
+          ne(connectionGrants.connectionId, connection.id),
+        ));
+      if (otherGrants.some((row) => row.config?.sourceTemplateKey === "github")) {
         throw conflict("This agent already has an active dedicated grant on another connection; revoke it first", {
           code: "github_app_grant_existing_grant",
         });

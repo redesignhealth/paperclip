@@ -90,14 +90,14 @@ export async function mintGitHubAppInstallationToken(input: {
     for (const [cacheKey, entry] of tokenCache) if (entry.expiresAtMs <= now()) tokenCache.delete(cacheKey);
     const hit = fresh(tokenCache.get(key));
     if (hit && cachedSlug?.appId === config.appId) return { ok: true, value: { token: hit.token, identity: identityFor() } };
-    if (!cachedSlug || cachedSlug.appId !== config.appId) {
-      const app = await githubBotRequest<{ slug?: unknown }>(fetchImpl, signJwt(), "/app");
-      if (typeof app.slug !== "string" || !/^[A-Za-z0-9-]+$/.test(app.slug)) throw new AppTokenError("invalid_app_slug");
-      cachedSlug = { appId: config.appId, slug: app.slug };
-    }
     let pending = inflight.get(key);
     if (!pending) {
       pending = (async () => {
+        if (!cachedSlug || cachedSlug.appId !== config.appId) {
+          const app = await githubBotRequest<{ slug?: unknown }>(fetchImpl, signJwt(), "/app");
+          if (typeof app.slug !== "string" || !/^[A-Za-z0-9-]+$/.test(app.slug)) throw new AppTokenError("invalid_app_slug");
+          cachedSlug = { appId: config.appId, slug: app.slug };
+        }
         const minted = await githubBotRequest<{ token?: unknown; expires_at?: unknown; repositories?: unknown }>(
           fetchImpl, signJwt(), `/app/installations/${config.installationId}/access_tokens`,
           { method: "POST", body: { repositories: scope.names, permissions: GITHUB_APP_TOKEN_PERMISSIONS } },
@@ -122,9 +122,10 @@ export async function mintGitHubAppInstallationToken(input: {
     return { ok: true, value: { token: entry.token, identity: identityFor() } };
   } catch (error) {
     // Log a coarse category only: provider bodies and key-parse errors can carry secrets.
-    const status = (error as { status?: unknown })?.status;
+    // githubBotRequest wraps every rejection as a 422 whose fixed message names GitHub's status.
+    const status = error instanceof Error ? /^GitHub rejected this operation \(HTTP (\d{3})\)/.exec(error.message)?.[1] : undefined;
     const reason = error instanceof AppTokenError ? error.category
-      : typeof status === "number" ? `github_http_${status}` : "request_failed";
+      : status ? `github_http_${status}` : "request_failed";
     logger.warn({ reason }, "GitHub App token unavailable");
     return { ok: false, error: "GitHub App installation credentials are temporarily unavailable" };
   }

@@ -144,7 +144,7 @@ Repositories are `owner/name`; GitHub resolves bare names against the installati
 
 Tokens are cached in memory per (installation, repository set) until five minutes before GitHub's `expires_at`. They are never persisted, logged, or recorded in run identity history. Like an OAuth token, the token is returned only to the managed `git`/`gh` command process through the credential broker, not to the long-lived provider process. Failures log a coarse reason code only. Commits are authored as the App bot, `<slug>[bot]` with `<app-id>+<slug>[bot]@users.noreply.github.com`, where the slug comes from `GET /app`.
 
-The GitHub connection must be installed for the agent or company. A conflicting active grant for the agent (OAuth, or on another connection) makes the request fail with 409. App grants serve managed git/gh only; GitHub MCP gateway calls fail closed for them.
+The GitHub connection must be installed for the agent or company. A conflicting active grant for the agent (OAuth, or on another connection) makes the request fail with 409. App grants serve managed git/gh only; GitHub MCP gateway calls fail closed for them, and GitHub MCP tools are not offered to an agent using one. The OAuth dedicated-grant flow does not check for an App grant; having both on different GitHub connections makes selection ambiguous and fails closed.
 
 Create the grant with `POST /api/tool-connections/{connectionId}/grants/github-app` (board user with configure access) and `{"agentId": "...", "repositories": ["owner/name"]}`. Posting again for the same agent replaces its repository list. OAuth grants are unchanged.
 
