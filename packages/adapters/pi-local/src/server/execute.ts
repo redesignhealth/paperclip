@@ -63,6 +63,13 @@ import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import {
+  collectSessionSecrets,
+  protectRemoteSessionDir,
+  restoreRemoteSession,
+  saveRemoteSession,
+  type RemoteSessionExec,
+} from "./session-persistence.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -539,6 +546,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const sessionParamsCwdMatches =
       runtimeSessionCwd.length === 0 ||
       executionCwdsMatch(runtimeSessionCwd, effectiveExecutionCwd, executionTargetIsRemote);
+    // A reused pod is scrubbed between turns, which deletes the Pi session file.
+    // Put the server's saved copy back before deciding whether to resume (TECH-9798).
+    const remoteSessionExec: RemoteSessionExec | null = runtimeExecutionTarget?.kind === "remote" && runtimeExecutionTarget.transport === "sandbox"
+      ? async (script, stdin) => {
+          const result = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, "sh", ["-c", script], {
+            cwd,
+            env,
+            ...(stdin !== undefined ? { stdin } : {}),
+            timeoutSec: 30,
+            graceSec: 5,
+            onLog: async () => {},
+          });
+          return { exitCode: result.exitCode, timedOut: result.timedOut, stdout: result.stdout };
+        }
+      : null;
+    const sessionSecrets = collectSessionSecrets(env, [authToken]);
+    if (remoteSessionExec && sessionTargetMatches && sessionParamsCwdMatches && runtimeSessionId.length > 0) {
+      try {
+        if (await restoreRemoteSession({ exec: remoteSessionExec, storeDir: PAPERCLIP_SESSIONS_DIR, sessionPath: runtimeSessionId })) {
+          await onLog("stdout", `[paperclip] Restored Pi session "${runtimeSessionId}" from the server copy.\n`);
+        }
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Could not restore the saved Pi session: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
     const savedSessionCwd =
       runtimeSessionId.length > 0
         ? await readSavedSessionCwd({
@@ -588,6 +620,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           graceSec: 5,
           onLog,
         });
+        if (remoteSessionExec) await protectRemoteSessionDir(remoteSessionExec, sessionPath).catch(() => undefined);
       } else {
         try {
           await fs.writeFile(sessionPath, "", { flag: "wx" });
@@ -794,6 +827,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       await accountingLog.flush();
 
+      // Copy the session off the pod before the between-turn scrub deletes it.
+      if (remoteSessionExec) {
+        try {
+          await saveRemoteSession({ exec: remoteSessionExec, storeDir: PAPERCLIP_SESSIONS_DIR, sessionPath: sessionFile, secrets: sessionSecrets });
+        } catch (err) {
+          await onLog("stderr", `[paperclip] Could not save the Pi session to the server: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
+      }
+
       // Flush any remaining buffer content
       if (stdoutBuffer) {
         await emitCompacted(stdoutBuffer, "");
@@ -910,6 +952,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             graceSec: 5,
             onLog,
           });
+          if (remoteSessionExec) await protectRemoteSessionDir(remoteSessionExec, newSessionPath).catch(() => undefined);
         } else {
           try {
             await fs.writeFile(newSessionPath, "", { flag: "wx" });
