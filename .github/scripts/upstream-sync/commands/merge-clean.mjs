@@ -32,6 +32,7 @@ export async function run(argv, { cwd = process.cwd(), stdout = process.stdout, 
   const original = gitOut(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   const originalRef = original === "HEAD" ? gitOut(cwd, ["rev-parse", "HEAD"]) : original;
   const passed = [];
+  const risks = [];
   let failed = null;
   let lastGood = report.master;
   try {
@@ -43,11 +44,12 @@ export async function run(argv, { cwd = process.cwd(), stdout = process.stdout, 
         break;
       }
       passed.push(merged);
+      for (const risk of result.risks) risks.push(`${shortSha(merged.sha)}: ${risk}`);
       lastGood = merged.merge;
       say(`step ${passed.length}/${walk.clean.length} ${shortSha(merged.sha)} ${merged.subject}: checks pass`);
     }
   } finally {
-    git(cwd, ["checkout", "-q", originalRef], { allowFail: true });
+    git(cwd, ["checkout", "-q", originalRef]);
   }
 
   const summary = {
@@ -69,13 +71,17 @@ export async function run(argv, { cwd = process.cwd(), stdout = process.stdout, 
   git(cwd, ["branch", "-f", branch, last.merge]);
   say(`branch ${branch} at ${shortSha(last.merge)} (${passed.length} step(s))`);
 
-  const conflictEntries = [...new Set(passed.flatMap((s) => s.restoredLockfiles))].map((path) => ({
+  const conflictEntries = [...new Set(passed.flatMap((s) => s.restoredLockfiles ?? []))].map((path) => ({
     path,
     kind: "mechanical",
     rule: "lockfile",
     resolution: "kept the fork's copy (CI owns lockfile updates)",
   }));
-  const body = buildCleanStretchBody({ steps: passed, base: report.base, conflictEntries });
+  const checkSummary = [
+    "Typecheck and the changed tests ran after every merged step, and the generators and lockfile were checked.",
+    ...(risks.length ? ["", "Both sides made the same numeric edit in these places; their tests ran, but a person should confirm the value:", ...risks.map((r) => `- ${r}`)] : []),
+  ].join("\n");
+  const body = buildCleanStretchBody({ steps: passed, base: report.base, conflictEntries, checkSummary });
   const title = buildCleanStretchTitle(passed);
 
   if (opts.push !== false) {
@@ -84,7 +90,7 @@ export async function run(argv, { cwd = process.cwd(), stdout = process.stdout, 
     if (opts.pr !== false) {
       const created = runArgv(cwd, ["gh", "pr", "create", "--base", "master", "--head", branch, "--title", title, "--body", body]);
       if (!created.ok) throw new Error(`gh pr create failed: ${created.output.trim()}`);
-      summary.pr = created.output.trim().split("\n").pop();
+      summary.pr = created.output.split("\n").map((l) => l.trim()).filter((l) => /^https:\/\/\S+\/pull\/\d+$/.test(l)).pop() ?? created.output.trim();
       say(`opened ${summary.pr}`);
     }
   }

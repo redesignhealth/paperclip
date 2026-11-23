@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { Writable } from 'node:stream';
 import { Fixture } from './upstream-sync-fixture.mjs';
 import { run } from '../upstream-sync/commands/merge-clean.mjs';
-import { buildCleanStretchBody, buildCleanStretchTitle, formatConflictLog, parseConflictLog } from '../upstream-sync/lib/prbody.mjs';
+import { buildCleanStretchBody, buildCleanStretchTitle, formatConflictLog, parseConflictLog, safeSubject } from '../upstream-sync/lib/prbody.mjs';
 import { checkTemplate } from '../check-pr-template.mjs';
 
+const LOG_END_FIRST = '<!-- /upstream-sync:conflict-log -->';
 const sink = () => {
   const chunks = [];
   const stream = new Writable({ write(c, _e, cb) { chunks.push(String(c)); cb(); } });
@@ -126,4 +127,33 @@ test('the conflict log round-trips and the sync PR body satisfies the PR templat
   assert.equal(checked.passed, true, JSON.stringify(checked.failures));
   assert.deepEqual(parseConflictLog(body), entries);
   assert.match(buildCleanStretchTitle(steps), /^chore\(upstream-sync\): merge 2 upstream commit/);
+});
+
+test('merge-clean builds the same commits every time, so a re-run reaches the same branch', async () => {
+  const { fx } = Fixture.scenario({
+    base: { 'a.txt': 'a\n' },
+    upstream: [[{ 'u1.txt': '1\n' }, 'one (#1)'], [{ 'u2.txt': '2\n' }, 'two (#2)']],
+  });
+  try {
+    const first = sink();
+    await run(ARGS, { cwd: fx.dir, stdout: first.stream });
+    const tip1 = fx.git('rev-parse', JSON.parse(first.text()).branch);
+    const second = sink();
+    await run(ARGS, { cwd: fx.dir, stdout: second.stream });
+    assert.equal(fx.git('rev-parse', JSON.parse(second.text()).branch), tip1);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('upstream subjects cannot close or link issues in the fork', () => {
+  const safe = safeSubject('Fixes #12 and closes #3: feat (#99)');
+  assert.ok(!/\bFixes\b(?!\u200b)/.test(safe));
+  assert.ok(!/(^|[^\w])#\d+/.test(safe));
+  assert.match(safe, /upstream#99/);
+});
+
+test('parseConflictLog finds the end marker after the begin marker', () => {
+  const body = `${LOG_END_FIRST}\n${formatConflictLog([{ path: 'a', kind: 'real', resolution: 'x' }])}`;
+  assert.deepEqual(parseConflictLog(body), [{ path: 'a', kind: 'real', resolution: 'x' }]);
 });

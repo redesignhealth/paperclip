@@ -17,8 +17,8 @@ export function formatConflictLog(entries) {
 
 export function parseConflictLog(body) {
   const start = body.indexOf(LOG_BEGIN);
-  const end = body.indexOf(LOG_END);
-  if (start < 0 || end < start) return null;
+  const end = start < 0 ? -1 : body.indexOf(LOG_END, start + LOG_BEGIN.length);
+  if (start < 0 || end < 0) return null;
   const entries = [];
   for (const line of body.slice(start + LOG_BEGIN.length, end).split("\n")) {
     const m = line.match(/^- (.+?) \| (real|mechanical:[^|]+?) \| (.+)$/);
@@ -32,11 +32,14 @@ export function parseConflictLog(body) {
 }
 
 const short = (s) => s.slice(0, 10);
+// Upstream subjects are untrusted text. "Fixes #12" in one would close an unrelated issue in the fork when the sync PR
+// merges, and #12 means a different thing here than upstream. Defuse every #N and closing keyword.
+export const safeSubject = (subject) => subject.replace(/\b(close[sd]?|fix(?:es|ed)?|resolve[sd]?)\b/gi, "$1\u200b").replace(/#(\d+)/g, "upstream#$1");
 
 export function buildCleanStretchBody({ steps, base, conflictEntries = [], checkSummary }) {
   const first = steps[0];
   const last = steps[steps.length - 1];
-  const list = steps.map((s) => `- \`${short(s.sha)}\` ${s.pr ? `#${s.pr} ` : ""}${s.subject}`).join("\n");
+  const list = steps.map((s) => `- \`${short(s.sha)}\` ${safeSubject(s.subject)}`).join("\n");
   return [
     "## Thinking Path",
     "",

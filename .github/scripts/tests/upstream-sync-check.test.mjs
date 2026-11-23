@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Fixture } from './upstream-sync-fixture.mjs';
 import { runCheck, formatCheck } from '../upstream-sync/commands/check.mjs';
 import { convergentNumericEdits, parseHunks, isNumericBump } from '../upstream-sync/lib/convergent.mjs';
-import { selectTests, siblingTests } from '../upstream-sync/lib/testselect.mjs';
+import { selectTests, siblingTests, vitestGroups } from '../upstream-sync/lib/testselect.mjs';
 
 const nodeTest = (name, expr) =>
   `import { test } from 'node:test';\nimport assert from 'node:assert/strict';\ntest('${name}', () => { assert.ok(${expr}); });\n`;
@@ -155,6 +155,45 @@ test('selectTests picks changed tests, sibling tests of changed sources, and spl
     assert.deepEqual(picked.nodeTest, ['src/b.test.mjs']);
     assert.deepEqual(siblingTests('src/a.ts'), ['src/a.test.ts', 'src/a.spec.ts']);
     assert.deepEqual(siblingTests('src/a.test.ts'), []);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('check fails, never passes, when it cannot resolve what it must compare against', () => {
+  const { fx } = Fixture.scenario({ base: { 'a.txt': 'a\n' }, fork: [[{ 'b.txt': 'b\n' }, 'b']] });
+  try {
+    const noMaster = runCheck(fx.dir, { ...OK, master: 'refs/remotes/nowhere/master' });
+    assert.equal(noMaster.ok, false);
+    assert.equal(noMaster.steps.find((s) => s.name === 'lockfile').status, 'fail');
+    const noSince = runCheck(fx.dir, { ...OK, since: 'does-not-exist' });
+    assert.equal(noSince.ok, false);
+    assert.equal(noSince.steps[0].name, 'since');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('vitestGroups runs each file from the package that owns its vitest config', () => {
+  const fx = new Fixture();
+  try {
+    fx.commit(
+      {
+        'vitest.config.ts': 'export default {};\n',
+        'packages/runner/vitest.config.ts': 'export default {};\n',
+        'packages/runner/src/a.test.ts': 'x\n',
+        'packages/other/src/b.test.ts': 'x\n',
+        'server/vitest.config.ts': 'export default {};\n',
+        'server/src/c.test.ts': 'x\n',
+      },
+      'files',
+    );
+    const groups = vitestGroups(fx.dir, ['packages/runner/src/a.test.ts', 'packages/other/src/b.test.ts', 'server/src/c.test.ts']);
+    assert.deepEqual([...groups.entries()].sort(), [
+      ['.', ['packages/other/src/b.test.ts']],
+      ['packages/runner', ['src/a.test.ts']],
+      ['server', ['src/c.test.ts']],
+    ]);
   } finally {
     fx.cleanup();
   }

@@ -37,17 +37,15 @@ export function convergentNumericEdits(cwd, mergeCommit) {
   const parents = gitOut(cwd, ["rev-list", "--parents", "-n", "1", mergeCommit]).split(" ").slice(1);
   if (parents.length !== 2) return [];
   const [ours, theirs] = parents;
-  const base = gitOut(cwd, ["merge-base", ours, theirs], { allowFail: true });
-  if (!base) return [];
+  const base = gitOut(cwd, ["merge-base", ours, theirs]);
   const sideFiles = (side) =>
-    new Set(gitOut(cwd, ["diff", "--name-only", "-z", base, side], { allowFail: true }).split("\0").filter(Boolean));
+    new Set(gitOut(cwd, ["diff", "--name-only", "-z", base, side]).split("\0").filter(Boolean));
   const theirsFiles = sideFiles(theirs);
   const both = [...sideFiles(ours)].filter((f) => theirsFiles.has(f));
   const found = [];
   for (const file of both) {
     const diffOf = (side) =>
-      git(cwd, ["diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", base, side, "--", file], { allowFail: true })
-        .stdout;
+      git(cwd, ["diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", base, side, "--", file]).stdout;
     const oursHunks = parseHunks(diffOf(ours)).filter(isNumericBump);
     if (oursHunks.length === 0) continue;
     const theirKeys = new Set(parseHunks(diffOf(theirs)).filter(isNumericBump).map(key));

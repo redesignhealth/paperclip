@@ -10,9 +10,9 @@ export function listSteps(cwd, base, upstream, limit = Infinity) {
   const total = shas.length;
   const wanted = Number.isFinite(limit) ? shas.slice(0, limit) : shas;
   const steps = wanted.map((sha) => {
-    const subject = gitOut(cwd, ["log", "-1", "--format=%s", sha]);
+    const [subject, date] = gitOut(cwd, ["log", "-1", "--format=%s%n%cI", sha]).split("\n");
     const pr = subject.match(/\(#(\d+)\)\s*$/);
-    return { sha, subject, pr: pr ? Number(pr[1]) : null };
+    return { sha, subject, date, pr: pr ? Number(pr[1]) : null };
   });
   return { total, steps };
 }
@@ -33,7 +33,7 @@ export function walkCleanStretch(cwd, { head, master, steps, maxSteps = Infinity
       return { clean, tip, stoppedBy: "conflict", conflict: { step, files: merged.files, tree: merged.tree } };
     }
     const { tree, restored } = restoreLockfiles(cwd, merged.tree, master);
-    tip = commitTree(cwd, tree, [tip, step.sha], mergeMessage(step));
+    tip = commitTree(cwd, tree, [tip, step.sha], mergeMessage(step), { date: step.date });
     clean.push({ ...step, merge: tip, restoredLockfiles: restored });
   }
   return { clean, tip, stoppedBy: "end", conflict: null };

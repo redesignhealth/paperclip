@@ -18,6 +18,7 @@ export function testsMentioning(cwd, file, cap = 40) {
   const base = file.replace(/^.*\//, "").replace(/\.[cm]?[jt]sx?$/, "");
   if (base.length < 4) return [];
   const r = git(cwd, ["grep", "-l", "-w", "--fixed-strings", base, "--", "*.test.*", "*.spec.*"], { allowFail: true });
+  if (r.status > 1) throw new Error(`git grep failed: ${r.stderr.trim()}`); // status 1 is "no match"
   return r.stdout.split("\n").filter(Boolean).slice(0, cap);
 }
 
@@ -53,7 +54,25 @@ export function selectTests(cwd, changed, convergent = []) {
 /** Files the step changed: for a merge commit, the diff from its fork-side parent; otherwise from `since`. */
 export function changedInStep(cwd, head, since) {
   const parent = since ?? `${head}^1`;
-  return gitOut(cwd, ["diff", "--name-only", "-z", "--no-renames", parent, head], { allowFail: true })
-    .split("\0")
-    .filter(Boolean);
+  return gitOut(cwd, ["diff", "--name-only", "-z", "--no-renames", parent, head]).split("\0").filter(Boolean);
+}
+
+/** Group Vitest files by the nearest ancestor directory with its own vitest config ("." when only the root has one). */
+export function vitestGroups(cwd, files) {
+  const groups = new Map();
+  for (const file of files) {
+    const parts = file.split("/");
+    let dir = ".";
+    for (let i = parts.length - 1; i > 0; i--) {
+      const candidate = parts.slice(0, i).join("/");
+      if (["ts", "mts", "js", "mjs"].some((ext) => existsSync(join(cwd, candidate, `vitest.config.${ext}`)))) {
+        dir = candidate;
+        break;
+      }
+    }
+    const rel = dir === "." ? file : file.slice(dir.length + 1);
+    if (!groups.has(dir)) groups.set(dir, []);
+    groups.get(dir).push(rel);
+  }
+  return groups;
 }
