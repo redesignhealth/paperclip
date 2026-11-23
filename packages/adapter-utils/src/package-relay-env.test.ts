@@ -40,14 +40,16 @@ describe("package relay env", () => {
     it("adds one git insteadOf rule per configured repo, and nothing for gitea", () => {
       const env = buildPackageRelayEnv({ PAPERCLIP_PACKAGE_RELAY: "github" }, bridge, repos);
       expect(env.UV_EXTRA_INDEX_URL).toBeUndefined();
-      // Two rules per repo, each ending at a separator, so a look-alike repo name is not captured.
-      expect(env.GIT_CONFIG_COUNT).toBe("4");
-      expect(env.GIT_CONFIG_KEY_0).toBe("url.http://paperclip:abc_DEF-123@127.0.0.1:41234/api/package-relay/github/redesignhealth/rh-maiea.git.insteadOf");
-      expect(env.GIT_CONFIG_VALUE_0).toBe("https://github.com/redesignhealth/rh-maiea.git");
-      expect(env.GIT_CONFIG_KEY_1).toContain("/api/package-relay/github/redesignhealth/rh-maiea/.insteadOf");
-      expect(env.GIT_CONFIG_VALUE_1).toBe("https://github.com/redesignhealth/rh-maiea/");
-      expect(env.GIT_CONFIG_KEY_2).toContain("/api/package-relay/github/acme/other-repo.git.insteadOf");
-      expect(env.GIT_CONFIG_VALUE_3).toBe("https://github.com/acme/other-repo/");
+      // One rule per repo on the bare URL: git's insteadOf is a prefix match, so it covers `<repo>`, `<repo>.git` and `<repo>/`.
+      expect(env.GIT_CONFIG_COUNT).toBe("2");
+      expect(env.GIT_CONFIG_KEY_0).toBe("url.http://paperclip:abc_DEF-123@127.0.0.1:41234/api/package-relay/github/redesignhealth/rh-maiea.insteadOf");
+      expect(env.GIT_CONFIG_VALUE_0).toBe("https://github.com/redesignhealth/rh-maiea");
+      expect(env.GIT_CONFIG_KEY_1).toContain("/api/package-relay/github/acme/other-repo.insteadOf");
+      expect(env.GIT_CONFIG_VALUE_1).toBe("https://github.com/acme/other-repo");
+      // A prefix rule is what lets the `.git` and bare forms both match.
+      for (const url of ["https://github.com/redesignhealth/rh-maiea", "https://github.com/redesignhealth/rh-maiea.git", "https://github.com/redesignhealth/rh-maiea/"]) {
+        expect(url.startsWith(env.GIT_CONFIG_VALUE_0!)).toBe(true);
+      }
       // The token is only in key names; no value carries it.
       expect(Object.entries(env).filter(([k, v]) => !k.includes("KEY") && v.includes("abc_DEF-123"))).toEqual([]);
     });
@@ -55,7 +57,7 @@ describe("package relay env", () => {
     it("combines with gitea, and adds nothing when the repo list is missing or invalid", () => {
       const both = buildPackageRelayEnv({ PAPERCLIP_PACKAGE_RELAY: "gitea, github" }, bridge, repos);
       expect(both.UV_EXTRA_INDEX_URL).toBeDefined();
-      expect(both.GIT_CONFIG_COUNT).toBe("4");
+      expect(both.GIT_CONFIG_COUNT).toBe("2");
       for (const bad of [undefined, "", "a", "a/b.git", "a/b,bad repo", "a/b/c", "a/..", "a/."]) {
         expect(Object.keys(buildPackageRelayEnv({ PAPERCLIP_PACKAGE_RELAY: "github" }, bridge, bad))).toEqual([]);
       }

@@ -86,9 +86,10 @@ export function buildPackageRelayEnv(
     // name. The value is a plain GitHub URL.
     const repos = (githubRepos ?? "").split(",").map((r) => r.trim()).filter(Boolean);
     if (repos.length > 0 && repos.every((r) => GITHUB_REPO_RE.test(r) && !r.endsWith(".git") && !r.endsWith("/.") && !r.endsWith("/.."))) {
-      // insteadOf is a plain prefix match, so each rule ends at a separator (`<repo>.git`, `<repo>/`): allowlisting
-      // `acme/repo` must not also capture `acme/repo-tools`. The match is case-sensitive.
-      const rules = repos.flatMap((repo) => [`${repo}.git`, `${repo}/`]);
+      // One rule per repo on the bare URL. insteadOf is a plain prefix match, so this covers `<repo>`, `<repo>.git` and
+      // `<repo>/`. Known limit: it also captures a look-alike `<repo>-tools`, which the relay answers with a 404 (not on
+      // the allowlist). The match is case-sensitive.
+      const rules = repos;
       rules.forEach((rule, index) => {
         out[`GIT_CONFIG_KEY_${index}`] = `url.${base.protocol}//paperclip:${token}@${base.host}${PACKAGE_RELAY_GITHUB_PATH}${rule}.insteadOf`;
         out[`GIT_CONFIG_VALUE_${index}`] = `https://github.com/${rule}`;
