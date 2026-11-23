@@ -62,6 +62,7 @@ import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compac
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
+import { PI_GUARD_EXTENSION_FILE, preparePiGuardExtension, readPiGuardProfile } from "./guard-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   collectSessionSecrets,
@@ -359,8 +360,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
   }
   let attributionExtension: Awaited<ReturnType<typeof preparePiOpenRouterExtension>> | undefined;
+  // TECH-9797: a pod has no person to approve a tool call. Remote runs load the headless guard (pre-approved list,
+  // deny list, fail fast on the rest). Local runs keep Pi's own behaviour.
+  let guardExtension: Awaited<ReturnType<typeof preparePiGuardExtension>> | undefined;
+  let guardExtensionPath: string | null = null;
   try {
     attributionExtension = await preparePiOpenRouterExtension();
+    if (executionTargetIsRemote) {
+      guardExtension = await preparePiGuardExtension(readPiGuardProfile(envConfig));
+      guardExtensionPath = guardExtension.extensionPath;
+    }
     let attributionExtensionPath = attributionExtension.extensionPath;
     // Prepend installed skill `bin/` dirs to PATH so an agent's bash tool can
     // invoke skill binaries (e.g. `paperclip-get-issue`) by name. Without this,
@@ -459,6 +468,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               key: "attribution",
               localDir: attributionExtension.directory,
             },
+            ...(guardExtension
+              ? [{
+                key: "guard",
+                localDir: guardExtension.directory,
+              }]
+              : []),
             {
               key: "skills",
               localDir: localSkillsDir,
@@ -496,6 +511,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const remoteAttributionDir = preparedRemoteRuntime.assetDirs.attribution;
         if (!remoteAttributionDir) throw new Error("Pi attribution extension was not staged to the execution target.");
         attributionExtensionPath = path.posix.join(remoteAttributionDir, "openrouter-attribution.mjs");
+        if (guardExtension) {
+          const remoteGuardDir = preparedRemoteRuntime.assetDirs.guard;
+          // Fail closed: never start a pod run without its guard.
+          if (!remoteGuardDir) throw new Error("Pi guard extension was not staged to the execution target.");
+          guardExtensionPath = path.posix.join(remoteGuardDir, PI_GUARD_EXTENSION_FILE);
+        }
         if (localAgentConfigDir && preparedRemoteRuntime.assetDirs.agentConfig) {
           env.PI_CODING_AGENT_DIR = preparedRemoteRuntime.assetDirs.agentConfig;
         }
@@ -718,6 +739,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       if (extraArgs.length > 0) args.push(...extraArgs);
       args.push("--extension", attributionExtensionPath);
+      if (guardExtensionPath) args.push("--extension", guardExtensionPath);
 
       // Add the user prompt as the last argument
       args.push(userPrompt);
@@ -980,6 +1002,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
-    await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup()]);
+    await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup(), guardExtension?.cleanup()]);
   }
 }
