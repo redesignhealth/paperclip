@@ -222,3 +222,7 @@ To run the kind-cluster integration test (requires `kubectl --context kind-paper
 ```bash
 RUN_K8S_INTEGRATION_TESTS=1 pnpm test test/integration/end-to-end-run.test.ts
 ```
+
+## Default runtime image (server self-resolution)
+
+An `adapters[]` entry whose `runtimeImage` is unset or empty runs sandbox pods on the digest of the running paperclip-server image, so environments follow deploys. The digest comes from `PAPERCLIP_SERVER_IMAGE_REF` (`<repo>@sha256:<digest>`) when set, otherwise from the ECS task metadata v4 `ImageID` (`ECS_CONTAINER_METADATA_URI_V4`). It is resolved once and cached. If neither is available, validation and lease acquisition fail with an explicit error; there is no fallback to a stale or default image. An explicit `runtimeImage` is used unchanged as an override.

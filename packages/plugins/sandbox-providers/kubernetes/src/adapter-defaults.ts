@@ -1,4 +1,5 @@
 import type { AdapterRegistryEntry } from "./adapter-registry.js";
+import { resolveServerImageRef, type ServerImageRefDeps } from "./server-image-ref.js";
 
 export interface AdapterDefaults {
   runtimeImage: string;
@@ -55,9 +56,10 @@ function fromRegistryEntry(entry: AdapterRegistryEntry): AdapterDefaults {
   // default to []: the operator emits them with `omitempty`, so a genuinely
   // empty allowFqdns/envKeys/probeCommand arrives as undefined, which is valid
   // (no extra egress / no forwarded secrets / no probe), NOT an error.
-  if (!entry.runtimeImage) {
+  if (!entry.runtimeImage?.trim()) {
     throw new Error(
-      `Adapter "${entry.adapterType}" is missing required runtime field: runtimeImage`,
+      `Adapter "${entry.adapterType}" is missing required runtime field: runtimeImage ` +
+        `(use getAdapterDefaultsResolved to default it to the server's own image)`,
     );
   }
   return {
@@ -90,6 +92,41 @@ export function getAdapterDefaults(
     throw new Error(`Unknown adapter type: ${adapterType}`);
   }
   return defaults;
+}
+
+/**
+ * Async variant of getAdapterDefaults: a registry entry with an unset/empty
+ * `runtimeImage` defaults to the digest of the running server's own image
+ * (TECH-9856), so sandbox pods follow deploys. An explicit `runtimeImage` is
+ * used unchanged. Throws (no stale/default fallback) if the server image
+ * cannot be determined.
+ */
+export async function getAdapterDefaultsResolved(
+  adapterType: string,
+  registry?: readonly AdapterRegistryEntry[],
+  deps?: ServerImageRefDeps,
+): Promise<AdapterDefaults> {
+  const entry =
+    registry && registry.length > 0
+      ? registry.find((e) => e.adapterType === adapterType)
+      : undefined;
+  if (!entry || entry.runtimeImage?.trim()) {
+    return getAdapterDefaults(adapterType, registry);
+  }
+  let image: string;
+  try {
+    image = await resolveServerImageRef(deps);
+  } catch (err) {
+    throw new Error(
+      `Adapter "${adapterType}" has no runtimeImage and the server image could not be resolved: ` +
+        `${err instanceof Error ? err.message : String(err)}. ` +
+        `Set runtimeImage explicitly or fix the server image reference.`,
+    );
+  }
+  return getAdapterDefaults(
+    adapterType,
+    registry!.map((e) => (e === entry ? { ...e, runtimeImage: image } : e)),
+  );
 }
 
 /**
