@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
+  adapterExecutionTargetIsSandbox,
   adapterExecutionTargetRemoteCwd,
   overrideAdapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
@@ -364,14 +365,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // TECH-9794: runtime MCP servers reach Pi only through the sandbox bridge relay, so no MCP token or run
   // token is written to the pod. Targets without the bridge (and local runs) continue without them.
   const allRuntimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
-  const mcpRelayAvailable = executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
+  // Sandbox pods only: they run the runtime image that carries the pinned extension. SSH hosts also use the bridge
+  // but do not have it.
+  const mcpRelayAvailable = adapterExecutionTargetIsSandbox(executionTarget) && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
   const { relayServers: piMcpRelayServers, skipped: piMcpSkipped } = mcpRelayAvailable
     ? selectPiMcpRelayServers(allRuntimeMcpServers)
     : { relayServers: [], skipped: [] };
   if (allRuntimeMcpServers.length > 0 && !mcpRelayAvailable) {
     await onLog(
       "stdout",
-      `[paperclip] Warning: ${allRuntimeMcpServers.length} runtime MCP server(s) need the Paperclip bridge relay, which this target does not use; this run continues without them.\n`,
+      `[paperclip] Warning: ${allRuntimeMcpServers.length} runtime MCP server(s) need the Paperclip bridge relay and the runtime image extension, which only sandbox pod targets have; this run continues without them.\n`,
     );
   }
   if (piMcpSkipped.length > 0) {
@@ -380,7 +383,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Warning: skipped runtime MCP server(s) with no allowed tools: ${piMcpSkipped.join(", ")}.\n`,
     );
   }
-  const piMcpEnabled = piMcpRelayServers.length > 0;
+  let piMcpEnabled = piMcpRelayServers.length > 0;
+  const piMcpAdapterPath = resolvePiMcpAdapterPath();
   const preparedRuntimeConfig = await preparePiRuntimeConfig({
     env,
     mcpConfig: piMcpEnabled ? buildPiMcpConfig(piMcpRelayServers) : null,
@@ -549,6 +553,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
         if (localAgentConfigDir && preparedRemoteRuntime.assetDirs.agentConfig) {
           env.PI_CODING_AGENT_DIR = preparedRemoteRuntime.assetDirs.agentConfig;
+        }
+        if (piMcpEnabled) {
+          // Fail soft: an image without the pinned extension must not break the run. Pi would abort on a
+          // missing --extension, so run without MCP and say why.
+          const probe = await runAdapterExecutionTargetShellCommand(
+            runId,
+            executionTarget,
+            `test -f ${shellQuote(piMcpAdapterPath)}`,
+            { cwd: effectiveExecutionCwd, env: runtimeEnv, timeoutSec: 15, graceSec: 5 },
+          ).catch(() => null);
+          if (!probe || probe.timedOut || (probe.exitCode ?? 1) !== 0) {
+            piMcpEnabled = false;
+            await onLog(
+              "stdout",
+              `[paperclip] Warning: the Pi MCP adapter extension was not found at ${piMcpAdapterPath} in the execution target image; this run continues without runtime MCP servers.\n`,
+            );
+          }
         }
       } catch (error) {
         await Promise.allSettled([
@@ -771,7 +792,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (extraArgs.length > 0) args.push(...extraArgs);
       args.push("--extension", attributionExtensionPath);
       if (guardExtensionPath) args.push("--extension", guardExtensionPath);
-      if (piMcpEnabled) args.push("--extension", resolvePiMcpAdapterPath(env));
+      if (piMcpEnabled) args.push("--extension", piMcpAdapterPath);
 
       // Add the user prompt as the last argument
       args.push(userPrompt);

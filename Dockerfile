@@ -205,6 +205,7 @@ COPY docker/pi-mcp-adapter/package.json docker/pi-mcp-adapter/package-lock.json 
 RUN cd /opt/pi-mcp-adapter \
   && npm ci --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund \
   && test "$(node -p "require('/opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/package.json').version")" = "7.0.1" \
+  && test -f /opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/index.ts \
   && chmod -R a+rX /opt/pi-mcp-adapter
 
 # TECH-9787: build tools for sandbox build pods (the root fs is read-only and HOME is wiped between

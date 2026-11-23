@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -106,6 +107,25 @@ const runtimeMcp = {
   ],
 };
 
+const RUNTIME_ROOT = "/workspace/.paperclip-runtime/pi";
+
+const runnerInputs: Array<{ command?: string; args?: string[]; env?: Record<string, string> }> = [];
+
+function sandboxTarget(probeExitCode: number): AdapterExecutionTarget {
+  return {
+    kind: "remote",
+    transport: "sandbox",
+    providerKey: "kubernetes",
+    remoteCwd: "/workspace",
+    runner: {
+      execute: async (input: { command?: string; args?: string[]; env?: Record<string, string> }) => (runnerInputs.push(input), {
+        exitCode: JSON.stringify(input).includes("test -f") ? probeExitCode : 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+        startedAt: new Date().toISOString(),
+      }),
+    },
+  } as AdapterExecutionTarget;
+}
+
 const sshTransport = {
   remoteExecution: {
     host: "127.0.0.1",
@@ -126,6 +146,7 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
   function reset() {
     vi.clearAllMocks();
     syncedMcpJson.length = 0;
+    runnerInputs.length = 0;
     runChildProcess.mockReset().mockImplementation(async () => ({
       exitCode: 0, signal: null, timedOut: false, stdout: PI_TURN_END, stderr: "", pid: 123,
       startedAt: new Date().toISOString(),
@@ -134,17 +155,30 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
       env: { ...BRIDGE_ENV },
       stop: async () => {},
     }));
-    prepareAdapterExecutionTargetRuntime.mockReset().mockImplementation(actualPrepare.fn as never);
-    syncDirectoryToSsh.mockReset().mockImplementation((async (input: { localDir: string }) => {
-      try {
-        syncedMcpJson.push(await readFile(path.join(input.localDir, "mcp.json"), "utf8"));
-      } catch {
-        // not the agentConfig directory
+    prepareAdapterExecutionTargetRuntime.mockReset().mockImplementation((async (input: { target: AdapterExecutionTarget; assets?: Array<{ key: string; localDir: string }> }) => {
+      for (const asset of input.assets ?? []) {
+        if (asset.key !== "agentConfig") continue;
+        try { syncedMcpJson.push(await readFile(path.join(asset.localDir, "mcp.json"), "utf8")); } catch { /* none */ }
       }
+      return {
+        target: input.target,
+        workspaceRemoteDir: "/workspace",
+        runtimeRootDir: RUNTIME_ROOT,
+        assetDirs: {
+          attribution: `${RUNTIME_ROOT}/attribution`,
+          skills: `${RUNTIME_ROOT}/skills`,
+          agentConfig: `${RUNTIME_ROOT}/agentConfig`,
+        },
+        additionalSourceDirs: {},
+        additionalSourceFailures: [],
+        workspaceSyncSnapshot: null,
+        restoreWorkspace: async () => {},
+      };
     }) as never);
   }
 
   async function run(overrides: Record<string, unknown> = {}) {
+    runnerInputs.length = 0;
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-mcp-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -156,12 +190,16 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: { command: "pi", model: "openai/gpt-5.4-mini" },
       context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
-      executionTransport: sshTransport,
+      executionTarget: sandboxTarget(0),
+      runtimeCommandSpec: { command: "pi", installCommand: "npm install -g pi", detectCommand: "pi" },
       authToken: RUN_JWT,
       runtimeMcp,
       onLog: async (_stream: string, line: string) => { logs.push(line); },
       ...overrides,
     } as never);
+    const invocation = runnerInputs.find((input) => input.args?.includes("--mode"));
+    // SSH and local targets run Pi through runChildProcess instead of the sandbox runner.
+    if (invocation) return { args: invocation.args!, env: invocation.env ?? {}, logs };
     const [, , args, options] = runChildProcess.mock.calls[0] as unknown as
       [string, string, string[], { env: Record<string, string> }];
     return { args, env: options.env, logs };
@@ -205,28 +243,52 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls,mcp");
     const extensions = args.flatMap((value, index) => (args[index - 1] === "--extension" ? [value] : []));
     expect(extensions).toContain("/opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/index.ts");
-    expect(env.PI_CODING_AGENT_DIR).toContain("agentConfig");
+    expect(env.PI_CODING_AGENT_DIR).toBe(`${RUNTIME_ROOT}/agentConfig`);
     expect(logs.join("")).toContain("skipped runtime MCP server(s) with no allowed tools: No Tools");
 
     // No MCP token and no run JWT anywhere the pod can see.
-    const podVisible = JSON.stringify({ args, env, written, sync: syncDirectoryToSsh.mock.calls, sync2: syncedMcpJson });
+    const podVisible = JSON.stringify({ args, env, written, sync: prepareAdapterExecutionTargetRuntime.mock.calls.map((call) => (call[0] as { assets: unknown }).assets) });
     expect(podVisible).not.toContain(MCP_TOKEN);
     expect(podVisible).not.toContain(RUN_JWT);
     expect(env.PAPERCLIP_API_KEY).toBe("bridge-token");
   });
 
-  it("honours PAPERCLIP_PI_MCP_ADAPTER_PATH", async () => {
-    const { args } = await run({
-      config: { command: "pi", model: "openai/gpt-5.4-mini", env: { PAPERCLIP_PI_MCP_ADAPTER_PATH: "/custom/mcp/index.ts" } },
+  it("honours the server-side PAPERCLIP_PI_MCP_ADAPTER_PATH but ignores the agent's own env", async () => {
+    const agentOnly = await run({
+      config: { command: "pi", model: "openai/gpt-5.4-mini", env: { PAPERCLIP_PI_MCP_ADAPTER_PATH: "/agent/chosen.ts" } },
     });
-    expect(args).toContain("/custom/mcp/index.ts");
+    expect(agentOnly.args).not.toContain("/agent/chosen.ts");
+    process.env.PAPERCLIP_PI_MCP_ADAPTER_PATH = "/custom/mcp/index.ts";
+    try {
+      const { args } = await run();
+      expect(args).toContain("/custom/mcp/index.ts");
+    } finally {
+      delete process.env.PAPERCLIP_PI_MCP_ADAPTER_PATH;
+    }
+  });
+
+  it("runs without MCP when the image has no adapter extension", async () => {
+    const { args, logs } = await run({ executionTarget: sandboxTarget(1) });
+    expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls");
+    expect(args).not.toContain("/opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/index.ts");
+    expect(logs.join("")).toContain("extension was not found");
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
+      expect.not.objectContaining({ relayRoutes: expect.anything() }),
+    );
+  });
+
+  it("does not wire MCP for an SSH target (it has the bridge but not the image extension)", async () => {
+    const { args, logs } = await run({ executionTarget: undefined, executionTransport: sshTransport });
+    expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls");
+    expect(args.some((arg) => arg.includes("pi-mcp-adapter"))).toBe(false);
+    expect(syncedMcpJson).toHaveLength(0);
+    expect(logs.join("")).toContain("only sandbox pod targets have");
   });
 
   it("leaves Pi unchanged when the run has no MCP servers", async () => {
-    const { args, env } = await run({ runtimeMcp: { getServers: () => [] } });
+    const { args } = await run({ runtimeMcp: { getServers: () => [] } });
     expect(syncedMcpJson).toHaveLength(0);
     expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls");
-    expect(env.PI_CODING_AGENT_DIR).toBeUndefined();
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
       expect.not.objectContaining({ relayRoutes: expect.anything() }),
     );
@@ -235,6 +297,6 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
   it("continues without MCP and says so on a local target", async () => {
     const { args, logs } = await run({ executionTransport: undefined, executionTarget: undefined });
     expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls");
-    expect(logs.join("")).toContain("runtime MCP server(s) need the Paperclip bridge relay");
+    expect(logs.join("")).toContain("only sandbox pod targets have");
   });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { sandboxBridgeMcpRelayPath, sanitizeMcpServerKey } from "@paperclipai/adapter-utils/sandbox-bridge-relay";
 import {
   buildPiMcpConfig,
   buildPiMcpRelayRoutes,
@@ -55,6 +56,13 @@ describe("pi mcp-config", () => {
         label: "Argus",
       },
     ]);
+  });
+
+  it("numbers keys that still collide after the connection-id suffix", () => {
+    const { relayServers } = selectPiMcpRelayServers([server("A", "c1"), server("A", "c1"), server("A", "c1")]);
+    expect(relayServers.map((entry) => entry.key)).toEqual(["a", "a_c1", "a_c1_2"]);
+    expect(sanitizeMcpServerKey("!!!", "", new Set())).toBe("mcp_server");
+    expect(sandboxBridgeMcpRelayPath("x")).toBe("/paperclip-relay/mcp/x");
   });
 
   it("resolves the extension path with an env override", () => {

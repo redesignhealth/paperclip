@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
-import { sandboxBridgeMcpRelayPath } from "@paperclipai/adapter-utils/sandbox-bridge-relay";
+import { sandboxBridgeMcpRelayPath, sanitizeMcpServerKey } from "@paperclipai/adapter-utils/sandbox-bridge-relay";
 import {
   type MemoryHardeningFlags,
   resolveEffectiveMemoryHardeningFlags,
@@ -272,33 +272,7 @@ export function validateMcpServer(server: AdapterRuntimeMcpServer): void {
  * Collisions are handled deterministically using the connectionId and an incrementing suffix.
  */
 export function sanitizeServerKey(rawName: string, connectionId: string, usedKeys: Set<string>): string {
-  const sanitized = rawName
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  let key = sanitized.length > 0 ? sanitized : "mcp_server";
-
-  if (usedKeys.has(key)) {
-    const connSuffix = (connectionId || "")
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 16);
-    if (connSuffix.length > 0) {
-      key = `${key}_${connSuffix}`;
-    }
-  }
-
-  let counter = 2;
-  const baseKey = key;
-  while (usedKeys.has(key)) {
-    key = `${baseKey}_${counter}`;
-    counter++;
-  }
-  usedKeys.add(key);
-  return key;
+  return sanitizeMcpServerKey(rawName, connectionId, usedKeys);
 }
 
 /**

@@ -482,6 +482,13 @@ export function adapterExecutionTargetIsRemote(
   return target?.kind === "remote";
 }
 
+/** True for a Kubernetes/sandbox pod target (not SSH, which also uses the bridge). */
+export function adapterExecutionTargetIsSandbox(
+  target: AdapterExecutionTarget | null | undefined,
+): boolean {
+  return target?.kind === "remote" && target.transport === "sandbox";
+}
+
 export function adapterExecutionTargetUsesManagedHome(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {

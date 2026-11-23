@@ -52,6 +52,18 @@ describe("preparePiRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
+  it("writes models.json and mcp.json together when both are configured", async () => {
+    const mcpConfig = { mcpServers: {} };
+    const prepared = await preparePiRuntimeConfig({
+      env: { PAPERCLIP_PI_PROVIDERS: JSON.stringify({ other: { baseUrl: "https://other.example/v1" } }) },
+      mcpConfig,
+    });
+    cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
+    expect(JSON.parse(await fs.readFile(path.join(prepared.agentConfigDir!, "mcp.json"), "utf8"))).toEqual(mcpConfig);
+    expect(Object.keys((await readModelsJson(prepared.agentConfigDir!)).providers as object)).toEqual(["other"]);
+    await prepared.cleanup();
+  });
+
   it("is a no-op when PAPERCLIP_PI_PROVIDERS is unset", async () => {
     const prepared = await preparePiRuntimeConfig({ env: { FOO: "bar" } });
 

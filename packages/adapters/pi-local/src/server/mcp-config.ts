@@ -1,12 +1,15 @@
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
-import { sandboxBridgeMcpRelayPath } from "@paperclipai/adapter-utils/sandbox-bridge-relay";
+import { sandboxBridgeMcpRelayPath, sanitizeMcpServerKey } from "@paperclipai/adapter-utils/sandbox-bridge-relay";
 
 // TECH-9794: Pi 0.87 has no native MCP client. The pinned `pi-mcp-adapter` extension (installed in the
 // runtime image, see docker/pi-mcp-adapter) reads `$PI_CODING_AGENT_DIR/mcp.json`. In a sandbox pod every
 // server points at the bridge relay route and authenticates with the run's bridge token; the server's own
 // token never reaches the pod (the host injects it per route).
 
-/** Env var that overrides where the pinned extension lives in the runtime image. */
+/**
+ * Server-process env var (operator-set, never read from agent adapterConfig.env) that overrides where the pinned
+ * extension lives in the runtime image.
+ */
 export const PI_MCP_ADAPTER_PATH_ENV = "PAPERCLIP_PI_MCP_ADAPTER_PATH";
 export const PI_MCP_ADAPTER_DEFAULT_PATH = "/opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/index.ts";
 /** The one tool the extension registers; `--tools` is a name allowlist, so it must be listed. */
@@ -19,24 +22,8 @@ export interface PiMcpRelayServer {
   server: AdapterRuntimeMcpServer;
 }
 
-export function resolvePiMcpAdapterPath(env: Record<string, string | undefined>): string {
-  return env[PI_MCP_ADAPTER_PATH_ENV]?.trim() || PI_MCP_ADAPTER_DEFAULT_PATH;
-}
-
-function sanitizeKey(rawName: string, connectionId: string, used: Set<string>): string {
-  const clean = (value: string) =>
-    value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  const base = clean(rawName) || "mcp_server";
-  let key = base;
-  if (used.has(key)) {
-    const suffix = clean(connectionId || "").slice(0, 16);
-    if (suffix) key = `${base}_${suffix}`;
-  }
-  let counter = 2;
-  const stem = key;
-  while (used.has(key)) key = `${stem}_${counter++}`;
-  used.add(key);
-  return key;
+export function resolvePiMcpAdapterPath(serverEnv: Record<string, string | undefined> = process.env): string {
+  return serverEnv[PI_MCP_ADAPTER_PATH_ENV]?.trim() || PI_MCP_ADAPTER_DEFAULT_PATH;
 }
 
 /**
@@ -55,7 +42,7 @@ export function selectPiMcpRelayServers(servers: readonly AdapterRuntimeMcpServe
       skipped.push(server.name);
       continue;
     }
-    relayServers.push({ key: sanitizeKey(server.name, server.connectionId, used), server });
+    relayServers.push({ key: sanitizeMcpServerKey(server.name, server.connectionId, used), server });
   }
   return { relayServers, skipped };
 }
