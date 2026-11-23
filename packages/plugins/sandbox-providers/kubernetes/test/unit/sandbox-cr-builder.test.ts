@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildSandboxCrManifest } from "../../src/sandbox-cr-builder.js";
+import { buildScrubScript } from "../../src/pod-scrub.js";
 
 const baseInput = {
   namespace: "paperclip-acme",
@@ -78,6 +79,7 @@ describe("buildSandboxCrManifest", () => {
       .map((m: { mountPath: string }) => m.mountPath)
       .sort();
     expect(mountPaths).toEqual([
+      "/deps",
       "/home/paperclip",
       "/home/paperclip/.cache",
       "/tmp",
@@ -88,6 +90,24 @@ describe("buildSandboxCrManifest", () => {
     expect(
       volumes.every((v: { emptyDir?: unknown }) => v.emptyDir !== undefined),
     ).toBe(true);
+  });
+
+  it("persists dependency caches on a /deps volume outside the workspace and scrub (TECH-9789)", () => {
+    const cr = buildSandboxCrManifest(baseInput);
+    const container = cr.spec.podTemplate.spec.containers[0];
+    const env = Object.fromEntries(
+      container.env.map((e: { name: string; value: string }) => [e.name, e.value]),
+    );
+    expect(env.UV_CACHE_DIR).toBe("/deps/uv");
+    expect(env.npm_config_cache).toBe("/deps/npm");
+    expect(env.HOME).toBe("/home/paperclip");
+    const deps = cr.spec.podTemplate.spec.volumes.find(
+      (v: { name: string }) => v.name === "deps",
+    );
+    expect(deps.emptyDir.sizeLimit).toBe("4Gi");
+    // Larger than the 1Gi home/cache caps and the measured 773 MB uv cache.
+    // The scrub script must never reference it.
+    expect(buildScrubScript("/workspace/x")).not.toContain("/deps");
   });
 
   it("envFrom references the per-run secret", () => {
