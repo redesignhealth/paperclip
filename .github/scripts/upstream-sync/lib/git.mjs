@@ -4,10 +4,8 @@ import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 
-// Nothing to change in the environment: the digest is pinned by `-c` flags, which beat every config file. The global
-// and system config must stay readable, because that is where `safe.directory` lives on a pod or a CI runner.
-export const PINNED_ENV = undefined;
-
+// The digest is pinned by `-c` flags, which beat every config file. The global and system config stay readable on
+// purpose, because that is where `safe.directory` lives on a pod or a CI runner.
 export class GitError extends Error {
   constructor(args, result) {
     super(`git ${args.join(" ")} failed (${result.status}): ${String(result.stderr).trim()}`);
@@ -90,7 +88,6 @@ export function mergeTree(cwd, ours, theirs, { pin = false } = {}) {
     : [];
   const r = git(cwd, [...config, "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", ours, theirs], {
     allowFail: true,
-    env: pin ? PINNED_ENV : undefined,
   });
   if (r.status !== 0 && r.status !== 1) {
     throw new GitError(["merge-tree", ours, theirs], r);

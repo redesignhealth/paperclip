@@ -61,7 +61,17 @@ function treeDiff(cwd, from, to, { summarize }) {
   return { mechanical, diffText };
 }
 
-const isChangedLine = (line) => (line.startsWith("+") || line.startsWith("-")) && !line.startsWith("+++") && !line.startsWith("---");
+/** Changed lines of a unified diff: only lines inside hunks, so `++i;` and `-- sql comment` still count. */
+export function countChangedLines(diffText) {
+  let inHunk = false;
+  let count = 0;
+  for (const line of diffText.split("\n")) {
+    if (line.startsWith("diff --git ")) inHunk = false;
+    else if (line.startsWith("@@")) inHunk = true;
+    else if (inHunk && (line.startsWith("+") || line.startsWith("-"))) count += 1;
+  }
+  return count;
+}
 
 /** Build the document for `head` against `base`. Returns { document, digest, files, changed_lines, chars, ... }. */
 export function buildResolutionDiff(cwd, { head, base }) {
@@ -94,7 +104,7 @@ export function buildResolutionDiff(cwd, { head, base }) {
     if (diffText) {
       out.push(diffText.endsWith("\n") ? diffText.slice(0, -1) : diffText);
       files += (diffText.match(/^diff --git /gm) ?? []).length;
-      changedLines += diffText.split("\n").filter(isChangedLine).length;
+      changedLines += countChangedLines(diffText);
     }
   }
   const document = `${out.join("\n")}\n`;

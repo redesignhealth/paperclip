@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Fixture } from './upstream-sync-fixture.mjs';
 import { computeResolutionDiff } from '../upstream-sync/commands/resolution-diff.mjs';
-import { LIMITS, buildResolutionDiff as buildResolutionDiffDirect } from '../upstream-sync/lib/resolutiondiff.mjs';
+import { LIMITS, countChangedLines, buildResolutionDiff as buildResolutionDiffDirect } from '../upstream-sync/lib/resolutiondiff.mjs';
 import { submit, judgeVerdict, NOTES_REF } from '../upstream-sync/commands/submit.mjs';
 
 const CLI = fileURLToPath(new URL('../upstream-sync/cli.mjs', import.meta.url));
@@ -272,4 +272,39 @@ test('an unregistered generated file in a merge is shown in full, not summarized
   } finally {
     fx.cleanup();
   }
+});
+
+test('countChangedLines counts lines that start with ++ or -- inside hunks', () => {
+  const diff = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-- sql comment\n++i;\n context\n+new\n';
+  assert.equal(countChangedLines(diff), 3);
+});
+
+test('a rejected notes push is reported, and rounds recorded here survive the next fetch', async () => {
+  const { fx } = syncBranch();
+  const remote = mkdtempSync(join(tmpdir(), 'upstream-sync-remote-'));
+  try {
+    execFileSync('git', ['init', '-q', '--bare', remote]);
+    fx.git('remote', 'add', 'origin', remote);
+    fx.git('push', '-q', 'origin', 'sync', 'master');
+    // a pre-receive hook that rejects the notes ref, so the push fails
+    writeFileSync(join(remote, 'hooks', 'pre-receive'), '#!/bin/sh\nwhile read a b ref; do case "$ref" in refs/notes/*) exit 1;; esac; done\n', { mode: 0o755 });
+    const first = await submit(fx.dir, {});
+    const v = writeVerdict(fx, first);
+    const done = await submit(fx.dir, { verdict: v });
+    assert.equal(done.exit, 0);
+    assert.match(done.warning, /could not be pushed/);
+    // the next submit merges remote notes in rather than replacing the local ones
+    const again = await submit(fx.dir, { verdict: v });
+    assert.equal(again.round, 1);
+    assert.match(fx.git('notes', `--ref=${NOTES_REF}`, 'show', first.head), /"round":1/);
+    rmSync(v, { force: true });
+  } finally {
+    rmSync(remote, { recursive: true, force: true });
+    fx.cleanup();
+  }
+});
+
+test('judgeVerdict rejects a verdict that is not an object', () => {
+  assert.equal(judgeVerdict(null, { head: 'h', digest: 'd' }).exit, 9);
+  assert.equal(judgeVerdict([], { head: 'h', digest: 'd' }).exit, 9);
 });

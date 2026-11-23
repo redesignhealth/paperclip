@@ -28,7 +28,7 @@ function restoreFromMaster(cwd, master, path) {
   }
 }
 
-/** Exit codes: 0 started or committed, 1 error or generators did not finish (a nothing-to-start case throws). */
+/** Exit codes: 0 started or committed, 1 generators did not finish, 2 error (thrown) (a nothing-to-start case throws). */
 export async function startConflict(cwd, opts, positional) {
   if (!isWorkingTreeClean(cwd)) throw new Error("tracked files have uncommitted changes; commit or stash them first");
   const refs = resolveRefs(cwd, opts);
