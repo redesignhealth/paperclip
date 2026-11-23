@@ -5,7 +5,9 @@ Spec: upstream-sync process plan, revision 3. This is phase P0:
 `paperclipai/paperclip` commits so later phases (worker loop, conflict path) have a queue.
 
 Code: `tools/upstream-sync/` (Node >=24.11.0, matching
-`packages/shared/src/node-version.ts`; one dependency: `pg`). Fork-owned path list:
+`packages/shared/src/node-version.ts`; one dependency: `pg`). Runtime dependencies
+and Amazon RDS global CA bundle are baked into the Paperclip container image at
+build time. Fork-owned path list:
 `FORK_OWNED.md`. Requires **git >= 2.31** (`diff-tree --diff-merges=first-parent`).
 
 ## Branch model (TECH-8283)
@@ -232,239 +234,87 @@ queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` 
 | `UPSTREAM_SYNC_LEASE_MINUTES` | `15` | worker claim lease duration |
 | `UPSTREAM_SYNC_ALERT_*`, `UPSTREAM_SYNC_SLACK_WEBHOOK_URL` | see Alerts | |
 
-## Routine setup (one-off runbook)
+## Production deployment: Scheduled ECS Fargate Task (TECH-9777)
 
-The hourly job runs as a Paperclip **routine** on an ops/CTO agent, not as a
-hand-rolled cron on a box. The secrets below come first, then one routine.
+The hourly upstream-sync detector runs as a scheduled ECS Fargate task in AWS,
+defined and managed in [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397).
+The earlier in-agent Kubernetes sandbox pod routine was retired because sandbox
+pods lack egress to public npm registries and Amazon RDS CA host truststores.
 
-### 1. Three company secrets: a restricted DB login, a classifier key, a repo read token
+The task runs the standard Paperclip production container image within the
+Paperclip ECS task security group (granting port 5432 ingress to the RDS instance)
+with NAT egress (enabling outbound access to GitHub and LLM provider endpoints).
 
-Create all three in the company that owns the routine (Secrets -> company scope).
-The routine binds them by `secretId` as `secret_ref` env values, so no value is
-ever pasted into a routine body or a run log.
+The container executes:
 
-| secret key | what it holds |
-|---|---|
-| `UPSTREAM_SYNC_DATABASE_URL` | the DSN of the **restricted** login below, including its password |
-| `UPSTREAM_SYNC_LLM_API_KEY` | an OpenAI-compatible classifier key |
-| `UPSTREAM_SYNC_GIT_TOKEN` | a **read-only** credential for `redesignhealth/paperclip` |
+```sh
+node tools/upstream-sync/cli.mjs run
+```
 
-`redesignhealth/paperclip` is a **private** repo, so the bootstrap checkout needs
-a credential. Use either a fine-grained GitHub token scoped to
-`redesignhealth/paperclip` only with `contents: read`, or a deploy key for that
-repo with read access. Nothing wider: this token can read the fork's source and
-nothing else.
+directly against the ledger DB using the restricted `upstream_sync_runner` DB role.
 
-Keep it distinct from the upstream mirror. `UPSTREAM_SYNC_UPSTREAM_REPO`
-(`paperclipai/paperclip`) is a **public** repo, so the hourly detect step's mirror
-fetch needs no credential at all. `UPSTREAM_SYNC_GIT_TOKEN` is only ever used by
-the one-off bootstrap below.
+### 1. Credentials and Environment Configuration
 
-A `secret_ref` protects how the value is *stored*. It does not limit what the
-routine's process can *do* once it is running, so the login in the DSN is the
-real privilege boundary. Give this routine its own Postgres login that can reach
-nothing but the three ledger tables and the read view.
+Task credentials and configuration are provisioned in AWS Secrets Manager / SSM
+Parameter Store via [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397),
+injected directly into the container definition. No Paperclip company secrets or
+sandbox routines are required.
 
-#### Create the restricted login (`upstream_sync_runner`)
+| Environment / Secret | Source | Purpose |
+|---|---|---|
+| `UPSTREAM_SYNC_DATABASE_URL` | SSM `/paperclip/prod/UPSTREAM_SYNC_DATABASE_URL` | DSN for `upstream_sync_runner` role with `sslmode=require` |
+| `UPSTREAM_SYNC_LLM_API_KEY` | SSM `/paperclip/prod/UPSTREAM_SYNC_LLM_API_KEY` | Dedicated OpenAI-compatible key for commit classification |
+| `UPSTREAM_SYNC_ALERT_SINK` | plain `slack-webhook` | Alert sink for newly classified upstream commits |
+| `UPSTREAM_SYNC_SLACK_WEBHOOK_URL` | SSM `/paperclip/prod/UPSTREAM_SYNC_SLACK_WEBHOOK_URL` | Slack incoming webhook URL for alert delivery |
+| `UPSTREAM_SYNC_MIRROR_DIR` | plain `/tmp/upstream-sync/mirror.git` | Writable cache path for the git mirror on ephemeral volume |
+| `UPSTREAM_SYNC_RDS_CA` | optional | Override path for CA bundle; defaults to baked `/app/tools/upstream-sync/global-bundle.pem` |
+| `UPSTREAM_SYNC_RDS_TRUST` | optional `true`/`false` | Explicit opt-in for fail-closed RDS verified TLS on aliases/CNAMEs |
 
-Production roles are not created by hand: the RDS instance only accepts 5432 from
-the Paperclip ECS task security group, and RH bootstraps DB roles through an
-audited script run inside a one-off bootstrap ECS task. Run
-`scripts/upstream-sync-bootstrap-role.sh` from `redesignhealth/rh-paperclip`
-(PR redesignhealth/rh-paperclip#201) via `aws ecs execute-command` inside that
-bootstrap task, the same way as that repo's tech-6999 app-role bootstrap. It
-requires migration 0380
-(`packages/db/src/migrations/0380_upstream_sync_ledger.sql`) to be applied first,
-and refuses to run otherwise.
+Note: The public upstream repository (`paperclipai/paperclip.git`) requires no credentials to clone.
+The git mirror cache path **must** be set to a writable directory (`/tmp/upstream-sync/mirror.git`),
+as the container root `/app` filesystem is read-only at runtime.
 
-The script writes the generated password to SSM at
-`/paperclip/prod/UPSTREAM_SYNC_RUNNER_PASSWORD`. Compose the DSN as
-`postgresql://upstream_sync_runner:<url-encoded password>@<db host>:5432/paperclip?sslmode=require`
-and store it as the Paperclip company secret bound to `UPSTREAM_SYNC_DATABASE_URL`
-(step 1's secrets table).
+#### Database Role (`upstream_sync_runner`)
 
-What the script grants:
+Production roles are bootstrapped using `scripts/upstream-sync-bootstrap-role.sh`
+from `redesignhealth/rh-paperclip` (PR redesignhealth/rh-paperclip#201) inside a
+one-off bootstrap ECS task. The role requires migration `0380_upstream_sync_ledger.sql`
+to be applied first.
 
-- `CONNECT` on the `paperclip` database and `USAGE` on schema `public`.
-- The three ledger tables:
-  - `SELECT, INSERT, UPDATE` on `upstream_sync_log`
+Privileges granted:
+- `CONNECT` on database `paperclip` and `USAGE` on schema `public`.
+- Append/update on ledger tables:
+  - `SELECT, INSERT, UPDATE` on `upstream_sync_log` and `upstream_sync_alerts`
   - `SELECT, INSERT, UPDATE, DELETE` on `upstream_sync_state`
-  - `SELECT, INSERT, UPDATE` on `upstream_sync_alerts`
-- `USAGE, SELECT` on the sequences behind their bigserial ids,
-  `upstream_sync_log_id_seq` and `upstream_sync_alerts_id_seq`.
-- `SELECT` on `upstream_sync_log_view`, the read surface used by
-  `cli.mjs view|report`.
+  - `USAGE, SELECT` on bigserial sequences (`upstream_sync_log_id_seq`, `upstream_sync_alerts_id_seq`)
+  - `SELECT` on `upstream_sync_log_view`
+- No `CREATE`, `DROP`, or access to other tenant/application tables.
 
-The view is not `security_invoker`, so Postgres evaluates it with the view owner's
-privileges: the `SELECT` on the view above is what makes `view`/`report` work, and
-it would keep working even without the table grant. `upstream_sync_runner` reaches
-no other company's rows because it has no privilege on any other table — `issues`
-and every other app table are denied to it.
+### 2. Verified RDS TLS and CA Bundle Build Hash Rotation
 
-The grants are deliberately asymmetric. `DELETE` is the privilege you least want a
-leaked routine credential to hold, so the two append-only tables do not get it: no
-CLI path deletes from `upstream_sync_log` or `upstream_sync_alerts` (rows move
-between `status`/`alert_state` values instead). Only `upstream_sync_state` needs
-it, because `delState()` in `tools/upstream-sync/lib/db.mjs` clears state keys —
-`resume` removes the paused flag, and the ops-alert episodes are deleted when a
-condition clears (`lib/alerts.mjs`).
+The Paperclip Docker image bakes the Amazon RDS global root CA bundle at build time
+from `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem` with pinned
+SHA-256 digest `90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b`.
 
-This needs a Postgres that supports role management (managed Postgres, or a
-self-hosted instance where you can bootstrap the role). **The embedded dev
-database has no extra roles**, so a dev run cannot use a restricted login — dev
-only, never production.
+Strict fail-closed TLS verification is enforced in `tools/upstream-sync/lib/db.mjs`:
+- Active for all `*.rds.amazonaws.com` hostnames or when `UPSTREAM_SYNC_RDS_TRUST=true`.
+- Any insecure or downgrade SSL mode (`disable`, `allow`, `prefer`, `no-verify`, `false`) throws an immediate fail-closed error.
+- All SSL URL query parameters are stripped before passing to `node-postgres` to prevent parameter overrides.
+- Certificates are verified against the baked CA bundle with `rejectUnauthorized: true` and SNI hostname verification (`servername: host`).
+- Non-RDS database connections without explicit RDS trust preserve native `pg` TLS / CA / mTLS semantics untouched.
 
-`loadConfig()` does accept `DATABASE_URL` as a fallback, but that fallback cannot
-save a dev routine: routine runs are executed by an adapter, and
-`packages/adapter-utils/src/adapters-no-process-env-spread.test.ts` (TECH-7076)
-forbids adapters from copying the server's `process.env` into a child process, so
-`DATABASE_URL` is never present in the run environment. Two options work on dev:
+**CA Bundle Rotation Procedure**:
+If Amazon rotates the global root CA bundle:
+1. Update the URL and pinned SHA-256 digest in `Dockerfile`.
+2. Run scoped tests in `tools/upstream-sync` (`npm test`) to verify digest matching.
+3. The next image build automatically bundles the updated certificates. In an emergency, operators can override the CA bundle path at runtime via `UPSTREAM_SYNC_RDS_CA` without an image rebuild.
 
-- bind a dev DSN through the same `UPSTREAM_SYNC_DATABASE_URL` `secret_ref`,
-  pointing at the dev application database (dev-only), or
-- run the CLI by hand outside a routine, where your shell's `DATABASE_URL`
-  applies.
+### 3. Safe Rollout with Disabled Schedule
 
-> **Warning — application role in production.** Pointing
-> `UPSTREAM_SYNC_DATABASE_URL` at the application DSN in production gives the
-> routine process the application role's instance-wide reach: `SELECT`, write
-> **and** DDL across **every** table in the instance, not just the ledger. That is
-> an instance-wide grant made for the life of every run, not a per-query
-> restriction, so a bug in the routine could modify or drop any tenant's data.
-> Choosing it must be a deliberate, recorded decision (note it in the routine or
-> issue), never the default path.
-
-Use a dedicated classifier key rather than a general `OPENAI_API_KEY` so the
-secret can be rotated or revoked without touching anything else.
-
-### 2. Create the routine
-
-On the ops/CTO agent, create a routine `upstream-sync: hourly detect, classify, alert` with:
-
-- `concurrencyPolicy: "skip_if_active"` — a slow run must not stack up.
-- `catchUpPolicy: "skip_missed"` — a missed hour is not replayed; the detector
-  reads from the stored marker, so the next run picks the gap up anyway.
-- `activityGatePolicy: "always"` — this is infrastructure upkeep, not work that
-  should be gated on company activity.
-- env bindings:
-  - `UPSTREAM_SYNC_DATABASE_URL` -> `secret_ref` (the DSN secret above)
-  - `UPSTREAM_SYNC_LLM_API_KEY` -> `secret_ref` (the classifier key above)
-  - `UPSTREAM_SYNC_GIT_TOKEN` -> `secret_ref` (the read-only repo token above; bootstrap only)
-  - `UPSTREAM_SYNC_ALERT_SINK` -> plain `paperclip-comment`
-  - `UPSTREAM_SYNC_ALERT_ISSUE_ID` -> plain issue identifier, e.g. `RED-544`
-  - `UPSTREAM_SYNC_MIRROR_DIR` -> plain path inside the agent workspace, e.g. `.cache/upstream-sync/mirror.git`
-- a `schedule` trigger: `cronExpression: "0 * * * *"`, `timezone: "UTC"`,
-  **`enabled: false`**. Set `enabled: false` explicitly in the trigger payload —
-  it is not enough to "remember to enable it later". `createTrigger` defaults
-  `enabled` to `true`, so an omitted field starts the hour immediately and it can
-  fire before the backlog load (below) is verified, alerting on hundreds of
-  backfilled rows.
-
-**Do not bind `PAPERCLIP_API_KEY`.** The harness mints and injects the run token
-per run, and a user or routine binding for it is stripped before the run env is
-built (see `FORBIDDEN_ENV_BINDING_KEYS` in
-`server/src/services/heartbeat/run-preparation.ts`), so a binding there is a
-silent no-op that looks like it should work. `PAPERCLIP_API_URL` is not forbidden
-— it is resolved at runtime from the server's configured base URL, so leave it
-unbound as well. `paperclip-comment` uses the harness-injected values, which is
-why the sink works with no explicit binding.
-
-### 3. Routine description (self-bootstrapping)
-
-The description carries the bootstrap step, mirroring
-`server/src/services/default-kb-ingest-routine.ts`: the agent fetches
-`tools/upstream-sync` **and** the root `FORK_OWNED.md` at a pinned SHA into a
-checkout of its own on first run, so the routine does not depend on a
-pre-existing workspace. Paste this as the routine description, replacing the
-`<PINNED_SHA>` placeholder before you save, and bumping it when the tool changes.
-
-`<PINNED_SHA>` **must** be a commit on `master` at or after the merge of this
-change — the commit that adds `packages/db/src/migrations/0380_upstream_sync_ledger.sql`
-and the verify-only `cli.mjs migrate`. An older commit has the old `migrate`, which
-writes DDL, and the old single-key advisory lock. The DDL fails under the
-restricted `upstream_sync_runner` login (no `CREATE` privilege), and the single-key
-lock can collide with Paperclip's own locks. The bootstrap checks this after
-checkout and stops if it does not hold.
-
-Both paths are required: `loadForkOwnedMatcher()` reads
-`forkOwnedFile`, which `loadConfig()` defaults to
-`path.resolve(<tools/upstream-sync/lib>, "../../../FORK_OWNED.md")` — i.e. the
-repository root — and `cli.mjs reflag` calls it. A checkout that contains only
-the tool throws `ENOENT` on `reflag`.
-
-`redesignhealth/paperclip` is private, so the fetch authenticates with the
-read-only `UPSTREAM_SYNC_GIT_TOKEN` from step 1, passed as a request header
-rather than written into the remote URL or `.git/config`. The upstream
-mirror (`paperclipai/paperclip`) is public and needs no credential; do not reuse
-this token for it.
-
-```
-Hourly upstream-sync run for paperclipai/paperclip. Checkout dir: this agent's
-own workspace, under `upstream-sync` (create if missing). Never merge anything;
-this tool only records, classifies and announces upstream commits.
-
-1. Node guard. Run `node --version`. If it is older than 24.11.0 (the
-   MINIMUM_NODE_VERSION in packages/shared/src/node-version.ts), comment on the
-   run issue with the version you saw and this requirement, then stop. Do not
-   attempt install, `npm ci`, or `cli.mjs` on an unsupported runtime.
-2. Bootstrap (first run only). If `<checkout>/tools/upstream-sync/cli.mjs` does
-   not exist, fetch the pinned tree into `<checkout>`. The sparse checkout must
-   include BOTH `tools/upstream-sync` and the root `FORK_OWNED.md`. This repo is
-   private, so the fetch authenticates with `UPSTREAM_SYNC_GIT_TOKEN`:
-
-     mkdir -p <checkout> && cd <checkout>
-     git init -q
-     git remote add origin https://github.com/redesignhealth/paperclip.git
-     git config core.sparseCheckout true
-     printf '%s\n' '/FORK_OWNED.md' '/tools/upstream-sync/' > .git/info/sparse-checkout
-     AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$UPSTREAM_SYNC_GIT_TOKEN" | base64 | tr -d '\n')"
-     export AUTH_HEADER
-     git --config-env=http.extraHeader=AUTH_HEADER fetch --depth 1 origin <PINNED_SHA>
-     unset AUTH_HEADER
-     git checkout --detach <PINNED_SHA>
-     git rev-parse HEAD   # must print the full pinned SHA
-
-   **The fetch must be complete before the checkout.** Do not add `--filter` to
-   it: with `--filter=blob:none`, blobs stay on the server and the following
-   `git checkout --detach` lazy-fetches them from `origin` with no auth header,
-   which fails 401/404 on this private repo. Fetching without the filter makes
-   the fetch self-contained, so checkout touches no network.
-
-   The header value goes through `--config-env`, which reads it from the
-   `AUTH_HEADER` environment variable instead of the command line: the token is
-   absent from the remote URL, `.git/config`, and the process argument list. It is
-   not invisible, though — a shell with tracing on (`set -x`) or a process that
-   can read `/proc/<pid>/environ` can still observe it, so treat run logs as
-   sensitive. If `UPSTREAM_SYNC_GIT_TOKEN` is unset or the fetch is denied,
-   comment on the run issue and stop rather than guessing.
-
-   Then enforce the pin's minimum. `<PINNED_SHA>` must be a commit on `master` at
-   or after the merge of the upstream-sync ledger change (the commit that adds
-   `packages/db/src/migrations/0380_upstream_sync_ledger.sql` and the
-   verify-only `migrate`). Check for it directly:
-
-     grep -q UPSTREAM_SYNC_LOCK_NAMESPACE tools/upstream-sync/lib/db.mjs
-
-   If that grep fails, the pinned commit predates the change: its `migrate` would
-   write DDL (denied for the restricted login) and its run lock would be the old
-   single-key form. Comment on the run issue with that reason and stop; do not
-   work around it. If `rev-parse HEAD` does not print `<PINNED_SHA>`, comment and
-   stop the same way.
-3. From `<checkout>/tools/upstream-sync` (not `<checkout>`): `npm ci`.
-4. From the same directory: `node cli.mjs migrate` to confirm the ledger schema
-   is present. It writes no DDL; if it reports missing tables, the Paperclip
-   migrations have not run and you should comment on the run issue and stop.
-5. From the same directory: `node cli.mjs run`.
-6. Comment the JSON result on the run issue only when something is notable
-   (rows inserted, classifications failed, alerts failed); a quiet run closes
-   with one line.
-```
-
-### 4. Enable the schedule
-
-**Leave the schedule trigger disabled until the backlog load below verifies.**
-Then enable it. Enabling earlier would alert on hundreds of backfilled rows at
-once.
+In [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397), the EventBridge
+schedule rule is deployed **disabled** (`state = "DISABLED"`). This prevents the task from firing
+automatically before the one-off backlog load is verified, preventing mass alert spam across hundreds
+of older commits. Enable the schedule only after the backlog load verifies below.
 
 ## Backlog load (one-off runbook)
 
@@ -528,11 +378,11 @@ alert spam.
    category is empty where it should not be, stop and investigate before enabling
    the schedule.
 
-5. **Enable the schedule trigger** only after step 4 verifies.
+5. **Enable the schedule trigger** in [redesignhealth/infra#397](https://github.com/redesignhealth/infra/pull/397) (set EventBridge rule state to ENABLED) only after step 4 verifies.
 
 ## Day-to-day runbook
 
-Run from `<checkout>/tools/upstream-sync` (`cd <checkout>/tools/upstream-sync && npm ci`).
+Run from `tools/upstream-sync` (or in container: `cd /app/tools/upstream-sync`).
 
 - Look: `node cli.mjs status` (counts, marker, paused flag, undelivered alerts) or `node cli.mjs report`.
 - **Pause the detector**: `node cli.mjs pause`. Existing rows are still classified and alerted by `run`;

@@ -157,6 +157,13 @@ RUN pnpm --filter @paperclipai/server build:runtime \
   && test -f server/dist-runtime/index.mjs || (echo "ERROR: server runtime bundle missing" && exit 1)
 RUN rm -rf packages/paperclip-runner/runner/target
 
+# TECH-9777: bake tools/upstream-sync runtime dependencies and verified RDS CA bundle
+RUN cd tools/upstream-sync \
+  && npm ci --omit=dev \
+  && curl -fsSL -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+  && echo "90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b  global-bundle.pem" | sha256sum -c - \
+  && chmod 0644 global-bundle.pem
+
 # Remote OpenCode and ACPX runs require a controller-owned provider pack to
 # verify the sandbox installation or stage matching assets. Ship it in the
 # standard image so downstream Cloud compositions inherit the same artifacts.
@@ -366,6 +373,10 @@ RUN set -eu; \
     echo "ERROR: packages/db depends on embedded-postgres but no @embedded-postgres native/lib directory was found under /app/node_modules/.pnpm; the pnpm layout changed" >&2; exit 1; \
   fi; \
   echo "embedded-postgres native lib directories processed: $processed"
+
+# TECH-9777: verify upstream-sync runtime closure and CA bundle landed in production stage
+RUN test -f /app/tools/upstream-sync/global-bundle.pem || { echo "ERROR: upstream-sync global-bundle.pem missing in production stage" >&2; exit 1; } \
+  && test -d /app/tools/upstream-sync/node_modules/pg || { echo "ERROR: upstream-sync node_modules/pg missing in production stage" >&2; exit 1; }
 
 COPY --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
 COPY --from=runner-provider-pack /provider-pack-transport/ /opt/paperclip-runner/

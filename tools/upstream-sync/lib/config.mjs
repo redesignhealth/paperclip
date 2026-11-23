@@ -47,6 +47,8 @@ export function loadConfig(env = process.env, warn = console.warn) {
   const count = (name, d) => parseIntEnv(env, name, d, { min: 0, warn });
   return {
     databaseUrl: env.UPSTREAM_SYNC_DATABASE_URL || env.DATABASE_URL || "",
+    caFile: env.UPSTREAM_SYNC_RDS_CA || env.UPSTREAM_SYNC_CA_FILE || null,
+    rdsTrust: env.UPSTREAM_SYNC_RDS_TRUST === "true" || env.UPSTREAM_SYNC_RDS_TRUST === "1",
     upstreamRepo: env.UPSTREAM_SYNC_UPSTREAM_REPO || "https://github.com/paperclipai/paperclip.git",
     upstreamBranch: env.UPSTREAM_SYNC_BRANCH || "master",
     mirrorDir: env.UPSTREAM_SYNC_MIRROR_DIR || path.join(env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "upstream-sync", "mirror.git"),
