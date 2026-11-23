@@ -409,16 +409,6 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/ },
 ] as const;
 
-/**
- * Scoped bridge route policy for the Ashby relay route.
- * Bounded by in-pod deadline with proven margin above the server relay's 25 s upstream deadline.
- */
-export const ASHBY_RELAY_ROUTE_POLICY: SandboxCallbackBridgeRoutePolicy = {
-  path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/,
-  deadlineMs: 30_000,
-  maxConcurrent: 4,
-};
-
 // Keep the public alias for callers selecting the HTTP/2 transport.
 export const HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST;
 
@@ -3111,6 +3101,11 @@ function tokensMatch(received) {
   return timingSafeEqual(expected, actual);
 }
 
+function isAshbyRelayPath(url) {
+  const p = (url || "").split("?")[0];
+  return p.startsWith("/api/ashby-relay/");
+}
+
 // Read the bridge token a local caller presented. The gateway accepts two
 // header conventions for the same token. "Authorization: Bearer <token>" is the
 // bridge convention. "X-API-Key: <token>" is the convention the public Paperclip
@@ -3134,7 +3129,9 @@ function readBridgeToken(req) {
     if (separator >= 0) {
       const user = decoded.slice(0, separator);
       const pass = decoded.slice(separator + 1);
-      if (tokensMatch(user)) return user;
+      // Restrict Basic username token matching strictly to Ashby relay routes to preserve
+      // standard password-only (user:token) extraction on all other routes (e.g. package relay uv).
+      if (isAshbyRelayPath(req.url) && tokensMatch(user)) return user;
       return pass;
     }
     return decoded;

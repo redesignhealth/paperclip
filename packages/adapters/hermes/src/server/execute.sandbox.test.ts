@@ -126,6 +126,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
 
 import { execute } from "./execute.js";
 import {
+  HERMES_SANDBOX_ASHBY_BRIDGE_REQUIRED_MESSAGE,
   HERMES_SANDBOX_COMMAND_SCAN_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_MANAGED_CONNECTION_UNSUPPORTED_MESSAGE,
   HERMES_SANDBOX_PROVIDER_UNSUPPORTED_MESSAGE,
@@ -458,6 +459,45 @@ describe("Hermes execute on a sandbox target (TECH-8174)", () => {
       expect(env.MEM0_HOST).toBeUndefined();
       expect(env.MEM0_API_KEY).toBeUndefined();
       expect(env.MEM0_PROXY).toBeUndefined();
+    });
+  });
+
+  describe("Ashby API relay (TECH-9966)", () => {
+    it("stages ASHBY_API_BASE and ASHBY_API_KEY with bridge token when opted in, and scrubs stale Ashby credentials", async () => {
+      await execute(ctx({
+        config: {
+          env: {
+            OPENAI_API_KEY: PROVIDER_KEY,
+            PAPERCLIP_ASHBY_RELAY: "on",
+            ASHBY_API_KEY: "stale-real-ashby-key-do-not-ship",
+            ASHBY_API_BASE: "https://api.ashbyhq.com",
+          },
+        },
+      }));
+      const call = hermesCall();
+      const env = call.options.env;
+      expect(env.ASHBY_API_BASE).toBe(`${BRIDGE_URL}/api/ashby-relay`);
+      expect(env.ASHBY_API_KEY).toBe(BRIDGE_TOKEN);
+      expect(JSON.stringify(h.processCalls)).not.toContain("stale-real-ashby-key-do-not-ship");
+    });
+
+    it("refuses execution when opted into Ashby relay but bridge is unavailable", async () => {
+      vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockResolvedValueOnce(null);
+      await expect(execute(ctx({
+        config: {
+          env: {
+            OPENAI_API_KEY: PROVIDER_KEY,
+            PAPERCLIP_ASHBY_RELAY: "on",
+          },
+        },
+      }))).rejects.toThrow(HERMES_SANDBOX_ASHBY_BRIDGE_REQUIRED_MESSAGE);
+    });
+
+    it("does not stage ASHBY_API_BASE or ASHBY_API_KEY when not opted in", async () => {
+      await execute(ctx());
+      const env = hermesCall().options.env;
+      expect(env.ASHBY_API_BASE).toBeUndefined();
+      expect(env.ASHBY_API_KEY).toBeUndefined();
     });
   });
 

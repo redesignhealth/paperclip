@@ -186,6 +186,7 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/__tests__/package-relay-git.test.ts`
 - `packages/adapter-utils/src/github-launcher-relay.test.ts`
 - `packages/adapter-utils/src/github-launcher.ts` managed GitHub launcher keeps the git relay insteadOf rules (TECH-9786)
+
 ## Comms board wake route (TECH-9906)
 
 - `packages/db/src/schema/comms_wake.ts` registrations, received events and conversation-to-issue links
@@ -209,3 +210,5 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/__tests__/ashby-relay.test.ts`
 - `packages/adapter-utils/src/ashby-relay-env.ts` opt-in bridge environment settings for the Ashby relay
 - `packages/adapter-utils/src/ashby-relay-env.test.ts`
+- `packages/adapters/hermes/src/server/execute-sandbox.ts` Hermes sandbox launch wires Ashby relay env and scrubs stale credentials
+- `packages/adapters/hermes/src/server/execute.sandbox.test.ts`
