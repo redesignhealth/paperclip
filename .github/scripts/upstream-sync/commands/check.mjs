@@ -9,7 +9,8 @@
 import { parseArgs } from "../lib/args.mjs";
 import { git, gitOut, isWorkingTreeClean, revParse } from "../lib/git.mjs";
 import { convergentNumericEdits } from "../lib/convergent.mjs";
-import { BUILD_COMMAND, GENERATORS, generatorIsAffected } from "../lib/mechanical.mjs";
+import { BUILD_COMMAND } from "../lib/mechanical.mjs";
+import { affectedGenerators, runGenerators } from "../lib/generate.mjs";
 import { runArgv, runShell, shq, tail } from "../lib/shell.mjs";
 import { changedInStep, selectTests, vitestGroups } from "../lib/testselect.mjs";
 
@@ -32,7 +33,7 @@ function checkLockfile(cwd, masterRev) {
 }
 
 function checkGenerated(cwd, changed, buildCmd) {
-  const affected = GENERATORS.filter((g) => generatorIsAffected(g, changed));
+  const affected = affectedGenerators(changed);
   if (affected.length === 0) return step("generated", "pass", "no generator affected");
   const problems = [];
   const statusOf = () =>
@@ -55,15 +56,7 @@ function checkGenerated(cwd, changed, buildCmd) {
       const built = buildCmd ? runShell(cwd, buildCmd) : runArgv(cwd, BUILD_COMMAND);
       if (!built.ok) return step("generated", "fail", `build before generators failed:\n${tail(built.output)}`);
     }
-    for (const g of affected) {
-      for (const argv of g.commands) {
-        const r = runArgv(g.cwd === "." ? cwd : `${cwd}/${g.cwd}`, argv);
-        if (!r.ok) {
-          problems.push(`generator ${g.id} failed (${argv.join(" ")}):\n${tail(r.output, 1500)}`);
-          break;
-        }
-      }
-    }
+    for (const r of runGenerators(cwd, affected, { buildCmd, skipBuild: true })) if (!r.ok) problems.push(r.output);
     const dirty = statusOf().filter((d) => !(d.code === "??" && untrackedBefore.has(d.path)));
     for (const d of dirty) problems.push(`stale generated file ${d.path}: it differs from generator output; regenerate it, never edit it`);
   } finally {
