@@ -130,6 +130,17 @@ async function main() {
       env.GIT_CONFIG_COUNT = String(start + relayRules.length);
     }
   }
+  // Sandbox pods run as a different user than the one that owns the staged
+  // /workspace checkout, so Git refuses it as dubious ownership while global and
+  // system config are forced to /dev/null. Trust exactly that path, appended
+  // after the broker env so its own GIT_CONFIG_* entries cannot drop it.
+  {
+    const parsed = Number.parseInt(env.GIT_CONFIG_COUNT || '0', 10);
+    const index = Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+    env.GIT_CONFIG_COUNT = String(index + 1);
+    env['GIT_CONFIG_KEY_' + index] = 'safe.directory';
+    env['GIT_CONFIG_VALUE_' + index] = '/workspace';
+  }
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
   env.PATH = originalPath.join(path.delimiter);

@@ -111,6 +111,32 @@ describe("managed GitHub launchers", () => {
     expect(result.stderr).not.toContain("broker_transport_unavailable");
     expect(result.stderr).not.toMatch(/host-token|run-capability/);
   });
+  it("trusts only /workspace as a safe.directory, alongside the managed broker's Git config", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-safe-dir-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "git"), '#!/usr/bin/env node\nconst e=process.env;const n=Number(e.GIT_CONFIG_COUNT);const o=[];for(let i=0;i<n;i++)o.push([e["GIT_CONFIG_KEY_"+i],e["GIT_CONFIG_VALUE_"+i]]);process.stdout.write(JSON.stringify(o));', { mode: 0o700 });
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "t", GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "broker" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const run = async (url: string) => JSON.parse((await exec(path.join(bin, "git"), [], { env: {
+      ...process.env, ...githubBrokerEnvironment({}, { url, token: "run-capability" }),
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    } })).stdout) as string[][];
+    // With broker config merged in, the broker's entry survives and /workspace is appended.
+    expect(await run(`http://127.0.0.1:${port}`)).toEqual([["user.name", "broker"], ["safe.directory", "/workspace"]]);
+    // Without the broker, the launcher's own entries are kept and still no wildcard is trusted.
+    const fallback = await run("http://127.0.0.1:1");
+    expect(fallback.at(-1)).toEqual(["safe.directory", "/workspace"]);
+    expect(fallback.filter(([key]) => key === "safe.directory")).toEqual([["safe.directory", "/workspace"]]);
+  });
+
   it("asks the callback bridge, not the unreachable server address, for credentials when API calls are bridged", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-bridged-"));
     cleanups.push(() => rm(root, {recursive:true,force:true}));
