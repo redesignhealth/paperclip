@@ -63,7 +63,7 @@ function fromRegistryEntry(entry: AdapterRegistryEntry): AdapterDefaults {
     );
   }
   return {
-    runtimeImage: entry.runtimeImage,
+    runtimeImage: entry.runtimeImage.trim(),
     envKeys: entry.envKeys ?? [],
     allowFqdns: entry.allowFqdns ?? [],
     probeCommand: entry.probeCommand ?? [],
@@ -121,6 +121,7 @@ export async function getAdapterDefaultsResolved(
       `Adapter "${adapterType}" has no runtimeImage and the server image could not be resolved: ` +
         `${err instanceof Error ? err.message : String(err)}. ` +
         `Set runtimeImage explicitly or fix the server image reference.`,
+      { cause: err },
     );
   }
   return getAdapterDefaults(

@@ -4,6 +4,7 @@ import type { AdapterRegistryEntry } from "../../src/adapter-registry.js";
 import {
   ECS_METADATA_URI_ENV,
   SERVER_IMAGE_REF_ENV,
+  parseDigestRef,
   resetServerImageRefCache,
   resolveServerImageRef,
 } from "../../src/server-image-ref.js";
@@ -48,6 +49,19 @@ describe("resolveServerImageRef", () => {
     await expect(resolveServerImageRef({ env: {} })).rejects.toThrow(
       /cannot determine the paperclip-server image/,
     );
+  });
+
+  it("builds the reference from Image when ImageID is a bare digest", async () => {
+    const env = { [ECS_METADATA_URI_ENV]: META };
+    const fetchImpl = metadataFetch({ Image: `${REPO}:latest`, ImageID: `sha256:${DIGEST}` });
+    expect(await resolveServerImageRef({ env, fetchImpl })).toBe(REF);
+    resetServerImageRefCache();
+    const withDigest = metadataFetch({ Image: `${REPO}@sha256:${"c".repeat(64)}`, ImageID: `sha256:${DIGEST}` });
+    expect(await resolveServerImageRef({ env, fetchImpl: withDigest })).toBe(REF);
+    resetServerImageRefCache();
+    await expect(
+      resolveServerImageRef({ env, fetchImpl: metadataFetch({ ImageID: `sha256:${DIGEST}` }) }),
+    ).rejects.toThrow(/bare digest and Image has no repository/);
   });
 
   it("rejects a malformed ImageID", async () => {
@@ -110,5 +124,15 @@ describe("getAdapterDefaultsResolved", () => {
     await expect(getAdapterDefaultsResolved("hermes_local", [unsetEntry], { env: {} })).rejects.toThrow(
       /hermes_local.*no runtimeImage.*could not be resolved/s,
     );
+  });
+});
+
+describe("parseDigestRef", () => {
+  it("trims and strips a docker-pullable:// prefix", () => {
+    expect(parseDigestRef(`  docker-pullable://${REF}\n`, "x")).toBe(REF);
+  });
+  it("rejects short digests and tag-only refs", () => {
+    expect(() => parseDigestRef(`${REPO}@sha256:abc`, "x")).toThrow(/not a digest-pinned/);
+    expect(() => parseDigestRef(`${REPO}:latest`, "x")).toThrow(/not a digest-pinned/);
   });
 });

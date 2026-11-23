@@ -180,6 +180,25 @@ describe("buildPluginWorkerEnv", () => {
     });
   });
 
+  it("passes the server-image self-resolution pointers to environment driver plugins", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: { capabilities: ["environment.drivers.register"] },
+      instanceInfo,
+      processEnv: {
+        ECS_CONTAINER_METADATA_URI_V4: "http://169.254.170.2/v4/abc",
+        PAPERCLIP_SERVER_IMAGE_REF: "repo/img@sha256:" + "a".repeat(64),
+        AWS_SECRET_ACCESS_KEY: "aws-secret",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      ECS_CONTAINER_METADATA_URI_V4: "http://169.254.170.2/v4/abc",
+      PAPERCLIP_SERVER_IMAGE_REF: "repo/img@sha256:" + "a".repeat(64),
+    });
+  });
+
   it("does not pass provider keys to non-environment plugins", () => {
     const env = buildPluginWorkerEnv({
       manifest: { capabilities: ["ui.slots.register"] },

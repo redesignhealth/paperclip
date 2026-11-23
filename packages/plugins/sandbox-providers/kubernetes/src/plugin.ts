@@ -940,7 +940,8 @@ const plugin = definePlugin({
     // Emit a runtime warning if FQDNs are configured but egressMode=standard
     // cannot enforce them. Mirrors the validateConfig warning so operators see
     // it in paperclip-server logs even if they missed the validation step.
-    const adapterDefaultsForWarn = await getAdapterDefaultsResolved(effectiveAdapterType, config.adapters);
+    const adapterDefaults = await getAdapterDefaultsResolved(effectiveAdapterType, config.adapters);
+    const adapterDefaultsForWarn = adapterDefaults;
     const totalFqdnsForWarn = [...adapterDefaultsForWarn.allowFqdns, ...config.egressAllowFqdns];
     if (config.egressMode === "standard" && totalFqdnsForWarn.length > 0) {
       if (config.egressAllowCidrs.length === 0) {
@@ -963,7 +964,6 @@ const plugin = definePlugin({
 
     // Ensure the tenant namespace and all its RBAC / network policy resources
     // exist before we try to create the Job.
-    const adapterDefaults = await getAdapterDefaultsResolved(effectiveAdapterType, config.adapters);
 
     // What one more pod adds to the quota (CPU/memory limits and requests).
     const quotaNeed = podQuotaNeed(config.defaultResources);
