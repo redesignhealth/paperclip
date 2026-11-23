@@ -398,7 +398,8 @@ export async function resolveManagedGitHubIdentitySelection(
       ))
     : [];
   const hasCredentialRecord = (grant: typeof connectionGrants.$inferSelect) => {
-    if (candidates.length === 1 || isGitHubAppInstallationGrant(grant)) return true;
+    if (isGitHubAppInstallationGrant(grant)) return (grant.providerTenant?.github?.repositories?.length ?? 0) > 0;
+    if (candidates.length === 1) return true;
     const github = grant.providerTenant?.github;
     const ref = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
     return Boolean(github && github.installationCount > 0 && github.repositoryCount > 0 && ref

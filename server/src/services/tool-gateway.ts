@@ -26,7 +26,7 @@ import { runIdentityContexts, bindCompanyScope } from "@paperclipai/db";
 import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent-tools.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
-import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { isGitHubAppInstallationGrant, resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import { logger } from "../middleware/logger.js";
 import { getAppDefinitionForApplicationKey, isConnectorFeatureEnabled } from "@paperclipai/shared";
@@ -4377,6 +4377,14 @@ export function createToolGatewayService(
     grant: typeof connectionGrants.$inferSelect,
     resolveOptions: { forceRefresh?: boolean } = {},
   ): Promise<Record<string, string>> {
+    // App installation grants back managed git/gh only; they carry no gateway credential.
+    if (isGitHubAppInstallationGrant(grant)) {
+      throw new ToolGatewayHttpError(
+        409,
+        "GitHub tools are unavailable for GitHub App installation identities",
+        "github_identity_unavailable",
+      );
+    }
     if (connection.credentialSource === "vercel_connect") {
       if (!connection.externalCredential || !vercelConnect) {
         throw new ToolGatewayHttpError(

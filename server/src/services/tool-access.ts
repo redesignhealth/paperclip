@@ -13689,7 +13689,8 @@ export function toolAccessService(
       if (
         config.sourceTemplateKey !== "github" ||
         oauth.connectorProfile !== "github.code" ||
-        !grant.providerTenant?.github
+        !grant.providerTenant?.github ||
+        grant.providerTenant.github.appInstallation === true
       )
         return false;
       const expiresAt = grant.providerTenant.oauth?.accessTokenExpiresAt;
@@ -21958,6 +21959,17 @@ export function toolAccessService(
         eq(agents.id, input.agentId), eq(agents.companyId, connection.companyId),
       )).limit(1);
       if (!agent) throw badRequest("Dedicated identity requires an agent in this company");
+      const [install] = await db.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+        eq(toolConnectionInstalls.companyId, connection.companyId),
+        eq(toolConnectionInstalls.connectionId, connection.id),
+        or(
+          and(eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, connection.companyId)),
+          and(eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, input.agentId)),
+        ),
+      )).limit(1);
+      if (!install) {
+        throw unprocessable("Install the GitHub connection for this company or agent first", { code: "github_app_grant_not_installed" });
+      }
       const providerTenant = {
         name: "GitHub App installation",
         github: {
@@ -21969,16 +21981,34 @@ export function toolAccessService(
         },
       };
       const binding = actorBinding(actor);
-      const existing = (await db.select().from(connectionGrants).where(and(
+      // connection_grants is unique on (connection, agent), so reuse any prior row for this pair.
+      const [existing] = await db.select().from(connectionGrants).where(and(
         eq(connectionGrants.companyId, connection.companyId),
         eq(connectionGrants.connectionId, connection.id),
+        eq(connectionGrants.subjectAgentId, input.agentId),
+      )).limit(1);
+      if (existing && existing.status === "active" && existing.providerTenant?.github?.appInstallation !== true) {
+        throw conflict("This agent already has a dedicated grant on this connection; revoke it first", {
+          code: "github_app_grant_existing_grant",
+        });
+      }
+      const [otherGrant] = await db.select({ id: connectionGrants.id }).from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, connection.companyId),
         eq(connectionGrants.kind, "agent"),
         eq(connectionGrants.subjectAgentId, input.agentId),
         eq(connectionGrants.status, "active"),
-      ))).find((grant) => grant.providerTenant?.github?.appInstallation === true);
+        ne(connectionGrants.connectionId, connection.id),
+      )).limit(1);
+      if (otherGrant) {
+        throw conflict("This agent already has an active dedicated grant on another connection; revoke it first", {
+          code: "github_app_grant_existing_grant",
+        });
+      }
       const [grant] = existing
-        ? await db.update(connectionGrants).set({ providerTenant, updatedAt: new Date() })
-            .where(eq(connectionGrants.id, existing.id)).returning()
+        ? await db.update(connectionGrants).set({
+            providerTenant, credentialSecretRefs: [], status: "active", revokedAt: null,
+            revokedByAgentId: null, revokedByUserId: null, updatedAt: new Date(),
+          }).where(eq(connectionGrants.id, existing.id)).returning()
         : await db.insert(connectionGrants).values({
             companyId: connection.companyId, connectionId: connection.id, kind: "agent",
             subjectAgentId: input.agentId, providerTenant, credentialSecretRefs: [], status: "active",

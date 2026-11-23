@@ -228,7 +228,7 @@ export const connectionGrantSchema = z.object({
       refreshedAt: z.string().datetime().optional(),
     }).optional(),
     github: z.object({
-      userId: z.string().regex(/^[1-9][0-9]{0,30}$/),
+      userId: z.union([z.string().regex(/^[1-9][0-9]{0,30}$/), z.literal("github-app")]),
       login: z.string().trim().min(1).max(100),
       avatarUrl: z.string().url().max(2000).optional(),
       installationCount: z.number().int().nonnegative(),
@@ -243,6 +243,7 @@ export const connectionGrantSchema = z.object({
       lastWebhookAt: z.string().datetime().optional(),
       webhookHealth: z.enum(["pending", "healthy", "unhealthy"]).optional(),
       appInstallation: z.boolean().optional(),
+      repositories: z.array(z.object({ id: z.string(), fullName: z.string(), installationId: z.string(), private: z.boolean().optional() })).max(200).optional(),
     }).optional(),
   }).nullable(),
   credentialSecretRefs: z.array(toolCredentialSecretRefSchema),
