@@ -14,6 +14,7 @@ export const GENERATORS = [
   {
     id: "app-definitions",
     cwd: ".",
+    inputs: [/^packages\/shared\/src\/app-definitions\//, /^scripts\/ingest-app-definitions\.mjs$/],
     commands: [["node", "scripts/ingest-app-definitions.mjs", "--definitions-only"]],
     outputs: [
       /^packages\/shared\/src\/app-definitions\.generated\.ts$/,
@@ -88,6 +89,17 @@ export const GENERATORS = [
     outputs: [new RegExp(`^${PR}/spec/capability/protocol-coverage\\.json$`)],
   },
 ];
+
+/** Did a change to any of these paths possibly make this generator's outputs stale? */
+export function generatorIsAffected(generator, changedPaths) {
+  const prefix = generator.cwd === "." ? null : `${generator.cwd}/`;
+  return changedPaths.some(
+    (p) =>
+      (prefix && p.startsWith(prefix)) ||
+      generator.outputs.some((re) => re.test(p)) ||
+      (generator.inputs ?? []).some((re) => re.test(p)),
+  );
+}
 
 export const BUILD_COMMAND = ["pnpm", "run", "build:typescript"];
 
