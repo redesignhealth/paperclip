@@ -12,6 +12,11 @@ import type { SandboxCallbackBridgeRoutePolicy, SandboxCallbackBridgeRouteRule }
 
 export const SANDBOX_BRIDGE_RELAY_PATH_PREFIX = "/paperclip-relay/";
 
+/** The in-sandbox bridge path that relays to one runtime MCP server key. Adapter-neutral. */
+export function sandboxBridgeMcpRelayPath(serverKey: string): string {
+  return `${SANDBOX_BRIDGE_RELAY_PATH_PREFIX}mcp/${serverKey}`;
+}
+
 /** MCP session headers a relay forwards. Added to the header allowlists only when relay routes exist. */
 export const SANDBOX_BRIDGE_RELAY_EXTRA_HEADERS = ["mcp-protocol-version", "mcp-session-id"] as const;
 

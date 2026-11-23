@@ -1,0 +1,10 @@
+{
+  "name": "paperclip-pi-mcp-adapter",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pinned pi-mcp-adapter for Pi sandbox pods (TECH-9794). Installed offline-safe in the image; never fetched at runtime.",
+  "dependencies": {
+    "pi-mcp-adapter": "7.0.1",
+    "zod": "^3.25.0"
+  }
+}

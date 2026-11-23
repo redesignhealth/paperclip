@@ -42,6 +42,16 @@ describe("preparePiRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
+  it("writes only mcp.json into a managed dir when there are no providers", async () => {
+    const mcpConfig = { mcpServers: { argus: { url: "${PAPERCLIP_API_URL}/paperclip-relay/mcp/argus" } } };
+    const prepared = await preparePiRuntimeConfig({ env: { FOO: "bar" }, mcpConfig });
+    cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
+    expect(prepared.agentConfigDir).toBe(prepared.env.PI_CODING_AGENT_DIR);
+    expect(JSON.parse(await fs.readFile(path.join(prepared.agentConfigDir!, "mcp.json"), "utf8"))).toEqual(mcpConfig);
+    await expect(fs.access(path.join(prepared.agentConfigDir!, "models.json"))).rejects.toThrow();
+    await prepared.cleanup();
+  });
+
   it("is a no-op when PAPERCLIP_PI_PROVIDERS is unset", async () => {
     const prepared = await preparePiRuntimeConfig({ env: { FOO: "bar" } });
 

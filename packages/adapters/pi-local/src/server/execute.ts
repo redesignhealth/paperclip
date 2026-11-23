@@ -61,6 +61,13 @@ import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./pa
 import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
+import {
+  PI_MCP_TOOL_NAME,
+  buildPiMcpConfig,
+  buildPiMcpRelayRoutes,
+  resolvePiMcpAdapterPath,
+  selectPiMcpRelayServers,
+} from "./mcp-config.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { PI_GUARD_EXTENSION_FILE, preparePiGuardExtension, readPiGuardProfile } from "./guard-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -354,7 +361,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Materialize custom Pi providers (PAPERCLIP_PI_PROVIDERS) into a managed
   // PI_CODING_AGENT_DIR before runtimeEnv is computed, so both local validation
   // and the spawned Pi process resolve models against the managed models.json.
-  const preparedRuntimeConfig = await preparePiRuntimeConfig({ env });
+  // TECH-9794: runtime MCP servers reach Pi only through the sandbox bridge relay, so no MCP token or run
+  // token is written to the pod. Targets without the bridge (and local runs) continue without them.
+  const allRuntimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const mcpRelayAvailable = executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
+  const { relayServers: piMcpRelayServers, skipped: piMcpSkipped } = mcpRelayAvailable
+    ? selectPiMcpRelayServers(allRuntimeMcpServers)
+    : { relayServers: [], skipped: [] };
+  if (allRuntimeMcpServers.length > 0 && !mcpRelayAvailable) {
+    await onLog(
+      "stdout",
+      `[paperclip] Warning: ${allRuntimeMcpServers.length} runtime MCP server(s) need the Paperclip bridge relay, which this target does not use; this run continues without them.\n`,
+    );
+  }
+  if (piMcpSkipped.length > 0) {
+    await onLog(
+      "stdout",
+      `[paperclip] Warning: skipped runtime MCP server(s) with no allowed tools: ${piMcpSkipped.join(", ")}.\n`,
+    );
+  }
+  const piMcpEnabled = piMcpRelayServers.length > 0;
+  const preparedRuntimeConfig = await preparePiRuntimeConfig({
+    env,
+    mcpConfig: piMcpEnabled ? buildPiMcpConfig(piMcpRelayServers) : null,
+  });
   const localAgentConfigDir = preparedRuntimeConfig.agentConfigDir ?? "";
   if (localAgentConfigDir) {
     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
@@ -540,6 +570,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timeoutSec,
         hostApiToken: authToken,
         onLog,
+        ...(piMcpEnabled ? { relayRoutes: buildPiMcpRelayRoutes(piMcpRelayServers) } : {}),
         // The package relay routes get their own lane and deadline (TECH-9786).
         ...(packageRelayAnyOptedIn(envConfig) ? { bridgeRoutePolicies: PACKAGE_RELAY_ROUTE_POLICIES } : {}),
       });
@@ -733,13 +764,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (modelId) args.push("--model", modelId);
       if (thinking) args.push("--thinking", thinking);
 
-      args.push("--tools", "read,bash,edit,write,grep,find,ls");
+      args.push("--tools", piMcpEnabled ? `read,bash,edit,write,grep,find,ls,${PI_MCP_TOOL_NAME}` : "read,bash,edit,write,grep,find,ls");
       args.push("--session", sessionFile);
       args.push("--skill", remoteSkillsDir ?? PI_AGENT_SKILLS_DIR);
 
       if (extraArgs.length > 0) args.push(...extraArgs);
       args.push("--extension", attributionExtensionPath);
       if (guardExtensionPath) args.push("--extension", guardExtensionPath);
+      if (piMcpEnabled) args.push("--extension", resolvePiMcpAdapterPath(env));
 
       // Add the user prompt as the last argument
       args.push(userPrompt);

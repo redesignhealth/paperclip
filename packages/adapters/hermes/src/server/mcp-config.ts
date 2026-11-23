@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import YAML from "yaml";
 
 import { redactDiagnosticText, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import { sandboxBridgeMcpRelayPath } from "@paperclipai/adapter-utils/sandbox-bridge-relay";
 import {
   type MemoryHardeningFlags,
   resolveEffectiveMemoryHardeningFlags,
@@ -68,7 +69,7 @@ export interface PrepareHermesMcpHomeOptions {
 
 /** The in-sandbox bridge path that relays to one Hermes MCP server key (TECH-8909). */
 export function hermesMcpRelayPath(serverKey: string): string {
-  return `/paperclip-relay/mcp/${serverKey}`;
+  return sandboxBridgeMcpRelayPath(serverKey);
 }
 
 export interface PreparedHermesMcpHome {
