@@ -1,0 +1,113 @@
+# VENDORED from redesignhealth/rh-paperclip scripts/dev-eks/paperclip-rbac.yaml (main). Keep byte-identical below this line.
+# Least-privilege access for the Paperclip server's sandbox plugin. Verbs come from the plugin's
+# Kubernetes client calls. No batch verbs: the plugin's "job" backend fails closed.
+#
+# Two identities are bound, so either auth path works (TECH-9843):
+#   - Group "paperclip-server": the dev ECS task role (paperclip-dev-task-role) has an EKS access entry
+#     (terraform/environments/dev-eks/access.tf) mapped to this group, with no EKS access policy. This is
+#     the EKS IAM auth path (fork TECH-8817, environment auth type "eks-iam"; 15-minute tokens).
+#   - ServiceAccount pc-control/paperclip-server: the legacy static-token path
+#     (scripts/dev-eks/mint-kubeconfig.sh). The cluster caps its tokens at 24h.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pc-control
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paperclip-eks-proof
+  labels:
+    # Placeholder label: the plugin never reads it back. Not the real test-company id (none is recorded in
+    # the repo; set it from the dev eks-proof company before relying on the label check).
+    paperclip.io/company-id: eks-proof
+    paperclip.io/managed-by: paperclip-k8s-plugin
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: paperclip-server
+  namespace: pc-control
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: paperclip-server-namespaces
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: paperclip-server-namespaces
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: paperclip-server-namespaces
+subjects:
+  - kind: ServiceAccount
+    name: paperclip-server
+    namespace: pc-control
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: paperclip-server
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: paperclip-server
+  namespace: paperclip-eks-proof
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "limitranges"]
+    verbs: ["get", "create"]
+  # update: the plugin reconciles the per-company ResourceQuota (replaceNamespacedResourceQuota) on acquire.
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create"]
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["get", "create"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: paperclip-server
+  namespace: paperclip-eks-proof
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: paperclip-server
+subjects:
+  - kind: ServiceAccount
+    name: paperclip-server
+    namespace: pc-control
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: paperclip-server
