@@ -803,6 +803,36 @@ describe("agent skill routes", () => {
     expect(versionSelections?.has("stale/removed/skill")).toBe(false);
   });
 
+  it("materializes only the desired and core skills when syncing a materializing adapter (TECH-9904)", async () => {
+    const entry = (key: string) => ({ key, runtimeName: key.split("/").pop(), source: `/tmp/${key}`, sourceStatus: "missing" });
+    mockAgentService.getById.mockResolvedValue(makeAgent("pi_local"));
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeAgent("pi_local"),
+      ...patch,
+    }));
+    mockAdapter.syncSkills.mockResolvedValue(skillSnapshot("pi_local"));
+    mockCompanySkillService.listRuntimeSkillEntries.mockImplementation(
+      async (_companyId: string, options: { materializeMissing?: boolean; onlyKeys?: Set<string> }) => {
+        const all = ["paperclipai/paperclip/paperclip", "acme/skills/wanted", "acme/skills/other"].map(entry);
+        const selected = options.onlyKeys ? all.filter((candidate) => options.onlyKeys!.has(candidate.key)) : all;
+        return options.materializeMissing
+          ? selected.map((candidate) => ({ ...candidate, sourceStatus: "available" }))
+          : selected;
+      },
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .post("/api/agents/11111111-1111-4111-8111-111111111111/skills/sync?companyId=company-1")
+      .send({ desiredSkills: ["acme/skills/wanted"], mode: "replace" }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const calls = mockCompanySkillService.listRuntimeSkillEntries.mock.calls.map(([, options]) => options);
+    const materializing = calls.filter((options) => options.materializeMissing === true);
+    expect(materializing).toHaveLength(1);
+    expect([...materializing[0].onlyKeys].sort()).toEqual(["acme/skills/wanted", "paperclipai/paperclip/paperclip"]);
+    expect(calls.some((options) => options.materializeMissing === false && !options.onlyKeys)).toBe(true);
+  });
+
   it("skips runtime materialization when listing persistent skill adapters", async () => {
     mockAgentService.getById.mockResolvedValue(makeAgent("cursor"));
     mockAdapter.listSkills.mockResolvedValue(skillSnapshot("cursor", "persistent"));
