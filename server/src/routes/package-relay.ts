@@ -10,7 +10,8 @@ import { secretService } from "../services/secrets.js";
  * A sandbox pod cannot reach the tailnet and holds no credentials. The pod's package installer (uv or pip) points an
  * extra index at the sandbox bridge, which forwards here with the run JWT. This server adds the Gitea read token, so the
  * credential never enters the pod. Fixed surface, GET only: `simple/:package/` and `files/:package/:version/:filename`.
- * The relay answers 404 when it is not configured. The upstream is ONLY the server's configured `PAPERCLIP_PACKAGE_RELAY_GITEA_URL`, and only for packages named in
+ * The relay answers 503 (fail closed) when it is not configured, and 404 for a package name not on the allowlist, so
+ * the installer falls through to the public index only for names that are not private. The upstream is ONLY the server's configured `PAPERCLIP_PACKAGE_RELAY_GITEA_URL`, and only for packages named in
  * `PAPERCLIP_PACKAGE_RELAY_GITEA_PACKAGES`; nothing in a request can choose the host, the path or another package.
  * Only agents that opt in (adapterConfig env `PAPERCLIP_PACKAGE_RELAY` lists `gitea`) may use it, so the registry is not
  * opened to every sandbox agent. The token is the company secret `package_relay.gitea`.
@@ -121,13 +122,15 @@ export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
     }
     const config = giteaConfig();
     if (!config) {
-      // Not configured (or invalid). Answer 404, not 5xx: the installer treats the relay as its first index and falls
-      // through to the default index on 404, but fails the whole install on a 5xx.
+      // Fail closed. Without the configuration the relay cannot tell a private name from a public one, and an installer
+      // that gets a 404 for a private name falls through to the public index, where a same-named package could be
+      // registered. A 503 stops the install. An opted-in agent on an unconfigured server is an operator error that
+      // should be loud.
       if (!warnedUnconfigured) {
         warnedUnconfigured = true;
-        logger.warn("package relay is not configured or its settings are invalid; answering 404 for every package");
+        logger.warn("package relay is not configured or its settings are invalid; answering 503");
       }
-      fail(res, 404, "not_found");
+      fail(res, 503, "package_relay_unavailable");
       return null;
     }
     const normalized = normalizePackageName(pkg);

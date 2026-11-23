@@ -117,12 +117,12 @@ describe("package relay (TECH-9786)", () => {
     }
   });
 
-  it("answers 404 (so the installer falls through to the default index) when not configured, and 403 when the company has no token", async () => {
+  it("fails closed with 503 when not configured or invalid (so a private name never falls through to the public index), and 403 when the company has no token", async () => {
     const off = build({ env: {} as NodeJS.ProcessEnv });
-    await request(off.app).get(`${BASE}/simple/rh-auth/`).expect(404);
+    await request(off.app).get(`${BASE}/simple/rh-auth/`).expect(503);
     expect(off.fetchImpl).not.toHaveBeenCalled();
     const httpOnly = build({ env: { ...env, [PACKAGE_RELAY_GITEA_URL_ENV]: "http://gitea.example.com/pypi" } as NodeJS.ProcessEnv });
-    await request(httpOnly.app).get(`${BASE}/simple/rh-auth/`).expect(404);
+    await request(httpOnly.app).get(`${BASE}/simple/rh-auth/`).expect(503);
     const noToken = build({ token: null });
     await request(noToken.app).get(`${BASE}/simple/rh-auth/`).expect(403);
     expect(noToken.fetchImpl).not.toHaveBeenCalled();
