@@ -477,6 +477,24 @@ async function runGit(args: string[], cwd: string) {
   return await execFileAsync("git", ["-C", cwd, ...args], { cwd });
 }
 
+// `git rev-parse --show-toplevel` only succeeds when a `.git` entry (directory
+// or gitfile) exists in the path or one of its ancestors. A stat walk is far
+// cheaper than a child spawn, so plain directories never reach git.
+async function hasGitMarkerInAncestry(start: string): Promise<boolean> {
+  let current = path.resolve(start);
+  for (;;) {
+    try {
+      await fs.stat(path.join(current, ".git"));
+      return true;
+    } catch {
+      // keep walking
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 async function runExpensiveGitStatus(input: {
   args: readonly string[];
   cwd: string;
@@ -913,6 +931,9 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
 
   let repoRoot: string | null = null;
   try {
+    if (!(await hasGitMarkerInAncestry(workspacePath))) {
+      throw new Error("not a git repository (no .git in the path or its parents)");
+    }
     repoRoot = (await runGit(["rev-parse", "--show-toplevel"], workspacePath)).stdout.trim() || null;
   } catch (error) {
     warnings.push(
@@ -1717,6 +1738,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // sweep and starves eligible rows behind them. The cursor resets to the start
   // when a sweep reaches the end of the candidate set.
   let terminalSweepCursor: { updatedAt: Date; id: string } | null = null;
+  // Must exceed the number of terminal workspaces one rotation visits, or the
+  // oldest entries are evicted before the next rotation and every unchanged
+  // workspace is inspected again. Entries are small (a hash and a few ids).
+  const TERMINAL_INSPECTION_CACHE_LIMIT = 16_384;
   const terminalInspections = new Map<string, { revision: string; issueIds: Set<string>; nextAt: number }>();
   const terminalWorkspaceDeadlines = new Map<string, number>();
   let terminalSweepRescanRequested = false;
@@ -3374,7 +3399,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             result.skippedBackoff += 1;
             continue;
           }
-          if (terminalInspections.size >= 256) terminalInspections.delete(terminalInspections.keys().next().value!);
+          if (terminalInspections.size >= TERMINAL_INSPECTION_CACHE_LIMIT) terminalInspections.delete(terminalInspections.keys().next().value!);
           terminalInspections.set(workspace.id, {
             revision, issueIds: new Set(issueTree.map(issue => issue.id)),
             nextAt: now().getTime() + opts.terminalWorkspaceInspectionBackoffMs,
