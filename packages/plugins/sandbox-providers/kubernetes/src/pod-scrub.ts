@@ -24,6 +24,10 @@
  *  - empty `/home/paperclip` (including `.cache`), `/tmp` and `/dev/shm`;
  *  - verify all of the above are empty and fail loudly otherwise.
  *
+ * `/deps` (sandbox-cr-builder.ts, TECH-9789) is the one deliberate exception: a
+ * public-package cache (uv, npm, pip) outside the workspace that outlives the
+ * scrub so reinstalls stay warm. Nothing secret is written there.
+ *
  * The workspace files are kept: the next turn's sync-in overwrites them and the
  * server copy is authoritative. Not covered, by design: files the agent left in
  * the workspace itself (same principal, same conversation).

@@ -16,6 +16,27 @@
  * release path is explicit delete via sandboxCrOrchestrator.release().
  */
 
+/**
+ * Dependency cache that survives the between-turn scrub (TECH-9789).
+ *
+ * The scrub (pod-scrub.ts) empties home, `.cache` and `/tmp` and every cold
+ * install repeats: 13-70 s at 2 CPU versus 0.4-4 s warm. `/deps` is a fifth
+ * emptyDir the scrub never touches, so it lives as long as the reused pod. It is
+ * outside `/workspace`, so it is never synced to the server. It holds only
+ * public package downloads: no credential is written here, because the per-run
+ * secrets reach the container only as env vars. Sized above the measured
+ * 700-773 MB uv cache per service, with room for several services and pnpm/npm.
+ */
+export const DEPS_MOUNT_PATH = "/deps";
+export const DEPS_VOLUME_SIZE_LIMIT = "4Gi";
+
+/** Non-secret env pointing the package managers at the persisted volume. */
+export const DEPS_CACHE_ENV: ReadonlyArray<{ name: string; value: string }> = [
+  { name: "UV_CACHE_DIR", value: `${DEPS_MOUNT_PATH}/uv` },
+  { name: "npm_config_cache", value: `${DEPS_MOUNT_PATH}/npm` },
+  { name: "PIP_CACHE_DIR", value: `${DEPS_MOUNT_PATH}/pip` },
+];
+
 export interface BuildSandboxCrManifestInput {
   namespace: string;
   sandboxName: string;
@@ -100,7 +121,10 @@ export function buildSandboxCrManifest(
                // HOME=/home/node is inside the readOnly root filesystem.
                // Claude (and most agent runtimes) silently exit with code 0
                // and no output when HOME is unwritable, so set this explicitly.
-              env: [{ name: "HOME", value: "/home/paperclip" }],
+              env: [
+                { name: "HOME", value: "/home/paperclip" },
+                ...DEPS_CACHE_ENV,
+              ],
               envFrom: [{ secretRef: { name: input.envSecretName } }],
               securityContext: {
                 runAsNonRoot: true,
@@ -125,6 +149,7 @@ export function buildSandboxCrManifest(
                 { name: "home", mountPath: "/home/paperclip" },
                 { name: "cache", mountPath: "/home/paperclip/.cache" },
                 { name: "tmp", mountPath: "/tmp" },
+                { name: "deps", mountPath: DEPS_MOUNT_PATH },
               ],
             },
           ],
@@ -133,6 +158,7 @@ export function buildSandboxCrManifest(
             { name: "home", emptyDir: { sizeLimit: "1Gi" } },
             { name: "cache", emptyDir: { sizeLimit: "1Gi" } },
             { name: "tmp", emptyDir: { sizeLimit: "2Gi" } },
+            { name: "deps", emptyDir: { sizeLimit: DEPS_VOLUME_SIZE_LIMIT } },
           ],
         },
       },

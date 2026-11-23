@@ -46,9 +46,12 @@ describe("buildScrubScript", () => {
     }) as { spec: { podTemplate: { spec: { containers: Array<{ securityContext: { readOnlyRootFilesystem: boolean }; volumeMounts: Array<{ mountPath: string }> }> } } } };
     const container = manifest.spec.podTemplate.spec.containers[0]!;
     expect(container.securityContext.readOnlyRootFilesystem).toBe(true);
+    // /deps is the one deliberate exception (TECH-9789): a public-package cache
+    // the scrub keeps so warm turns stay warm. It must hold no credentials.
     expect(container.volumeMounts.map((m) => m.mountPath).sort()).toEqual(
-      ["/home/paperclip", "/home/paperclip/.cache", "/tmp", "/workspace"],
+      ["/deps", "/home/paperclip", "/home/paperclip/.cache", "/tmp", "/workspace"],
     );
+    expect(buildScrubScript("/workspace")).not.toContain("/deps");
   });
 });
 
