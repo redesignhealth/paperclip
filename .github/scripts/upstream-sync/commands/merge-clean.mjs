@@ -11,7 +11,7 @@ import { shortSha } from "../lib/walk.mjs";
 
 export const MERGE_CLEAN_FLAGS = { boolean: [...NEXT_FLAGS.boolean, "push", "pr", "json"], number: NEXT_FLAGS.number };
 
-/** Exit codes: 0 done or nothing to do, 1 error, 5 the first clean-merging commit fails its checks (needs a model fix). */
+/** Exit codes: 0 done or nothing to do, 2 error (thrown), 5 the first clean-merging commit fails its checks (needs a model fix). */
 export async function run(argv, { cwd = process.cwd(), stdout = process.stdout, check = runCheck } = {}) {
   const { opts } = parseArgs(argv, MERGE_CLEAN_FLAGS);
   const say = (line) => (opts.json ? null : stdout.write(`${line}\n`));

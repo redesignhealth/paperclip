@@ -18,7 +18,7 @@ export function runArgv(cwd, argv, { env } = {}) {
     env: base,
   });
   const output = `${r.stdout ?? ""}${r.stderr ?? ""}${r.error ? `\n${r.error.message}` : ""}`;
-  return { ok: r.status === 0 && !r.error, status: r.status, output };
+  return { ok: r.status === 0 && !r.error, status: r.status, output, stdout: r.stdout ?? "" };
 }
 
 /** Run an operator-supplied command line through the shell (the `--typecheck-cmd` / `--test-cmd` overrides). */

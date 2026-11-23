@@ -11,6 +11,8 @@ const COMMANDS = {
   "start-conflict": () => import("./commands/start-conflict.mjs"),
   regenerate: async () => ({ run: (await import("./commands/start-conflict.mjs")).runRegenerate }),
   context: () => import("./commands/context.mjs"),
+  "resolution-diff": () => import("./commands/resolution-diff.mjs"),
+  submit: () => import("./commands/submit.mjs"),
 };
 
 export async function main(argv, io = {}) {
@@ -37,7 +39,7 @@ if (invokedDirectly) {
     (code) => process.exit(code ?? 0),
     (err) => {
       process.stderr.write(`${err.message}\n`);
-      process.exit(1);
+      process.exit(2); // an error, kept apart from the commands' own result codes (1 = failed checks or blocking findings)
     },
   );
 }

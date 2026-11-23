@@ -4,6 +4,8 @@ import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 
+// The digest is pinned by `-c` flags, which beat every config file. The global and system config stay readable on
+// purpose, because that is where `safe.directory` lives on a pod or a CI runner.
 export class GitError extends Error {
   constructor(args, result) {
     super(`git ${args.join(" ")} failed (${result.status}): ${String(result.stderr).trim()}`);
@@ -79,8 +81,12 @@ export function syncPoint(cwd, master, upstream) {
  * `git merge-tree --write-tree` of two commits without touching the work tree or index. A conflicted merge still
  * yields a tree (conflict markers inside the blobs), which is the "marker tree" the resolution diff is measured from.
  */
-export function mergeTree(cwd, ours, theirs) {
-  const r = git(cwd, ["merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", ours, theirs], {
+export function mergeTree(cwd, ours, theirs, { pin = false } = {}) {
+  // `pin` fixes the merge settings that change the marker tree, so every machine builds the same one.
+  const config = pin
+    ? ["-c", "merge.conflictStyle=merge", "-c", "merge.renormalize=false", "-c", "merge.renames=true", "-c", "diff.algorithm=default", "-c", "diff.renames=true"]
+    : [];
+  const r = git(cwd, [...config, "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", ours, theirs], {
     allowFail: true,
   });
   if (r.status !== 0 && r.status !== 1) {
