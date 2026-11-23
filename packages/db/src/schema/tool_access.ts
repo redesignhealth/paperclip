@@ -231,6 +231,11 @@ export const connectionGrants = pgTable(
         lastAccessRefreshAt?: string;
         lastWebhookAt?: string;
         webhookHealth?: "pending" | "healthy" | "unhealthy";
+        /**
+         * Dedicated agent grant backed by the server's GitHub App installation instead of an
+         * OAuth token. `repositories[].fullName` is the exact scope of every minted token.
+         */
+        appInstallation?: boolean;
       };
     }>(),
     credentialSecretRefs: jsonb("credential_secret_refs").$type<ToolCredentialSecretRef[]>().notNull().default([]),

@@ -132,6 +132,18 @@ local operations can still proceed without credentials.
 
 Run details show identity revisions and redacted GitHub results: responsible person, selected login when available, personal/dedicated source, and an unavailable reason. Tasks do not receive an additional identity indicator or takeover action.
 
+## GitHub App installation grants
+
+A dedicated agent grant can be backed by the server's GitHub App installation instead of a user's OAuth token. The grant is an ordinary `kind: "agent"` grant (so it overrides personal selection like any dedicated grant) with `providerTenant.github.appInstallation = true` and its repository list in `providerTenant.github.repositories[].fullName`. It stores no credential and needs no migration.
+
+Server env: `PAPERCLIP_GITHUB_APP_ID`, `PAPERCLIP_GITHUB_APP_INSTALLATION_ID`, `PAPERCLIP_GITHUB_APP_PRIVATE_KEY` (PEM; literal `\n` is accepted). When any is missing the grant is unavailable with a redacted reason and nothing else changes.
+
+For each credential request the server signs an App JWT and calls `POST /app/installations/{id}/access_tokens` with exactly `{repositories, permissions: {contents: "write", pull_requests: "write"}}`. The App installation may cover every repository, so per-token scoping is the only limit: the server refuses to mint when the repository list is empty, missing, or contains a non-string, blank, or malformed entry. It fails closed with a redacted error and never requests an org-wide token. No other permissions are ever requested.
+
+Tokens are cached in memory per (installation, repository set) until five minutes before GitHub's `expires_at`. They are never persisted, logged, put in the pod environment, or recorded in run identity history. Commits are authored as the App bot, `<slug>[bot]` with `<app-id>+<slug>[bot]@users.noreply.github.com`, where the slug comes from `GET /app`.
+
+Create the grant with `POST /api/tool-connections/{connectionId}/grants/github-app` (board user with configure access) and `{"agentId": "...", "repositories": ["owner/name"]}`. Posting again for the same agent replaces its repository list. OAuth grants are unchanged.
+
 ## Deployment and verification
 
 Deploy the schema, server broker, launcher staging, and runtime environment contract together. Already-running processes retain their original environment; only newly dispatched processes receive the broker contract. Run-scoped capabilities remain valid only while their bound run is active.

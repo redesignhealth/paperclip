@@ -242,6 +242,7 @@ export const connectionGrantSchema = z.object({
       lastAccessRefreshAt: z.string().datetime().optional(),
       lastWebhookAt: z.string().datetime().optional(),
       webhookHealth: z.enum(["pending", "healthy", "unhealthy"]).optional(),
+      appInstallation: z.boolean().optional(),
     }).optional(),
   }).nullable(),
   credentialSecretRefs: z.array(toolCredentialSecretRefSchema),

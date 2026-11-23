@@ -1,5 +1,5 @@
 import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
-import { aiConnectionRouterPluginKey } from "@paperclipai/shared";
+import { aiConnectionRouterPluginKey, isUuidLike } from "@paperclipai/shared";
 import { aiConnectionRouterService } from "../services/ai-connection-router.js";
 import { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSchema, composioAppAccountSchema } from "@paperclipai/shared";
 import { aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema } from "@paperclipai/shared/aggregator-apps";
@@ -1927,6 +1927,31 @@ function connectorEnrollmentPrincipal(req: Request): string {
       entityType: "connection_grant",
       entityId: grant.id,
       details: { connectionId: connection.id, kind: grant.kind },
+    });
+    res.status(201).json(grant);
+  });
+
+  router.post("/tool-connections/:connectionId/grants/github-app", async (req, res) => {
+    assertBoard(req);
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    await assertToolConnectionConfigureAccess(req, connection);
+    const body = req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {};
+    if (typeof body.agentId !== "string" || !isUuidLike(body.agentId)
+      || !Array.isArray(body.repositories) || !body.repositories.every((value) => typeof value === "string")) {
+      throw badRequest("agentId and repositories (owner/name strings) are required");
+    }
+    const grant = await svc.addGitHubAppAgentGrant(connection.id, {
+      agentId: body.agentId, repositories: body.repositories as string[],
+    }, getActorInfo(req));
+    await logActivity(db, {
+      companyId: connection.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "tool_connection.grant_added",
+      entityType: "connection_grant",
+      entityId: grant.id,
+      details: { connectionId: connection.id, kind: grant.kind, githubApp: true },
     });
     res.status(201).json(grant);
   });
