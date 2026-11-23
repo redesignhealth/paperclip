@@ -110,6 +110,9 @@ function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = 
   app.post("/api/routine-triggers/public/:publicId/fire", (req, res) => {
     res.json({ reachedWebhook: true, actorType: req.actor.type });
   });
+  app.post("/api/comms-board/wake/:agentId", (req, res) => {
+    res.json({ reachedWake: true, actorType: req.actor.type });
+  });
   app.post("/mcp/gateways/:gatewayPublicId", (req, res) => {
     res.json({ reachedGatewayProtocol: true, actorType: req.actor.type });
   });
@@ -248,6 +251,19 @@ describe("agent auth middleware", () => {
         .send({ event: "created" });
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ reachedWebhook: true, actorType: "none" });
+    },
+  );
+
+  it.each(["authenticated", "local_trusted"] as const)(
+    "leaves comms wake signature checks to the route in %s mode",
+    async (deploymentMode) => {
+      const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+      const res = await request(createApp(db, deploymentMode))
+        .post(`/api/comms-board/wake/${randomUUID()}`)
+        .set("Authorization", "Bearer not-a-key")
+        .send({});
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ reachedWake: true, actorType: "none" });
     },
   );
 

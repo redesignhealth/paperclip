@@ -1,5 +1,6 @@
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
 import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema, slackConfigurationCredentialSaveSchema, slackConfigurationCredentialSchema, slackOptInScopeGroupsSchema } from "@paperclipai/shared";
+import { commsWakeEventSchema } from "../services/comms-wake-event.js";
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
 import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
@@ -1367,6 +1368,7 @@ const RUNTIME_TOOLS_OPERATIONS = new Set([
 ]);
 
 const PUBLIC_OPERATIONS = new Set([
+  "POST /api/comms-board/wake/{agentId}",
   "GET /api/agent-avatars/{version}/{palette}/{file}",
   "GET /api/health",
   "GET /api/liveness",
@@ -5543,6 +5545,30 @@ registry.registerPath({
   summary: "Fire a public routine trigger",
   request: { params: z.object({ publicId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/comms-board/wake/{agentId}",
+  tags: ["comms-board"],
+  summary: "Receive a signed comms board wake event for an agent",
+  description:
+    "Called by the comms board, not by agents or the UI. Authenticated by a Standard Webhooks signature " +
+    "(`webhook-id`, `webhook-timestamp`, `webhook-signature` with `v1,<base64 HMAC-SHA256>`) over the raw JSON body. " +
+    "Returns 200 `accepted` for a new event and 200 `duplicate` for an event id already received for the agent. " +
+    "A missing, malformed or wrong signature, a timestamp more than 5 minutes from the server clock, a `webhook-id` " +
+    "that differs from `eventId`, or a `recipientAgentId` that is not the agent's board identity returns 401. " +
+    "An unknown agent or an agent with no wake registration returns 410.",
+  request: {
+    params: z.object({ agentId: z.string() }),
+    body: jsonBody(commsWakeEventSchema),
+  },
+  responses: {
+    200: r.ok(z.object({ status: z.enum(["accepted", "duplicate"]), sessionRef: z.string().nullable() })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    410: { description: "Unknown agent or no wake registration", content: { "application/json": { schema: ErrorSchema } } },
+  },
 });
 
 // ─── Goals ───────────────────────────────────────────────────────────────────

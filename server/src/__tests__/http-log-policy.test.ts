@@ -32,6 +32,7 @@ describe("isPrivateWebhookHttpRequest", () => {
       "http://host.invalid/api/voice-webhooks/../private-component",
       "/api/routine-triggers/public",
       "/api/routine-triggers/public/private-id/fire",
+      "/api/comms-board/wake/private-id",
       "https://host.invalid/api/routine-triggers/public/../private-id",
       "/api/chat-webhooks",
       "/api/chat-webhooks/id",
