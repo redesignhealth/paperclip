@@ -1,17 +1,20 @@
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { commsWakeEvents, commsWakeRegistrations } from "@paperclipai/db";
+import { agents, commsWakeEvents, commsWakeRegistrations } from "@paperclipai/db";
 import { HttpError, badRequest, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { commsWakeEventSchema } from "./comms-wake-event.js";
-import { parseCommsWakeSecret, verifyCommsWakeSignature } from "./comms-wake-signature.js";
+import { commsWakeIssueService, type CommsWakeHeartbeat } from "./comms-wake-issue.js";
+import { parseCommsWakeSecret, precheckCommsWakeHeaders, verifyCommsWakeSignature } from "./comms-wake-signature.js";
 import { secretService } from "./secrets.js";
 
 /** Config path recorded on the vault access event when the signing secret is read. */
 export const COMMS_WAKE_SECRET_CONFIG_PATH = "comms_wake.signing_secret";
 
-export type CommsWakeResponse = { status: "accepted" | "duplicate"; sessionRef: string | null };
+export type CommsWakeResponse =
+  | { status: "accepted" | "duplicate"; sessionRef: string | null }
+  | { status: "retry_later"; reason: string };
 
 export type CommsWakeRequest = {
   agentId: string;
@@ -25,8 +28,9 @@ export type CommsWakeRequest = {
 
 const gone = () => new HttpError(410, "Wake registration not found");
 
-export function commsWakeService(db: Db) {
+export function commsWakeService(db: Db, deps: { heartbeat: CommsWakeHeartbeat }) {
   const secrets = secretService(db);
+  const issueFlow = commsWakeIssueService(db, deps);
 
   async function loadRegistration(agentId: string) {
     return db
@@ -46,6 +50,20 @@ export function commsWakeService(db: Db) {
     if (!z.string().uuid().safeParse(input.agentId).success) throw gone();
     const registration = await loadRegistration(input.agentId);
     if (!registration) throw gone();
+
+    // Cheap checks first: nothing here touches the vault, so unauthenticated junk causes no audited secret read.
+    const precheck = input.rawBody
+      ? precheckCommsWakeHeaders({
+          webhookId: input.webhookId,
+          timestamp: input.webhookTimestamp,
+          signatureHeader: input.webhookSignature,
+          nowMs: input.nowMs,
+        })
+      : "missing_header";
+    if (precheck) {
+      logger.warn({ agentId: input.agentId, reason: precheck }, "comms wake rejected");
+      throw unauthorized("Invalid webhook signature");
+    }
 
     let secretValue: string;
     try {
@@ -100,7 +118,15 @@ export function commsWakeService(db: Db) {
       throw unauthorized("Event is not addressed to this agent");
     }
 
-    const inserted = await db
+    const [agent] = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, registration.companyId)));
+    if (!agent || agent.status === "terminated") throw gone();
+
+    // An event is finished only once its outcome is "accepted". A repeat of an unfinished event (for example one that
+    // answered retry_later) is processed again and reuses the issue and comment it already created.
+    await db
       .insert(commsWakeEvents)
       .values({
         companyId: registration.companyId,
@@ -114,16 +140,24 @@ export function commsWakeService(db: Db) {
         senderBoardAgentId: event.data.senderAgentId,
         boardSessionRef: event.data.sessionRef,
       })
-      .onConflictDoNothing({ target: [commsWakeEvents.agentId, commsWakeEvents.eventId] })
-      .returning({ id: commsWakeEvents.id });
-    if (inserted.length > 0) return { status: "accepted", sessionRef: null };
-
-    const existing = await db
-      .select({ sessionRef: commsWakeEvents.sessionRef })
+      .onConflictDoNothing({ target: [commsWakeEvents.agentId, commsWakeEvents.eventId] });
+    const row = await db
+      .select({
+        id: commsWakeEvents.id,
+        issueId: commsWakeEvents.issueId,
+        commentId: commsWakeEvents.commentId,
+        outcome: commsWakeEvents.outcome,
+        sessionRef: commsWakeEvents.sessionRef,
+      })
       .from(commsWakeEvents)
       .where(and(eq(commsWakeEvents.agentId, input.agentId), eq(commsWakeEvents.eventId, event.eventId)))
-      .then((rows) => rows[0] ?? null);
-    return { status: "duplicate", sessionRef: existing?.sessionRef ?? null };
+      .then((rows) => rows[0]!);
+    if (row.outcome === "accepted") return { status: "duplicate", sessionRef: row.sessionRef };
+
+    const result = await issueFlow.process({ companyId: registration.companyId, agentId: input.agentId, event, eventRow: row });
+    if (result.status === "gone") throw gone();
+    if (result.status === "retry_later") return result;
+    return result;
   }
 
   return { receive };

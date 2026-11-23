@@ -5555,10 +5555,13 @@ registry.registerPath({
   description:
     "Called by the comms board, not by agents or the UI. Authenticated by a Standard Webhooks signature " +
     "(`webhook-id`, `webhook-timestamp`, `webhook-signature` with `v1,<base64 HMAC-SHA256>`) over the raw JSON body. " +
-    "Returns 200 `accepted` for a new event and 200 `duplicate` for an event id already received for the agent. " +
+    "Finds or creates the issue for the board conversation, adds a pointer comment and wakes the agent on it. " +
+    "Returns 200 `accepted` with the issue id as `sessionRef` once the wake is queued, deferred or coalesced, and 200 `duplicate` " +
+    "(with the stored `sessionRef`) for an event already accepted. An event that could not run yet answers 409 " +
+    "`retry_later` with a short `reason`; the same event id may be sent again and reuses the issue and comment. " +
     "A missing, malformed or wrong signature, a timestamp more than 5 minutes from the server clock, a `webhook-id` " +
     "that differs from `eventId`, or a `recipientAgentId` that is not the agent's board identity returns 401. " +
-    "An unknown agent or an agent with no wake registration returns 410.",
+    "An unknown agent, a terminated agent or an agent with no wake registration returns 410.",
   request: {
     params: z.object({ agentId: z.string() }),
     body: jsonBody(commsWakeEventSchema),
@@ -5567,7 +5570,8 @@ registry.registerPath({
     200: r.ok(z.object({ status: z.enum(["accepted", "duplicate"]), sessionRef: z.string().nullable() })),
     400: r.badRequest,
     401: r.unauthorized,
-    410: { description: "Unknown agent or no wake registration", content: { "application/json": { schema: ErrorSchema } } },
+    409: { description: "The agent cannot run now; retry the same event later", content: { "application/json": { schema: z.object({ status: z.literal("retry_later"), reason: z.string() }) } } },
+    410: { description: "Unknown or terminated agent, or no wake registration", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
 

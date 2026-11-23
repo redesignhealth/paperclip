@@ -71,6 +71,30 @@ function candidateSignatures(header: string): Buffer[] | null {
   return candidates.length > 0 ? candidates : null;
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Cheap request checks that need no secret: headers present and well formed (`webhook-id` a uuid, timestamp an
+ * integer, at least one `v1,` entry) and the timestamp inside the tolerance window. Run before the signing secret is
+ * read from the vault so unauthenticated junk never causes an audited secret read.
+ */
+export function precheckCommsWakeHeaders(input: {
+  webhookId: string | undefined;
+  timestamp: string | undefined;
+  signatureHeader: string | undefined;
+  nowMs?: number;
+  toleranceSeconds?: number;
+}): CommsWakeSignatureFailure | null {
+  if (!input.webhookId || !input.timestamp || !input.signatureHeader) return "missing_header";
+  if (!UUID_PATTERN.test(input.webhookId)) return "missing_header";
+  if (!UNIX_SECONDS_PATTERN.test(input.timestamp)) return "malformed_timestamp";
+  const nowSeconds = Math.floor((input.nowMs ?? Date.now()) / 1000);
+  const tolerance = input.toleranceSeconds ?? COMMS_WAKE_TIMESTAMP_TOLERANCE_SECONDS;
+  if (Math.abs(nowSeconds - Number(input.timestamp)) > tolerance) return "stale_timestamp";
+  if (!candidateSignatures(input.signatureHeader)) return "malformed_signature";
+  return null;
+}
+
 export function verifyCommsWakeSignature(input: {
   key: Buffer;
   webhookId: string | undefined;
