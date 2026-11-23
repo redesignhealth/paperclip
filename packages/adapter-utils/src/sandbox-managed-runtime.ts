@@ -66,6 +66,9 @@ import {
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
   "node_modules",
+  // Python virtualenv (~0.9 GB for a typical service): rebuilt from the
+  // persisted package cache each turn, never synced (TECH-9789).
+  ".venv",
   "vendor",
   "dist",
   "build",
