@@ -371,14 +371,20 @@ const CLI_SECRET_FLAG_RE = new RegExp(
   String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`,
   "i",
 );
-const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
+// The name pattern starts with an unbounded `[A-Za-z0-9_-]*` prefix. Unanchored,
+// the engine retries it from every position inside every word, which is
+// quadratic in word length on large run logs. The lookbehind makes a match start
+// only at the beginning of a word; a match starting mid-word would end at the
+// same place as the one from the word start, so the output is unchanged.
+const SECRET_FIELD_NAME_LOOKBEHIND = String.raw`(?<![A-Za-z0-9_-])`;
+export const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
+  String.raw`((?:"|')?${SECRET_FIELD_NAME_LOOKBEHIND}${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
     "`" +
     String.raw`\r\n]+((?:"|'))`,
   "gi",
 );
-const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
+export const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
+  String.raw`((?:\\")?${SECRET_FIELD_NAME_LOOKBEHIND}${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
 const SECRET_TEXT_HINTS = [
