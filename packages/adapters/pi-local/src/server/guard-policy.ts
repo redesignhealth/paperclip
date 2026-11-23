@@ -145,7 +145,6 @@ export const INFRASTRUCTURE_GUARD_POLICY: PiGuardPolicy = {
     issue: ["view", "list", "comment"],
     repo: ["view"],
   },
-  allowedTerraform: IR_TERRAFORM,
 };
 
 /** An unknown profile name selects the stricter policy. */

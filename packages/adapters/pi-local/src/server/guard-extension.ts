@@ -209,6 +209,7 @@ function checkGit(words, cwd, state) {
   while (i < words.length && words[i].startsWith("-")) {
     const w = words[i];
     if (w === "-C") { dir = path.resolve(dir, words[i + 1] || "."); i += 2; continue; }
+    if (/^-c.+/.test(w) && /^-c(core\.(sshcommand|pager|editor|fsmonitor|hookspath|askpass)|alias\.|credential\.|protocol\.|url\.|http\.|include)/i.test(w)) return deny("git -c with a setting that can run commands or redirect credentials");
     if (w === "-c") {
       if (/^(core\.(sshcommand|pager|editor|fsmonitor|hookspath|askpass)|alias\.|credential\.|protocol\.|url\.|http\.|include)/i.test(words[i + 1] || "")) return deny("git -c with a setting that can run commands or redirect credentials");
       i += 2; continue;
@@ -245,7 +246,7 @@ function checkGh(words) {
         if (/merge/.test(words.join(" "))) return deny("merging a pull request");
         return unlisted("gh api with a write method");
       }
-      if (/^(-f|-F|--field|--raw-field|--input)$/.test(w)) return unlisted("gh api with a request body");
+      if (/^(-f|-F|--field|--raw-field|--input)(=|$)|^-[fF]./.test(w)) return unlisted("gh api with a request body");
     }
   }
   const allowedActions = POLICY.allowedGh[group];
