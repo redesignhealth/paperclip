@@ -184,3 +184,5 @@ any new fork patch; remove one when the patch is upstreamed.
 - `packages/adapter-utils/src/package-relay-env.test.ts`
 - `server/src/routes/package-relay-git.ts` read-only git smart-HTTP relay to allowlisted GitHub repositories for opted-in builder agents
 - `server/src/__tests__/package-relay-git.test.ts`
+- `packages/adapter-utils/src/github-launcher-relay.test.ts`
+- `packages/adapter-utils/src/github-launcher.ts` managed GitHub launcher keeps the git relay insteadOf rules (TECH-9786)

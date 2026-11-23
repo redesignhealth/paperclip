@@ -3221,7 +3221,12 @@ async function runFileGateway() {
       const multipartAttachment = req.method === "POST"
         && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
         && /^multipart\\/form-data(?:;|$)/i.test(contentType);
-      if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment
+      // The git relay's fetch request (TECH-9786) is binary: pass it through byte for byte, like the multipart upload.
+      const gitUploadPack = req.method === "POST"
+        && /^\\/api\\/package-relay\\/github\\/[A-Za-z0-9-]+\\/[A-Za-z0-9._-]+\\/git-upload-pack$/.test(url.pathname)
+        && /^application\\/x-git-upload-pack-request(?:;|$)/i.test(contentType);
+      const binaryBody = multipartAttachment || gitUploadPack;
+      if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !binaryBody
         && !url.pathname.startsWith("/paperclip-relay/")) {
         writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
         return;
@@ -3240,7 +3245,7 @@ async function runFileGateway() {
         path: url.pathname,
         query: url.search,
         headers: normalizeHeaders(req.headers),
-        ...encodeSandboxBridgeBody(multipartAttachment ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
+        ...encodeSandboxBridgeBody(binaryBody ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
         createdAt: new Date().toISOString(),
       };
       const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);

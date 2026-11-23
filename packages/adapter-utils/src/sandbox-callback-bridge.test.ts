@@ -3799,6 +3799,25 @@ describe("sandbox callback bridge", () => {
     expect(handled).toHaveBeenCalledTimes(1);
   });
 
+  it("passes a binary git upload-pack request through the file gateway byte for byte, and only on the git relay path (TECH-9786)", async () => {
+    const bytes = Buffer.from([0xff, 0x00, 0xfe, 0x1f, 0x8b, 0x08]);
+    const handled = vi.fn(async (request: { body?: string | Buffer }) => ({
+      status: 200, headers: { "content-type": "application/x-git-upload-pack-result" }, body: Buffer.from(request.body ?? ""),
+    }));
+    const gateway = await startQueueGatewayForFileTest({ maxBodyBytes: 1024, handleRequest: handled });
+    const post = (path: string, contentType: string) => fetch(`${gateway.baseUrl}${path}`, {
+      method: "POST", headers: { authorization: `Bearer ${gateway.bridgeToken}`, "content-type": contentType }, body: new Uint8Array(bytes),
+    });
+    const ok = await post("/api/package-relay/github/redesignhealth/rh-maiea/git-upload-pack", "application/x-git-upload-pack-request");
+    expect(ok.status).toBe(200);
+    expect(Buffer.from(await ok.arrayBuffer())).toEqual(bytes);
+    expect(handled.mock.calls[0][0]).toMatchObject({ headers: { "content-type": "application/x-git-upload-pack-request" } });
+    // The same content type on any other path, or push, is still refused.
+    expect((await post("/api/agents/me", "application/x-git-upload-pack-request")).status).toBe(415);
+    expect((await post("/api/package-relay/github/redesignhealth/rh-maiea/git-receive-pack", "application/x-git-receive-pack-request")).status).toBe(415);
+    expect(handled).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects malformed queue encodings without forwarding a mutation", async () => {
     const handled = vi.fn(async () => ({ status: 200, body: "ok" }));
     const gateway = await startQueueGatewayForFileTest({ maxBodyBytes: 1024, handleRequest: handled });
