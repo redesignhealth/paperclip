@@ -28,7 +28,7 @@ import {
 } from "./types.js";
 import { createKubeConfig, makeKubeClients } from "./kube-client.js";
 import { eksIamNotAllowedMessage, isEksIamClusterAllowed } from "./eks-iam-auth.js";
-import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./adapter-defaults.js";
+import { getAdapterDefaultsResolved, buildAdapterEnv, resolveRunAdapterType, type AdapterDefaults } from "./adapter-defaults.js";
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
 import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
@@ -837,7 +837,12 @@ const plugin = definePlugin({
     if (cfg.auth && !isEksIamClusterAllowed(cfg.auth)) {
       return { ok: false, errors: [eksIamNotAllowedMessage(cfg.auth)] };
     }
-    const adapterDefaults = getAdapterDefaults(cfg.adapterType, cfg.adapters);
+    let adapterDefaults: AdapterDefaults;
+    try {
+      adapterDefaults = await getAdapterDefaultsResolved(cfg.adapterType, cfg.adapters);
+    } catch (err) {
+      return { ok: false, errors: [err instanceof Error ? err.message : String(err)] };
+    }
     const totalFqdns = [...adapterDefaults.allowFqdns, ...cfg.egressAllowFqdns];
     if (cfg.egressMode === "standard" && totalFqdns.length > 0) {
       if (cfg.egressAllowCidrs.length === 0) {
@@ -935,7 +940,8 @@ const plugin = definePlugin({
     // Emit a runtime warning if FQDNs are configured but egressMode=standard
     // cannot enforce them. Mirrors the validateConfig warning so operators see
     // it in paperclip-server logs even if they missed the validation step.
-    const adapterDefaultsForWarn = getAdapterDefaults(effectiveAdapterType, config.adapters);
+    const adapterDefaults = await getAdapterDefaultsResolved(effectiveAdapterType, config.adapters);
+    const adapterDefaultsForWarn = adapterDefaults;
     const totalFqdnsForWarn = [...adapterDefaultsForWarn.allowFqdns, ...config.egressAllowFqdns];
     if (config.egressMode === "standard" && totalFqdnsForWarn.length > 0) {
       if (config.egressAllowCidrs.length === 0) {
@@ -958,7 +964,6 @@ const plugin = definePlugin({
 
     // Ensure the tenant namespace and all its RBAC / network policy resources
     // exist before we try to create the Job.
-    const adapterDefaults = getAdapterDefaults(effectiveAdapterType, config.adapters);
 
     // What one more pod adds to the quota (CPU/memory limits and requests).
     const quotaNeed = podQuotaNeed(config.defaultResources);

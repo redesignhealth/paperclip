@@ -44,7 +44,7 @@ The full design review (options, security review, rollout) is the TECH-8174 desi
 
 ## Environment config (ops, not code)
 
-The Kubernetes plugin needs an `adapters[]` entry for `hermes_local`: `runtimeImage` (the server image digest), `allowFqdns` (the provider's API host), `envKeys: []` (keys come from the agent's own binding over stdin), and `probeCommand: ["/opt/hermes/bin/hermes", "--version"]`.
+The Kubernetes plugin needs an `adapters[]` entry for `hermes_local`: `runtimeImage` (leave it unset to follow the deployed server image: the plugin resolves the server's own digest from `PAPERCLIP_SERVER_IMAGE_REF` when set, otherwise from ECS task metadata, and fails loudly if it cannot; set it only to pin an override), `allowFqdns` (the provider's API host), `envKeys: []` (keys come from the agent's own binding over stdin), and `probeCommand: ["/opt/hermes/bin/hermes", "--version"]`.
 
 ## Open questions
 

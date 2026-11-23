@@ -150,6 +150,10 @@ const K8S_IN_CLUSTER_ENV_PASSTHROUGH = [
   "KUBERNETES_SERVICE_HOST",
   "KUBERNETES_SERVICE_PORT",
   "KUBERNETES_SERVICE_PORT_HTTPS",
+  // Non-secret pointers the kubernetes plugin uses to resolve the server's own
+  // image digest when an adapter's runtimeImage is unset (TECH-9856).
+  "ECS_CONTAINER_METADATA_URI_V4",
+  "PAPERCLIP_SERVER_IMAGE_REF",
 ];
 
 /**
