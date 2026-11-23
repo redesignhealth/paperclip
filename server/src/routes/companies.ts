@@ -1269,6 +1269,10 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       return;
     }
 
+    // Rollout scope for comms-board wake subscriptions (TECH-9912): an instance admin decides which orgs are on, never
+    // an org's own board member or its CEO agent (agents cannot reach this field: they use the branding schema).
+    if (body.commsBoardWakeEnabled !== undefined) assertInstanceAdmin(req);
+
     if (req.actor.type !== "agent") {
       if (body.feedbackDataSharingEnabled === true && !existingCompany.feedbackDataSharingEnabled) {
         body = {
