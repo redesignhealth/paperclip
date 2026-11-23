@@ -403,6 +403,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Read-only git smart-HTTP relay to allowlisted GitHub repositories (fetch only; the server refuses pushes).
   { method: "GET", path: /^\/api\/package-relay\/github\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/info\/refs$/ },
   { method: "POST", path: /^\/api\/package-relay\/github\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/git-upload-pack$/ },
+
+  // Fixed-destination Ashby API relay (TECH-9966). POST only; the server checks the operation allowlist,
+  // the agent's opt-in, and resolves the Ashby API key server-side from company secrets.
+  { method: "POST", path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.
@@ -3227,7 +3231,8 @@ async function runFileGateway() {
         && /^application\\/x-git-upload-pack-request(?:;|$)/i.test(contentType);
       const binaryBody = multipartAttachment || gitUploadPack;
       if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !binaryBody
-        && !url.pathname.startsWith("/paperclip-relay/")) {
+        && !url.pathname.startsWith("/paperclip-relay/")
+        && !url.pathname.startsWith("/api/ashby-relay/")) {
         writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
         return;
       }

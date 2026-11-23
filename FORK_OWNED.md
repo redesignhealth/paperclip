@@ -186,7 +186,6 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/__tests__/package-relay-git.test.ts`
 - `packages/adapter-utils/src/github-launcher-relay.test.ts`
 - `packages/adapter-utils/src/github-launcher.ts` managed GitHub launcher keeps the git relay insteadOf rules (TECH-9786)
-
 ## Comms board wake route (TECH-9906)
 
 - `packages/db/src/schema/comms_wake.ts` registrations, received events and conversation-to-issue links
@@ -203,3 +202,8 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/routes/comms-wake-admin.ts` instance-admin routes under `/companies/:companyId/comms-wake`
 - `server/src/__tests__/comms-wake-admin.test.ts`
 - `server/src/__tests__/comms-wake-admin-routes.test.ts`
+
+## Ashby API relay (TECH-9966)
+
+- `server/src/routes/ashby-relay.ts` fixed-destination Ashby API relay for opted-in sandbox agents (TECH-9966)
+- `server/src/__tests__/ashby-relay.test.ts`

@@ -4106,3 +4106,39 @@ describe("memory relay routes in the bridge allowlist (TECH-8908)", () => {
       .toBe(`Route not allowed: ${method} ${requestPath}`);
   });
 });
+
+describe("ashby relay routes in the bridge allowlist (TECH-9966)", () => {
+  const P = "/api/ashby-relay";
+  const allowed: Array<[string, string]> = [
+    ["POST", `${P}/candidate.search`],
+    ["POST", `${P}/candidate.info`],
+    ["POST", `${P}/application.list`],
+    ["POST", `${P}/job.list`],
+    ["POST", `${P}/candidate.create`],
+    ["POST", `${P}/candidate.addNote`],
+    ["POST", `${P}/candidate.uploadResume`],
+  ];
+  it.each(allowed)("admits %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes)).toBeNull();
+    }
+  });
+  it.each([
+    ["GET", `${P}/job.list`],
+    ["PUT", `${P}/job.list`],
+    ["DELETE", `${P}/job.list`],
+    ["POST", `${P}`],
+    ["POST", `${P}/`],
+    ["POST", `${P}/candidate`],
+    ["POST", `${P}/job.list/`],
+    ["POST", `${P}/job.list/extra`],
+    ["POST", `${P}/job..list`],
+    ["POST", `${P}/..%2fsecret`],
+    ["POST", `${P}/job.list%20`],
+    ["POST", `${P}/job.list/git-upload-pack`],
+    ["POST", `${P}/candidate.search?status=open`],
+  ])("denies %s %s", (method, requestPath) => {
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }))
+      .toBe(`Route not allowed: ${method} ${requestPath}`);
+  });
+});

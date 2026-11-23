@@ -1,0 +1,264 @@
+import { Router, type Request, type Response } from "express";
+import type { Db } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
+import { guardedRemoteHttpFetch } from "../services/remote-http-fetch.js";
+import { secretService } from "../services/secrets.js";
+
+/**
+ * TECH-9966: fixed-destination Ashby API relay for sandboxed agents.
+ *
+ * A sandbox pod cannot reach api.ashbyhq.com directly under default-deny network egress policy and holds no API key.
+ * The pod points its Ashby client at the sandbox bridge (`ASHBY_API_BASE=${PAPERCLIP_API_URL}/api/ashby-relay`), which
+ * forwards here with the run JWT. This server validates the operation against an allowlist, resolves the company's
+ * Ashby API key server-side from company secret `ashby_relay.api_key`, and adds HTTP Basic auth before forwarding
+ * to the pinned upstream `https://api.ashbyhq.com`. The key never enters the pod.
+ *
+ * Upstream is pinned to `PAPERCLIP_ASHBY_RELAY_BASE_URL` (HTTPS only, no client-selectable host/scheme).
+ * Operations are restricted to a closed allowlist: read-only by default (`candidate.search`, `candidate.info`,
+ * `application.list`, `job.list`). Writes require explicit opt-in via `PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS`.
+ * Auth requires a run-JWT (`actor.type === "agent" && actor.source === "agent_jwt"` with runId) and per-agent
+ * opt-in `adapterConfig.env.PAPERCLIP_ASHBY_RELAY=on`.
+ * Fails closed 503 when unconfigured. Error bodies never echo upstream content or keys.
+ */
+
+export const ASHBY_RELAY_BASE_URL_ENV = "PAPERCLIP_ASHBY_RELAY_BASE_URL";
+export const ASHBY_RELAY_OPERATIONS_ENV = "PAPERCLIP_ASHBY_RELAY_OPERATIONS";
+export const ASHBY_RELAY_WRITE_OPERATIONS_ENV = "PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS";
+export const ASHBY_RELAY_SECRET_KEY = "ashby_relay.api_key";
+/** The agent adapterConfig env key that opts an agent in. */
+export const ASHBY_RELAY_OPT_IN_ENV_KEY = "PAPERCLIP_ASHBY_RELAY";
+
+export const ASHBY_RELAY_DEADLINE_MS = 60_000;
+/** Byte cap under the bridge limit (~10 MB). */
+export const ASHBY_RELAY_MAX_BODY_BYTES = 10_000_000;
+
+export const DEFAULT_ASHBY_RELAY_READ_OPERATIONS = [
+  "candidate.search",
+  "candidate.info",
+  "application.list",
+  "job.list",
+] as const;
+
+const OPERATION_RE = /^[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/;
+const JSON_CONTENT_TYPE_RE = /^application\/json\s*(;|$)/i;
+
+export interface AshbyRelayDeps {
+  env?: NodeJS.ProcessEnv;
+  fetchImpl?: typeof fetch;
+  /** True when the agent opted in to the Ashby relay. Replaceable in tests. */
+  isOptedIn?: (agentId: string) => Promise<boolean>;
+  /** The company's Ashby API key, or null when none is stored. Replaceable in tests. */
+  resolveToken?: (companyId: string) => Promise<string | null>;
+}
+
+export interface AshbyRelayConfig {
+  base: string;
+  operations: Set<string>;
+  readOperations: Set<string>;
+  writeOperations: Set<string>;
+}
+
+function fail(res: Response, status: number, detail: string) {
+  res.status(status).json({ detail });
+}
+
+export function parseOptIn(value: unknown): string[] {
+  const raw = value && typeof value === "object" && "value" in value ? (value as { value: unknown }).value : value;
+  return typeof raw === "string" ? raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+}
+
+export function parseOperations(
+  envValue: string | undefined,
+  defaultOps: readonly string[] = [],
+): Set<string> | null {
+  const raw = envValue?.trim();
+  if (!raw) {
+    return new Set(defaultOps);
+  }
+  const entries = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (entries.length === 0 || !entries.every((op) => OPERATION_RE.test(op))) {
+    return null;
+  }
+  return new Set(entries);
+}
+
+export function parseAshbyRelayConfig(env: NodeJS.ProcessEnv): AshbyRelayConfig | null {
+  const url = env[ASHBY_RELAY_BASE_URL_ENV]?.trim().replace(/\/+$/, "");
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    return null;
+  }
+
+  const readOps = parseOperations(env[ASHBY_RELAY_OPERATIONS_ENV], DEFAULT_ASHBY_RELAY_READ_OPERATIONS);
+  if (!readOps) return null;
+
+  const writeOps = parseOperations(env[ASHBY_RELAY_WRITE_OPERATIONS_ENV], []);
+  if (!writeOps) return null;
+
+  return {
+    base: url,
+    operations: new Set([...readOps, ...writeOps]),
+    readOperations: readOps,
+    writeOperations: writeOps,
+  };
+}
+
+export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
+  const router = Router();
+  let warnedUnconfigured = false;
+  const env = deps.env ?? process.env;
+  const fetchImpl = deps.fetchImpl ?? ((url: string | URL, init?: RequestInit) =>
+    guardedRemoteHttpFetch(url, init ?? {}, {
+      allowPrivateNetwork: false,
+      error: (message, code) => new Error(`${code}: ${message}`),
+    }));
+
+  const isOptedIn = deps.isOptedIn ?? (async (agentId: string) => {
+    const { agentService } = await import("../services/agents.js");
+    const agent = await agentService(db).getById(agentId);
+    const adapterEnv = (agent?.adapterConfig as { env?: Record<string, unknown> } | null | undefined)?.env;
+    const optIns = parseOptIn(adapterEnv?.[ASHBY_RELAY_OPT_IN_ENV_KEY]);
+    return optIns.includes("on") || optIns.includes("true") || optIns.includes("enabled");
+  });
+
+  const resolveToken = deps.resolveToken ?? (async (companyId: string) => {
+    const secrets = secretService(db);
+    const secret = await secrets.getByKey(companyId, ASHBY_RELAY_SECRET_KEY);
+    if (!secret || secret.status !== "active") return null;
+    return secrets.resolveSecretValue(companyId, secret.id, "latest");
+  });
+
+  router.post("/ashby-relay/:operation", async (req: Request, res: Response, next) => {
+    try {
+      // The run JWT only: an agent API key has no run, and a board user has no pod.
+      const actor = req.actor;
+      if (actor.type !== "agent" || actor.source !== "agent_jwt" || !actor.agentId || !actor.companyId || !actor.runId) {
+        return fail(res, 403, "forbidden");
+      }
+
+      const config = parseAshbyRelayConfig(env);
+      if (!config) {
+        if (!warnedUnconfigured) {
+          warnedUnconfigured = true;
+          logger.warn("ashby relay is not configured or its settings are invalid; answering 503");
+        }
+        return fail(res, 503, "ashby_relay_unavailable");
+      }
+
+      const operation = req.params.operation as string;
+      if (!OPERATION_RE.test(operation) || !config.operations.has(operation)) {
+        return fail(res, 404, "not_found");
+      }
+
+      const contentType = req.header("content-type");
+      if (contentType && !JSON_CONTENT_TYPE_RE.test(contentType)) {
+        return fail(res, 415, "json_required");
+      }
+
+      const raw = (req as unknown as { rawBody?: Buffer }).rawBody
+        ?? (req.body ? Buffer.from(typeof req.body === "string" ? req.body : JSON.stringify(req.body)) : Buffer.alloc(0));
+
+      if (raw.length > ASHBY_RELAY_MAX_BODY_BYTES) {
+        return fail(res, 413, "too_large");
+      }
+
+      let apiKey: string | null;
+      try {
+        if (!(await isOptedIn(actor.agentId))) {
+          return fail(res, 403, "forbidden");
+        }
+        apiKey = await resolveToken(actor.companyId);
+      } catch (err) {
+        logger.warn(
+          { method: req.method, path: req.path, errorClass: err instanceof Error ? err.constructor.name : typeof err },
+          "ashby relay lookup failed",
+        );
+        return fail(res, 503, "ashby_relay_unavailable");
+      }
+      if (!apiKey) {
+        return fail(res, 403, "forbidden");
+      }
+
+      let upstream: globalThis.Response;
+      try {
+        upstream = await fetchImpl(`${config.base}/${encodeURIComponent(operation)}`, {
+          method: "POST",
+          headers: {
+            authorization: `Basic ${Buffer.from(`${apiKey.trim()}:`).toString("base64")}`,
+            "content-type": "application/json",
+            accept: "application/json",
+          },
+          body: raw.length > 0 ? new Uint8Array(raw) : new Uint8Array(Buffer.from("{}")),
+          redirect: "manual",
+          signal: AbortSignal.timeout(ASHBY_RELAY_DEADLINE_MS),
+        });
+      } catch (err) {
+        const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+        logger.warn(
+          { method: req.method, path: req.path, errorClass: err instanceof Error ? err.name : typeof err, timedOut },
+          "ashby relay upstream call failed",
+        );
+        return fail(res, timedOut ? 504 : 502, timedOut ? "ashby_relay_timeout" : "ashby_relay_unavailable");
+      }
+
+      if (upstream.status >= 300 && upstream.status < 400) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return fail(res, 502, "ashby_relay_unavailable");
+      }
+
+      if (!upstream.ok) {
+        await upstream.body?.cancel().catch(() => undefined);
+        const status = upstream.status === 404 ? 404 : upstream.status === 429 ? 429 : upstream.status === 400 ? 400 : 502;
+        const detail = upstream.status === 404 ? "not_found" : upstream.status === 429 ? "rate_limited" : upstream.status === 400 ? "bad_request" : "ashby_relay_unavailable";
+        return fail(res, status, detail);
+      }
+
+      const upstreamContentType = upstream.headers.get("content-type") ?? "";
+      if (!JSON_CONTENT_TYPE_RE.test(upstreamContentType)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return fail(res, 502, "ashby_relay_unavailable");
+      }
+
+      const declared = Number(upstream.headers.get("content-length") ?? "0");
+      if (declared > ASHBY_RELAY_MAX_BODY_BYTES) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return fail(res, 502, "ashby_relay_unavailable");
+      }
+
+      const chunks: Buffer[] = [];
+      let received = 0;
+      try {
+        const reader = upstream.body?.getReader();
+        while (reader) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          received += value.byteLength;
+          if (received > ASHBY_RELAY_MAX_BODY_BYTES) {
+            await reader.cancel().catch(() => undefined);
+            return fail(res, 502, "ashby_relay_unavailable");
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } catch {
+        return fail(res, 502, "ashby_relay_unavailable");
+      }
+
+      const body = Buffer.concat(chunks);
+      if (apiKey && body.includes(apiKey.trim())) {
+        return fail(res, 502, "ashby_relay_unavailable");
+      }
+
+      res.status(upstream.status).type("application/json").send(body);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  return router;
+}
