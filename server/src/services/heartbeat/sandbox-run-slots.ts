@@ -188,6 +188,8 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
   const waiters = new Map<string, Waiter>();
   const reservations = new Map<string, { companyId: string; reservedAtMs: number }>();
   let checkSeq = 0;
+  /** Longest wait of a run admitted since the last metrics read (TECH-9857). */
+  let admittedWaitMaxMs = 0;
   let placementCache: { db: Db; atMs: number; placement: Promise<SandboxPlacement> } | null = null;
   let lockTail: Promise<unknown> = Promise.resolve();
   let promoting: Promise<void> | null = null;
@@ -275,6 +277,7 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
         .findIndex((waiter) => waiter.runId === candidate.runId);
       if (max - inUse > position) {
         waiters.delete(candidate.runId);
+        if (existing) admittedWaitMaxMs = Math.max(admittedWaitMaxMs, at - existing.waitingSinceMs);
         reservations.set(candidate.runId, { companyId: candidate.companyId, reservedAtMs: at });
         return { admitted: true, reserved: true, waitedMs: existing ? at - existing.waitingSinceMs : null, inUse, limit: max };
       }
@@ -331,8 +334,25 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
     return promoting;
   }
 
+  /**
+   * Queue-pressure measures for the metrics emitter (TECH-9857). `waiting` and
+   * `oldestWaitMs` cover live waiters (not parked, re-checked recently).
+   * `admittedWaitMaxMs` is the longest wait of a run admitted since the last
+   * call, and resets on read, so a run that waited and started between two
+   * samples is still seen.
+   */
+  function metrics() {
+    const at = now();
+    const live = [...waiters.values()].filter((waiter) => !waiter.parked && at - waiter.lastCheckedAtMs <= WAITER_STALE_MS);
+    const oldestWaitMs = live.reduce((max, waiter) => Math.max(max, at - waiter.waitingSinceMs), 0);
+    const result = { waiting: live.length, oldestWaitMs, admittedWaitMaxMs, limit: limit() };
+    admittedWaitMaxMs = 0;
+    return result;
+  }
+
   return {
     limit,
+    metrics,
     providerForAgent,
     admit,
     settle,

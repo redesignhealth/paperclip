@@ -321,6 +321,27 @@ describe.skipIf(!support.supported)("server-wide sandbox run limit in the run qu
     expect(await stalled.freeSlots(db)).toBe(2);
   });
 
+  it("reports waiting runs and their wait for the metrics emitter", async () => {
+    limit = 1;
+    const gate = newGate();
+    const c = await company("Metrics");
+    const owner = await agent(c.id, "Metrics owner");
+    const [first, second] = await runs(owner, 2);
+    const entry = (run: typeof first) => ({ runId: run.id, companyId: run.companyId, agentId: run.agentId, provider: "kubernetes", conversation: false, queuedAtMs: run.createdAt.getTime() });
+    expect(await gate.admit(db, entry(first))).toMatchObject({ admitted: true });
+    expect(await gate.admit(db, entry(second))).toMatchObject({ admitted: false });
+    clock += 20_000;
+    expect(await gate.admit(db, entry(second))).toMatchObject({ admitted: false });
+    expect(gate.metrics()).toMatchObject({ waiting: 1, oldestWaitMs: 20_000, admittedWaitMaxMs: 0, limit: 1 });
+    // The first run finishes and the second is admitted: its wait is reported once, then resets.
+    gate.settle(first.id);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, first.id));
+    clock += 10_000;
+    expect(await gate.admit(db, entry(second))).toMatchObject({ admitted: true, waitedMs: 30_000 });
+    expect(gate.metrics()).toMatchObject({ waiting: 0, oldestWaitMs: 0, admittedWaitMaxMs: 30_000 });
+    expect(gate.metrics().admittedWaitMaxMs).toBe(0);
+  });
+
   it("releases the claim reservation when the claim does not start the run", async () => {
     limit = 1;
     const owner = await agent((await company("Budget")).id, "Budget agent");
