@@ -2,24 +2,28 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
+import { DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS } from "@paperclipai/adapter-utils/sandbox-callback-bridge";
 import {
   ASHBY_RELAY_BASE_URL_ENV,
+  ASHBY_RELAY_DEADLINE_MS,
   ASHBY_RELAY_OPERATIONS_ENV,
   ASHBY_RELAY_WRITE_OPERATIONS_ENV,
+  ASHBY_UPSTREAM_ORIGIN,
+  KNOWN_ASHBY_RELAY_READ_OPERATIONS,
+  KNOWN_ASHBY_RELAY_WRITE_OPERATIONS,
   ashbyRelayRoutes,
   parseAshbyRelayConfig,
   parseOperations,
   parseOptIn,
 } from "../routes/ashby-relay.js";
 
-const ASHBY_UPSTREAM = "https://api.ashbyhq.com";
 const AGENT_A = "11111111-1111-4111-8111-111111111111";
 const AGENT_B = "22222222-2222-4222-8222-222222222222";
 const COMPANY = "33333333-3333-4333-8333-333333333333";
 const API_KEY = "ashby-secret-key-xyz-123";
 
 const defaultEnv = {
-  [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM,
+  [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN,
 } as NodeJS.ProcessEnv;
 
 function build(
@@ -29,6 +33,8 @@ function build(
     fetchImpl?: typeof fetch;
     optedIn?: string[];
     token?: string | null;
+    runActive?: boolean;
+    assertActiveRun?: (input: { companyId: string; agentId: string; runId: string }) => Promise<boolean>;
   } = {},
 ) {
   const fetchImpl =
@@ -47,6 +53,9 @@ function build(
   const resolveToken = vi.fn(async () =>
     opts.token === undefined ? API_KEY : opts.token,
   );
+  const assertActiveRun =
+    opts.assertActiveRun ??
+    vi.fn(async () => (opts.runActive === undefined ? true : opts.runActive));
 
   const app = express();
   app.use(express.json());
@@ -68,6 +77,7 @@ function build(
       fetchImpl: fetchImpl as typeof fetch,
       isOptedIn,
       resolveToken,
+      assertActiveRun,
     }),
   );
 
@@ -76,12 +86,20 @@ function build(
     fetchImpl: fetchImpl as unknown as ReturnType<typeof vi.fn>,
     isOptedIn,
     resolveToken,
+    assertActiveRun,
   };
 }
 
 const BASE = "/api/ashby-relay";
 
 describe("ashby relay (TECH-9966)", () => {
+  it("proves upstream deadline has a safe margin before bridge default timeout", () => {
+    // Finding 5: Host returns before bridge default (30 s), leaving at least 5 s margin
+    expect(DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS).toBe(30_000);
+    expect(ASHBY_RELAY_DEADLINE_MS).toBe(25_000);
+    expect(DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS - ASHBY_RELAY_DEADLINE_MS).toBeGreaterThanOrEqual(5_000);
+  });
+
   it("parses opt-in and operation allowlists", () => {
     expect(parseOptIn("on")).toEqual(["on"]);
     expect(parseOptIn({ value: "ON, True" })).toEqual(["on", "true"]);
@@ -98,7 +116,15 @@ describe("ashby relay (TECH-9966)", () => {
     expect(parseOperations("candidate/search")).toBeNull();
   });
 
-  it("fails closed with 503 when unconfigured or invalid URL/operations", async () => {
+  it("pins exact https://api.ashbyhq.com origin with root path and rejects all other hosts/paths/ports/userinfo/queries", async () => {
+    // Finding 4: Exact origin pin and strict URL rejection
+    expect(parseAshbyRelayConfig({ [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN })?.base).toBe(
+      ASHBY_UPSTREAM_ORIGIN,
+    );
+    expect(parseAshbyRelayConfig({ [ASHBY_RELAY_BASE_URL_ENV]: `${ASHBY_UPSTREAM_ORIGIN}/` })?.base).toBe(
+      ASHBY_UPSTREAM_ORIGIN,
+    );
+
     // Unset base URL -> 503
     const unconfigured = build({ env: {} as NodeJS.ProcessEnv });
     await request(unconfigured.app).post(`${BASE}/job.list`).send({}).expect(503);
@@ -110,29 +136,97 @@ describe("ashby relay (TECH-9966)", () => {
     });
     await request(httpOnly.app).post(`${BASE}/job.list`).send({}).expect(503);
 
-    // URL with search params or credentials -> 503
-    const badUrl = build({
-      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://user:pass@api.ashbyhq.com?query=1" } as NodeJS.ProcessEnv,
+    // Different host -> 503
+    const evilHost = build({
+      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://evil.example.com" } as NodeJS.ProcessEnv,
     });
-    await request(badUrl.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(evilHost.app).post(`${BASE}/job.list`).send({}).expect(503);
 
-    // Invalid operation name in PAPERCLIP_ASHBY_RELAY_OPERATIONS -> 503
-    const badOps = build({
+    // Custom port -> 503
+    const customPort = build({
+      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com:8443" } as NodeJS.ProcessEnv,
+    });
+    await request(customPort.app).post(`${BASE}/job.list`).send({}).expect(503);
+
+    // Path segment (non-root) -> 503
+    const pathPrefix = build({
+      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com/v1" } as NodeJS.ProcessEnv,
+    });
+    await request(pathPrefix.app).post(`${BASE}/job.list`).send({}).expect(503);
+
+    // Userinfo credentials in URL -> 503
+    const userPass = build({
+      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://user:pass@api.ashbyhq.com" } as NodeJS.ProcessEnv,
+    });
+    await request(userPass.app).post(`${BASE}/job.list`).send({}).expect(503);
+
+    // Query string in URL -> 503
+    const withQuery = build({
+      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com?q=1" } as NodeJS.ProcessEnv,
+    });
+    await request(withQuery.app).post(`${BASE}/job.list`).send({}).expect(503);
+
+    // Hash fragment in URL -> 503
+    const withHash = build({
+      env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com#frag" } as NodeJS.ProcessEnv,
+    });
+    await request(withHash.app).post(`${BASE}/job.list`).send({}).expect(503);
+  });
+
+  it("intersects read operations strictly with known read-only set and rejects mutating operations without write opt-in", async () => {
+    // Finding 2: Read operations intersected with known read-only set
+    // Candidate.create in read operations env MUST NOT be enabled
+    const readWithMutation = build({
       env: {
-        [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM,
-        [ASHBY_RELAY_OPERATIONS_ENV]: "job.list, invalid op",
+        [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN,
+        [ASHBY_RELAY_OPERATIONS_ENV]: "candidate.create, job.list",
       } as NodeJS.ProcessEnv,
     });
-    await request(badOps.app).post(`${BASE}/job.list`).send({}).expect(503);
 
-    // Invalid operation name in PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS -> 503
-    const badWriteOps = build({
+    // job.list is known read-only, so it is allowed
+    await request(readWithMutation.app).post(`${BASE}/job.list`).send({}).expect(200);
+
+    // candidate.create is a write operation, so it was filtered out from read allowlist -> 404
+    await request(readWithMutation.app).post(`${BASE}/candidate.create`).send({}).expect(404);
+    expect(readWithMutation.fetchImpl).toHaveBeenCalledTimes(1);
+
+    // candidate.create is only allowed when explicitly opted in via write env
+    const withExplicitWrite = build({
       env: {
-        [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM,
-        [ASHBY_RELAY_WRITE_OPERATIONS_ENV]: "candidate.create;bad",
+        [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN,
+        [ASHBY_RELAY_OPERATIONS_ENV]: "job.list",
+        [ASHBY_RELAY_WRITE_OPERATIONS_ENV]: "candidate.create",
       } as NodeJS.ProcessEnv,
     });
-    await request(badWriteOps.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(withExplicitWrite.app).post(`${BASE}/candidate.create`).send({ name: "Alice" }).expect(200);
+  });
+
+  it("requires actual active run scoped to agent/company, rejecting missing or terminal runs with 403", async () => {
+    // Finding 3: Database active run verification
+    const missingRun = build({
+      assertActiveRun: vi.fn(async () => false),
+    });
+    await request(missingRun.app).post(`${BASE}/job.list`).send({}).expect(403);
+    expect(missingRun.assertActiveRun).toHaveBeenCalledWith({
+      companyId: COMPANY,
+      agentId: AGENT_A,
+      runId: "run-1",
+    });
+    expect(missingRun.fetchImpl).not.toHaveBeenCalled();
+
+    // Terminal run (e.g. cancelled / succeeded / failed) -> assertActiveRun returns false
+    const terminalRun = build({
+      runActive: false,
+    });
+    await request(terminalRun.app).post(`${BASE}/job.list`).send({}).expect(403);
+    expect(terminalRun.fetchImpl).not.toHaveBeenCalled();
+
+    // Active run -> passes
+    const activeRun = build({
+      runActive: true,
+    });
+    await request(activeRun.app).post(`${BASE}/job.list`).send({}).expect(200);
+    expect(activeRun.fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("forwards allowed read operations with Basic auth header (apiKey:)", async () => {
@@ -146,7 +240,7 @@ describe("ashby relay (TECH-9966)", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
 
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${ASHBY_UPSTREAM}/job.list`);
+    expect(url).toBe(`${ASHBY_UPSTREAM_ORIGIN}/job.list`);
     expect(init.method).toBe("POST");
     expect(init.redirect).toBe("manual");
 
@@ -200,8 +294,6 @@ describe("ashby relay (TECH-9966)", () => {
   it("refuses operations off the allowlist with 404", async () => {
     const { app, fetchImpl } = build();
 
-    // Default allowlist has candidate.search, candidate.info, application.list, job.list
-    // Any other operation, including candidate.create, is refused 404 by default
     await request(app).post(`${BASE}/candidate.create`).send({}).expect(404);
     await request(app).post(`${BASE}/candidate.addNote`).send({}).expect(404);
     await request(app).post(`${BASE}/unknown.operation`).send({}).expect(404);
@@ -210,25 +302,6 @@ describe("ashby relay (TECH-9966)", () => {
     await request(app).post(`${BASE}/job..list`).send({}).expect(404);
 
     expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it("allows write operations only when explicitly opted in via PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS", async () => {
-    const withWrites = build({
-      env: {
-        [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM,
-        [ASHBY_RELAY_WRITE_OPERATIONS_ENV]: "candidate.create, candidate.addNote",
-      } as NodeJS.ProcessEnv,
-    });
-
-    // Allowed write operations
-    await request(withWrites.app).post(`${BASE}/candidate.create`).send({ name: "Jane" }).expect(200);
-    await request(withWrites.app).post(`${BASE}/candidate.addNote`).send({ note: "Hello" }).expect(200);
-
-    // Default read operations are still allowed
-    await request(withWrites.app).post(`${BASE}/job.list`).send({}).expect(200);
-
-    // Unlisted write operation is still refused 404
-    await request(withWrites.app).post(`${BASE}/candidate.uploadResume`).send({}).expect(404);
   });
 
   it("rejects non-JSON content-type with 415", async () => {
@@ -245,7 +318,6 @@ describe("ashby relay (TECH-9966)", () => {
     const { app, fetchImpl } = build();
     const big = Buffer.alloc(10_000_001);
     const rawReq = request(app).post(`${BASE}/job.list`).set("Content-Type", "application/json");
-    // Attach rawBody exceeding max
     (rawReq as unknown as { rawBody: Buffer }).rawBody = big;
     await rawReq.send(big.toString()).expect(413);
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -315,7 +387,6 @@ describe("ashby relay (TECH-9966)", () => {
   });
 
   it("rejects oversized upstream responses with 502", async () => {
-    // Declared Content-Length > 10MB
     const bigDeclared = build({
       fetchImpl: vi.fn(
         async () =>
@@ -327,7 +398,6 @@ describe("ashby relay (TECH-9966)", () => {
     });
     await request(bigDeclared.app).post(`${BASE}/job.list`).send({}).expect(502);
 
-    // Streaming chunks exceeding 10MB
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
         controller.enqueue(new Uint8Array(4_000_000));

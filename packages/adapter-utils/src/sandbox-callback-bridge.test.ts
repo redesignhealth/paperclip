@@ -3818,6 +3818,57 @@ describe("sandbox callback bridge", () => {
     expect(handled).toHaveBeenCalledTimes(1);
   });
 
+  it("authenticates standard Ashby Basic call shape (API key as username, empty password) and relay Bearer through the bridge gateway (TECH-9966)", async () => {
+    const payload = JSON.stringify({ status: "Open" });
+    const handled = vi.fn(async (request: { body?: string | Buffer }) => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ success: true, results: [] }),
+    }));
+    const gateway = await startQueueGatewayForFileTest({ maxBodyBytes: 1024, handleRequest: handled });
+
+    // Call shape 1: standard Ashby client sends Basic auth with the bridge token as username and empty password
+    const basicRes = await fetch(`${gateway.baseUrl}/api/ashby-relay/job.list`, {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${Buffer.from(`${gateway.bridgeToken}:`).toString("base64")}`,
+        "content-type": "application/json",
+      },
+      body: payload,
+    });
+    expect(basicRes.status).toBe(200);
+    expect(handled).toHaveBeenCalledTimes(1);
+    expect(handled.mock.calls[0][0]).toMatchObject({
+      method: "POST",
+      path: "/api/ashby-relay/job.list",
+      body: payload,
+    });
+
+    // Call shape 2: explicit relay-mode caller path sends Bearer token
+    const bearerRes = await fetch(`${gateway.baseUrl}/api/ashby-relay/job.list`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${gateway.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: payload,
+    });
+    expect(bearerRes.status).toBe(200);
+    expect(handled).toHaveBeenCalledTimes(2);
+
+    // Call shape 3: wrong bridge token in Basic username is rejected with 401
+    const badBasicRes = await fetch(`${gateway.baseUrl}/api/ashby-relay/job.list`, {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${Buffer.from("wrong-token:").toString("base64")}`,
+        "content-type": "application/json",
+      },
+      body: payload,
+    });
+    expect(badBasicRes.status).toBe(401);
+    expect(handled).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects malformed queue encodings without forwarding a mutation", async () => {
     const handled = vi.fn(async () => ({ status: 200, body: "ok" }));
     const gateway = await startQueueGatewayForFileTest({ maxBodyBytes: 1024, handleRequest: handled });

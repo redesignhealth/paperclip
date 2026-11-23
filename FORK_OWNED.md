@@ -207,3 +207,5 @@ any new fork patch; remove one when the patch is upstreamed.
 
 - `server/src/routes/ashby-relay.ts` fixed-destination Ashby API relay for opted-in sandbox agents (TECH-9966)
 - `server/src/__tests__/ashby-relay.test.ts`
+- `packages/adapter-utils/src/ashby-relay-env.ts` opt-in bridge environment settings for the Ashby relay
+- `packages/adapter-utils/src/ashby-relay-env.test.ts`

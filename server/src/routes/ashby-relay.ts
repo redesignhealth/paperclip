@@ -13,10 +13,11 @@ import { secretService } from "../services/secrets.js";
  * Ashby API key server-side from company secret `ashby_relay.api_key`, and adds HTTP Basic auth before forwarding
  * to the pinned upstream `https://api.ashbyhq.com`. The key never enters the pod.
  *
- * Upstream is pinned to `PAPERCLIP_ASHBY_RELAY_BASE_URL` (HTTPS only, no client-selectable host/scheme).
- * Operations are restricted to a closed allowlist: read-only by default (`candidate.search`, `candidate.info`,
- * `application.list`, `job.list`). Writes require explicit opt-in via `PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS`.
- * Auth requires a run-JWT (`actor.type === "agent" && actor.source === "agent_jwt"` with runId) and per-agent
+ * Upstream is pinned to `https://api.ashbyhq.com` from `PAPERCLIP_ASHBY_RELAY_BASE_URL` (HTTPS only, root path only).
+ * Operations are restricted to a closed allowlist: read-only operations intersected with KNOWN_ASHBY_RELAY_READ_OPERATIONS
+ * (`candidate.search`, `candidate.info`, `application.list`, `job.list`). Writes require explicit opt-in via
+ * `PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS` and are intersected with KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.
+ * Auth requires a run-JWT (`actor.type === "agent" && actor.source === "agent_jwt"` with active run in database) and per-agent
  * opt-in `adapterConfig.env.PAPERCLIP_ASHBY_RELAY=on`.
  * Fails closed 503 when unconfigured. Error bodies never echo upstream content or keys.
  */
@@ -28,9 +29,31 @@ export const ASHBY_RELAY_SECRET_KEY = "ashby_relay.api_key";
 /** The agent adapterConfig env key that opts an agent in. */
 export const ASHBY_RELAY_OPT_IN_ENV_KEY = "PAPERCLIP_ASHBY_RELAY";
 
-export const ASHBY_RELAY_DEADLINE_MS = 60_000;
+export const ASHBY_UPSTREAM_ORIGIN = "https://api.ashbyhq.com";
+
+/**
+ * Host upstream deadline is 25 s, leaving a proven 5,000 ms margin before the bridge's
+ * 30 s default timeout (DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS).
+ */
+export const ASHBY_RELAY_DEADLINE_MS = 25_000;
 /** Byte cap under the bridge limit (~10 MB). */
 export const ASHBY_RELAY_MAX_BODY_BYTES = 10_000_000;
+
+export const KNOWN_ASHBY_RELAY_READ_OPERATIONS = new Set([
+  "candidate.search",
+  "candidate.info",
+  "application.list",
+  "job.list",
+]);
+
+export const KNOWN_ASHBY_RELAY_WRITE_OPERATIONS = new Set([
+  "candidate.create",
+  "candidate.addNote",
+  "candidate.uploadResume",
+  "candidate.tag",
+  "application.create",
+  "application.updateStage",
+]);
 
 export const DEFAULT_ASHBY_RELAY_READ_OPERATIONS = [
   "candidate.search",
@@ -49,6 +72,8 @@ export interface AshbyRelayDeps {
   isOptedIn?: (agentId: string) => Promise<boolean>;
   /** The company's Ashby API key, or null when none is stored. Replaceable in tests. */
   resolveToken?: (companyId: string) => Promise<string | null>;
+  /** Verifies that the run is an actual active, non-terminal run scoped to this agent/company. */
+  assertActiveRun?: (input: { companyId: string; agentId: string; runId: string }) => Promise<boolean>;
 }
 
 export interface AshbyRelayConfig {
@@ -91,18 +116,34 @@ export function parseAshbyRelayConfig(env: NodeJS.ProcessEnv): AshbyRelayConfig 
   } catch {
     return null;
   }
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+  // Pinned exact origin https://api.ashbyhq.com with root path only:
+  // Reject non-https, different host, custom port, path prefix, userinfo, query, fragment.
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "api.ashbyhq.com" ||
+    parsed.port !== "" ||
+    (parsed.pathname !== "/" && parsed.pathname !== "") ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
+  ) {
     return null;
   }
 
-  const readOps = parseOperations(env[ASHBY_RELAY_OPERATIONS_ENV], DEFAULT_ASHBY_RELAY_READ_OPERATIONS);
-  if (!readOps) return null;
+  // Intersect read operations strictly with known read-only set; no mutation permitted via read config
+  const rawReadOps = parseOperations(env[ASHBY_RELAY_OPERATIONS_ENV], DEFAULT_ASHBY_RELAY_READ_OPERATIONS);
+  if (!rawReadOps) return null;
+  const readOps = new Set([...rawReadOps].filter((op) => KNOWN_ASHBY_RELAY_READ_OPERATIONS.has(op)));
+  if (readOps.size === 0) return null;
 
-  const writeOps = parseOperations(env[ASHBY_RELAY_WRITE_OPERATIONS_ENV], []);
-  if (!writeOps) return null;
+  // Intersect write operations strictly with known write set
+  const rawWriteOps = parseOperations(env[ASHBY_RELAY_WRITE_OPERATIONS_ENV], []);
+  if (!rawWriteOps) return null;
+  const writeOps = new Set([...rawWriteOps].filter((op) => KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.has(op)));
 
   return {
-    base: url,
+    base: ASHBY_UPSTREAM_ORIGIN,
     operations: new Set([...readOps, ...writeOps]),
     readOperations: readOps,
     writeOperations: writeOps,
@@ -134,11 +175,36 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
     return secrets.resolveSecretValue(companyId, secret.id, "latest");
   });
 
+  const assertActiveRun = deps.assertActiveRun ?? (async (input: { companyId: string; agentId: string; runId: string }) => {
+    const { heartbeatRuns } = await import("@paperclipai/db");
+    const { and, eq } = await import("drizzle-orm");
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ))
+      .limit(1);
+    return run?.status === "running";
+  });
+
   router.post("/ashby-relay/:operation", async (req: Request, res: Response, next) => {
     try {
       // The run JWT only: an agent API key has no run, and a board user has no pod.
       const actor = req.actor;
       if (actor.type !== "agent" || actor.source !== "agent_jwt" || !actor.agentId || !actor.companyId || !actor.runId) {
+        return fail(res, 403, "forbidden");
+      }
+
+      // Require actual active run scoped to agent/company in the database, not just token claims.
+      const runActive = await assertActiveRun({
+        companyId: actor.companyId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+      });
+      if (!runActive) {
         return fail(res, 403, "forbidden");
       }
 

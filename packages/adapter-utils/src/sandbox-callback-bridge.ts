@@ -27,7 +27,7 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
-const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
+export const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
@@ -408,6 +408,16 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // the agent's opt-in, and resolves the Ashby API key server-side from company secrets.
   { method: "POST", path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/ },
 ] as const;
+
+/**
+ * Scoped bridge route policy for the Ashby relay route.
+ * Bounded by in-pod deadline with proven margin above the server relay's 25 s upstream deadline.
+ */
+export const ASHBY_RELAY_ROUTE_POLICY: SandboxCallbackBridgeRoutePolicy = {
+  path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/,
+  deadlineMs: 30_000,
+  maxConcurrent: 4,
+};
 
 // Keep the public alias for callers selecting the HTTP/2 transport.
 export const HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST;
@@ -3115,13 +3125,19 @@ function readBridgeToken(req) {
   if (auth.startsWith("Bearer ")) {
     return auth.slice("Bearer ".length);
   }
-  // HTTP Basic carries the same token as the password (any username). Package installers such as uv can
-  // send credentials only this way, so this is what lets them use the package relay. It is the same constant-time
-  // comparison, and the header allowlist strips it like the others.
+  // HTTP Basic carries the same token as the password (any username, e.g. uv) or as the username (e.g. Ashby API clients: apiKey:).
+  // Package installers such as uv and API clients can send credentials only this way, so this is what lets them use relays.
+  // It is the same constant-time comparison, and the header allowlist strips it like the others.
   if (auth.startsWith("Basic ")) {
     const decoded = Buffer.from(auth.slice("Basic ".length), "base64").toString("utf8");
     const separator = decoded.indexOf(":");
-    if (separator >= 0) return decoded.slice(separator + 1);
+    if (separator >= 0) {
+      const user = decoded.slice(0, separator);
+      const pass = decoded.slice(separator + 1);
+      if (tokensMatch(user)) return user;
+      return pass;
+    }
+    return decoded;
   }
   const apiKey = req.headers["x-api-key"];
   return typeof apiKey === "string" ? apiKey : "";
