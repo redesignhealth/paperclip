@@ -100,6 +100,10 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await visible(waiting)).toBe(0); // in_review + waiting conversation
     await db.update(chatConversations).set({ state: "active" }).where(eq(chatConversations.id, waiting.conversationId));
     expect(await visible(waiting)).toBe(1); // in_review but the conversation is not waiting
+    // A non-in_review issue is kept even if its conversation row says waiting.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, waiting.issueId));
+    await db.update(chatConversations).set({ state: "waiting" }).where(eq(chatConversations.id, waiting.conversationId));
+    expect(await visible(waiting)).toBe(1);
     const plain = await fixture();
     await db.delete(chatConversations).where(eq(chatConversations.id, plain.conversationId));
     await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, plain.issueId));
