@@ -190,7 +190,7 @@ describe("pi remote execution", () => {
     });
     expect(String(result.sessionId)).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/pi/sessions/`);
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledTimes(1);
-    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(2);
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(3);
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/pi/skills`,
       followSymlinks: true,
@@ -208,6 +208,11 @@ describe("pi remote execution", () => {
     expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/pi/skills`);
     expect(call?.[2]).toContain("--extension");
     expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/pi/attribution/openrouter-attribution.mjs`);
+    // TECH-9797: a remote (pod) run always loads the headless guard.
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/pi/guard`,
+    }));
+    expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/pi/guard/paperclip-guard.mjs`);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
       {

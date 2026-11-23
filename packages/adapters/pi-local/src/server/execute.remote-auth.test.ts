@@ -209,7 +209,7 @@ describe("pi run JWT handling per execution target", () => {
       target: sandboxTarget,
       workspaceRemoteDir: "/workspace",
       runtimeRootDir: runtimeRoot,
-      assetDirs: { attribution: `${runtimeRoot}/attribution`, skills: `${runtimeRoot}/skills` },
+      assetDirs: { attribution: `${runtimeRoot}/attribution`, guard: `${runtimeRoot}/guard`, skills: `${runtimeRoot}/skills` },
       additionalSourceDirs: {},
       additionalSourceFailures: [],
       workspaceSyncSnapshot: null,
@@ -263,9 +263,11 @@ describe("pi run JWT handling per execution target", () => {
 
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
     expect(runChildProcess).toHaveBeenCalledTimes(1);
-    const [, piCommand, , piOptions] = runChildProcess.mock.calls[0] as unknown as
+    const [, piCommand, piArgs, piOptions] = runChildProcess.mock.calls[0] as unknown as
       [string, string, string[], { env: Record<string, string> }];
     expect(piCommand).toBe("pi");
     expect(piOptions.env.PAPERCLIP_API_KEY).toBe(runJwt);
+    // TECH-9797: the headless guard is for pods only; a local run keeps Pi's own behaviour.
+    expect(piArgs.some((arg) => arg.includes("paperclip-guard"))).toBe(false);
   });
 });
