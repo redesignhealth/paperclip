@@ -197,6 +197,25 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   # seconds and gets the task killed by the container health check. Keep the major >= the RDS server's (17).
   && pg_dump --version | grep -q '^pg_dump (PostgreSQL) 17\.'
 
+# TECH-9787: build tools for sandbox build pods (the root fs is read-only and HOME is wiped between
+# turns, so nothing can be installed or downloaded at runtime).
+# uv: official multi-arch image, pinned by tag and index digest; keep >= the services' required-version.
+COPY --from=ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d /uv /uvx /usr/local/bin/
+# pnpm: corepack is enabled in the base stage; pre-activate the version this repo pins (packageManager) into a
+# root-owned, world-readable COREPACK_HOME so user 1000 resolves it offline.
+# UV_LINK_MODE=copy: uv's default hardlink/clone fails across the cache and project volumes in a pod.
+ENV COREPACK_HOME=/usr/local/share/corepack \
+  COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+  UV_LINK_MODE=copy
+COPY package.json /tmp/pm/package.json
+RUN PNPM_VERSION="$(node -p "require('/tmp/pm/package.json').packageManager.replace(/^pnpm@/, '').split('+')[0]")" \
+  && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+  && chmod -R a+rX "$COREPACK_HOME" \
+  && rm -rf /tmp/pm \
+  && uv --version | grep -q '^uv 0\.13\.9' \
+  && gosu node uv --version \
+  && (cd / && gosu node env HOME=/nonexistent pnpm --version | grep -qx "${PNPM_VERSION}")
+
 COPY docker/hermes/ /tmp/hermes/
 RUN /usr/bin/python3 -m venv /opt/hermes \
   && /opt/hermes/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/hermes/requirements.txt \
