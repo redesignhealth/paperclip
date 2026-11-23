@@ -4,9 +4,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS } from "@paperclipai/adapter-utils/sandbox-callback-bridge";
 import {
+  ASHBY_RELAY_API_KEY_ENV,
   ASHBY_RELAY_BASE_URL_ENV,
   ASHBY_RELAY_DEADLINE_MS,
   ASHBY_RELAY_OPERATIONS_ENV,
+  ASHBY_RELAY_SECRET_KEY,
   ASHBY_RELAY_WRITE_OPERATIONS_ENV,
   ASHBY_UPSTREAM_ORIGIN,
   KNOWN_ASHBY_RELAY_READ_OPERATIONS,
@@ -14,7 +16,8 @@ import {
   ashbyRelayRoutes,
   parseAshbyRelayConfig,
   parseOperations,
-  parseOptIn,
+  resolveAshbyToken,
+  validateApiKey,
 } from "../routes/ashby-relay.js";
 
 const AGENT_A = "11111111-1111-4111-8111-111111111111";
@@ -34,6 +37,7 @@ function build(
     optedIn?: string[];
     token?: string | null;
     runActive?: boolean;
+    resolveToken?: (companyId: string) => Promise<string | null>;
     assertActiveRun?: (input: { companyId: string; agentId: string; runId: string }) => Promise<boolean>;
   } = {},
 ) {
@@ -50,9 +54,9 @@ function build(
   const isOptedIn = vi.fn(async (agentId: string) =>
     (opts.optedIn ?? [AGENT_A]).includes(agentId),
   );
-  const resolveToken = vi.fn(async () =>
-    opts.token === undefined ? API_KEY : opts.token,
-  );
+  const resolveToken =
+    opts.resolveToken ??
+    vi.fn(async () => (opts.token === undefined ? API_KEY : opts.token));
   const assertActiveRun =
     opts.assertActiveRun ??
     vi.fn(async () => (opts.runActive === undefined ? true : opts.runActive));
@@ -94,17 +98,24 @@ const BASE = "/api/ashby-relay";
 
 describe("ashby relay (TECH-9966)", () => {
   it("proves upstream deadline has a safe margin before bridge default timeout", () => {
-    // Finding 5: Host returns before bridge default (30 s), leaving at least 5 s margin
     expect(DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS).toBe(30_000);
     expect(ASHBY_RELAY_DEADLINE_MS).toBe(25_000);
     expect(DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS - ASHBY_RELAY_DEADLINE_MS).toBeGreaterThanOrEqual(5_000);
   });
 
-  it("parses opt-in and operation allowlists", () => {
-    expect(parseOptIn("on")).toEqual(["on"]);
-    expect(parseOptIn({ value: "ON, True" })).toEqual(["on", "true"]);
-    expect(parseOptIn(undefined)).toEqual([]);
+  it("validates API keys strictly: trims whitespace, rejects blank and control chars/CRLF", () => {
+    expect(validateApiKey("  secret-key  ")).toBe("secret-key");
+    expect(validateApiKey("")).toBeNull();
+    expect(validateApiKey("   ")).toBeNull();
+    expect(validateApiKey(undefined)).toBeNull();
+    expect(validateApiKey(null)).toBeNull();
+    expect(validateApiKey("key-with-\r-cr")).toBeNull();
+    expect(validateApiKey("key-with-\n-lf")).toBeNull();
+    expect(validateApiKey("key-with-\0-nul")).toBeNull();
+    expect(validateApiKey("key-with-\x1f-ctrl")).toBeNull();
+  });
 
+  it("parses operation allowlists", () => {
     const readOps = parseOperations(undefined, ["job.list"]);
     expect(readOps).toEqual(new Set(["job.list"]));
 
@@ -117,7 +128,6 @@ describe("ashby relay (TECH-9966)", () => {
   });
 
   it("pins exact https://api.ashbyhq.com origin with root path and rejects all other hosts/paths/ports/userinfo/queries", async () => {
-    // Finding 4: Exact origin pin and strict URL rejection
     expect(parseAshbyRelayConfig({ [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN })?.base).toBe(
       ASHBY_UPSTREAM_ORIGIN,
     );
@@ -127,55 +137,54 @@ describe("ashby relay (TECH-9966)", () => {
 
     // Unset base URL -> 503
     const unconfigured = build({ env: {} as NodeJS.ProcessEnv });
-    await request(unconfigured.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(unconfigured.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
     expect(unconfigured.fetchImpl).not.toHaveBeenCalled();
 
     // HTTP only URL -> 503
     const httpOnly = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "http://api.ashbyhq.com" } as NodeJS.ProcessEnv,
     });
-    await request(httpOnly.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(httpOnly.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
 
     // Different host -> 503
     const evilHost = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://evil.example.com" } as NodeJS.ProcessEnv,
     });
-    await request(evilHost.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(evilHost.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
 
     // Custom port -> 503
     const customPort = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com:8443" } as NodeJS.ProcessEnv,
     });
-    await request(customPort.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(customPort.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
 
     // Path segment (non-root) -> 503
     const pathPrefix = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com/v1" } as NodeJS.ProcessEnv,
     });
-    await request(pathPrefix.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(pathPrefix.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
 
     // Userinfo credentials in URL -> 503
     const userPass = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://user:pass@api.ashbyhq.com" } as NodeJS.ProcessEnv,
     });
-    await request(userPass.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(userPass.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
 
     // Query string in URL -> 503
     const withQuery = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com?q=1" } as NodeJS.ProcessEnv,
     });
-    await request(withQuery.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(withQuery.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
 
     // Hash fragment in URL -> 503
     const withHash = build({
       env: { [ASHBY_RELAY_BASE_URL_ENV]: "https://api.ashbyhq.com#frag" } as NodeJS.ProcessEnv,
     });
-    await request(withHash.app).post(`${BASE}/job.list`).send({}).expect(503);
+    await request(withHash.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
   });
 
   it("intersects read operations strictly with known read-only set and rejects mutating operations without write opt-in", async () => {
-    // Finding 2: Read operations intersected with known read-only set
-    // Candidate.create in read operations env MUST NOT be enabled
+    // candidate.create in read operations env MUST NOT be enabled
     const readWithMutation = build({
       env: {
         [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN,
@@ -184,29 +193,39 @@ describe("ashby relay (TECH-9966)", () => {
     });
 
     // job.list is known read-only, so it is allowed
-    await request(readWithMutation.app).post(`${BASE}/job.list`).send({}).expect(200);
+    await request(readWithMutation.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(200);
 
     // candidate.create is a write operation, so it was filtered out from read allowlist -> 404
-    await request(readWithMutation.app).post(`${BASE}/candidate.create`).send({}).expect(404);
+    await request(readWithMutation.app).post(`${BASE}/candidate.create`).set("Content-Type", "application/json").send({}).expect(404);
     expect(readWithMutation.fetchImpl).toHaveBeenCalledTimes(1);
 
-    // candidate.create is only allowed when explicitly opted in via write env
+    // Supported write operations: candidate.create, candidate.createNote, candidate.addTag, application.create, application.changeStage
+    expect(KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.has("candidate.createNote")).toBe(true);
+    expect(KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.has("candidate.addTag")).toBe(true);
+    expect(KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.has("application.changeStage")).toBe(true);
+    // Unsupported multipart operation is removed
+    expect(KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.has("candidate.uploadResume")).toBe(false);
+
+    // candidate.createNote is only allowed when explicitly opted in via write env
     const withExplicitWrite = build({
       env: {
         [ASHBY_RELAY_BASE_URL_ENV]: ASHBY_UPSTREAM_ORIGIN,
         [ASHBY_RELAY_OPERATIONS_ENV]: "job.list",
-        [ASHBY_RELAY_WRITE_OPERATIONS_ENV]: "candidate.create",
+        [ASHBY_RELAY_WRITE_OPERATIONS_ENV]: "candidate.createNote",
       } as NodeJS.ProcessEnv,
     });
-    await request(withExplicitWrite.app).post(`${BASE}/candidate.create`).send({ name: "Alice" }).expect(200);
+    await request(withExplicitWrite.app)
+      .post(`${BASE}/candidate.createNote`)
+      .set("Content-Type", "application/json")
+      .send({ note: "Interview feedback" })
+      .expect(200);
   });
 
   it("requires actual active run scoped to agent/company, rejecting missing or terminal runs with 403", async () => {
-    // Finding 3: Database active run verification
     const missingRun = build({
       assertActiveRun: vi.fn(async () => false),
     });
-    await request(missingRun.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(missingRun.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(403);
     expect(missingRun.assertActiveRun).toHaveBeenCalledWith({
       companyId: COMPANY,
       agentId: AGENT_A,
@@ -214,25 +233,121 @@ describe("ashby relay (TECH-9966)", () => {
     });
     expect(missingRun.fetchImpl).not.toHaveBeenCalled();
 
-    // Terminal run (e.g. cancelled / succeeded / failed) -> assertActiveRun returns false
     const terminalRun = build({
       runActive: false,
     });
-    await request(terminalRun.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(terminalRun.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(403);
     expect(terminalRun.fetchImpl).not.toHaveBeenCalled();
 
-    // Active run -> passes
     const activeRun = build({
       runActive: true,
     });
-    await request(activeRun.app).post(`${BASE}/job.list`).send({}).expect(200);
+    await request(activeRun.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(200);
     expect(activeRun.fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves token via company secret first and falls back to PAPERCLIP_ASHBY_RELAY_API_KEY if absent", async () => {
+    const mockDb = {} as Db;
+    const mockSecrets = {
+      getByKey: vi.fn(),
+      resolveSecretValue: vi.fn(),
+    } as unknown as ReturnType<typeof import("../services/secrets.js").secretService>;
+
+    // 1. Company secret is present and active -> returns secret value
+    mockSecrets.getByKey = vi.fn(async (_companyId: string, key: string) => {
+      if (key === ASHBY_RELAY_SECRET_KEY) return { id: "sec-1", status: "active" };
+      return null;
+    }) as typeof mockSecrets.getByKey;
+    mockSecrets.resolveSecretValue = vi.fn(async () => "company-secret-value") as typeof mockSecrets.resolveSecretValue;
+
+    const tokenFromSecret = await resolveAshbyToken(
+      mockDb,
+      COMPANY,
+      { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
+      mockSecrets,
+    );
+    expect(tokenFromSecret).toBe("company-secret-value");
+
+    // 2. Company secret is absent (null) -> falls back to env key
+    mockSecrets.getByKey = vi.fn(async () => null) as typeof mockSecrets.getByKey;
+    const tokenFromEnv = await resolveAshbyToken(
+      mockDb,
+      COMPANY,
+      { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
+      mockSecrets,
+    );
+    expect(tokenFromEnv).toBe("env-fallback-key");
+
+    // 3. Company secret is inactive -> falls back to env key
+    mockSecrets.getByKey = vi.fn(async () => ({ id: "sec-1", status: "disabled" })) as typeof mockSecrets.getByKey;
+    const tokenInactive = await resolveAshbyToken(
+      mockDb,
+      COMPANY,
+      { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
+      mockSecrets,
+    );
+    expect(tokenInactive).toBe("env-fallback-key");
+
+    // 4. Secret lookup throws an error -> must rethrow and NOT fall through to env!
+    mockSecrets.getByKey = vi.fn(async () => {
+      throw new Error("DB connection failure");
+    }) as typeof mockSecrets.getByKey;
+    await expect(
+      resolveAshbyToken(
+        mockDb,
+        COMPANY,
+        { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
+        mockSecrets,
+      ),
+    ).rejects.toThrow("DB connection failure");
+
+    // 5. Neither secret nor env key exists -> returns null
+    mockSecrets.getByKey = vi.fn(async () => null) as typeof mockSecrets.getByKey;
+    const tokenNeither = await resolveAshbyToken(
+      mockDb,
+      COMPANY,
+      {} as NodeJS.ProcessEnv,
+      mockSecrets,
+    );
+    expect(tokenNeither).toBeNull();
+
+    // 6. Env key is blank or whitespace -> returns null
+    const tokenBlank = await resolveAshbyToken(
+      mockDb,
+      COMPANY,
+      { [ASHBY_RELAY_API_KEY_ENV]: "   " } as NodeJS.ProcessEnv,
+      mockSecrets,
+    );
+    expect(tokenBlank).toBeNull();
+
+    // 7. Env key has control characters / CRLF -> returns null
+    const tokenControl = await resolveAshbyToken(
+      mockDb,
+      COMPANY,
+      { [ASHBY_RELAY_API_KEY_ENV]: "bad\r\nkey" } as NodeJS.ProcessEnv,
+      mockSecrets,
+    );
+    expect(tokenControl).toBeNull();
+
+    // Route tests for resolveToken failure paths:
+    // When resolveToken returns null -> route fails closed 503
+    const noTokenApp = build({ resolveToken: async () => null });
+    await request(noTokenApp.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
+
+    // When resolveToken throws -> route fails closed 503
+    const errorTokenApp = build({
+      resolveToken: async () => {
+        throw new Error("Secret service timeout");
+      },
+    });
+    await request(errorTokenApp.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
   });
 
   it("forwards allowed read operations with Basic auth header (apiKey:)", async () => {
     const { app, fetchImpl } = build();
     const res = await request(app)
       .post(`${BASE}/job.list`)
+      .set("Content-Type", "application/json")
       .send({ status: "Open" })
       .expect(200);
 
@@ -255,9 +370,13 @@ describe("ashby relay (TECH-9966)", () => {
     expect(JSON.stringify(res.body)).not.toContain(API_KEY);
   });
 
-  it("handles empty request body by forwarding empty JSON object {}", async () => {
+  it("handles empty request body with JSON content-type by forwarding empty JSON object {}", async () => {
     const { app, fetchImpl } = build();
-    await request(app).post(`${BASE}/candidate.search`).send().expect(200);
+    await request(app)
+      .post(`${BASE}/candidate.search`)
+      .set("Content-Type", "application/json")
+      .send()
+      .expect(200);
 
     const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     const bodyText = Buffer.from(init.body as Uint8Array).toString("utf8");
@@ -266,50 +385,59 @@ describe("ashby relay (TECH-9966)", () => {
 
   it("refuses board users with 403", async () => {
     const board = build({ actor: { type: "board", source: "session" } });
-    await request(board.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(board.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(403);
     expect(board.fetchImpl).not.toHaveBeenCalled();
   });
 
   it("refuses agent API key callers without runId with 403", async () => {
     const agentKey = build({ actor: { source: "agent_key", runId: undefined } });
-    await request(agentKey.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(agentKey.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(403);
     expect(agentKey.fetchImpl).not.toHaveBeenCalled();
 
     const missingRun = build({ actor: { runId: null } });
-    await request(missingRun.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(missingRun.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(403);
   });
 
   it("refuses opted-out agents with 403", async () => {
     const optedOut = build({ actor: { agentId: AGENT_B }, optedIn: [AGENT_A] });
-    await request(optedOut.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(optedOut.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(403);
     expect(optedOut.fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("refuses callers when company has no secret with 403", async () => {
+  it("refuses callers when neither secret nor env key exists with 503", async () => {
     const noSecret = build({ token: null });
-    await request(noSecret.app).post(`${BASE}/job.list`).send({}).expect(403);
+    await request(noSecret.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(503);
     expect(noSecret.fetchImpl).not.toHaveBeenCalled();
   });
 
   it("refuses operations off the allowlist with 404", async () => {
     const { app, fetchImpl } = build();
 
-    await request(app).post(`${BASE}/candidate.create`).send({}).expect(404);
-    await request(app).post(`${BASE}/candidate.addNote`).send({}).expect(404);
-    await request(app).post(`${BASE}/unknown.operation`).send({}).expect(404);
-    await request(app).post(`${BASE}/singleword`).send({}).expect(404);
-    await request(app).post(`${BASE}/..%2fsecret`).send({}).expect(404);
-    await request(app).post(`${BASE}/job..list`).send({}).expect(404);
+    await request(app).post(`${BASE}/candidate.create`).set("Content-Type", "application/json").send({}).expect(404);
+    await request(app).post(`${BASE}/candidate.createNote`).set("Content-Type", "application/json").send({}).expect(404);
+    await request(app).post(`${BASE}/unknown.operation`).set("Content-Type", "application/json").send({}).expect(404);
+    await request(app).post(`${BASE}/singleword`).set("Content-Type", "application/json").send({}).expect(404);
+    await request(app).post(`${BASE}/..%2fsecret`).set("Content-Type", "application/json").send({}).expect(404);
+    await request(app).post(`${BASE}/job..list`).set("Content-Type", "application/json").send({}).expect(404);
 
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("rejects non-JSON content-type with 415", async () => {
+  it("rejects missing or non-JSON content-type with 415", async () => {
     const { app, fetchImpl } = build();
+    // Non-JSON content-type
     await request(app)
       .post(`${BASE}/job.list`)
       .set("Content-Type", "text/plain")
       .send("raw text")
+      .expect(415);
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    // Missing content-type
+    await request(app)
+      .post(`${BASE}/job.list`)
+      .unset("Content-Type")
+      .send("raw")
       .expect(415);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
@@ -334,7 +462,7 @@ describe("ashby relay (TECH-9966)", () => {
       ) as unknown as typeof fetch,
     });
 
-    const res = await request(redirect.app).post(`${BASE}/job.list`).send({}).expect(502);
+    const res = await request(redirect.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(502);
     expect(res.headers.location).toBeUndefined();
     expect(res.body).toEqual({ detail: "ashby_relay_unavailable" });
   });
@@ -350,7 +478,7 @@ describe("ashby relay (TECH-9966)", () => {
       ) as unknown as typeof fetch,
     });
 
-    const res404 = await request(upstreamNotFound.app).post(`${BASE}/candidate.info`).send({}).expect(404);
+    const res404 = await request(upstreamNotFound.app).post(`${BASE}/candidate.info`).set("Content-Type", "application/json").send({}).expect(404);
     expect(res404.body).toEqual({ detail: "not_found" });
     expect(JSON.stringify(res404.body)).not.toContain(API_KEY);
     expect(JSON.stringify(res404.body)).not.toContain("Internal DB error");
@@ -365,7 +493,7 @@ describe("ashby relay (TECH-9966)", () => {
       ) as unknown as typeof fetch,
     });
 
-    const res429 = await request(upstreamRateLimit.app).post(`${BASE}/job.list`).send({}).expect(429);
+    const res429 = await request(upstreamRateLimit.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(429);
     expect(res429.body).toEqual({ detail: "rate_limited" });
     expect(JSON.stringify(res429.body)).not.toContain(API_KEY);
   });
@@ -381,7 +509,7 @@ describe("ashby relay (TECH-9966)", () => {
       ) as unknown as typeof fetch,
     });
 
-    const res = await request(htmlResponse.app).post(`${BASE}/job.list`).send({}).expect(502);
+    const res = await request(htmlResponse.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(502);
     expect(res.body).toEqual({ detail: "ashby_relay_unavailable" });
     expect(res.text).not.toContain("Login Page");
   });
@@ -396,7 +524,7 @@ describe("ashby relay (TECH-9966)", () => {
           }),
       ) as unknown as typeof fetch,
     });
-    await request(bigDeclared.app).post(`${BASE}/job.list`).send({}).expect(502);
+    await request(bigDeclared.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(502);
 
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -412,7 +540,7 @@ describe("ashby relay (TECH-9966)", () => {
           }),
       ) as unknown as typeof fetch,
     });
-    await request(bigStream.app).post(`${BASE}/job.list`).send({}).expect(502);
+    await request(bigStream.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(502);
   });
 
   it("handles upstream timeouts with 504 and network errors with 502 without leaking credentials", async () => {
@@ -424,7 +552,7 @@ describe("ashby relay (TECH-9966)", () => {
       }) as unknown as typeof fetch,
     });
 
-    const res504 = await request(timeout.app).post(`${BASE}/job.list`).send({}).expect(504);
+    const res504 = await request(timeout.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(504);
     expect(res504.body).toEqual({ detail: "ashby_relay_timeout" });
     expect(JSON.stringify(res504.body)).not.toContain(API_KEY);
 
@@ -436,7 +564,7 @@ describe("ashby relay (TECH-9966)", () => {
       }) as unknown as typeof fetch,
     });
 
-    const res502 = await request(netErr.app).post(`${BASE}/job.list`).send({}).expect(502);
+    const res502 = await request(netErr.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(502);
     expect(res502.body).toEqual({ detail: "ashby_relay_unavailable" });
     expect(JSON.stringify(res502.body)).not.toContain(API_KEY);
   });
@@ -452,7 +580,7 @@ describe("ashby relay (TECH-9966)", () => {
       ) as unknown as typeof fetch,
     });
 
-    const res = await request(echoKey.app).post(`${BASE}/job.list`).send({}).expect(502);
+    const res = await request(echoKey.app).post(`${BASE}/job.list`).set("Content-Type", "application/json").send({}).expect(502);
     expect(res.body).toEqual({ detail: "ashby_relay_unavailable" });
     expect(JSON.stringify(res.body)).not.toContain(API_KEY);
   });

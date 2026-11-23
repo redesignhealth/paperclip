@@ -3103,7 +3103,7 @@ function tokensMatch(received) {
 
 function isAshbyRelayPath(url) {
   const p = (url || "").split("?")[0];
-  return p.startsWith("/api/ashby-relay/");
+  return /^\\/api\\/ashby-relay\\/[a-zA-Z0-9]+(?:\\.[a-zA-Z0-9]+)+$/.test(p);
 }
 
 // Read the bridge token a local caller presented. The gateway accepts two

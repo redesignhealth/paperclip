@@ -3867,6 +3867,28 @@ describe("sandbox callback bridge", () => {
     });
     expect(badBasicRes.status).toBe(401);
     expect(handled).toHaveBeenCalledTimes(2);
+
+    // Negative test 1: Basic-username auth on non-Ashby route is rejected with 401
+    const nonAshbyBasicRes = await fetch(`${gateway.baseUrl}/api/agents/me`, {
+      method: "GET",
+      headers: {
+        authorization: `Basic ${Buffer.from(`${gateway.bridgeToken}:`).toString("base64")}`,
+      },
+    });
+    expect(nonAshbyBasicRes.status).toBe(401);
+    expect(handled).toHaveBeenCalledTimes(2);
+
+    // Negative test 2: Path traversal on Ashby route (/api/ashby-relay/../) does not trigger username extraction and is rejected
+    const traversalRes = await fetch(`${gateway.baseUrl}/api/ashby-relay/../agents/me`, {
+      method: "POST",
+      headers: {
+        authorization: `Basic ${Buffer.from(`${gateway.bridgeToken}:`).toString("base64")}`,
+        "content-type": "application/json",
+      },
+      body: payload,
+    });
+    expect([401, 403, 404]).toContain(traversalRes.status);
+    expect(handled).toHaveBeenCalledTimes(2);
   });
 
   it("rejects malformed queue encodings without forwarding a mutation", async () => {
@@ -4185,6 +4207,9 @@ describe("ashby relay routes in the bridge allowlist (TECH-9966)", () => {
     ["POST", `${P}/job.list/extra`],
     ["POST", `${P}/job..list`],
     ["POST", `${P}/..%2fsecret`],
+    ["POST", `${P}/../agents/me`],
+    ["POST", `${P}/../`],
+    ["POST", `${P}/..`],
     ["POST", `${P}/job.list%20`],
     ["POST", `${P}/job.list/git-upload-pack`],
     ["POST", `${P}/candidate.search?status=open`],

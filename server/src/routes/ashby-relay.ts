@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
+import { ashbyRelayOptedIn, ASHBY_RELAY_OPT_IN_ENV_KEY } from "@paperclipai/adapter-utils/ashby-relay-env";
 import { logger } from "../middleware/logger.js";
 import { guardedRemoteHttpFetch } from "../services/remote-http-fetch.js";
 import { secretService } from "../services/secrets.js";
@@ -9,9 +10,10 @@ import { secretService } from "../services/secrets.js";
  *
  * A sandbox pod cannot reach api.ashbyhq.com directly under default-deny network egress policy and holds no API key.
  * The pod points its Ashby client at the sandbox bridge (`ASHBY_API_BASE=${PAPERCLIP_API_URL}/api/ashby-relay`), which
- * forwards here with the run JWT. This server validates the operation against an allowlist, resolves the company's
- * Ashby API key server-side from company secret `ashby_relay.api_key`, and adds HTTP Basic auth before forwarding
- * to the pinned upstream `https://api.ashbyhq.com`. The key never enters the pod.
+ * forwards here with the run JWT. This server validates the operation against an allowlist, resolves the Ashby API key
+ * (first from company secret `ashby_relay.api_key`, falling back to server env `PAPERCLIP_ASHBY_RELAY_API_KEY` injected
+ * by ECS from SSM), and adds HTTP Basic auth before forwarding to the pinned upstream `https://api.ashbyhq.com`.
+ * The key never enters the pod.
  *
  * Upstream is pinned to `https://api.ashbyhq.com` from `PAPERCLIP_ASHBY_RELAY_BASE_URL` (HTTPS only, root path only).
  * Operations are restricted to a closed allowlist: read-only operations intersected with KNOWN_ASHBY_RELAY_READ_OPERATIONS
@@ -19,15 +21,15 @@ import { secretService } from "../services/secrets.js";
  * `PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS` and are intersected with KNOWN_ASHBY_RELAY_WRITE_OPERATIONS.
  * Auth requires a run-JWT (`actor.type === "agent" && actor.source === "agent_jwt"` with active run in database) and per-agent
  * opt-in `adapterConfig.env.PAPERCLIP_ASHBY_RELAY=on`.
- * Fails closed 503 when unconfigured. Error bodies never echo upstream content or keys.
+ * Fails closed 503 when unconfigured or when neither credential source exists. Error bodies never echo upstream content or keys.
  */
 
 export const ASHBY_RELAY_BASE_URL_ENV = "PAPERCLIP_ASHBY_RELAY_BASE_URL";
 export const ASHBY_RELAY_OPERATIONS_ENV = "PAPERCLIP_ASHBY_RELAY_OPERATIONS";
 export const ASHBY_RELAY_WRITE_OPERATIONS_ENV = "PAPERCLIP_ASHBY_RELAY_WRITE_OPERATIONS";
 export const ASHBY_RELAY_SECRET_KEY = "ashby_relay.api_key";
-/** The agent adapterConfig env key that opts an agent in. */
-export const ASHBY_RELAY_OPT_IN_ENV_KEY = "PAPERCLIP_ASHBY_RELAY";
+export const ASHBY_RELAY_API_KEY_ENV = "PAPERCLIP_ASHBY_RELAY_API_KEY";
+export { ASHBY_RELAY_OPT_IN_ENV_KEY };
 
 export const ASHBY_UPSTREAM_ORIGIN = "https://api.ashbyhq.com";
 
@@ -48,11 +50,10 @@ export const KNOWN_ASHBY_RELAY_READ_OPERATIONS = new Set([
 
 export const KNOWN_ASHBY_RELAY_WRITE_OPERATIONS = new Set([
   "candidate.create",
-  "candidate.addNote",
-  "candidate.uploadResume",
-  "candidate.tag",
+  "candidate.createNote",
+  "candidate.addTag",
   "application.create",
-  "application.updateStage",
+  "application.changeStage",
 ]);
 
 export const DEFAULT_ASHBY_RELAY_READ_OPERATIONS = [
@@ -64,13 +65,14 @@ export const DEFAULT_ASHBY_RELAY_READ_OPERATIONS = [
 
 const OPERATION_RE = /^[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/;
 const JSON_CONTENT_TYPE_RE = /^application\/json\s*(;|$)/i;
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
 
 export interface AshbyRelayDeps {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   /** True when the agent opted in to the Ashby relay. Replaceable in tests. */
   isOptedIn?: (agentId: string) => Promise<boolean>;
-  /** The company's Ashby API key, or null when none is stored. Replaceable in tests. */
+  /** The Ashby API key, or null when none is stored/configured. Replaceable in tests. */
   resolveToken?: (companyId: string) => Promise<string | null>;
   /** Verifies that the run is an actual active, non-terminal run scoped to this agent/company. */
   assertActiveRun?: (input: { companyId: string; agentId: string; runId: string }) => Promise<boolean>;
@@ -87,9 +89,48 @@ function fail(res: Response, status: number, detail: string) {
   res.status(status).json({ detail });
 }
 
-export function parseOptIn(value: unknown): string[] {
-  const raw = value && typeof value === "object" && "value" in value ? (value as { value: unknown }).value : value;
-  return typeof raw === "string" ? raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+export function validateApiKey(key: string | null | undefined): string | null {
+  if (!key) return null;
+  const trimmed = key.trim();
+  if (!trimmed || CONTROL_CHARS_RE.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
+ * Resolves the Ashby API key for a company:
+ * 1. Looks up company secret `ashby_relay.api_key`.
+ * 2. If absent (clear not-found: null, non-active, or empty), falls back to server env `PAPERCLIP_ASHBY_RELAY_API_KEY`
+ *    (injected as an ECS container secret from SSM).
+ * 3. A database or secret-store error does NOT fall through to env (it rethrows).
+ * 4. Blank/whitespace keys or keys with control characters/CRLF are rejected.
+ */
+export async function resolveAshbyToken(
+  db: Db,
+  companyId: string,
+  env: NodeJS.ProcessEnv,
+  secrets = secretService(db),
+): Promise<string | null> {
+  let secret;
+  try {
+    secret = await secrets.getByKey(companyId, ASHBY_RELAY_SECRET_KEY);
+  } catch (err) {
+    throw err;
+  }
+
+  if (secret && secret.status === "active") {
+    let value: string | null = null;
+    try {
+      value = await secrets.resolveSecretValue(companyId, secret.id, "latest");
+    } catch (err) {
+      throw err;
+    }
+    const validated = validateApiKey(value);
+    if (validated) return validated;
+  }
+
+  return validateApiKey(env[ASHBY_RELAY_API_KEY_ENV]);
 }
 
 export function parseOperations(
@@ -164,16 +205,10 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
     const { agentService } = await import("../services/agents.js");
     const agent = await agentService(db).getById(agentId);
     const adapterEnv = (agent?.adapterConfig as { env?: Record<string, unknown> } | null | undefined)?.env;
-    const optIns = parseOptIn(adapterEnv?.[ASHBY_RELAY_OPT_IN_ENV_KEY]);
-    return optIns.includes("on") || optIns.includes("true") || optIns.includes("enabled");
+    return ashbyRelayOptedIn(adapterEnv);
   });
 
-  const resolveToken = deps.resolveToken ?? (async (companyId: string) => {
-    const secrets = secretService(db);
-    const secret = await secrets.getByKey(companyId, ASHBY_RELAY_SECRET_KEY);
-    if (!secret || secret.status !== "active") return null;
-    return secrets.resolveSecretValue(companyId, secret.id, "latest");
-  });
+  const resolveToken = deps.resolveToken ?? ((companyId: string) => resolveAshbyToken(db, companyId, env));
 
   const assertActiveRun = deps.assertActiveRun ?? (async (input: { companyId: string; agentId: string; runId: string }) => {
     const { heartbeatRuns } = await import("@paperclipai/db");
@@ -222,8 +257,9 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
         return fail(res, 404, "not_found");
       }
 
-      const contentType = req.header("content-type");
-      if (contentType && !JSON_CONTENT_TYPE_RE.test(contentType)) {
+      // Require JSON content-type consistently; reject missing or non-JSON media types.
+      const contentType = req.header("content-type") ?? "";
+      if (!JSON_CONTENT_TYPE_RE.test(contentType)) {
         return fail(res, 415, "json_required");
       }
 
@@ -247,8 +283,10 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
         );
         return fail(res, 503, "ashby_relay_unavailable");
       }
+
+      // Fail closed 503 if neither company secret nor SSM-injected env key exists
       if (!apiKey) {
-        return fail(res, 403, "forbidden");
+        return fail(res, 503, "ashby_relay_unavailable");
       }
 
       let upstream: globalThis.Response;
@@ -256,7 +294,7 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
         upstream = await fetchImpl(`${config.base}/${encodeURIComponent(operation)}`, {
           method: "POST",
           headers: {
-            authorization: `Basic ${Buffer.from(`${apiKey.trim()}:`).toString("base64")}`,
+            authorization: `Basic ${Buffer.from(`${apiKey}:`).toString("base64")}`,
             "content-type": "application/json",
             accept: "application/json",
           },
@@ -316,7 +354,7 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
       }
 
       const body = Buffer.concat(chunks);
-      if (apiKey && body.includes(apiKey.trim())) {
+      if (apiKey && body.includes(apiKey)) {
         return fail(res, 502, "ashby_relay_unavailable");
       }
 
