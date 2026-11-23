@@ -323,6 +323,19 @@ async function waitForTextMatch(
 }
 
 describe("buildInvocationEnvForLogs", () => {
+  it("masks URL credentials in any env value, keeping the rest of the URL", () => {
+    const loggedEnv = buildInvocationEnvForLogs({
+      UV_EXTRA_INDEX_URL: "http://paperclip:run-token_123@127.0.0.1:41234/api/package-relay/gitea/simple/",
+      PLAIN_URL: "https://example.com/path",
+    });
+    expect(loggedEnv.UV_EXTRA_INDEX_URL).toBe("http://***REDACTED***@127.0.0.1:41234/api/package-relay/gitea/simple/");
+    expect(loggedEnv.PLAIN_URL).toBe("https://example.com/path");
+    const forms = buildInvocationEnvForLogs({ A: "https://tok@host/x", B: "https://:pw@host/x", C: "https://u:@host/x?e=a:b@c" });
+    expect(forms.A).toBe("https://***REDACTED***@host/x");
+    expect(forms.B).toBe("https://***REDACTED***@host/x");
+    expect(forms.C).toBe("https://***REDACTED***@host/x?e=a:b@c");
+  });
+
   it("redacts inline secrets from resolved command metadata", () => {
     const loggedEnv = buildInvocationEnvForLogs(
       { SAFE_VALUE: "visible" },
