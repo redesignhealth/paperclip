@@ -400,6 +400,9 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // opt-in and holds the registry token.
   { method: "GET", path: /^\/api\/package-relay\/gitea\/simple\/[a-z0-9]+(?:-[a-z0-9]+)*\/$/ },
   { method: "GET", path: /^\/api\/package-relay\/gitea\/files\/[A-Za-z0-9._%+!-]+\/[A-Za-z0-9._%+!-]+\/[A-Za-z0-9._%+!-]+$/ },
+  // Read-only git smart-HTTP relay to allowlisted GitHub repositories (fetch only; the server refuses pushes).
+  { method: "GET", path: /^\/api\/package-relay\/github\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/info\/refs$/ },
+  { method: "POST", path: /^\/api\/package-relay\/github\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/git-upload-pack$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.

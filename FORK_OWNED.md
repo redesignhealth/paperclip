@@ -182,3 +182,5 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/__tests__/package-relay.test.ts`
 - `packages/adapter-utils/src/package-relay-env.ts` opt-in uv index settings and bridge route policy for the package relay
 - `packages/adapter-utils/src/package-relay-env.test.ts`
+- `server/src/routes/package-relay-git.ts` read-only git smart-HTTP relay to allowlisted GitHub repositories for opted-in builder agents
+- `server/src/__tests__/package-relay-git.test.ts`
