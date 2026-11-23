@@ -11,6 +11,8 @@ const COMMANDS = {
   "start-conflict": () => import("./commands/start-conflict.mjs"),
   regenerate: async () => ({ run: (await import("./commands/start-conflict.mjs")).runRegenerate }),
   context: () => import("./commands/context.mjs"),
+  "resolution-diff": () => import("./commands/resolution-diff.mjs"),
+  submit: () => import("./commands/submit.mjs"),
 };
 
 export async function main(argv, io = {}) {
