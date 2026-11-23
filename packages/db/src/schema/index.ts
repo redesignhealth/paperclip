@@ -226,6 +226,7 @@ export {
   type UpgradeState,
   type TerminalUpgradeState,
 } from "./company_memory_upgrades.js";
+export { commsWakeConversations, commsWakeEvents, commsWakeRegistrations } from "./comms_wake.js";
 export * from "./email.js";
 export { announcementDismissals, announcementPublications } from "./announcement_dismissals.js";
 export { chatTaskHandoffs, chatCompletionDeliveries } from "./chat_completion_deliveries.js";

@@ -186,3 +186,13 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/__tests__/package-relay-git.test.ts`
 - `packages/adapter-utils/src/github-launcher-relay.test.ts`
 - `packages/adapter-utils/src/github-launcher.ts` managed GitHub launcher keeps the git relay insteadOf rules (TECH-9786)
+
+## Comms board wake route (TECH-9906)
+
+- `packages/db/src/schema/comms_wake.ts` registrations, received events and conversation-to-issue links
+- `server/src/routes/comms-wake.ts` public signed wake route
+- `server/src/services/comms-wake.ts` registration lookup, signature check and duplicate drop
+- `server/src/services/comms-wake-event.ts`
+- `server/src/services/comms-wake-signature.ts` Standard Webhooks verification
+- `server/src/__tests__/comms-wake-routes.test.ts`
+- `server/src/__tests__/comms-wake-signature.test.ts`

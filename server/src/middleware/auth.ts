@@ -236,6 +236,8 @@ interface ActorMiddlewareOptions {
 
 const publicRoutineWebhookPath = /^\/api\/routine-triggers\/public\/[a-f0-9]{24}\/fire\/?$/i;
 
+const publicCommsWakePath = /^\/api\/comms-board\/wake\/[^/]+\/?$/i;
+
 const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
@@ -255,7 +257,8 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     // Routine ingress authenticates its own bearer/signature. Never interpret
     // webhook credentials as agent keys or attach an ambient browser session.
-    if (req.method === "POST" && publicRoutineWebhookPath.test(req.path)) {
+    // The comms board wake route authenticates its own Standard Webhooks signature.
+    if (req.method === "POST" && (publicRoutineWebhookPath.test(req.path) || publicCommsWakePath.test(req.path))) {
       req.actor = { type: "none", source: "none" };
       next();
       return;

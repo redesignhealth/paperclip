@@ -71,6 +71,9 @@ function isPrivateWebhook(req: {
 }
 
 function privateWebhookLogUrl(url: unknown) {
+  if (typeof url === "string" && /\/comms-board\/wake(?:\/|$)/i.test(url)) {
+    return "/api/comms-board/wake/:agentId";
+  }
   return typeof url === "string" && /\/routine-triggers\/public(?:\/|$)/i.test(url)
     ? "/api/routine-triggers/public/:publicId/fire"
     : "/api/chat-webhooks/:publicId/:provider";
