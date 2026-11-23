@@ -36,6 +36,7 @@ import { isExternalChatWaitAuthorizationContention } from "../../native-runtime/
 import { isExplicitOperatorPublication } from "./policy.js";
 import { attachmentFailureNoticeFence } from "./policy.js";
 import type { createChatPublicationTaskControl } from "./task-control.js";
+import { findIssuedTaskControlAuthorizationAction } from "./task-control-authorization-action.js";
 type ConversationRow = typeof chatConversations.$inferSelect;
 type PublicationAuthorizationOptions = {
   authorizeInboundWakePublication: (tx: DbOrTransaction, publication: typeof chatPublications.$inferSelect) => Promise<boolean>;
@@ -171,24 +172,12 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
         (await hasCommittedTaskControlCompletion(conversation.id, tx));
       const authorizationAction =
         endpoint && isTaskControl
-          ? await tx
-              .select()
-              .from(chatActions)
-              .where(
-                and(
-                  eq(chatActions.companyId, endpoint.companyId),
-                  eq(chatActions.endpointId, endpoint.id),
-                  eq(chatActions.conversationId, conversation?.id ?? ""),
-                  eq(chatActions.kind, "task_control_authorization"),
-                  eq(
-                    chatActions.providerActionId,
-                    `task-control-authorization:${input.publication.id}`,
-                  ),
-                  eq(chatActions.status, "issued"),
-                ),
-              )
-              .for("update")
-              .then((rows) => rows[0] ?? null)
+          ? await findIssuedTaskControlAuthorizationAction(tx, {
+              companyId: endpoint.companyId,
+              endpointId: endpoint.id,
+              conversationId: conversation?.id,
+              publicationId: input.publication.id,
+            })
           : null;
       const destinationAllowed =
         endpoint !== null &&
