@@ -166,6 +166,7 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
         runtimeRootDir: RUNTIME_ROOT,
         assetDirs: {
           attribution: `${RUNTIME_ROOT}/attribution`,
+          guard: `${RUNTIME_ROOT}/guard`,
           skills: `${RUNTIME_ROOT}/skills`,
           agentConfig: `${RUNTIME_ROOT}/agentConfig`,
         },
