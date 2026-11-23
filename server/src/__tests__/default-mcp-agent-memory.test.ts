@@ -162,6 +162,15 @@ describe("agent memory config", () => {
       proxyEnvKey: "RH_MEMORY_PROXY",
     });
     expect(AGENT_MEMORY_ADAPTER_PROFILES.codex_local).toEqual(AGENT_MEMORY_ADAPTER_PROFILES.claude_local);
+    // Pi: no env keys, so no token, URL or proxy ever reaches the pod (TECH-9795).
+    expect(AGENT_MEMORY_ADAPTER_PROFILES.pi_local).toEqual({ adapterConfig: { memoryExtension: true } });
+  });
+
+  it("pi_local is enrolled by adapter type only, never through a native runner", () => {
+    expect(agentMemoryProfileFor("pi_local", {})).toBe(AGENT_MEMORY_ADAPTER_PROFILES.pi_local);
+    expect(agentMemoryProfileFor("paperclip_runner", { provider: "acpx", acpxAgent: "pi" })).toBeNull();
+    expect(agentMemoryEligibleForNewAgent("pi_local", {}, on)).toBe(true);
+    expect(agentMemoryEligibleForNewAgent("pi_local", {}, {})).toBe(false);
   });
 
   it("the spec entry is a new-agents-only managed hook entry that is never installed or enabled by default", () => {
@@ -451,6 +460,37 @@ describeEmbeddedPostgres("agent_memory setup hook", () => {
     );
     expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_CAPTURE).toBe("off");
     expect((resolved.config.env as Record<string, unknown>).RH_MEMORY_TOKEN).toBe(BOARD_TOKEN);
+  });
+
+  it("two new Pi agents each get their own memory secret keyed on the agent id, and no token, URL or proxy in their env", async () => {
+    enable();
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const fetchMock = downstreamFetch();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await createAgent(companyId, ownerId, { adapterType: "pi_local", adapterConfig: { env: { KEEP_ME: "yes" }, model: "some-model" }, runner: "legacy" });
+    const second = await createAgent(companyId, ownerId, { adapterType: "pi_local", adapterConfig: { model: "some-model" }, runner: "legacy" });
+
+    // One mint per agent, subject = that agent's id: the scope is the agent id, not the adapter type.
+    const subs = fetchMock.calls.mint.filter((call) => call.sub.startsWith("agent-memory-")).map((call) => call.sub).sort();
+    expect(subs).toEqual([`agent-memory-${first.id}`, `agent-memory-${second.id}`].sort());
+
+    const secretIds: string[] = [];
+    for (const agent of [first, second]) {
+      expect(await memoryEntryOf(agent.id)).toMatchObject({ setup: { state: "ready" } });
+      const secrets = await secretsFor(companyId, agent.id);
+      expect(secrets).toHaveLength(1);
+      secretIds.push(secrets[0]!.id);
+      const config = (await rowOf(agent.id)).adapterConfig as Record<string, any>;
+      expect(config.memoryExtension).toBe(true);
+      expect(config.memoryProvider).toBeUndefined();
+      // Nothing memory-related is written to the env, so nothing can reach the pod.
+      for (const key of Object.keys(config.env ?? {})) expect(key).not.toMatch(/^(RH_MEMORY|MEM0)_/);
+      expect(JSON.stringify(config)).not.toContain(BOARD_TOKEN);
+    }
+    expect(new Set(secretIds).size).toBe(2);
+    expect(((await rowOf(first.id)).adapterConfig as Record<string, any>).env).toEqual({ KEEP_ME: { type: "plain", value: "yes" } });
   });
 
   it("a default native-runner agent is stored as provider codex and gets the Codex profile", async () => {
