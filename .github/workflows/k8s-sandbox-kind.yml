@@ -1,0 +1,163 @@
+name: Kubernetes sandbox (kind)
+
+# TECH-9831: one real agent run through the Kubernetes sandbox provider in a kind cluster, with the
+# server running under the same RBAC as production (not cluster-admin). Upstream changes the provider,
+# the pod contract and the file sync often; this fails a sync PR that breaks agent runs instead of
+# finding out in EKS.
+#
+# The job always reports a result on pull requests (so it can be a required check) and skips its work
+# unless the PR is an upstream sync (a branch containing upstream-sync/ or sync-upstream, label
+# `upstream-sync`) or touches the provider, its RBAC fixtures or this workflow.
+#
+# Not covered, by design: EKS IAM auth, Cilium egress rules (the plugin's standard egress mode creates
+# plain NetworkPolicies, which this test only checks exist), real quotas, the pre-pulled image. The dev
+# cluster smoke test covers those.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/k8s-sandbox-kind.yml
+      - packages/plugins/sandbox-providers/kubernetes/**
+      - packages/plugins/sdk/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: k8s-sandbox-kind-${{ github.event.pull_request.number || github.ref }}
+  # Never cancel a master run: it may be about to save the image cache.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  kind:
+    name: k8s-sandbox-kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      KIND_CI_DIR: packages/plugins/sandbox-providers/kubernetes/test/kind-ci
+      KIND_CI_OUT: /tmp/kind-ci
+      IMAGES_TAR: /tmp/kind-ci-images.tar
+    steps:
+      - name: Decide whether this change needs the test
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run=false; why=""
+          if [ "$EVENT" != "pull_request" ]; then
+            run=true; why="$EVENT"
+          elif [[ "$HEAD_REF" == *upstream-sync/* || "$HEAD_REF" == *sync-upstream* ]]; then
+            run=true; why="upstream sync branch"
+          elif jq -e 'index("upstream-sync") != null' <<<"$LABELS" >/dev/null; then
+            run=true; why="label upstream-sync"
+          else
+            # Capture first: grep -q closing the pipe early can SIGPIPE gh under pipefail.
+            files="$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')"
+            if grep -qE '^(packages/plugins/sandbox-providers/kubernetes/|packages/plugins/sdk/|scripts/link-plugin-dev-sdk\.mjs$|\.github/workflows/k8s-sandbox-kind\.yml$)' <<<"$files"; then
+              run=true; why="touches the Kubernetes sandbox provider, the plugin SDK or this workflow"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Run: $run ($why)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: steps.decide.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        if: steps.decide.outputs.run == 'true'
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        if: steps.decide.outputs.run == 'true'
+        with:
+          node-version: 24
+
+      - name: Restore materialized dependencies and shared builds
+        if: steps.decide.outputs.run == 'true'
+        uses: ./.github/actions/setup-ci-dependencies
+
+      - name: Restore cached images (kind node, agent-sandbox controller, alpine)
+        if: steps.decide.outputs.run == 'true'
+        id: images
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.IMAGES_TAR }}
+          key: k8s-kind-images-v1-node1.32.2-sandbox0.5.6-alpine3.20
+
+      - name: Load or pull images
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          if [ -f "$IMAGES_TAR" ]; then
+            docker load -i "$IMAGES_TAR"
+          else
+            docker pull kindest/node:v1.32.2
+            docker pull registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6
+            docker pull alpine:3.20
+            docker save -o "$IMAGES_TAR" kindest/node:v1.32.2 registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6 alpine:3.20
+          fi
+
+      - name: Save images cache (master and manual runs only)
+        if: steps.decide.outputs.run == 'true' && github.event_name != 'pull_request' && steps.images.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.IMAGES_TAR }}
+          key: k8s-kind-images-v1-node1.32.2-sandbox0.5.6-alpine3.20
+
+      - name: Build plugin SDK and install the provider's standalone dependencies
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          # Sandbox providers are excluded from the pnpm workspace (pnpm-workspace.yaml).
+          pnpm --dir packages/plugins/sandbox-providers/kubernetes install --ignore-workspace --ignore-scripts
+          node scripts/link-plugin-dev-sdk.mjs
+
+      - name: Create kind cluster
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          kind version
+          s=$(date +%s); "$KIND_CI_DIR/kind-ci.sh" cluster; echo "- cluster: $(( $(date +%s) - s ))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install sandbox prerequisites (agent-sandbox, prod and dev RBAC, namespace labels)
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          s=$(date +%s); "$KIND_CI_DIR/kind-ci.sh" prereqs; echo "- prerequisites: $(( $(date +%s) - s ))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the agent runtime image and load it into kind
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          s=$(date +%s); "$KIND_CI_DIR/kind-ci.sh" image; echo "- image: $(( $(date +%s) - s ))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mint the non-admin server kubeconfig
+        if: steps.decide.outputs.run == 'true'
+        run: |
+          "$KIND_CI_DIR/kind-ci.sh" kubeconfig
+
+      - name: Run one agent run through the Kubernetes provider
+        if: steps.decide.outputs.run == 'true'
+        working-directory: packages/plugins/sandbox-providers/kubernetes
+        run: |
+          s=$(date +%s)
+          pnpm exec vitest run --config vitest.kind-ci.config.ts
+          echo "- agent run test: $(( $(date +%s) - s ))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cluster state on failure
+        if: failure() && steps.decide.outputs.run == 'true'
+        run: |
+          kubectl --context kind-paperclip-ci get all,sandboxes.agents.x-k8s.io,events -A 2>&1 | tail -150 || true
+          kubectl --context kind-paperclip-ci -n agent-sandbox-system logs deploy/agent-sandbox-controller --tail=80 2>&1 || true
