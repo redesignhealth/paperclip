@@ -1234,6 +1234,10 @@ describe("sandbox managed runtime", () => {
       "nested dependency\n",
       "utf8",
     );
+    await mkdir(path.join(localWorkspaceDir, ".venv", "lib"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "services", "api", ".venv", "lib"), { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, ".venv", "lib", "pkg.bin"), "root venv\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "services", "api", ".venv", "lib", "pkg.bin"), "nested venv\n", "utf8");
     await writeFile(path.join(localWorkspaceDir, "src", "local-only.ts"), "export const local = true;\n", "utf8");
 
     const uploadedTars: { remotePath: string; bytes: Buffer }[] = [];
@@ -1271,6 +1275,7 @@ describe("sandbox managed runtime", () => {
     expect(workspaceMembers).toContain("src/local-only.ts");
     expect(workspaceMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(workspaceMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
+    expect(workspaceMembers.some((entry) => entry === ".venv" || entry.startsWith(".venv/") || entry.includes("/.venv"))).toBe(false);
 
     await expect(readFile(path.join(remoteWorkspaceDir, "src", "local-only.ts"), "utf8")).resolves.toBe("export const local = true;\n");
     await expect(readFile(path.join(remoteWorkspaceDir, "node_modules", "root-package", "cache.bin"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
@@ -1302,6 +1307,7 @@ describe("sandbox managed runtime", () => {
     expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
+    expect(downloadMembers.some((entry) => entry === ".venv" || entry.startsWith(".venv/") || entry.includes("/.venv"))).toBe(false);
   });
 
   it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
