@@ -96,7 +96,8 @@ export function mergeTree(cwd, ours, theirs) {
   return { tree, clean: r.status === 0, files };
 }
 
-export function commitTree(cwd, tree, parents, message) {
+/** `date` (ISO) pins author and committer time, so the same merge always yields the same commit id. */
+export function commitTree(cwd, tree, parents, message, { date } = {}) {
   const args = ["commit-tree", tree];
   for (const p of parents) args.push("-p", p);
   return gitOut(cwd, args, {
@@ -106,6 +107,7 @@ export function commitTree(cwd, tree, parents, message) {
       GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL || "upstream-sync@localhost",
       GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME || "upstream-sync",
       GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL || "upstream-sync@localhost",
+      ...(date ? { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : {}),
     },
   });
 }

@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 
 const COMMANDS = {
   next: () => import("./commands/next.mjs"),
+  check: () => import("./commands/check.mjs"),
+  "merge-clean": () => import("./commands/merge-clean.mjs"),
 };
 
 export async function main(argv, io = {}) {
