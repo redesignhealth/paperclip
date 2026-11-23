@@ -4,7 +4,7 @@ import { buildPackageRelayEnv, packageRelayOptedIn, PACKAGE_RELAY_ROUTE_POLICIES
 const bridge = { PAPERCLIP_API_URL: "http://127.0.0.1:41234", PAPERCLIP_API_KEY: "abc_DEF-123" };
 
 describe("package relay env", () => {
-  it("points uv and pip at the gateway for an opted-in agent", () => {
+  it("points uv at the gateway for an opted-in agent", () => {
     const env = buildPackageRelayEnv({ PAPERCLIP_PACKAGE_RELAY: "gitea" }, bridge);
     expect(env.UV_EXTRA_INDEX_URL).toBe("http://paperclip:abc_DEF-123@127.0.0.1:41234/api/package-relay/gitea/simple/");
     // pip merges indexes and takes the highest version, so it is never configured.

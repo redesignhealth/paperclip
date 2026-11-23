@@ -3,7 +3,7 @@
  *
  * The pod cannot reach the private package registry and holds no registry credential. The Paperclip server relays
  * read-only package requests (`/api/package-relay/gitea/...`) with its own token. This builds the installer settings
- * that point uv and pip at the in-pod bridge gateway. The only credential in them is the run-scoped bridge token the pod
+ * that point uv at the in-pod bridge gateway (uv only; pip is deliberately not configured). The only credential in them is the run-scoped bridge token the pod
  * already holds. It applies only to agents that opt in with `PAPERCLIP_PACKAGE_RELAY=gitea` in their adapter env.
  */
 import type { SandboxCallbackBridgeRoutePolicy } from "./sandbox-callback-bridge.js";

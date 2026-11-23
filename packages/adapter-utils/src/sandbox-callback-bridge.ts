@@ -3108,7 +3108,7 @@ function readBridgeToken(req) {
   if (auth.startsWith("Bearer ")) {
     return auth.slice("Bearer ".length);
   }
-  // HTTP Basic carries the same token as the password (any username). Package installers such as uv and pip can
+  // HTTP Basic carries the same token as the password (any username). Package installers such as uv can
   // send credentials only this way, so this is what lets them use the package relay. It is the same constant-time
   // comparison, and the header allowlist strips it like the others.
   if (auth.startsWith("Basic ")) {
