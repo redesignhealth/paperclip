@@ -356,6 +356,18 @@ describe("sandbox callback bridge", () => {
     });
     expect(seenRequests[1]?.headers["x-api-key"]).toBeUndefined();
 
+    // Package installers (uv, pip) can send credentials only as HTTP Basic. The token is the password, any username,
+    // and it is stripped like the other credential headers.
+    const basic = (password: string) => `Basic ${Buffer.from(`paperclip:${password}`).toString("base64")}`;
+    const basicResponse = await fetch(`${bridge.baseUrl}/api/agents/me`, { headers: { authorization: basic(bridgeToken) } });
+    expect(basicResponse.status).toBe(200);
+    expect(seenRequests).toHaveLength(3);
+    expect(seenRequests[2]?.headers.authorization).toBeUndefined();
+    const basicDenied = await fetch(`${bridge.baseUrl}/api/agents/me`, { headers: { authorization: basic("wrong-token") } });
+    expect(basicDenied.status).toBe(401);
+    const basicNoPassword = await fetch(`${bridge.baseUrl}/api/agents/me`, { headers: { authorization: `Basic ${Buffer.from("no-colon").toString("base64")}` } });
+    expect(basicNoPassword.status).toBe(401);
+
     const githubResponse = await fetch(`${bridge.baseUrl}/runtime-tools/github/credentials`, {
       method: "POST",
       headers: {
@@ -367,11 +379,11 @@ describe("sandbox callback bridge", () => {
     });
     expect(githubResponse.status).toBe(200);
     await githubResponse.arrayBuffer();
-    expect(seenRequests[2]).toMatchObject({
+    expect(seenRequests[3]).toMatchObject({
       method: "POST", path: "/runtime-tools/github/credentials", body: "{}",
       headers: { "x-paperclip-github-capability": "test-run-scoped-capability" },
     });
-    expect(seenRequests[2]?.headers.authorization).toBeUndefined();
+    expect(seenRequests[3]?.headers.authorization).toBeUndefined();
 
     const feedbackBody = JSON.stringify({ kind: "complaint", body: "😭".repeat(5000), idempotencyKey: "bridge-feedback" });
     const feedbackResponse = await fetch(`${bridge.baseUrl}/api/companies/company-1/agent-commentary`, {
@@ -379,9 +391,9 @@ describe("sandbox callback bridge", () => {
     });
     expect(feedbackResponse.status).toBe(200);
     await feedbackResponse.arrayBuffer();
-    expect(seenRequests).toHaveLength(4);
-    expect(seenRequests[3]).toMatchObject({ method: "POST", path: "/api/companies/company-1/agent-commentary", body: feedbackBody });
-    expect(seenRequests[3]?.headers.authorization).toBeUndefined();
+    expect(seenRequests).toHaveLength(5);
+    expect(seenRequests[4]).toMatchObject({ method: "POST", path: "/api/companies/company-1/agent-commentary", body: feedbackBody });
+    expect(seenRequests[4]?.headers.authorization).toBeUndefined();
 
   });
 

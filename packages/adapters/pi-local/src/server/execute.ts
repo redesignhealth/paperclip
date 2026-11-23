@@ -1,6 +1,7 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
+import { buildPackageRelayEnv } from "@paperclipai/adapter-utils/package-relay-env";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -514,6 +515,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       if (paperclipBridge) {
         Object.assign(env, paperclipBridge.env);
+        // Opted-in builder agents install private packages through the server relay (TECH-9786).
+        Object.assign(env, buildPackageRelayEnv(envConfig, paperclipBridge.env));
         loggedEnv = buildInvocationEnvForLogs(env, {
           runtimeEnv: Object.fromEntries(
             Object.entries(ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env })).filter(
