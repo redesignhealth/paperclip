@@ -8,8 +8,9 @@
 // The payload and the checks on the verdict are the interface written into TECH-9826. Rounds are counted from git:
 // one note on `refs/notes/upstream-sync-review` per submitted head on the PR's first-parent chain.
 //
-// Exit codes: 0 APPROVE, 1 BLOCKING (findings), 4 round cap reached (hand to a person), 7 too large (split request),
-// 8 review halted or failed (not a verdict), 9 verdict does not match this head/diff, 10 awaiting the review.
+// Exit codes: 0 APPROVE, 1 BLOCKING (findings), 2 error (the CLI's code for any thrown error), 4 round cap reached
+// (hand to a person), 7 too large (split request), 8 review halted or failed (not a verdict), 9 verdict does not
+// match this head/diff, 10 awaiting the review. A round is counted only when a verdict for this head arrives.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "../lib/args.mjs";
@@ -19,7 +20,7 @@ import { computeResolutionDiff } from "./resolution-diff.mjs";
 
 export const NOTES_REF = "refs/notes/upstream-sync-review";
 export const DEFAULT_MAX_ROUNDS = 3; // TECH-9804
-const SIZE_HALTS = /scope|size|too_large|input_chars|patch/i;
+const SIZE_HALTS = /scope|too_large|input_chars|input_size|size_limit/i;
 
 /** Submitted heads on the first-parent chain base..head, from the notes ref. */
 export function submittedRounds(cwd, base, head) {
@@ -55,17 +56,18 @@ export function buildPayload({ repo, pr, result }) {
 export function judgeVerdict(verdict, { head, digest }) {
   const sha = verdict.head_sha ?? verdict.sha;
   if (sha !== head) return { exit: 9, reason: `verdict is for ${sha}, not ${head}` };
-  if (verdict.review_kind !== "supplied_diff") return { exit: 9, reason: `review_kind is ${verdict.review_kind}, not supplied_diff` };
-  if (verdict.diff_digest !== digest) return { exit: 9, reason: `diff_digest ${verdict.diff_digest} does not match ${digest}` };
   switch (verdict.status) {
     case "completed":
-      if (verdict.verdict === "APPROVE") return { exit: 0, reason: "APPROVE" };
-      if (verdict.verdict === "BLOCKING") return { exit: 1, reason: "BLOCKING", findings: verdict.findings ?? [] };
+      if (verdict.review_kind !== "supplied_diff") return { exit: 9, reason: `review_kind is ${verdict.review_kind}, not supplied_diff` };
+      if (verdict.diff_digest !== digest) return { exit: 9, reason: `diff_digest ${verdict.diff_digest} does not match ${digest}` };
+      if (verdict.verdict === "APPROVE") return { exit: 0, reason: "APPROVE", counted: true };
+      if (verdict.verdict === "BLOCKING") return { exit: 1, reason: "BLOCKING", findings: verdict.findings ?? [], counted: true };
       return { exit: 9, reason: `unknown verdict ${verdict.verdict}` };
     case "halted":
+      // A halt carries no verdict, so only the head is bound. It still used a round.
       return SIZE_HALTS.test(String(verdict.halt_reason))
-        ? { exit: 7, reason: `halted: ${verdict.halt_reason}; split the work` }
-        : { exit: 8, reason: `halted: ${verdict.halt_reason}` };
+        ? { exit: 7, reason: `halted: ${verdict.halt_reason}; split the work`, counted: true }
+        : { exit: 8, reason: `halted: ${verdict.halt_reason}`, counted: true };
     default:
       return { exit: 8, reason: `review ${verdict.status}${verdict.error_class ? ` (${verdict.error_class})` : ""}; not a verdict` };
   }
@@ -96,13 +98,11 @@ export async function submit(cwd, opts) {
     return { ...summary, exit: 4, status: "round-cap", round, reason: `${history.length} review round(s) used (cap ${maxRounds}); hand this PR to a person with the open findings` };
   }
 
-  const payloadPath = resolve(opts.out ?? `${gitOut(cwd, ["rev-parse", "--absolute-git-dir"])}/upstream-sync/submit-${result.head}.json`);
-  const payload = buildPayload({ repo: opts.repo ?? null, pr: opts.pr ?? null, result });
-  mkdirSync(dirname(payloadPath), { recursive: true });
-  writeFileSync(payloadPath, `${JSON.stringify(payload)}\n`);
-  if (!already) {
-    recordRound(cwd, result.head, result.digest, round);
-    if (opts.sync !== false && hasOrigin) git(cwd, ["push", "-q", "origin", `${NOTES_REF}:${NOTES_REF}`], { allowFail: true });
+  const payloadPath = resolve(opts.payload ?? `${gitOut(cwd, ["rev-parse", "--absolute-git-dir"])}/upstream-sync/submit-${result.head}.json`);
+  if (!opts.verdict) {
+    // Not when only judging a verdict: that would overwrite the payload the agent sent with one that lacks repo and pr.
+    mkdirSync(dirname(payloadPath), { recursive: true });
+    writeFileSync(payloadPath, `${JSON.stringify(buildPayload({ repo: opts.repo ?? null, pr: opts.pr ?? null, result }))}\n`);
   }
 
   let verdictText = null;
@@ -110,7 +110,9 @@ export async function submit(cwd, opts) {
   else if (opts.reviewCmd) {
     const r = runShell(cwd, opts.reviewCmd, { env: { UPSTREAM_SYNC_PAYLOAD: payloadPath } });
     if (!r.ok) return { ...summary, exit: 8, status: "review-command-failed", round, reason: r.output.slice(-2000), payload: payloadPath };
-    verdictText = r.output.trim().split("\n").pop();
+    // The verdict is the command's stdout (whole, or its last line); stderr noise is ignored.
+    const stdout = r.stdout.trim();
+    verdictText = stdout.startsWith("{") ? stdout : (stdout.split("\n").pop() ?? "");
   }
   if (verdictText === null) {
     return {
@@ -129,6 +131,10 @@ export async function submit(cwd, opts) {
     return { ...summary, exit: 9, status: "bad-verdict", round, reason: "the verdict is not JSON", payload: payloadPath };
   }
   const judged = judgeVerdict(verdict, { head: result.head, digest: result.digest });
+  if (judged.counted && !already) {
+    recordRound(cwd, result.head, result.digest, round);
+    if (opts.sync !== false && hasOrigin) git(cwd, ["push", "-q", "origin", `${NOTES_REF}:${NOTES_REF}`], { allowFail: true });
+  }
   return { ...summary, ...judged, status: judged.exit === 0 ? "approved" : judged.exit === 1 ? "blocking" : "stopped", round, payload: payloadPath };
 }
 

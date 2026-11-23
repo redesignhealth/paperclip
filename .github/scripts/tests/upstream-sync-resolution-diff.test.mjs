@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Fixture } from './upstream-sync-fixture.mjs';
 import { computeResolutionDiff } from '../upstream-sync/commands/resolution-diff.mjs';
-import { LIMITS } from '../upstream-sync/lib/resolutiondiff.mjs';
+import { LIMITS, buildResolutionDiff as buildResolutionDiffDirect } from '../upstream-sync/lib/resolutiondiff.mjs';
 import { submit, judgeVerdict, NOTES_REF } from '../upstream-sync/commands/submit.mjs';
 
 const CLI = fileURLToPath(new URL('../upstream-sync/cli.mjs', import.meta.url));
@@ -111,12 +111,20 @@ test('judgeVerdict accepts only a verdict bound to this head, kind and digest', 
   assert.equal(judgeVerdict({ ...ok, head_sha: 'x' }, ctx).exit, 9);
   assert.equal(judgeVerdict({ ...ok, review_kind: undefined }, ctx).exit, 9);
   assert.equal(judgeVerdict({ ...ok, diff_digest: 'sha256:other' }, ctx).exit, 9);
-  assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'scope_split' }, ctx).exit, 7);
+  assert.equal(judgeVerdict({ ...ok, review_kind: undefined, diff_digest: undefined, status: 'halted', halt_reason: 'scope_split' }, ctx).exit, 7);
+  assert.equal(judgeVerdict({ ...ok, review_kind: undefined, diff_digest: undefined, status: 'failed', error_class: 'timeout' }, ctx).exit, 8);
+  assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'patch_apply_error' }, ctx).exit, 8);
   assert.equal(judgeVerdict({ ...ok, status: 'halted', halt_reason: 'budget' }, ctx).exit, 8);
   assert.equal(judgeVerdict({ ...ok, status: 'failed', error_class: 'timeout' }, ctx).exit, 8);
 });
 
-test('submit writes the payload, records a round in git notes, and awaits the review', async () => {
+const writeVerdict = (fx, r, over = {}) => {
+  const path = join(fx.dir, '..', `verdict-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+  writeFileSync(path, JSON.stringify(verdictFor(r, over)));
+  return path;
+};
+
+test('submit writes the payload and awaits the review without using a round', async () => {
   const { fx } = syncBranch();
   try {
     const r = await submit(fx.dir, { repo: 'redesignhealth/paperclip', pr: 7 });
@@ -128,32 +136,43 @@ test('submit writes the payload, records a round in git notes, and awaits the re
     assert.equal(payload.diff_digest, r.digest);
     assert.equal(payload.pr, 7);
     assert.match(payload.diff, /^format: upstream-sync-resolution-diff v1/);
+    assert.equal(fx.git('notes', `--ref=${NOTES_REF}`, 'list'), ''); // no verdict yet, so no round used
+    // judging a verdict does not overwrite the payload that was sent
+    const approve = writeVerdict(fx, r);
+    const done = await submit(fx.dir, { verdict: approve });
+    assert.equal(done.exit, 0);
+    assert.equal(JSON.parse(execFileSync('cat', [r.payload], { encoding: 'utf8' })).pr, 7);
     assert.match(fx.git('notes', `--ref=${NOTES_REF}`, 'show', r.head), /"round":1/);
     // the same head and diff again is not a new round
-    assert.equal((await submit(fx.dir, {})).round, 1);
+    assert.equal((await submit(fx.dir, { verdict: approve })).round, 1);
+    rmSync(approve, { force: true });
   } finally {
     fx.cleanup();
   }
 });
 
-test('submit approves on a matching verdict, and stops at the round cap', async () => {
+test('submit counts a round only when a verdict arrives, and stops at the round cap', async () => {
   const { fx } = syncBranch();
   try {
-    let result = await submit(fx.dir, { maxRounds: 2 });
-    const approve = join(fx.dir, '..', `verdict-${process.pid}.json`);
-    writeFileSync(approve, JSON.stringify(verdictFor(result)));
-    const done = await submit(fx.dir, { maxRounds: 2, verdict: approve });
-    assert.equal(done.exit, 0);
-    assert.equal(done.status, 'approved');
-    rmSync(approve, { force: true });
+    const first = await submit(fx.dir, { maxRounds: 2 });
+    const v1 = writeVerdict(fx, first, { verdict: 'BLOCKING', findings: [{ severity: 'BLOCKING', summary: 'x' }] });
+    assert.equal((await submit(fx.dir, { maxRounds: 2, verdict: v1 })).exit, 1);
 
     fx.commit({ 'server/fix.ts': 'export const fix = 2;\n' }, 'round two');
-    result = await submit(fx.dir, { maxRounds: 2 });
-    assert.equal(result.round, 2);
+    const second = await submit(fx.dir, { maxRounds: 2 });
+    assert.equal(second.round, 2);
+    // a failed review does not use the round
+    const failed = writeVerdict(fx, second, { status: 'failed', verdict: null, error_class: 'timeout', review_kind: undefined, diff_digest: undefined });
+    assert.equal((await submit(fx.dir, { maxRounds: 2, verdict: failed })).exit, 8);
+    assert.equal((await submit(fx.dir, { maxRounds: 2 })).round, 2);
+    const v2 = writeVerdict(fx, second);
+    assert.equal((await submit(fx.dir, { maxRounds: 2, verdict: v2 })).exit, 0);
+
     fx.commit({ 'server/fix.ts': 'export const fix = 3;\n' }, 'round three');
     const capped = await submit(fx.dir, { maxRounds: 2 });
     assert.equal(capped.exit, 4);
     assert.equal(capped.status, 'round-cap');
+    [v1, failed, v2].forEach((f) => rmSync(f, { force: true }));
   } finally {
     fx.cleanup();
   }
@@ -183,6 +202,71 @@ test('submit reports a split request when the diff is over the Argus limits, wit
     assert.equal(r.exit, 7);
     assert.equal(r.split_request, true);
     assert.equal(fx.git('notes', `--ref=${NOTES_REF}`, 'list'), '');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('a failing git call stops the build instead of yielding a digest of a partial diff', () => {
+  const { fx } = syncBranch();
+  try {
+    assert.throws(() => computeResolutionDiff(fx.dir, { base: 'does-not-exist' }), /cannot resolve --base/);
+    assert.throws(() => buildResolutionDiffDirect(fx.dir, { head: 'f'.repeat(40), base: 'e'.repeat(40) }));
+    const out = (() => {
+      try {
+        execFileSync('node', [CLI, 'resolution-diff', '--digest', '--base', 'nope'], { cwd: fx.dir, stdio: 'pipe' });
+        return 0;
+      } catch (e) {
+        return e.status;
+      }
+    })();
+    assert.equal(out, 2); // an error, not the 1 that means blocking findings
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('the digest does not change with the machine\'s diff or merge configuration', () => {
+  const { fx } = syncBranch();
+  try {
+    const before = computeResolutionDiff(fx.dir, {}).digest;
+    fx.git('config', 'merge.conflictStyle', 'diff3');
+    fx.git('config', 'diff.algorithm', 'patience');
+    fx.git('config', 'diff.renames', 'copies');
+    fx.git('config', 'diff.context', '9');
+    fx.git('config', 'diff.noprefix', 'true');
+    assert.equal(computeResolutionDiff(fx.dir, {}).digest, before);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('a fix commit is shown in full, even for paths a script would settle in a merge', () => {
+  const { fx } = syncBranch();
+  try {
+    fx.commit({ 'pnpm-lock.yaml': 'hand edited lock\n', 'packages/db/src/migrations/0009_hand_written.sql': 'create table mine();\n' }, 'fix: by hand');
+    const r = computeResolutionDiff(fx.dir, {});
+    assert.match(r.document, /\n\+hand edited lock\n/);
+    assert.match(r.document, /\n\+create table mine\(\);\n/);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('an unregistered generated file in a merge is shown in full, not summarized', () => {
+  const { fx } = Fixture.scenario({
+    base: { 'a.txt': 'a\n' },
+    upstream: [[{ 'packages/x/src/thing.generated.ts': 'export const x = 1;\n' }, 'adds generated (#1)']],
+  });
+  try {
+    fx.git('checkout', '-q', '-b', 'sync');
+    fx.git('merge', '--no-commit', '--no-ff', 'upstream');
+    fx.write('packages/x/src/thing.generated.ts', 'export const x = 2; // edited by hand\n');
+    fx.git('add', '-A');
+    fx.git('commit', '-q', '-m', 'Merge upstream');
+    const r = computeResolutionDiff(fx.dir, {});
+    assert.match(r.document, /\+export const x = 2; \/\/ edited by hand/);
+    assert.ok(!/^mechanical generated:unregistered/m.test(r.document));
   } finally {
     fx.cleanup();
   }

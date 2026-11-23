@@ -11,8 +11,11 @@ export function resolveHeadBase(cwd, opts) {
   const head = revParse(cwd, opts.head ?? "HEAD");
   if (!head) throw new Error(`cannot resolve head ${opts.head ?? "HEAD"}`);
   const masterRef = opts.master || process.env.UPSTREAM_SYNC_MASTER_REF || "origin/master";
-  let base = opts.base ? revParse(cwd, opts.base) : null;
-  if (!base) {
+  let base = null;
+  if (opts.base) {
+    base = revParse(cwd, opts.base);
+    if (!base) throw new Error(`cannot resolve --base ${opts.base}`);
+  } else {
     const master = revParse(cwd, masterRef);
     if (!master) throw new Error(`cannot resolve ${masterRef}; pass --base or --master`);
     base = gitOut(cwd, ["merge-base", head, master], { allowFail: true });

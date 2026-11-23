@@ -3,79 +3,101 @@
 //
 // For every commit on the first-parent chain base..head, oldest first:
 //   merge commit M (parents P1 = fork side, P2 = upstream): diff from the automatic merge of P1 and P2 (conflict
-//     markers left in) to M's tree. A clean merge contributes nothing.
-//   other commit F: diff from F's parent tree to F's tree.
-// Paths that a script settles (lockfiles, migrations, generated files) appear as one `mechanical` line with the new
-// blob sha instead of hunks, so the digest still binds them. Everything else appears as a unified diff.
+//     markers left in) to M's tree. A clean merge contributes nothing. Paths a script settles (lockfiles,
+//     migrations, registered generated files) appear as one `mechanical` line with the new blob sha instead of
+//     hunks, so the digest still binds them.
+//   other commit F (a fix commit): diff from F's parent tree to F's tree, every path in full. A fix commit is our
+//     own work; nothing in it is summarized.
+// Every git call here must succeed: a failed call would otherwise yield a valid-looking digest of a partial diff.
 import { createHash } from "node:crypto";
-import { git, gitOut, mergeTree } from "./git.mjs";
+import { git, gitOut, mergeTree, PINNED_ENV } from "./git.mjs";
 import { classifyFile } from "./mechanical.mjs";
 
 export const FORMAT = "upstream-sync-resolution-diff v1";
 // The Argus review limits (TECH-9826): above either, the review halts and the work must be split.
+// `chars` counts code points, as a Python `len()` does on the service side.
 export const LIMITS = { changedLines: 5000, chars: 150000 };
 
+// Pin every setting that can change diff output, so builder and gate agree whatever their git configuration says.
+const PIN = [
+  "-c", "core.quotepath=false",
+  "-c", "core.autocrlf=false",
+  "-c", "diff.renames=false",
+  "-c", "diff.algorithm=default",
+  "-c", "diff.indentHeuristic=true",
+  "-c", "diff.noprefix=false",
+  "-c", "diff.mnemonicPrefix=false",
+  "-c", "diff.interHunkContext=0",
+  "-c", "diff.context=3",
+  "-c", "diff.orderFile=/dev/null",
+];
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--full-index", "-U3", "--src-prefix=a/", "--dst-prefix=b/"];
 
-function treeDiff(cwd, from, to) {
-  const raw = git(cwd, ["-c", "core.quotepath=false", "diff-tree", "-r", "-z", "--no-renames", "--raw", "--full-index", from, to], { allowFail: true }).stdout;
+// A path is summarized (not shown) only when a script, not a person, owns its content.
+const isSummarized = (cls) => cls.kind === "mechanical" && cls.action !== "needs-generator";
+
+function treeDiff(cwd, from, to, { summarize }) {
+  const raw = git(cwd, [...PIN, "diff-tree", "-r", "-z", "--no-renames", "--raw", "--full-index", from, to], { env: PINNED_ENV }).stdout;
   const parts = raw.split("\0");
   const changes = [];
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const meta = parts[i].split(" ");
-    if (meta.length < 5) continue;
+    if (!parts[i].startsWith(":") || meta.length < 5) throw new Error(`unexpected diff-tree record: ${JSON.stringify(parts[i])}`);
     changes.push({ path: parts[i + 1], newBlob: meta[3], status: meta[4] });
   }
   const mechanical = [];
   const hunkPaths = [];
   for (const c of changes) {
-    const cls = classifyFile(c.path);
-    if (cls.kind === "mechanical") mechanical.push({ ...c, rule: cls.rule });
+    const cls = summarize ? classifyFile(c.path) : { kind: "real" };
+    if (isSummarized(cls)) mechanical.push({ ...c, rule: cls.rule });
     else hunkPaths.push(c.path);
   }
-  mechanical.sort((a, b) => (a.path < b.path ? -1 : 1));
+  mechanical.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   let diffText = "";
   if (hunkPaths.length > 0) {
-    diffText = git(cwd, ["--literal-pathspecs", "-c", "core.quotepath=false", "diff", ...DIFF_FLAGS, from, to, "--", ...hunkPaths], { allowFail: true }).stdout;
+    diffText = git(cwd, ["--literal-pathspecs", ...PIN, "diff", ...DIFF_FLAGS, from, to, "--", ...hunkPaths], { env: PINNED_ENV }).stdout;
   }
   return { mechanical, diffText };
 }
 
 const isChangedLine = (line) => (line.startsWith("+") || line.startsWith("-")) && !line.startsWith("+++") && !line.startsWith("---");
 
-/** Build the document for `head` against `base`. Returns { document, digest, files, changedLines, chars, ... }. */
+/** Build the document for `head` against `base`. Returns { document, digest, files, changed_lines, chars, ... }. */
 export function buildResolutionDiff(cwd, { head, base }) {
-  const chain = gitOut(cwd, ["rev-list", "--first-parent", "--reverse", `${base}..${head}`], { allowFail: true }).split("\n").filter(Boolean);
+  const chain = gitOut(cwd, ["rev-list", "--first-parent", "--reverse", `${base}..${head}`], { env: PINNED_ENV }).split("\n").filter(Boolean);
+  const emptyTree = gitOut(cwd, ["hash-object", "-t", "tree", "/dev/null"]);
   const out = [`format: ${FORMAT}`, `base: ${base}`, `head: ${head}`];
   let files = 0;
   let changedLines = 0;
-  const mechanicalFiles = [];
+  let mechanicalFiles = 0;
   for (const sha of chain) {
     const parents = gitOut(cwd, ["rev-list", "--parents", "-n", "1", sha]).split(" ").slice(1);
     if (parents.length > 2) throw new Error(`commit ${sha} has ${parents.length} parents; octopus merges are not supported`);
     const tree = gitOut(cwd, ["rev-parse", `${sha}^{tree}`]);
     let from;
+    let summarize = false;
     if (parents.length === 2) {
       out.push(`== commit ${sha} merge upstream ${parents[1]} ==`);
-      from = mergeTree(cwd, parents[0], parents[1]).tree;
+      const merged = mergeTree(cwd, parents[0], parents[1], { pin: true });
+      from = merged.tree;
+      summarize = true;
     } else {
       out.push(`== commit ${sha} own ==`);
-      from = parents.length === 1 ? gitOut(cwd, ["rev-parse", `${parents[0]}^{tree}`]) : "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+      from = parents.length === 1 ? gitOut(cwd, ["rev-parse", `${parents[0]}^{tree}`]) : emptyTree;
     }
-    const { mechanical, diffText } = treeDiff(cwd, from, tree);
+    const { mechanical, diffText } = treeDiff(cwd, from, tree, { summarize });
     for (const m of mechanical) {
       out.push(`mechanical ${m.rule} ${m.path} ${m.status === "D" ? "deleted" : m.newBlob}`);
-      mechanicalFiles.push(m.path);
+      mechanicalFiles += 1;
     }
     if (diffText) {
-      const text = diffText.endsWith("\n") ? diffText.slice(0, -1) : diffText;
-      out.push(text);
+      out.push(diffText.endsWith("\n") ? diffText.slice(0, -1) : diffText);
       files += (diffText.match(/^diff --git /gm) ?? []).length;
       changedLines += diffText.split("\n").filter(isChangedLine).length;
     }
   }
   const document = `${out.join("\n")}\n`;
-  const chars = document.length;
+  const chars = Array.from(document).length;
   const digest = `sha256:${createHash("sha256").update(document, "utf8").digest("hex")}`;
   const exceeded = [];
   if (changedLines > LIMITS.changedLines) exceeded.push(`changed_lines ${changedLines} > ${LIMITS.changedLines}`);
@@ -86,7 +108,7 @@ export function buildResolutionDiff(cwd, { head, base }) {
     head,
     commits: chain.length,
     files,
-    mechanical_files: mechanicalFiles.length,
+    mechanical_files: mechanicalFiles,
     changed_lines: changedLines,
     chars,
     digest,
