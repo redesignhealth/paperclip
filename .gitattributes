@@ -1,5 +1,4 @@
 patches/*.patch whitespace=-space-before-tab
 tools/upstream-sync/vendor/** linguist-generated=true
-tools/upstream-sync/global-bundle.pem linguist-generated=true
 tools/upstream-sync/package-lock.json linguist-generated=true
 
