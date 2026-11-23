@@ -395,6 +395,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/agent-memory-relay\/memories$/ },
   { method: "PUT", path: /^\/api\/agent-memory-relay\/memories\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i },
   { method: "DELETE", path: /^\/api\/agent-memory-relay\/memories\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i },
+
+  // Read-only private package registry relay (TECH-9786). Two fixed GET routes; the server checks the package, the agent's
+  // opt-in and holds the registry token.
+  { method: "GET", path: /^\/api\/package-relay\/gitea\/simple\/[a-z0-9]+(?:-[a-z0-9]+)*\/$/ },
+  { method: "GET", path: /^\/api\/package-relay\/gitea\/files\/[A-Za-z0-9._%+!-]+\/[A-Za-z0-9._%+!-]+\/[A-Za-z0-9._%+!-]+$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.

@@ -129,6 +129,7 @@ import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { costRoutes } from "./routes/costs.js";
 import { agentCommentaryRoutes } from "./routes/agent-commentary.js";
 import { agentMemoryRelayRoutes } from "./routes/agent-memory-relay.js";
+import { packageRelayRoutes } from "./routes/package-relay.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { attentionRoutes } from "./routes/attention.js";
@@ -823,6 +824,7 @@ export async function createApp(
   api.use(inboxAgentPolicyRoutes(db));
   api.use(agentCommentaryRoutes(db));
   api.use(agentMemoryRelayRoutes(db));
+  api.use(packageRelayRoutes(db));
   api.use(builtInAgentRoutes(db));
   api.use(summarySlotRoutes(db));
   api.use(statusCardRoutes(db));
