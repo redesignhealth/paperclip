@@ -1556,6 +1556,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/tool-connections/{connectionId}",
   "GET /api/tool-connections/{connectionId}/grants",
   "POST /api/tool-connections/{connectionId}/grants/installations",
+  "POST /api/tool-connections/{connectionId}/grants/github-app",
   "POST /api/tool-connections/{connectionId}/grants/{grantId}/delegations",
   "DELETE /api/tool-connections/{connectionId}/grants/{grantId}/delegations/{delegationId}",
   "DELETE /api/tool-connections/{connectionId}/grants/{grantId}",
@@ -11772,6 +11773,22 @@ registerCurrentRoute({
   path: "/api/tool-connections/{connectionId}/grants",
   tags: ["tool-access"],
   summary: "List tool connection grants",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/tool-connections/{connectionId}/grants/github-app",
+  tags: ["tool-access"],
+  summary: "Add a GitHub App installation grant for an agent",
+  responses: {
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registerCurrentRoute({
