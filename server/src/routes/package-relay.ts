@@ -49,6 +49,17 @@ export function normalizePackageName(name: string): string {
   return name.toLowerCase().replace(/[-_.]+/g, "-");
 }
 
+const HASH_FRAGMENT_RE = /^[a-z0-9]{3,10}=[0-9a-f]{16,128}$/;
+const REQUIRES_PYTHON_RE = /^[A-Za-z0-9<>=!~.,*+ ]{1,64}$/;
+
+function decodeEntities(value: string): string {
+  return value.replace(/&(?:amp|lt|gt|quot|#39);/g, (e) => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'" })[e]!);
+}
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 /** Percent-decoding that never throws; a malformed sequence yields null, which never equals the input. */
 function safeDecode(value: string): string | null {
   try {
@@ -168,17 +179,27 @@ export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
       fail(res, 502, "package_relay_unavailable");
       return null;
     }
-    let body: Buffer;
+    // Read with a hard cap, so a missing or wrong content-length cannot make the server buffer a huge body.
+    const chunks: Buffer[] = [];
+    let received = 0;
     try {
-      body = Buffer.from(await upstream.arrayBuffer());
+      const reader = upstream.body?.getReader();
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          fail(res, 502, "package_relay_unavailable");
+          return null;
+        }
+        chunks.push(Buffer.from(value));
+      }
     } catch {
       fail(res, 502, "package_relay_unavailable");
       return null;
     }
-    if (body.length > maxBytes) {
-      fail(res, 502, "package_relay_unavailable");
-      return null;
-    }
+    const body = Buffer.concat(chunks);
     return { body, base: config.base };
   }
 
@@ -187,22 +208,31 @@ export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
     upstreamGet(req, res, pkg, (base) => `${base}/simple/${encodeURIComponent(normalizePackageName(pkg))}/`, PACKAGE_RELAY_MAX_INDEX_BYTES)
       .then((result) => {
         if (!result) return;
-        // Keep only links to this registry's own files, rewritten to the relay. Any other link is dropped, so the
-        // page can never point the installer at another host.
+        // Build a fresh page from validated entries only. Nothing from the upstream page is copied through (no <base>,
+        // no other tags or attributes), so the installer can only be pointed at this relay's own file routes.
         const filesPrefix = `${result.base}/files/`;
-        const html = result.body.toString("utf8").replace(/<a\b[^>]*>[\s\S]*?<\/a>\s*(?:<br\s*\/?>)?/gi, (anchor) => {
-          // `href` must be its own attribute (not the tail of `data-original-href`).
-          const href = /\shref="([^"]*)"/i.exec(anchor)?.[1]?.replace(/&amp;/g, "&");
-          if (!href) return "";
+        const links: string[] = [];
+        for (const anchor of result.body.toString("utf8").match(/<a\b[^>]*>/gi) ?? []) {
+          const attrs = new Map<string, string>();
+          for (const m of anchor.matchAll(/\s([a-z][a-z0-9-]*)="([^"]*)"/gi)) {
+            // The first occurrence wins, as in an HTML parser.
+            if (!attrs.has(m[1]!.toLowerCase())) attrs.set(m[1]!.toLowerCase(), decodeEntities(m[2]!));
+          }
+          const href = attrs.get("href");
+          if (!href) continue;
           const [target, fragment] = href.split("#", 2) as [string, string | undefined];
-          if (!target.startsWith(filesPrefix)) return "";
+          if (!target.startsWith(filesPrefix)) continue;
           const parts = target.slice(filesPrefix.length).split("/");
-          if (parts.length !== 3 || !parts.every((p) => safeDecode(p) === p)) return "";
+          if (parts.length !== 3 || !parts.every((p) => safeDecode(p) === p)) continue;
           const [name, version, filename] = parts as [string, string, string];
-          if (normalizePackageName(name) !== normalizePackageName(pkg) || !SEGMENT_RE.test(version) || !FILENAME_RE.test(filename)) return "";
+          if (normalizePackageName(name) !== normalizePackageName(pkg) || !SEGMENT_RE.test(version) || !FILENAME_RE.test(filename)) continue;
+          if (fragment !== undefined && !HASH_FRAGMENT_RE.test(fragment)) continue;
+          const requires = attrs.get("data-requires-python");
+          const requiresAttr = requires !== undefined && REQUIRES_PYTHON_RE.test(requires) ? ` data-requires-python="${escapeAttr(requires)}"` : "";
           const rewritten = `../../files/${encodeURIComponent(name)}/${encodeURIComponent(version)}/${encodeURIComponent(filename)}${fragment ? `#${fragment}` : ""}`;
-          return anchor.replace(/(\s)href="[^"]*"/i, `$1href="${rewritten.replace(/&/g, "&amp;")}"`);
-        });
+          links.push(`<a href="${escapeAttr(rewritten)}"${requiresAttr}>${escapeAttr(filename)}</a><br>`);
+        }
+        const html = `<!DOCTYPE html>\n<html><body>\n${links.join("\n")}\n</body></html>\n`;
         res.status(200).type("text/html").send(html);
       })
       .catch(next);

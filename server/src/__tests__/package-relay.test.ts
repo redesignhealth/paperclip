@@ -17,7 +17,7 @@ const TOKEN = "gitea-read-token-1";
 const env = { [PACKAGE_RELAY_GITEA_URL_ENV]: GITEA, [PACKAGE_RELAY_GITEA_PACKAGES_ENV]: "rh-auth, rh_lib" } as NodeJS.ProcessEnv;
 
 const INDEX = `<!DOCTYPE html><html><body>
-<a href="${GITEA}/files/rh-auth/1.2.0/rh_auth-1.2.0-py3-none-any.whl#sha256=abc" data-requires-python="&gt;=3.10">rh_auth-1.2.0-py3-none-any.whl</a><br>
+<a href="${GITEA}/files/rh-auth/1.2.0/rh_auth-1.2.0-py3-none-any.whl#sha256=0123456789abcdef0123456789abcdef" data-requires-python="&gt;=3.10">rh_auth-1.2.0-py3-none-any.whl</a><br>
 <a href="https://evil.example.com/rh_auth-9.9.9-py3-none-any.whl#sha256=bad">evil</a><br>
 <a data-original-href="${GITEA}/files/rh-auth/3.0.0/rh_auth-3.0.0-py3-none-any.whl" href="https://evil.example.com/x.whl">sneaky</a><br>
 <a href="${GITEA}/files/rh-auth/%E0%A4%A/rh_auth-3.0.0-py3-none-any.whl">malformed</a><br>
@@ -51,10 +51,12 @@ describe("package relay (TECH-9786)", () => {
     const { app, fetchImpl } = build();
     const res = await request(app).get(`${BASE}/simple/rh-auth/`).expect(200);
     expect(res.headers["content-type"]).toMatch(/text\/html/);
-    expect(res.text).toContain('href="../../files/rh-auth/1.2.0/rh_auth-1.2.0-py3-none-any.whl#sha256=abc"');
+    expect(res.text).toContain('href="../../files/rh-auth/1.2.0/rh_auth-1.2.0-py3-none-any.whl#sha256=0123456789abcdef0123456789abcdef"');
     expect(res.text).toContain('data-requires-python="&gt;=3.10"');
     expect(res.text).not.toContain("evil.example.com");
     expect(res.text).not.toContain("3.0.0");
+    expect(res.text).not.toContain("sneaky");
+    expect(res.text).not.toContain("malformed");
     expect(res.text).not.toContain("other-pkg");
     expect(res.text).not.toContain(GITEA);
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
@@ -65,6 +67,21 @@ describe("package relay (TECH-9786)", () => {
     expect(Buffer.from(auth.replace("Basic ", ""), "base64").toString()).toBe(`paperclip-relay:${TOKEN}`);
     expect(JSON.stringify(res.headers)).not.toContain(TOKEN);
     expect(res.text).not.toContain(TOKEN);
+  });
+
+  it("emits a fresh page: no <base>, no other tags, hostile fragments and duplicate hrefs dropped", async () => {
+    const hostile = `<base href="https://evil.example.com/"><script>x</script>
+<a href="${GITEA}/files/rh-auth/1.0.0/a-1.0.0.whl#sha256=0123456789abcdef0123456789abcdef" href="https://evil.example.com/dup" data-requires-python="&gt;=3.10">a-1.0.0.whl</a>
+<a href="${GITEA}/files/rh-auth/1.1.0/a-1.1.0.whl#$&quot;&gt;&lt;script">bad fragment</a>
+<a href="${GITEA}/files/rh-auth/1.2.0/a-1.2.0.whl" data-requires-python="&quot;&gt;&lt;img src=x">bad python</a>`;
+    const { app } = build({ fetchImpl: vi.fn(async () => new Response(hostile, { status: 200, headers: { "content-type": "text/html" } })) as unknown as typeof fetch });
+    const res = await request(app).get(`${BASE}/simple/rh-auth/`).expect(200);
+    expect(res.text).not.toMatch(/<base|<script|evil\.example\.com|<img/i);
+    expect(res.text).toContain('href="../../files/rh-auth/1.0.0/a-1.0.0.whl#sha256=0123456789abcdef0123456789abcdef"');
+    expect(res.text).toContain('data-requires-python="&gt;=3.10"');
+    expect(res.text).not.toContain("1.1.0");
+    expect(res.text).toContain('href="../../files/rh-auth/1.2.0/a-1.2.0.whl"');
+    expect(res.text).not.toContain("data-requires-python=\"&quot;");
   });
 
   it("serves a file for an allowed package", async () => {
@@ -121,6 +138,12 @@ describe("package relay (TECH-9786)", () => {
     expect(JSON.stringify(failed.body)).not.toContain(TOKEN);
     const timeout = build({ fetchImpl: vi.fn(async () => { throw Object.assign(new Error("t"), { name: "TimeoutError" }); }) as unknown as typeof fetch });
     await request(timeout.app).get(`${BASE}/simple/rh-auth/`).expect(504);
+  });
+
+  it("caps the body while reading when content-length is missing", async () => {
+    const stream = new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(new Uint8Array(4_000_000)); } });
+    const big = build({ fetchImpl: vi.fn(async () => new Response(stream, { status: 200 })) as unknown as typeof fetch });
+    await request(big.app).get(`${BASE}/files/rh-auth/1.0/rh_auth-1.0.whl`).expect(502);
   });
 
   it("rejects an oversized upstream body", async () => {
