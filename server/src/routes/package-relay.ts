@@ -25,7 +25,11 @@ export const PACKAGE_RELAY_OPT_IN_ENV_KEY = "PAPERCLIP_PACKAGE_RELAY";
 
 export const PACKAGE_RELAY_DEADLINE_MS = 60_000;
 export const PACKAGE_RELAY_MAX_INDEX_BYTES = 2_000_000;
-export const PACKAGE_RELAY_MAX_FILE_BYTES = 200_000_000;
+/**
+ * The sandbox bridge refuses a response body above its limit (about 10 MB by default), so a larger file could never
+ * reach the pod. Refuse it here with a clear 502 instead of buffering it.
+ */
+export const PACKAGE_RELAY_MAX_FILE_BYTES = 10_000_000;
 
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._+!-]{0,127}$/;
@@ -43,6 +47,15 @@ export interface PackageRelayDeps {
 /** PEP 503 name normalization. */
 export function normalizePackageName(name: string): string {
   return name.toLowerCase().replace(/[-_.]+/g, "-");
+}
+
+/** Percent-decoding that never throws; a malformed sequence yields null, which never equals the input. */
+function safeDecode(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
 }
 
 function fail(res: Response, status: number, detail: string) {
@@ -178,16 +191,17 @@ export function packageRelayRoutes(db: Db, deps: PackageRelayDeps = {}) {
         // page can never point the installer at another host.
         const filesPrefix = `${result.base}/files/`;
         const html = result.body.toString("utf8").replace(/<a\b[^>]*>[\s\S]*?<\/a>\s*(?:<br\s*\/?>)?/gi, (anchor) => {
-          const href = /\bhref="([^"]*)"/i.exec(anchor)?.[1]?.replace(/&amp;/g, "&");
+          // `href` must be its own attribute (not the tail of `data-original-href`).
+          const href = /\shref="([^"]*)"/i.exec(anchor)?.[1]?.replace(/&amp;/g, "&");
           if (!href) return "";
           const [target, fragment] = href.split("#", 2) as [string, string | undefined];
           if (!target.startsWith(filesPrefix)) return "";
           const parts = target.slice(filesPrefix.length).split("/");
-          if (parts.length !== 3 || !parts.every((p) => p === decodeURIComponent(p))) return "";
+          if (parts.length !== 3 || !parts.every((p) => safeDecode(p) === p)) return "";
           const [name, version, filename] = parts as [string, string, string];
           if (normalizePackageName(name) !== normalizePackageName(pkg) || !SEGMENT_RE.test(version) || !FILENAME_RE.test(filename)) return "";
           const rewritten = `../../files/${encodeURIComponent(name)}/${encodeURIComponent(version)}/${encodeURIComponent(filename)}${fragment ? `#${fragment}` : ""}`;
-          return anchor.replace(/\bhref="[^"]*"/i, `href="${rewritten.replace(/&/g, "&amp;")}"`);
+          return anchor.replace(/(\s)href="[^"]*"/i, `$1href="${rewritten.replace(/&/g, "&amp;")}"`);
         });
         res.status(200).type("text/html").send(html);
       })

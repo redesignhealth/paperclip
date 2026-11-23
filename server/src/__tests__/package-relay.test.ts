@@ -19,6 +19,8 @@ const env = { [PACKAGE_RELAY_GITEA_URL_ENV]: GITEA, [PACKAGE_RELAY_GITEA_PACKAGE
 const INDEX = `<!DOCTYPE html><html><body>
 <a href="${GITEA}/files/rh-auth/1.2.0/rh_auth-1.2.0-py3-none-any.whl#sha256=abc" data-requires-python="&gt;=3.10">rh_auth-1.2.0-py3-none-any.whl</a><br>
 <a href="https://evil.example.com/rh_auth-9.9.9-py3-none-any.whl#sha256=bad">evil</a><br>
+<a data-original-href="${GITEA}/files/rh-auth/3.0.0/rh_auth-3.0.0-py3-none-any.whl" href="https://evil.example.com/x.whl">sneaky</a><br>
+<a href="${GITEA}/files/rh-auth/%E0%A4%A/rh_auth-3.0.0-py3-none-any.whl">malformed</a><br>
 <a href="${GITEA}/files/other-pkg/1.0.0/other_pkg-1.0.0-py3-none-any.whl">other</a><br>
 </body></html>`;
 
@@ -52,6 +54,7 @@ describe("package relay (TECH-9786)", () => {
     expect(res.text).toContain('href="../../files/rh-auth/1.2.0/rh_auth-1.2.0-py3-none-any.whl#sha256=abc"');
     expect(res.text).toContain('data-requires-python="&gt;=3.10"');
     expect(res.text).not.toContain("evil.example.com");
+    expect(res.text).not.toContain("3.0.0");
     expect(res.text).not.toContain("other-pkg");
     expect(res.text).not.toContain(GITEA);
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
