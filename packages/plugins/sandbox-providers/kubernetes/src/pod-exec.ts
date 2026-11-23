@@ -41,6 +41,26 @@ function shQuoteSingleLine(value: string): string {
   return value.split("\n").map(shQuote).join('"$__pc_nl"');
 }
 
+// Run a command from `cwd`. The Kubernetes exec API has no working-directory
+// field, so without this the process inherits the container WORKDIR (`/app`, the
+// read-only runtime image directory) no matter what cwd the caller asked for
+// (TECH-9844). Only an absolute cwd that exists in the pod is applied; a missing
+// directory keeps the old behaviour (container default) so a pre-sync command
+// that creates the workspace still runs. The cwd travels as a positional
+// argument, never inside the script text.
+export function wrapCommandWithCwd(command: string[], cwd: string | undefined | null): string[] {
+  const dir = typeof cwd === "string" ? cwd.trim() : "";
+  if (!dir.startsWith("/") || command.length === 0) return command;
+  return [
+    "/bin/sh",
+    "-c",
+    '__pc_cwd=$1; shift; if [ -d "$__pc_cwd" ]; then cd "$__pc_cwd" || exit 126; fi; unset __pc_cwd; exec "$@"',
+    "pc-exec-cwd",
+    dir,
+    ...command,
+  ];
+}
+
 // Wrap a command so the given env vars are exported before it runs, WITHOUT putting
 // any env value in the command. The Kubernetes exec API has no env field, and the
 // command is sent as query parameters of the exec request URI, so anything in it

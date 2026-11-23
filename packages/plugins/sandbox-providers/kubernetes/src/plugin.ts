@@ -46,7 +46,7 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, execInPodStreaming, wrapCommandWithEnv } from "./pod-exec.js";
+import { execInPod, execInPodStreaming, wrapCommandWithCwd, wrapCommandWithEnv } from "./pod-exec.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
 import { checkLeaseResumable, destroyLeaseResources, waitForSandboxTermination } from "./lease-lifecycle.js";
 import {
@@ -645,7 +645,7 @@ async function executeInLease(
     // partial behaviour. Env values travel on stdin, never in the exec request URI
     // (see wrapCommandWithEnv).
     const wrapped = wrapCommandWithEnv(
-      baseExecCommand,
+      wrapCommandWithCwd(baseExecCommand, params.cwd),
       params.env,
       typeof params.stdin === "string" ? params.stdin : undefined,
     );
