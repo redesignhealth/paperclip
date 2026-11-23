@@ -128,6 +128,8 @@ function apiKeyWarnings(providers: Record<string, unknown>, env: Record<string, 
 // and repoints PI_CODING_AGENT_DIR at the in-sandbox copy.
 export async function preparePiRuntimeConfig(input: {
   env: Record<string, string>;
+  /** TECH-9794: `mcp.json` body for the pi-mcp-adapter extension. Forces a managed dir even with no providers. */
+  mcpConfig?: Record<string, unknown> | null;
 }): Promise<PreparedPiRuntimeConfig> {
   // TECH-7076: `{env:NAME}` placeholders may read the SERVER env only when the provider config
   // itself came from the server env (an operator-authored setting). If it came from the agent's
@@ -143,7 +145,7 @@ export async function preparePiRuntimeConfig(input: {
   );
   const keyWarnings = providers ? apiKeyWarnings(providers, input.env) : [];
   const warnings = [...(parseWarning ? [parseWarning] : []), ...keyWarnings];
-  if (!providers) {
+  if (!providers && !input.mcpConfig) {
     return {
       env: input.env,
       notes: warnings,
@@ -152,7 +154,7 @@ export async function preparePiRuntimeConfig(input: {
     };
   }
 
-  for (const [name, provider] of Object.entries(providers)) {
+  for (const [name, provider] of Object.entries(providers ?? {})) {
     if (!isPlainObject(provider)) continue;
     if (isOpenRouterUrl(provider.baseUrl) || (name === "openrouter" && provider.baseUrl === undefined)) {
       provider.headers = openRouterAttributionHeaders(isPlainObject(provider.headers) ? provider.headers as Record<string, string> : {});
@@ -167,11 +169,20 @@ export async function preparePiRuntimeConfig(input: {
   }
   const agentConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-agent-config-"));
   try {
-    await fs.writeFile(
-      path.join(agentConfigDir, "models.json"),
-      `${JSON.stringify({ providers }, null, 2)}\n`,
-      "utf8",
-    );
+    if (providers) {
+      await fs.writeFile(
+        path.join(agentConfigDir, "models.json"),
+        `${JSON.stringify({ providers }, null, 2)}\n`,
+        "utf8",
+      );
+    }
+    if (input.mcpConfig) {
+      await fs.writeFile(
+        path.join(agentConfigDir, "mcp.json"),
+        `${JSON.stringify(input.mcpConfig, null, 2)}\n`,
+        "utf8",
+      );
+    }
   } catch (err) {
     // Never leak the temp dir when the write fails (e.g. disk-full): the
     // caller only receives the cleanup handle on success.
@@ -186,7 +197,10 @@ export async function preparePiRuntimeConfig(input: {
     },
     notes: [
       ...warnings,
-      `Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed models.json: ${Object.keys(providers).join(", ")}.`,
+      ...(providers
+        ? [`Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed models.json: ${Object.keys(providers).join(", ")}.`]
+        : []),
+      ...(input.mcpConfig ? ["Wrote a managed mcp.json (no credentials; servers point at the sandbox bridge relay)."] : []),
     ],
     agentConfigDir,
     cleanup: async () => {

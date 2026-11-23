@@ -12,6 +12,30 @@ import type { SandboxCallbackBridgeRoutePolicy, SandboxCallbackBridgeRouteRule }
 
 export const SANDBOX_BRIDGE_RELAY_PATH_PREFIX = "/paperclip-relay/";
 
+/**
+ * A stable, unique, lowercase key for one runtime MCP server (used in relay paths and client configs).
+ * Collisions get a connection-id suffix, then a counter. `usedKeys` is updated.
+ */
+export function sanitizeMcpServerKey(rawName: string, connectionId: string, usedKeys: Set<string>): string {
+  const clean = (value: string) => value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const base = clean(rawName) || "mcp_server";
+  let key = base;
+  if (usedKeys.has(key)) {
+    const suffix = clean(connectionId || "").slice(0, 16);
+    if (suffix.length > 0) key = `${base}_${suffix}`;
+  }
+  const stem = key;
+  let counter = 2;
+  while (usedKeys.has(key)) key = `${stem}_${counter++}`;
+  usedKeys.add(key);
+  return key;
+}
+
+/** The in-sandbox bridge path that relays to one runtime MCP server key. Adapter-neutral. */
+export function sandboxBridgeMcpRelayPath(serverKey: string): string {
+  return `${SANDBOX_BRIDGE_RELAY_PATH_PREFIX}mcp/${serverKey}`;
+}
+
 /** MCP session headers a relay forwards. Added to the header allowlists only when relay routes exist. */
 export const SANDBOX_BRIDGE_RELAY_EXTRA_HEADERS = ["mcp-protocol-version", "mcp-session-id"] as const;
 

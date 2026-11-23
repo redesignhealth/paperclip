@@ -197,6 +197,17 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   # seconds and gets the task killed by the container health check. Keep the major >= the RDS server's (17).
   && pg_dump --version | grep -q '^pg_dump (PostgreSQL) 17\.'
 
+# TECH-9794: pi-mcp-adapter gives Pi (0.87.1, no native MCP) its MCP client. Pinned by exact version and
+# integrity in the lockfile; `npm ci` fails on any integrity mismatch. Installed here because the sandbox pod
+# root is read-only with limited egress, so nothing is fetched at run time. --ignore-scripts: no install hooks;
+# the native keyring module is only loaded for bearerTokenStore, which Paperclip never configures.
+COPY docker/pi-mcp-adapter/package.json docker/pi-mcp-adapter/package-lock.json /opt/pi-mcp-adapter/
+RUN cd /opt/pi-mcp-adapter \
+  && npm ci --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund \
+  && test "$(node -p "require('/opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/package.json').version")" = "7.0.1" \
+  && test -f /opt/pi-mcp-adapter/node_modules/pi-mcp-adapter/index.ts \
+  && chmod -R a+rX /opt/pi-mcp-adapter
+
 # TECH-9787: build tools for sandbox build pods (the root fs is read-only and HOME is wiped between
 # turns, so nothing can be installed or downloaded at runtime).
 # uv: official multi-arch image, pinned by tag and index digest; keep >= the services' required-version.
