@@ -2710,6 +2710,13 @@
       "when": 1794422726364,
       "tag": "0388_steady_mikhail_rasputin",
       "breakpoints": true
+    },
+    {
+      "idx": 389,
+      "version": "7",
+      "when": 1795450988381,
+      "tag": "0389_brainy_exodus",
+      "breakpoints": true
     }
   ]
 }

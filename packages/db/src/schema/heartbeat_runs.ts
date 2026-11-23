@@ -205,5 +205,16 @@ export const heartbeatRuns = pgTable(
         nullif(${table.contextSnapshot}->>'taskKey', '')
       )`)
       .concurrently(),
+    // Serves the GitHub response-comment reconciler's per-issue "latest run" and
+    // "newer run" lookups, which match this exact coalesce expression (TECH-9902).
+    companyAgentNativeIssueCreatedIdx: index("heartbeat_runs_company_agent_native_issue_created_idx")
+      .on(
+        table.companyId,
+        table.agentId,
+        sql`coalesce(${table.nativeIssueId}::text, ${table.contextSnapshot}->>'issueId')`,
+        table.createdAt.desc(),
+        table.id.desc(),
+      )
+      .concurrently(),
   }),
 );

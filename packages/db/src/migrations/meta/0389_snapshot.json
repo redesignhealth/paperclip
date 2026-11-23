@@ -1,6 +1,6 @@
 {
-  "id": "8718c995-14c2-4987-b704-658fcdfff95d",
-  "prevId": "31a9f095-2778-40e1-a313-33731ac2f2d5",
+  "id": "f26b5cda-b7fa-421b-912c-6edaf4513adf",
+  "prevId": "d1e791b3-f054-4641-8f3c-889052b0da20",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -15677,6 +15677,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "deletion_started_at": {
+          "name": "deletion_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -16087,6 +16093,24 @@
           "primaryKey": false,
           "notNull": false
         },
+        "scope_migration_completed_at": {
+          "name": "scope_migration_completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "scope_migration_mode": {
+          "name": "scope_migration_mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "scope_migration_agent_scope_observed_at": {
+          "name": "scope_migration_agent_scope_observed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "operation": {
           "name": "operation",
           "type": "text",
@@ -16365,6 +16389,342 @@
         "company_memory_databases_port_check": {
           "name": "company_memory_databases_port_check",
           "value": "\"company_memory_databases\".\"port\" >= 1 and \"company_memory_databases\".\"port\" <= 65535"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.company_memory_upgrades": {
+      "name": "company_memory_upgrades",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'sweeping'"
+        },
+        "recover_to_state": {
+          "name": "recover_to_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "converter_id": {
+          "name": "converter_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "converter_version": {
+          "name": "converter_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "collection_name": {
+          "name": "collection_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "embedding_model": {
+          "name": "embedding_model",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "embedding_dimensions": {
+          "name": "embedding_dimensions",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sweep_count": {
+          "name": "sweep_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "source_seen_count": {
+          "name": "source_seen_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "published_count": {
+          "name": "published_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "dropped_noise_count": {
+          "name": "dropped_noise_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "dropped_sensitive_count": {
+          "name": "dropped_sensitive_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "deduplicated_count": {
+          "name": "deduplicated_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "unroutable_count": {
+          "name": "unroutable_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "quarantined_count": {
+          "name": "quarantined_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "superseded_count": {
+          "name": "superseded_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "source_deleted_count": {
+          "name": "source_deleted_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "llm_input_tokens": {
+          "name": "llm_input_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "llm_output_tokens": {
+          "name": "llm_output_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "embedding_tokens": {
+          "name": "embedding_tokens",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "estimated_cost_nanodollars": {
+          "name": "estimated_cost_nanodollars",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "marked_at": {
+          "name": "marked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "drain_probe_streak_started_at": {
+          "name": "drain_probe_streak_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "drain_confirmed_at": {
+          "name": "drain_confirmed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "verified_at": {
+          "name": "verified_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "pruned_at": {
+          "name": "pruned_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "rolled_back_at": {
+          "name": "rolled_back_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_error": {
+          "name": "last_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "operator_label": {
+          "name": "operator_label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_token": {
+          "name": "lease_token",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_owner": {
+          "name": "lease_owner",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_acquired_at": {
+          "name": "lease_acquired_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "company_memory_upgrades_active_uq": {
+          "name": "company_memory_upgrades_active_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"company_memory_upgrades\".\"state\" not in ('completed', 'aborted', 'rolled_back')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "company_memory_upgrades_company_idx": {
+          "name": "company_memory_upgrades_company_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "company_memory_upgrades_lease_idx": {
+          "name": "company_memory_upgrades_lease_idx",
+          "columns": [
+            {
+              "expression": "lease_expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"company_memory_upgrades\".\"state\" not in ('completed', 'aborted', 'rolled_back')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "company_memory_upgrades_company_id_companies_id_fk": {
+          "name": "company_memory_upgrades_company_id_companies_id_fk",
+          "tableFrom": "company_memory_upgrades",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "company_memory_upgrades_state_check": {
+          "name": "company_memory_upgrades_state_check",
+          "value": "\"company_memory_upgrades\".\"state\" in ('sweeping', 'flipping', 'draining', 'verified', 'pruning', 'completed', 'rolled_back', 'aborted', 'needs_recovery')"
+        },
+        "company_memory_upgrades_recover_to_state_check": {
+          "name": "company_memory_upgrades_recover_to_state_check",
+          "value": "\"company_memory_upgrades\".\"recover_to_state\" is null or \"company_memory_upgrades\".\"recover_to_state\" in ('sweeping', 'flipping', 'draining', 'verified', 'pruning')"
         }
       },
       "isRLSEnabled": false
@@ -34061,6 +34421,45 @@
           "concurrently": true,
           "method": "btree",
           "with": {}
+        },
+        "heartbeat_runs_company_agent_native_issue_created_idx": {
+          "name": "heartbeat_runs_company_agent_native_issue_created_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "agent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "coalesce(\"native_issue_id\"::text, \"context_snapshot\"->>'issueId')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": true,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -35369,6 +35768,130 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.instance_slack_configuration_credentials": {
+      "name": "instance_slack_configuration_credentials",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "workspace_id": {
+          "name": "workspace_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "slack_user_id": {
+          "name": "slack_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "saved_by_user_id": {
+          "name": "saved_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'active'"
+        },
+        "access_material": {
+          "name": "access_material",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "refresh_material": {
+          "name": "refresh_material",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "access_expires_at": {
+          "name": "access_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "chain_generation": {
+          "name": "chain_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "rotation_started_at": {
+          "name": "rotation_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_rotated_at": {
+          "name": "last_rotated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "instance_slack_configuration_credentials_workspace_idx": {
+          "name": "instance_slack_configuration_credentials_workspace_idx",
+          "columns": [
+            {
+              "expression": "workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "instance_slack_configuration_credentials_status_check": {
+          "name": "instance_slack_configuration_credentials_status_check",
+          "value": "\"instance_slack_configuration_credentials\".\"status\" in ('active', 'rotating', 'reauthorize', 'revoked')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.instance_user_roles": {
@@ -59033,6 +59556,116 @@
         "upstream_sync_events_operation_check": {
           "name": "upstream_sync_events_operation_check",
           "value": "\"upstream_sync_events\".\"operation\" in ('insert', 'update', 'delete')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.upstream_sync_integration_repoints": {
+      "name": "upstream_sync_integration_repoints",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigserial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "log_id": {
+          "name": "log_id",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "upstream_sha": {
+          "name": "upstream_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "old_integration_sha": {
+          "name": "old_integration_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "new_integration_sha": {
+          "name": "new_integration_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor": {
+          "name": "actor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "run_ref": {
+          "name": "run_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "txid": {
+          "name": "txid",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "txid_current()"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "upstream_sync_repoints_log_idx": {
+          "name": "upstream_sync_repoints_log_idx",
+          "columns": [
+            {
+              "expression": "log_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "upstream_sync_repoints_sha_check": {
+          "name": "upstream_sync_repoints_sha_check",
+          "value": "\"upstream_sync_integration_repoints\".\"old_integration_sha\" ~ '^[0-9a-f]{40}$' and \"upstream_sync_integration_repoints\".\"new_integration_sha\" ~ '^[0-9a-f]{40}$'"
+        },
+        "upstream_sync_repoints_changed_check": {
+          "name": "upstream_sync_repoints_changed_check",
+          "value": "\"upstream_sync_integration_repoints\".\"old_integration_sha\" <> \"upstream_sync_integration_repoints\".\"new_integration_sha\""
+        },
+        "upstream_sync_repoints_reason_check": {
+          "name": "upstream_sync_repoints_reason_check",
+          "value": "btrim(\"upstream_sync_integration_repoints\".\"reason\") <> ''"
         }
       },
       "isRLSEnabled": false
