@@ -57,7 +57,7 @@ export function packageRelayAnyOptedIn(envConfig: Record<string, unknown> | null
 export function buildPackageRelayEnv(
   envConfig: Record<string, unknown> | null | undefined,
   bridgeEnv: Record<string, string> | null | undefined,
-  githubRepos: string | undefined = undefined,
+  githubRepos?: string,
 ): Record<string, string> {
   const gitea = packageRelayOptedIn(envConfig, "gitea");
   const github = packageRelayOptedIn(envConfig, "github");
@@ -85,12 +85,15 @@ export function buildPackageRelayEnv(
     // GitHub URL is rewritten. The bridge token is in the key name (git config key), which the log redaction masks by
     // name. The value is a plain GitHub URL.
     const repos = (githubRepos ?? "").split(",").map((r) => r.trim()).filter(Boolean);
-    if (repos.length > 0 && repos.every((r) => GITHUB_REPO_RE.test(r) && !r.endsWith(".git"))) {
-      repos.forEach((repo, index) => {
-        out[`GIT_CONFIG_KEY_${index}`] = `url.${base.protocol}//paperclip:${token}@${base.host}${PACKAGE_RELAY_GITHUB_PATH}${repo}.insteadOf`;
-        out[`GIT_CONFIG_VALUE_${index}`] = `https://github.com/${repo}`;
+    if (repos.length > 0 && repos.every((r) => GITHUB_REPO_RE.test(r) && !r.endsWith(".git") && !r.endsWith("/.") && !r.endsWith("/.."))) {
+      // insteadOf is a plain prefix match, so each rule ends at a separator (`<repo>.git`, `<repo>/`): allowlisting
+      // `acme/repo` must not also capture `acme/repo-tools`. The match is case-sensitive.
+      const rules = repos.flatMap((repo) => [`${repo}.git`, `${repo}/`]);
+      rules.forEach((rule, index) => {
+        out[`GIT_CONFIG_KEY_${index}`] = `url.${base.protocol}//paperclip:${token}@${base.host}${PACKAGE_RELAY_GITHUB_PATH}${rule}.insteadOf`;
+        out[`GIT_CONFIG_VALUE_${index}`] = `https://github.com/${rule}`;
       });
-      out.GIT_CONFIG_COUNT = String(repos.length);
+      out.GIT_CONFIG_COUNT = String(rules.length);
     }
   }
   return out;

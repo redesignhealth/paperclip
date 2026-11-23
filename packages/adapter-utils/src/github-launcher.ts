@@ -32,6 +32,24 @@ async function main() {
     configReady = true;
     process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
   } catch { diagnostic('configuration_directory_unavailable'); }
+  // Package relay (TECH-9786): the git relay's own insteadOf rules are the one GIT_CONFIG_* exception. They are kept only
+  // when they point at this run's bridge with this run's bridge token and rewrite a github.com URL, so an agent cannot
+  // use the exception to redirect git elsewhere. They are re-appended after everything else is set.
+  const relayRules = [];
+  try {
+    const apiUrl = env.PAPERCLIP_API_URL ? new URL(env.PAPERCLIP_API_URL) : null;
+    if (apiUrl && env.PAPERCLIP_API_KEY) {
+      const prefix = 'url.' + apiUrl.protocol + '//paperclip:' + env.PAPERCLIP_API_KEY + '@' + apiUrl.host + '/api/package-relay/github/';
+      const count = Number(env.GIT_CONFIG_COUNT);
+      if (Number.isInteger(count) && count > 0 && count <= 32) {
+        for (let i = 0; i < count; i++) {
+          const k = env['GIT_CONFIG_KEY_' + i], v = env['GIT_CONFIG_VALUE_' + i];
+          if (typeof k === 'string' && typeof v === 'string' && k.startsWith(prefix) && k.endsWith('.insteadOf')
+            && /^https:\/\/github\.com\/[A-Za-z0-9._\/-]+$/.test(v)) relayRules.push([k, v]);
+        }
+      }
+    }
+  } catch {}
   {
     for (const key of Object.keys(env)) {
       if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];
@@ -104,6 +122,13 @@ async function main() {
       }
     } else { diagnostic('capability_missing'); }
     } catch { diagnostic('broker_transport_unavailable'); }
+  }
+  if (relayRules.length > 0) {
+    const start = Number(env.GIT_CONFIG_COUNT);
+    if (Number.isInteger(start) && start >= 0) {
+      relayRules.forEach(([k, v], i) => { env['GIT_CONFIG_KEY_' + (start + i)] = k; env['GIT_CONFIG_VALUE_' + (start + i)] = v; });
+      env.GIT_CONFIG_COUNT = String(start + relayRules.length);
+    }
   }
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
