@@ -17,6 +17,20 @@ const GITHUB_CREDENTIALS_TTL_SECONDS = 30 * 24 * 60 * 60;
 /** Ceiling for credentials that leave the host (sandbox pods, remote targets). */
 export const REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+/** Time after the adapter's own timeout for the run to wind down (grace kill, restore, final callbacks). */
+export const GITHUB_BROKER_RUN_WINDDOWN_SECONDS = 600;
+
+/**
+ * Lifetime cap for the GitHub broker token (TECH-10174). A token that leaves the host (sandbox pod, SSH host) is only useful
+ * while the run is: cap it at the run's wall-clock timeout plus a wind-down margin, never above the 7 day remote ceiling.
+ * A run with no adapter timeout keeps the ceiling. Local runs have no cap here (undefined).
+ */
+export function githubBrokerMaxTtlSeconds(input: { remote: boolean; runTimeoutSec: number }): number | undefined {
+  if (!input.remote) return undefined;
+  if (!(Number.isFinite(input.runTimeoutSec) && input.runTimeoutSec > 0)) return REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS;
+  return Math.min(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, Math.ceil(input.runTimeoutSec) + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
+}
+
 function secret() {
   return process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim()
     || process.env.BETTER_AUTH_SECRET?.trim()

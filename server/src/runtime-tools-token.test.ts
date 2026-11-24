@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createRuntimeToolsToken, REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, verifyRuntimeToolsToken } from "./runtime-tools-token.js";
+import { createRuntimeToolsToken, GITHUB_BROKER_RUN_WINDDOWN_SECONDS, githubBrokerMaxTtlSeconds, REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, verifyRuntimeToolsToken } from "./runtime-tools-token.js";
 
 describe("runtime connection tools token", () => {
   afterEach(() => {
@@ -58,6 +58,16 @@ describe("runtime connection tools token", () => {
     expect(shorter.exp - now).toBe(600);
     const intents = verifyRuntimeToolsToken(createRuntimeToolsToken({ ...base, scope: undefined, maxTtlSeconds: 7 * 86400 })!.token)!;
     expect(intents.exp - now).toBe(3600);
+  });
+
+  it("caps the broker token at the run timeout plus a wind-down margin for remote runs only (TECH-10174)", () => {
+    expect(githubBrokerMaxTtlSeconds({ remote: false, runTimeoutSec: 3600 })).toBeUndefined();
+    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 14_400 })).toBe(14_400 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
+    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 0.5 })).toBe(1 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
+    // No adapter timeout, or a longer one than the ceiling, keeps the 7 day ceiling.
+    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 0 })).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: Number.NaN })).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 30 * 86400 })).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
   });
 
   it("rejects an invalid cap instead of failing open, and floors a fractional one", () => {
