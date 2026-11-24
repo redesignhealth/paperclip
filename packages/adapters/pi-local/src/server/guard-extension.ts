@@ -160,14 +160,28 @@ export function parseShell(src) {
   return { commands, nested };
 }
 
+// Git finds the repository from any subdirectory, so look for .git in the directory and each parent.
+function findGitEntry(cwd) {
+  let dir = path.resolve(cwd);
+  for (let depth = 0; depth < 64; depth++) {
+    const candidate = path.join(dir, ".git");
+    try { return { dir, gitPath: candidate, stat: fs.statSync(candidate) }; } catch { /* keep walking up */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
 function readCurrentBranch(cwd) {
   try {
-    let gitDir = path.join(cwd, ".git");
-    const stat = fs.statSync(gitDir);
-    if (stat.isFile()) {
+    const found = findGitEntry(cwd);
+    if (!found) return null;
+    let gitDir = found.gitPath;
+    if (found.stat.isFile()) {
       const pointer = /^gitdir:\s*(.+)$/m.exec(fs.readFileSync(gitDir, "utf8"));
       if (!pointer) return null;
-      gitDir = path.resolve(cwd, pointer[1].trim());
+      gitDir = path.resolve(found.dir, pointer[1].trim());
     }
     const head = fs.readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
     const ref = /^ref:\s*refs\/heads\/(.+)$/.exec(head);
