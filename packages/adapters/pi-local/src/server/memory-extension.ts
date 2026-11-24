@@ -50,8 +50,11 @@ const MAX_TOP_K = 20;
 const MAX_QUERY_CHARS = 6000;
 const MAX_TASK_QUERY_CHARS = 1500;
 const MAX_CONTEXT_CHARS = 4000;
-const MAX_TASK_CHARS = 600;
-const MAX_OUTCOME_CHARS = 3000;
+// rh-memory-mcp rejects memory_add text over 2000 characters (RH_MEMORY_MAX_TEXT_CHARS), so a capture is held well
+// under that: 17 characters of framing + 500 task + 1300 outcome, then a final hard clamp.
+const MAX_TASK_CHARS = 500;
+const MAX_OUTCOME_CHARS = 1300;
+const MAX_CAPTURE_CHARS = 1900;
 const MIN_OUTCOME_CHARS = 40;
 const RECALL_TIMEOUT_CAP_S = 8;
 
@@ -289,7 +292,7 @@ export function buildCaptureText(messages) {
   const outcome = cleanForCapture(textOf(assistant.content)).slice(-MAX_OUTCOME_CHARS);
   if (outcome.length < MIN_OUTCOME_CHARS) return null;
   const task = user ? cleanForCapture(textOf(user.content)).slice(0, MAX_TASK_CHARS) : "";
-  return (task ? "Task: " + task + "\n\n" : "") + "Outcome: " + outcome;
+  return ((task ? "Task: " + task + "\n\n" : "") + "Outcome: " + outcome).slice(0, MAX_CAPTURE_CHARS);
 }
 
 function toolText(data) {
