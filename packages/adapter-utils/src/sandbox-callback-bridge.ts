@@ -300,17 +300,60 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/approvals$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/routines$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills$/ },
+  // Note: GET .../skills/categories is matched incidentally by the [^/]+ rule below.
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/files$/ },
-  // Agent-authored company skills. The server still enforces the company boundary,
-  // company skill policy, low-trust denial, editable/read-only check, and
-  // task-bound-run on create. Deliberately NOT allowed from the sandbox: import,
-  // install-catalog, browse-project/scan-projects, install-update, reset, rename,
-  // fork, versions, DELETE skill or skill file, and PATCH of the skill resource
-  // (which can flip sharingScope to public_link).
+  // Agent-authored company skills (TECH-10534). The server still enforces the
+  // company boundary, company skill policy, low-trust denial, editable/read-only
+  // check, and task-bound-run on create.
   { method: "POST", path: /^\/api\/companies\/[^/]+\/skills$/ },
   { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/files$/ },
   { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/audit$/ },
+
+  // Low-risk company skill routes (TECH-10594): reads, versioning, catalog install,
+  // update, reset, test inputs/templates, test-run inspection/management, stars, and comments.
+  // Deliberately NOT allowed from the sandbox: import, skill-sources mutations,
+  // browse-project/scan-projects, rename (pending agent reassignment guard in PR-3),
+  // fork, test-run creation (pending task-bound-run guard in PR-3), DELETE skill
+  // or skill file, PATCH of the skill resource (which can flip sharingScope to public_link),
+  // and skill-policy mutations.
+
+  // Company skills reads and discovery
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/fork-precheck$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/versions$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/versions\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/update-status$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-sources$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-sources\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-policy$/ },
+
+  // Company skills versioning, catalog installation, update, and reset
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/versions$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/install-catalog$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/install-update$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/reset$/ },
+
+  // Company skills test inputs, templates, and run inspection/management
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-inputs$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-inputs$/ },
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-inputs\/[^/]+$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-inputs\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-test-run-templates$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skill-test-run-templates$/ },
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skill-test-run-templates\/[^/]+$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skill-test-run-templates\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-runs$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-runs\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-runs\/[^/]+\/cancel$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-runs\/[^/]+$/ },
+
+  // Company skills social actions: stars and comments
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/star$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/star$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments$/ },
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments\/[^/]+$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments\/[^/]+$/ },
   { method: "GET", path: /^\/api\/projects\/[^/]+$/ },
   { method: "GET", path: /^\/api\/goals\/[^/]+$/ },
 
