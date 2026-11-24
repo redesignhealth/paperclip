@@ -198,7 +198,7 @@ The owner it is registered to is an ACTIVE `owner` membership of that company wh
 
 ### Reviewed allowlist (mandatory)
 
-The board catalog lists every board tool regardless of the token's scope. So discovery runs once, then only an exact allowlist is made usable: version 2 is `comms_whoami`, `comms_list_agents`, `comms_lookup_agent_by_email`, `comms_list_conversations`, `comms_get_conversation`, `comms_inbox`, `comms_get_hold_status`, `comms_start_conversation`, `comms_post_message`, `comms_accept`, `comms_decline_invite`, `comms_invite`, `comms_rename_conversation`, `comms_leave`, `comms_extend_conversation`, `proposals_submit`, `proposals_get`. Those become ACTIVE with `reviewedAt`; every other discovered action is DISABLED. This deliberately excludes `comms_register` (identity fork hazard), the admin tools (`comms_admin_register`, `comms_deregister_agent`, `comms_set_agent_shared`), the other `proposals_*` tools (`proposals_list_pending`, `proposals_list_history`, `proposals_withdraw`), and permanent or privileged conversation operations (`comms_archive_conversation`, `comms_reopen_conversation`). The template's default-deny `app:<id>` profile includes the allowlisted actions only. If discovery finds none of them, the template waits as `catalog_unreviewed`. New tools found later are quarantined by the existing refresh; they are never enabled automatically.
+The board catalog lists every board tool regardless of the token's scope. So discovery runs once, then only an exact allowlist is made usable: version 3 is `comms_whoami`, `comms_list_agents`, `comms_lookup_agent_by_email`, `comms_list_conversations`, `comms_get_conversation`, `comms_inbox`, `comms_get_hold_status`, `comms_start_conversation`, `comms_post_message`, `comms_accept`, `comms_decline_invite`, `comms_invite`, `comms_rename_conversation`, `comms_leave`, `comms_extend_conversation`, `proposals_submit`, `proposals_get`, `comms_wake_rules_list`, `comms_wake_rule_add`, `comms_wake_rule_update`, `comms_wake_sessions_list`, `comms_wake_session_close` (version 3 adds the five wake-rule tools; the first two need `comms:read`, the other three `comms:write`, both already on every agent token). Those become ACTIVE with `reviewedAt`; every other discovered action is DISABLED. This deliberately excludes `comms_register` (identity fork hazard), the admin tools (`comms_admin_register`, `comms_deregister_agent`, `comms_set_agent_shared`, `comms_admin_wake_target_set`, `comms_admin_wake_target_remove`), the other `proposals_*` tools (`proposals_list_pending`, `proposals_list_history`, `proposals_withdraw`), and permanent or privileged conversation operations (`comms_archive_conversation`, `comms_reopen_conversation`). The template's default-deny `app:<id>` profile includes the allowlisted actions only. If discovery finds none of them, the template waits as `catalog_unreviewed`. New tools found later are quarantined by the existing refresh; they are never enabled automatically.
 
 ### No company-wide access, ever
 
@@ -510,7 +510,15 @@ reports `already_current`. Outcomes: `would_widen` (census), `widened`, `already
 allowlist version and tool names only).
 
 **Operator notes.** Run the census first and page it with `limit`/`afterId` as for the other routes; run the real pass as its
-own sequence starting with no `afterId`. This does not rotate tokens: agents whose token predates `comms:proposals:write` still
+own sequence starting with no `afterId`. **Moving existing agents to a new allowlist version (for example v2 to v3).** Order matters: (1) deploy; the company
+template re-runs discovery and review for the new version on the setup sweep (no new mint) and only then has the new tools
+active; (2) run this resync per company, dry run first (`{}` or `{"dryRun": true}`), check that every ready agent reports
+`would_widen` or `already_current` and that `tools` lists exactly the new tools, then `{"dryRun": false, "confirm":
+"resync-comms-board-catalogs"}`, paging with `afterId` until `nextCursor` is null. One call covers one company (25 agents per
+batch); repeat for each company. A run against a company whose template has not yet reached the new version reports
+`skipped_template_unavailable`. Allowlist v3 (the wake-rule tools) needs no token change.
+
+This does not rotate tokens: agents whose token predates `comms:proposals:write` still
 need the credential rescope above before `proposals_submit` succeeds at the board.
 
 ## Company visibility backfill and comms-board `is_shared` sync (existing companies and agents)

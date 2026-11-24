@@ -659,12 +659,12 @@ describe("arcana-brain spec: default ON (TECH-7253)", () => {
 });
 
 describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)", () => {
-  it("the comms entry bootstraps its template with exactly the 17 reviewed tools (version 2)", () => {
+  it("the comms entry bootstraps its template with exactly the 22 reviewed tools (version 3)", () => {
     const comms = DEFAULT_MCP_SPEC.find((entry) => entry.key === "comms-board")!;
     expect(comms.templateBootstrap).toBe(true);
     expect(comms.defaultEnabled).toBe(false);
     expect(comms.reviewedTools).toEqual({
-      version: 2,
+      version: 3,
       allow: [
         "comms_whoami",
         "comms_list_agents",
@@ -683,6 +683,11 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
         "comms_extend_conversation",
         "proposals_submit",
         "proposals_get",
+        "comms_wake_rules_list",
+        "comms_wake_rule_add",
+        "comms_wake_rule_update",
+        "comms_wake_sessions_list",
+        "comms_wake_session_close",
       ],
     });
     expect(Object.isFrozen(COMMS_BOARD_REVIEWED_TOOLS)).toBe(true);
@@ -693,6 +698,8 @@ describe("comms board spec: template bootstrap + reviewed allowlist (TECH-7271)"
       "comms_set_agent_shared",
       "comms_archive_conversation",
       "comms_reopen_conversation",
+      "comms_admin_wake_target_set",
+      "comms_admin_wake_target_remove",
       "proposals_list_pending",
       "proposals_list_history",
       "proposals_withdraw",

@@ -126,7 +126,7 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
     { name: "comms_admin_register", status: "disabled" as const },
   ];
 
-  async function seedCommsTemplate(companyId: string) {
+  async function seedCommsTemplate(companyId: string, tools: ReadonlyArray<{ name: string; status: "active" | "disabled" }> = TOOLS) {
     const application = await db
       .insert(toolApplications)
       .values({ companyId, applicationKey: `app-${randomUUID()}`, name: `app comms ${randomUUID().slice(0, 4)}`, type: "mcp_http", status: "active" })
@@ -160,7 +160,7 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
       .insert(toolProfiles)
       .values({ companyId, profileKey: `app:${connection.id}`, name: "comms access", defaultAction: "deny", metadata: { source: "app_gallery_finish", connectionId: connection.id } })
       .returning();
-    for (const tool of TOOLS) {
+    for (const tool of tools) {
       const [entry] = await db
         .insert(toolCatalogEntries)
         .values({ companyId, applicationId: application.id, connectionId: connection.id, name: tool.name, toolName: tool.name, versionHash: "v1", status: tool.status })
@@ -200,12 +200,14 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
   const rowOf = async (agentId: string) => (await db.select().from(agents).where(eq(agents.id, agentId)))[0]!;
   const entryOf = async (agentId: string) => readDefaultMcpState((await rowOf(agentId)).metadata)!.entries["comms-board"]!;
   const PROPOSALS = ["proposals_get", "proposals_submit"];
+  const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+  const ADMIN_WAKE = ["comms_admin_wake_target_remove", "comms_admin_wake_target_set"];
 
   /** Simulates a clone made while the allowlist was v1: proposals_* disabled and outside the clone's profile. */
-  async function makeV1Clone(agentId: string) {
+  async function makeV1Clone(agentId: string, names: readonly string[] = PROPOSALS) {
     const connectionId = (await entryOf(agentId)).binding!.connectionId!;
     const rows = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connectionId));
-    const ids = rows.filter((r) => PROPOSALS.includes(r.toolName)).map((r) => r.id);
+    const ids = rows.filter((r) => names.includes(r.toolName)).map((r) => r.id);
     await db.update(toolCatalogEntries).set({ status: "disabled" }).where(inArray(toolCatalogEntries.id, ids));
     await db.delete(toolProfileEntries).where(inArray(toolProfileEntries.catalogEntryId, ids));
     return connectionId;
@@ -423,6 +425,36 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
     expect(report.dryRun).toBe(true);
     expect(outcomeOf(report, agent.id)).toEqual({ agentId: agent.id, companyId, result: "would_widen", tools: PROPOSALS });
     expect(JSON.stringify([await cloneStatus(connectionId), await cloneIncludes(connectionId)])).toBe(before);
+  });
+
+  it("moves an agent cloned at allowlist v2 to v3: the five wake tools become active, the two admin wake tools stay disabled (TECH-9887)", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const template = await seedCommsTemplate(companyId, [
+      ...TOOLS,
+      ...WAKE.map((name) => ({ name, status: "active" as const })),
+      ...ADMIN_WAKE.map((name) => ({ name, status: "disabled" as const })),
+    ]);
+    const agent = await readyAgent(companyId, ownerId);
+    // A v2 clone has the proposals tools but never saw the wake tools (not in its catalog profile, disabled).
+    const connectionId = await makeV1Clone(agent.id, [...WAKE, ...ADMIN_WAKE]);
+    expect(template.id).not.toBe(connectionId);
+    expect(await cloneStatus(connectionId)).toMatchObject({ comms_wake_rule_add: "disabled", comms_wake_sessions_list: "disabled", proposals_submit: "active" });
+
+    const dry = await resyncCommsCatalogs(db, { companyId });
+    expect(dry.dryRun).toBe(true);
+    expect(outcomeOf(dry, agent.id)).toEqual({ agentId: agent.id, companyId, result: "would_widen", tools: WAKE });
+    expect(await cloneStatus(connectionId)).toMatchObject({ comms_wake_rule_add: "disabled" });
+
+    const report = await run(companyId);
+    expect(outcomeOf(report, agent.id)).toMatchObject({ result: "widened", tools: WAKE });
+    const status = await cloneStatus(connectionId);
+    for (const name of WAKE) expect(status[name]).toBe("active");
+    for (const name of ADMIN_WAKE) expect(status[name]).not.toBe("active");
+    const includes = await cloneIncludes(connectionId);
+    for (const name of WAKE) expect(includes).toContain(name);
+    for (const name of ADMIN_WAKE) expect(includes).not.toContain(name);
+    expect(outcomeOf(await run(companyId), agent.id)?.result).toBe("already_current");
   });
 
   it("a real run requires the exact confirmation string", async () => {
