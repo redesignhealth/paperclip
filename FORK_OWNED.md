@@ -208,11 +208,12 @@ any new fork patch; remove one when the patch is upstreamed.
 
 - `server/src/routes/ashby-relay.ts` fixed-destination Ashby API relay for opted-in sandbox agents (TECH-9966)
 - `server/src/__tests__/ashby-relay.test.ts`
+- `packages/adapter-utils/src/ashby-relay-env.ts` opt-in bridge environment settings for the Ashby relay
+- `packages/adapter-utils/src/ashby-relay-env.test.ts`
 - `server/src/routes/model-relay.ts` model gateway relay for sandbox pods: the server adds the key, the pod never holds it (TECH-10174)
 - `server/src/__tests__/model-relay.test.ts`
 - `packages/adapter-utils/src/model-relay.ts` host-side per-run registry, route policy and base URL for the model relay
 - `packages/adapter-utils/src/model-relay.test.ts`
-- `packages/adapter-utils/src/ashby-relay-env.ts` opt-in bridge environment settings for the Ashby relay
-- `packages/adapter-utils/src/ashby-relay-env.test.ts`
+- `packages/adapters/pi-local/src/server/execute.ts` and `runtime-config.ts`: sandbox runs route the Router provider through the model relay (TECH-10174)
 - `packages/adapters/hermes/src/server/execute-sandbox.ts` Hermes sandbox launch wires Ashby relay env and scrubs stale credentials
 - `packages/adapters/hermes/src/server/execute.sandbox.test.ts`

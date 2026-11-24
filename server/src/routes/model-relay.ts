@@ -56,6 +56,8 @@ export function modelRelayRoutes(db: Db, deps: ModelRelayDeps = {}) {
     guardedRemoteHttpFetch(url, init ?? {}, {
       allowPrivateNetwork: false,
       error: (message, code) => new Error(`${code}: ${message}`),
+      // The transport default is a 30 s headers/idle limit; a model turn can be silent far longer.
+      responseTimeoutMs: MODEL_RELAY_DEADLINE_MS,
     }));
   const assertActiveRun = deps.assertActiveRun ?? (async (input: { companyId: string; agentId: string; runId: string }) => {
     const { heartbeatRuns } = await import("@paperclipai/db");
@@ -135,35 +137,56 @@ export function modelRelayRoutes(db: Db, deps: ModelRelayDeps = {}) {
         }
 
         // Provider errors (400, 429, 5xx) pass through with their status so Pi's own retry logic keeps working.
-        res.status(upstream.status);
-        for (const name of PASSED_RESPONSE_HEADERS) {
-          const value = upstream.headers.get(name);
-          if (value) res.setHeader(name, value);
-        }
+        // Status and headers are applied only once the first body read succeeds, so a failed read can still answer a clean 502.
+        const sendHead = () => {
+          res.status(upstream.status);
+          for (const name of PASSED_RESPONSE_HEADERS) {
+            const value = upstream.headers.get(name);
+            if (value) res.setHeader(name, value);
+          }
+          res.flushHeaders();
+        };
         const keyBytes = Buffer.from(entry.apiKey);
+        const holdBack = keyBytes.length - 1;
         let received = 0;
-        let carry: Buffer = Buffer.alloc(0);
+        // Bytes not yet written: the last `holdBack` bytes stay here until the next chunk proves they are not the start of a key.
+        let pending: Buffer = Buffer.alloc(0);
+        let headSent = false;
         try {
           const reader = upstream.body?.getReader();
           while (reader) {
             const { done, value } = await reader.read();
             if (done) break;
             received += value.byteLength;
-            const chunk = Buffer.from(value);
-            // A key echoed by the upstream, even one split across two chunks, is never forwarded.
-            const window = Buffer.concat([carry, chunk]);
-            if (received > MODEL_RELAY_MAX_BODY_BYTES || window.includes(keyBytes)) {
+            if (received > MODEL_RELAY_MAX_BODY_BYTES) {
+              await reader.cancel().catch(() => undefined);
+              throw new Error("model relay response too large");
+            }
+            const window = Buffer.concat([pending, Buffer.from(value)]);
+            if (window.includes(keyBytes)) {
               await reader.cancel().catch(() => undefined);
               throw new Error("model relay response refused");
             }
-            carry = window.subarray(Math.max(0, window.length - (keyBytes.length - 1)));
-            res.write(chunk);
+            if (!headSent) {
+              sendHead();
+              headSent = true;
+            }
+            const safe = Math.max(0, window.length - holdBack);
+            if (safe > 0) res.write(window.subarray(0, safe));
+            pending = window.subarray(safe);
           }
+          if (!headSent) sendHead();
+          if (pending.length > 0) res.write(pending);
           clearTimeout(timer);
           res.end();
         } catch {
           clearTimeout(timer);
-          if (!res.headersSent) return fail(res, 502, "model_relay_unavailable");
+          if (!res.headersSent) {
+            res.removeHeader("content-type");
+            res.removeHeader("cache-control");
+            res.removeHeader("retry-after");
+            return fail(res, 502, "model_relay_unavailable");
+          }
           res.destroy();
         }
       } catch (err) {

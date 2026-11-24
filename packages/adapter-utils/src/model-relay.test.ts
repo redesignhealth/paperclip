@@ -31,6 +31,11 @@ describe("model relay (TECH-10174)", () => {
     expect(() => registerModelRelay("run-d", { "../x": entry })).toThrow();
   });
 
+  it("rejects an empty or header-unsafe credential", () => {
+    expect(() => registerModelRelay("run-e", { "ramp-router": { ...entry, apiKey: "" } })).toThrow();
+    expect(() => registerModelRelay("run-e", { "ramp-router": { ...entry, apiKey: "a\nb" } })).toThrow();
+  });
+
   it("builds the in-pod base URL", () => {
     expect(modelRelayBaseUrl("http://127.0.0.1:4310/", "ramp-router")).toBe("http://127.0.0.1:4310/api/model-relay/ramp-router");
   });

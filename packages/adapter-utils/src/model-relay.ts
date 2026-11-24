@@ -58,6 +58,7 @@ export function registerModelRelay(runId: string, providers: Readonly<Record<str
   const entries = new Map<string, ModelRelayEntry>();
   for (const [name, entry] of Object.entries(providers)) {
     if (!modelRelayProviderNameOk(name)) throw new Error("Invalid model relay provider name");
+    if (!entry.apiKey || /[\r\n\0]/.test(entry.apiKey)) throw new Error("Invalid model relay credential");
     entries.set(name, { ...entry });
   }
   registry().set(runId, entries);

@@ -648,7 +648,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
         const localModelsPath = path.join(localAgentConfigDir, "models.json");
         const rewritten = pointRelayedProvidersAtBridge(await fs.readFile(localModelsPath, "utf8"), relayedProviderNames, apiUrl);
-        if (rewritten) {
+        if (!rewritten) throw new Error("The model relay provider is missing from the staged Pi config; refusing to run.");
+        {
           const written = await runAdapterExecutionTargetProcess(
             runId,
             runtimeExecutionTarget,

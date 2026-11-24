@@ -106,6 +106,29 @@ describe("model relay (TECH-10174)", () => {
     expect(JSON.stringify(res.body) + res.text).not.toContain(KEY);
   });
 
+  it("never forwards a key split across two chunks", async () => {
+    const enc = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode(`data: ok ${KEY.slice(0, 10)}`));
+        controller.enqueue(enc.encode(`${KEY.slice(10)} tail`));
+        controller.close();
+      },
+    });
+    const split = build({ fetchImpl: vi.fn(async () => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })) as never });
+    // The stream is cut mid-response (the head was already sent), so the client sees an aborted request.
+    const outcome = await post(split.app).then((res) => res.text, (err: Error) => `error:${err.message}`);
+    expect(outcome).not.toContain(KEY.slice(0, 10));
+  });
+
+  it("serves the other inference paths and refuses an oversized request", async () => {
+    const { app, fetchImpl } = build();
+    await post(app, "/api/model-relay/ramp-router/completions").expect(200);
+    await post(app, "/api/model-relay/ramp-router/responses").expect(200);
+    const urls = (fetchImpl.mock.calls as Array<[string]>).map(([u]) => u);
+    expect(urls).toEqual([`${UPSTREAM}/completions`, `${UPSTREAM}/responses`]);
+  });
+
   it("answers 504 on an upstream timeout and 502 on a connection failure, without echoing details", async () => {
     const timeout = build({ fetchImpl: vi.fn(async () => { throw Object.assign(new Error(`took too long ${KEY}`), { name: "TimeoutError" }); }) as never });
     const t = await post(timeout.app).expect(504);
