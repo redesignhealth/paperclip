@@ -3146,6 +3146,9 @@ function readBridgeToken(req) {
 function writeJsonResponse(res, status, body) {
   res.statusCode = status;
   res.setHeader("content-type", "application/json");
+  // git (libcurl) only retries with the credentials in a remote URL after a 401 that names a scheme, and otherwise
+  // fails with "Authentication failed". uv and other clients send Basic up front and are unaffected.
+  if (status === 401) res.setHeader("www-authenticate", 'Basic realm="paperclip"');
   res.end(JSON.stringify(body));
 }
 

@@ -302,6 +302,8 @@ describe("sandbox callback bridge", () => {
       },
     });
     expect(unauthorizedResponse.status).toBe(401);
+    // git only retries with URL credentials after a 401 that names a scheme.
+    expect(unauthorizedResponse.headers.get("www-authenticate")).toMatch(/^Basic /);
     await expect(unauthorizedResponse.json()).resolves.toMatchObject({
       error: "Invalid bridge token.",
     });
