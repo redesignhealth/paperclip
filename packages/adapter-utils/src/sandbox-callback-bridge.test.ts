@@ -4238,13 +4238,6 @@ describe("company skill authoring routes in the bridge allowlist (TECH-10534)", 
 
   const denied: Array<[string, string]> = [
     ["POST", "/api/companies/c1/skills/import"],
-    ["POST", "/api/companies/c1/skills/scan-projects"],
-    ["POST", "/api/companies/c1/skills/browse-project"],
-    ["POST", "/api/companies/c1/skills/s1/fork"],
-    ["POST", "/api/companies/c1/skills/s1/rename"],
-    ["DELETE", "/api/companies/c1/skills/s1"],
-    ["DELETE", "/api/companies/c1/skills/s1/files"],
-    ["PATCH", "/api/companies/c1/skills/s1"],
     ["PUT", "/api/companies/c1/skills/s1/files"],
     ["POST", "/api/companies/c1/skills/"],
     ["POST", "/api/companies/c1/skills/extra/deep"],
@@ -4309,14 +4302,6 @@ describe("low-risk company skill routes in the bridge allowlist (TECH-10594)", (
   const denied: Array<[string, string]> = [
     // Still blocked routes
     ["POST", "/api/companies/c1/skills/import"],
-    ["POST", "/api/companies/c1/skills/scan-projects"],
-    ["POST", "/api/companies/c1/skills/browse-project"],
-    ["POST", "/api/companies/c1/skills/s1/fork"],
-    ["POST", "/api/companies/c1/skills/s1/rename"],
-    ["DELETE", "/api/companies/c1/skills/s1"],
-    ["DELETE", "/api/companies/c1/skills/s1/files"],
-    ["PATCH", "/api/companies/c1/skills/s1"],
-    ["POST", "/api/companies/c1/skills/s1/test-runs"],
     ["POST", "/api/companies/c1/skill-sources"],
     ["PATCH", "/api/companies/c1/skill-sources/src-1"],
     ["DELETE", "/api/companies/c1/skill-sources/src-1"],
@@ -4464,6 +4449,70 @@ describe("routine management routes in the bridge allowlist (TECH-10594)", () =>
 
     // Routine deletion is not allowed (no DELETE route on routines)
     ["DELETE", "/api/routines/r1"],
+  ];
+
+  it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))
+        .toBe(`Route not allowed: ${method} ${requestPath}`);
+    }
+  });
+});
+
+describe("guarded company skill routes in the bridge allowlist (TECH-10594 PR-3)", () => {
+  const allowed: Array<[string, string]> = [
+    ["PATCH", "/api/companies/c1/skills/s1"],
+    ["DELETE", "/api/companies/c1/skills/s1"],
+    ["DELETE", "/api/companies/c1/skills/s1/files"],
+    ["POST", "/api/companies/c1/skills/s1/fork"],
+    ["POST", "/api/companies/c1/skills/s1/rename"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs"],
+    ["POST", "/api/companies/c1/skills/browse-project"],
+    ["POST", "/api/companies/c1/skills/scan-projects"],
+  ];
+
+  it.each(allowed)("admits %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes)).toBeNull();
+    }
+  });
+
+  const denied: Array<[string, string]> = [
+    // Still blocked administrative and external mutations
+    ["POST", "/api/companies/c1/skills/import"],
+    ["POST", "/api/companies/c1/skill-sources"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1"],
+    ["DELETE", "/api/companies/c1/skill-sources/src-1"],
+    ["PUT", "/api/companies/c1/skill-policy"],
+    ["POST", "/api/companies/c1/skills/s1/fire"],
+
+    // Trailing slashes
+    ["PATCH", "/api/companies/c1/skills/s1/"],
+    ["DELETE", "/api/companies/c1/skills/s1/"],
+    ["DELETE", "/api/companies/c1/skills/s1/files/"],
+    ["POST", "/api/companies/c1/skills/s1/fork/"],
+    ["POST", "/api/companies/c1/skills/s1/rename/"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs/"],
+    ["POST", "/api/companies/c1/skills/browse-project/"],
+    ["POST", "/api/companies/c1/skills/scan-projects/"],
+
+    // Extra path segments
+    ["PATCH", "/api/companies/c1/skills/s1/extra"],
+    ["DELETE", "/api/companies/c1/skills/s1/extra"],
+    ["DELETE", "/api/companies/c1/skills/s1/files/extra"],
+    ["POST", "/api/companies/c1/skills/s1/fork/extra"],
+    ["POST", "/api/companies/c1/skills/s1/rename/extra"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs/extra"],
+    ["POST", "/api/companies/c1/skills/browse-project/extra"],
+    ["POST", "/api/companies/c1/skills/scan-projects/extra"],
+
+    // Wrong HTTP verbs
+    ["PUT", "/api/companies/c1/skills/s1"],
+    ["GET", "/api/companies/c1/skills/s1/fork"],
+    ["GET", "/api/companies/c1/skills/s1/rename"],
+    ["PUT", "/api/companies/c1/skills/s1/test-runs"],
+    ["PUT", "/api/companies/c1/skills/browse-project"],
+    ["PUT", "/api/companies/c1/skills/scan-projects"],
   ];
 
   it.each(denied)("denies %s %s on both transports", (method, requestPath) => {

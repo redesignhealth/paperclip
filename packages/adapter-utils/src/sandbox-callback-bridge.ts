@@ -312,11 +312,6 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
 
   // Low-risk company skill routes (TECH-10594): reads, versioning, catalog install,
   // update, reset, test inputs/templates, test-run inspection/management, stars, and comments.
-  // Deliberately NOT allowed from the sandbox: import, skill-sources mutations,
-  // browse-project/scan-projects, rename (pending agent reassignment guard in PR-3),
-  // fork, test-run creation (pending task-bound-run guard in PR-3), DELETE skill
-  // or skill file, PATCH of the skill resource (which can flip sharingScope to public_link),
-  // and skill-policy mutations.
 
   // Company skills reads and discovery
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/fork-precheck$/ },
@@ -354,6 +349,22 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments$/ },
   { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/comments\/[^/]+$/ },
+
+  // Guarded company skill routes (TECH-10594 PR-3): resource updates, deletions,
+  // peer-checked fork and rename, test-run orchestration, and workspace enumeration.
+  // The server enforces sharingScope restrictions, managed-local deletion bounds,
+  // task-bound-run requirements, project:read authorization, and agent_config:update
+  // authorization on affected agents.
+  // Deliberately NOT allowed from the sandbox: import, skill-sources mutations,
+  // skill-policy writes, and public fire.
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/files$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/fork$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/rename$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-runs$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/browse-project$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/scan-projects$/ },
   { method: "GET", path: /^\/api\/projects\/[^/]+$/ },
   { method: "GET", path: /^\/api\/goals\/[^/]+$/ },
 
