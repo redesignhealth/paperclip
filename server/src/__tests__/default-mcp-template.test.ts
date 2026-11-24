@@ -83,6 +83,8 @@ const RESTRICTED_TOOLS = [
   "comms_set_agent_shared",
   "comms_archive_conversation",
   "comms_reopen_conversation",
+  "comms_admin_wake_target_set",
+  "comms_admin_wake_target_remove",
   "proposals_list_pending",
   "proposals_list_history",
   "proposals_withdraw",
@@ -430,7 +432,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
       attemptCount: 1,
       claimId: null,
       leaseUntil: null,
-      allowlistVersion: 2,
+      allowlistVersion: 3,
       tokenExpiresAt: "2027-10-07T00:00:00+00:00",
     });
     expect(claim.mintAttemptedAt).toEqual(expect.any(String));
@@ -444,12 +446,12 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     ]);
     expect(await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, template.id))).toHaveLength(1);
 
-    // Catalog: the 17 reviewed actions are ACTIVE+reviewed, everything else DISABLED.
+    // Catalog: the 22 reviewed actions are ACTIVE+reviewed, everything else DISABLED.
     const catalog = await catalogOf(template.id);
     expect(catalog).toHaveLength(ALL_BOARD_TOOLS.length);
     const active = catalog.filter((entry) => entry.status === "active");
     expect(active.map((entry) => entry.toolName).sort()).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
-    expect(COMMS_BOARD_REVIEWED_TOOLS).toHaveLength(17);
+    expect(COMMS_BOARD_REVIEWED_TOOLS).toHaveLength(22);
     expect(active.every((entry) => entry.reviewedAt !== null)).toBe(true);
     expect(catalog.filter((entry) => entry.status === "disabled").map((entry) => entry.toolName).sort()).toEqual([...RESTRICTED_TOOLS].sort());
 
@@ -1103,16 +1105,174 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
   it("a newer reviewed allowlist version re-runs discovery and the review without a new mint", async () => {
     const { companyId, fetchMock } = await readyCompany();
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
-      entry.templateBootstrap === true ? { ...entry, reviewedTools: { version: 3, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
+      entry.templateBootstrap === true ? { ...entry, reviewedTools: { version: 4, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
     );
     expect(await ensureCompanyTemplate(ctxFor(fetchMock, { spec: bumped }), { companyId })).toEqual({ kind: "ready" });
     const template = (await templateRow(companyId))!;
-    expect(readTemplateClaim(template.config)).toMatchObject({ state: "ready", allowlistVersion: 3 });
+    expect(readTemplateClaim(template.config)).toMatchObject({ state: "ready", allowlistVersion: 4 });
     const catalog = await catalogOf(template.id);
     expect(catalog.find((entry) => entry.toolName === "comms_extend_conversation")!.status).toBe("disabled");
     const profile = (await profileOf(template.id))!;
-    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id))).toHaveLength(16);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id))).toHaveLength(21);
     expect(fetchMock.calls.mints).toHaveLength(1);
+  });
+
+  it("a board behind the allowlist never holds up provisioning: the template is published with the present tools, the missing ones are recorded, and the sweep enables them once the board lists them (TECH-9887)", async () => {
+    enableFeature();
+    const companyId = await seedCompany();
+    const ownerId = await seedMember(companyId);
+    const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+    const v2Allow = COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name));
+    // An older board: it lists the v2 tools (and the restricted ones) but not the wake tools.
+    let boardTools: string[] = [...v2Allow, ...RESTRICTED_TOOLS.filter((name) => !name.includes("wake"))];
+    let boardDown = false;
+    const fetchMock = makeFetch({ tools: () => boardTools });
+    const flaky = vi.fn(async (url: string, init: RequestInit) =>
+      boardDown && url === BOARD_URL && String(init.body).includes("tools/list") ? new Response("down", { status: 503 }) : fetchMock(url, init),
+    );
+    vi.stubGlobal("fetch", flaky);
+    const t0 = Date.now();
+    const at = (minutes: number) => ({
+      ...ctxFor(fetchMock, { now: () => new Date(t0 + minutes * 60_000) }),
+      fetchImpl: flaky as never,
+      toolAccessOptions: { remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 as const }], remoteHttpRequest: async (url: string, init: RequestInit) => flaky(url, init) },
+    });
+    const activeNames = async (connectionId: string) => (await catalogOf(connectionId)).filter((row) => row.status === "active").map((row) => row.toolName).sort();
+
+    // Board behind: still published at the CURRENT version, with the present tools and the missing list recorded.
+    expect(await ensureCompanyTemplate(at(0), { companyId })).toEqual({ kind: "ready" });
+    const published = (await templateRow(companyId))!;
+    const claim = readTemplateClaim(published.config)!;
+    expect(claim).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3 });
+    expect([...claim.missingReviewedTools!].sort()).toEqual(WAKE);
+    expect(Date.parse(claim.missingCheckAt!)).toBeGreaterThan(t0);
+    expect(await activeNames(published.id)).toEqual([...v2Allow].sort());
+    const activity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const logged = activity.find((row) => JSON.stringify(row.details).includes("catalog_missing_reviewed_tools"));
+    expect([...((logged!.details as { missingTools?: string[] }).missingTools ?? [])].sort()).toEqual(WAKE);
+
+    // A new agent is cloned and ready, with the tools that exist.
+    const agent = await createAgent(companyId, ownerId);
+    expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+    const clone = (await connectionsOf(companyId)).find((row) => row.name === `rh-comms-board:${agent.id}`)!;
+    expect(await activeNames(clone.id)).toEqual([...v2Allow].sort());
+
+    // No hot loop: nothing is selected or read before the check is due.
+    const lists = fetchMock.calls.toolsList.length;
+    expect(await sweepCompanyTemplates(at(0))).toBe(0);
+    expect(fetchMock.calls.toolsList.length).toBe(lists);
+
+    // Due, but the board is down: the published template is left exactly as it was and the check is pushed back.
+    boardDown = true;
+    expect(await sweepCompanyTemplates(at(61))).toBe(1);
+    const afterDown = readTemplateClaim((await templateRow(companyId))!.config)!;
+    expect(afterDown).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3 });
+    expect([...afterDown.missingReviewedTools!].sort()).toEqual(WAKE);
+    expect(Date.parse(afterDown.missingCheckAt!)).toBeGreaterThan(t0 + 61 * 60_000);
+    expect(afterDown.attemptCount).toBe(claim.attemptCount);
+    boardDown = false;
+
+    // Due, board still behind: unchanged, pushed back again.
+    expect(await sweepCompanyTemplates(at(125))).toBe(1);
+    expect([...readTemplateClaim((await templateRow(companyId))!.config)!.missingReviewedTools!].sort()).toEqual(WAKE);
+
+    // The board is upgraded: the wake tools are enabled on the template without a version change, and the list clears.
+    boardTools = [...ALL_BOARD_TOOLS];
+    expect(await sweepCompanyTemplates(at(200))).toBe(1);
+    const healed = (await templateRow(companyId))!;
+    expect(readTemplateClaim(healed.config)).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3, missingReviewedTools: [], missingCheckAt: null });
+    expect(await activeNames(healed.id)).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
+    expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 1)).toHaveLength(1);
+    // Idempotent: a healed template is not selected again.
+    expect(await sweepCompanyTemplates(at(2000))).toBe(0);
+  });
+
+  // A catalog re-read only ever adds tools to a published template: any failure leaves it exactly as it was (TECH-9887).
+  describe.each([
+    ["the board is down", "down"],
+    ["the board connection throws", "throws"],
+    ["drift appears while reading", "drift"],
+  ] as const)("a failed catalog re-read (%s)", (_label, failure) => {
+    it("leaves the published template as it was, still cloneable, and schedules the next hourly check", async () => {
+      enableFeature();
+      const companyId = await seedCompany();
+      const ownerId = await seedMember(companyId);
+      const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+      const v2Allow = COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name));
+      const boardTools = [...v2Allow, ...RESTRICTED_TOOLS.filter((name) => !name.includes("wake"))];
+      let failNow = false;
+      const fetchMock = makeFetch({ tools: () => boardTools });
+      const flaky = vi.fn(async (url: string, init: RequestInit) => {
+        if (failNow && url === BOARD_URL && String(init.body).includes("tools/list")) {
+          if (failure === "down") return new Response("down", { status: 503 });
+          if (failure === "throws") throw new Error("network down");
+          // drift: a profile binding lands on the template while the catalog is being read.
+          const template = (await templateRow(companyId))!;
+          const profile = (await profileOf(template.id))!;
+          await db.insert(toolProfileBindings).values({ companyId, profileId: profile.id, targetType: "company", targetId: companyId });
+        }
+        return fetchMock(url, init);
+      });
+      vi.stubGlobal("fetch", flaky);
+      const t0 = Date.now();
+      const at = (minutes: number) => ({
+        ...ctxFor(fetchMock, { now: () => new Date(t0 + minutes * 60_000) }),
+        fetchImpl: flaky as never,
+        toolAccessOptions: { remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 as const }], remoteHttpRequest: async (url: string, init: RequestInit) => flaky(url, init) },
+      });
+      const snapshot = async (connectionId: string) => (await catalogOf(connectionId)).map((row) => `${row.toolName}:${row.status}`).sort();
+
+      expect(await ensureCompanyTemplate(at(0), { companyId })).toEqual({ kind: "ready" });
+      const template = (await templateRow(companyId))!;
+      const before = readTemplateClaim(template.config)!;
+      const toolsBefore = await snapshot(template.id);
+      const profileBefore = (await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, (await profileOf(template.id))!.id))).length;
+
+      failNow = true;
+      expect(await sweepCompanyTemplates(at(61))).toBe(1);
+      failNow = false;
+      const afterRow = (await templateRow(companyId))!;
+      const after = readTemplateClaim(afterRow.config)!;
+      // Unchanged: state, version, reason, attempt budget, enabled tools, profile; connection still active.
+      expect(after).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3, attemptCount: before.attemptCount, readyAt: before.readyAt, claimId: null, leaseUntil: null });
+      expect([...after.missingReviewedTools!].sort()).toEqual(WAKE);
+      expect(afterRow.status).toBe("active");
+      expect(await snapshot(template.id)).toEqual(toolsBefore);
+      expect((await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, (await profileOf(template.id))!.id))).length).toBe(profileBefore);
+      // The next check is scheduled at the fixed hourly cadence, and nothing is selected before it is due.
+      expect(Date.parse(after.missingCheckAt!)).toBe(t0 + 61 * 60_000 + 60 * 60_000);
+      expect(await sweepCompanyTemplates(at(62))).toBe(0);
+      // The failure is on the activity row.
+      const activity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      expect(activity.some((row) => (row.details as { state?: string; reason?: string }).state === "ready" && typeof (row.details as { reason?: string }).reason === "string")).toBe(true);
+
+      if (failure === "drift") {
+        // The normal path owns drift: it sees it at its normal time (not the re-read).
+        expect(await verifyTemplateReady(db, afterRow, { allowedTools: COMMS_BOARD_REVIEWED_TOOLS })).toBe("drift");
+        const profile = (await profileOf(template.id))!;
+        await db.delete(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
+      }
+      // Still cloneable: a new agent gets a ready clone with the tools that exist.
+      const agent = await createAgent(companyId, ownerId);
+      expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+      const clone = (await connectionsOf(companyId)).find((row) => row.name === `rh-comms-board:${agent.id}`)!;
+      expect((await catalogOf(clone.id)).filter((row) => row.status === "active").map((row) => row.toolName).sort()).toEqual([...v2Allow].sort());
+    });
+  });
+
+  it("a revoked template secret is acted on by the normal setup path, never by the catalog re-read", async () => {
+    enableFeature();
+    const companyId = await seedCompany();
+    await seedMember(companyId);
+    const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+    const fetchMock = makeFetch({ tools: () => [...COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name)), ...RESTRICTED_TOOLS.filter((name) => !name.includes("wake"))] });
+    const t0 = Date.now();
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock, { now: () => new Date(t0) }), { companyId })).toEqual({ kind: "ready" });
+    const claim = readTemplateClaim((await templateRow(companyId))!.config)!;
+    await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, claim.secretId!));
+    const lists = fetchMock.calls.toolsList.length;
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock, { now: () => new Date(t0 + 61 * 60_000) }), { companyId })).toEqual({ kind: "error", reason: "template_drift" });
+    expect(fetchMock.calls.toolsList.length).toBe(lists); // the re-read never ran
   });
 
   it("an operator archive that lands AFTER the activation transaction has read the row can never be flipped back to active", async () => {
@@ -1183,15 +1343,15 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
   it("the production sweep upgrades a ready template with a stale allowlist version without a new mint", async () => {
     const { companyId, fetchMock } = await readyCompany();
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
-      entry.templateBootstrap === true ? { ...entry, reviewedTools: { version: 3, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
+      entry.templateBootstrap === true ? { ...entry, reviewedTools: { version: 4, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } } : entry,
     );
-    expect(readTemplateClaim((await templateRow(companyId))!.config)!.allowlistVersion).toBe(2);
+    expect(readTemplateClaim((await templateRow(companyId))!.config)!.allowlistVersion).toBe(3);
     const mintsBefore = fetchMock.calls.mints.length;
 
     // The sweep (the actual production entry point) selects the stale-version ready template and upgrades it.
     expect(await sweepCompanyTemplates(ctxFor(fetchMock, { spec: bumped }))).toBe(1);
     const template = (await templateRow(companyId))!;
-    expect(readTemplateClaim(template.config)).toMatchObject({ state: "ready", allowlistVersion: 3 });
+    expect(readTemplateClaim(template.config)).toMatchObject({ state: "ready", allowlistVersion: 4 });
     expect(fetchMock.calls.mints).toHaveLength(mintsBefore); // discovery + review only, never a new mint
     expect((await catalogOf(template.id)).find((row) => row.toolName === "comms_extend_conversation")!.status).toBe("disabled");
     expect(await installsOf(template.id)).toHaveLength(0);
@@ -1479,7 +1639,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(cloneCatalog.filter((row) => row.status === "active").map((row) => row.toolName).sort()).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
     const cloneProfile = (await profileOf(dedicated.id))!;
     const includes = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id));
-    expect(includes).toHaveLength(17);
+    expect(includes).toHaveLength(22);
     expect(includes.every((row) => row.selectorType === "catalog_entry" && row.effect === "include")).toBe(true);
     expect(includes.some((row) => row.catalogEntryId === cloneCatalog.find((c) => c.toolName === "comms_register")!.id)).toBe(false);
     expect((await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, cloneProfile.id))).map((b) => `${b.targetType}:${b.targetId}`)).toEqual([`agent:${agentId}`]);
@@ -1492,7 +1652,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     await db.insert(toolProfileEntries).values({ companyId, profileId: cloneProfile.id, selectorType: "catalog_entry", effect: "include", connectionId: dedicated.id, catalogEntryId: cloneRestricted.id });
     await cloneTemplateAccess(db, mutated, dedicated, agentId, allow);
     expect((await catalogOf(dedicated.id)).find((row) => row.toolName === "comms_register")!.status).toBe("disabled");
-    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(17);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(22);
 
     // An EMPTY allowlist (never "undefined = everything") clones nothing usable.
     await cloneTemplateAccess(db, mutated, dedicated, agentId, new Set());
@@ -1919,7 +2079,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(cloneCatalog.filter((row) => row.status === "active").map((row) => row.toolName).sort()).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
     expect(cloneCatalog.filter((row) => row.status === "disabled")).toHaveLength(RESTRICTED_TOOLS.length);
     const cloneProfile = (await profileOf(clone.id))!;
-    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(17);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(22);
     const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, cloneProfile.id));
     expect(bindings.map((b) => `${b.targetType}:${b.targetId}`)).toEqual([`agent:${agent.id}`]);
     // OFF: no install row for the agent, none for the clone, none for the template.
@@ -1939,7 +2099,7 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     await toolAccessService(db, ctxFor(grown).toolAccessOptions).refreshCatalog(clone.id, { actorType: "system", actorId: "test" });
     expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.targetType, "company"))).toHaveLength(0);
     expect((await catalogOf(clone.id)).find((row) => row.toolName === "comms_new_tool")!.status).toBe("quarantined");
-    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(17);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, cloneProfile.id))).toHaveLength(22);
   });
 
   it("agents created before the template exists wait, are nudged by the path-only update when it is ready, and then finish", async () => {

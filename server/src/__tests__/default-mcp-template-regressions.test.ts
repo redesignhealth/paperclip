@@ -96,6 +96,8 @@ const RESTRICTED_TOOLS = [
   "comms_set_agent_shared",
   "comms_archive_conversation",
   "comms_reopen_conversation",
+  "comms_admin_wake_target_set",
+  "comms_admin_wake_target_remove",
   "proposals_list_pending",
   "proposals_list_history",
   "proposals_withdraw",
@@ -715,7 +717,7 @@ describeEmbeddedPostgres("managed company template mid-claim regressions (TECH-7
     const at = (hours: number) => () => new Date(t0 + hours * 3_600_000);
     const bumped = DEFAULT_MCP_SPEC.map((entry) =>
       entry.templateBootstrap === true
-        ? { ...entry, reviewedTools: { version: 3, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } }
+        ? { ...entry, reviewedTools: { version: 4, allow: COMMS_BOARD_REVIEWED_TOOLS.filter((name) => name !== "comms_extend_conversation") } }
         : entry,
     );
 
@@ -732,17 +734,17 @@ describeEmbeddedPostgres("managed company template mid-claim regressions (TECH-7
     expect(good.calls.mints).toHaveLength(1);
     expect(good.calls.mints[0]!.scopes).toEqual(["comms:read"]);
 
-    // The reviewed allowlist moves to version 3: the agent is never cloned from the stale v2 template.
+    // The reviewed allowlist moves to version 4: the agent is never cloned from the stale v3 template.
     await runDefaultMcpSetupForAgent({ db, fetchImpl: good, now: at(4), spec: bumped }, { companyId, agentId: agent.id });
     expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "pending", reason: "template_provisioning" });
     expect((await connectionsOf(companyId)).filter((row) => row.credentialPolicy === "per_agent")).toHaveLength(0);
     expect(good.calls.registers).toEqual([]);
     expect(good.calls.mints).toHaveLength(1);
 
-    // The template catches up to v2 (discovery + L3 only, no new template mint) and the agent
+    // The template catches up to v4 (discovery + L3 only, no new template mint) and the agent
     // then completes against the updated allowlist.
     expect(await ensureCompanyTemplate(ctxFor(good, { now: at(6), spec: bumped }), { companyId })).toEqual({ kind: "ready" });
-    expect((await claimOf(companyId))!.allowlistVersion).toBe(3);
+    expect((await claimOf(companyId))!.allowlistVersion).toBe(4);
     expect(good.calls.mints).toHaveLength(1);
     await runDefaultMcpSetupForAgent({ db, fetchImpl: good, now: at(8), spec: bumped }, { companyId, agentId: agent.id });
     expect((await agentEntry(agent.id)).setup).toMatchObject({ state: "ready", reason: null });

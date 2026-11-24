@@ -124,13 +124,16 @@ export interface DefaultMcpEntrySpec {
 }
 
 /**
- * Reviewed comms-board actions an agent may use (version 2). Deliberately excludes `comms_register`
+ * Reviewed comms-board actions an agent may use (version 3). Deliberately excludes `comms_register`
  * (identity fork hazard), the admin tools (`comms_admin_register`, `comms_deregister_agent`,
- * `comms_set_agent_shared`), the `proposals_*` tools other than submit/get (version 2 adds `proposals_submit` and
+ * `comms_set_agent_shared`, `comms_admin_wake_target_set`, `comms_admin_wake_target_remove`), the `proposals_*` tools other than submit/get (version 2 adds `proposals_submit` and
  * `proposals_get` so an agent can propose an Arcana source and poll its outcome; both need `comms:proposals:write`),
  * and the permanent/privileged conversation operations (`comms_archive_conversation`, `comms_reopen_conversation`).
+ * Version 3 adds the five wake tools (TECH-9887) so an agent chooses what wakes it: `comms_wake_rules_list` and
+ * `comms_wake_sessions_list` need `comms:read`; `comms_wake_rule_add`, `comms_wake_rule_update` and
+ * `comms_wake_session_close` need `comms:write`. Both scopes are already on every agent token.
  */
-export const COMMS_BOARD_REVIEWED_TOOLS_VERSION = 2;
+export const COMMS_BOARD_REVIEWED_TOOLS_VERSION = 3;
 export const COMMS_BOARD_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "comms_whoami",
   "comms_list_agents",
@@ -149,6 +152,11 @@ export const COMMS_BOARD_REVIEWED_TOOLS: readonly string[] = Object.freeze([
   "comms_extend_conversation",
   "proposals_submit",
   "proposals_get",
+  "comms_wake_rules_list",
+  "comms_wake_rule_add",
+  "comms_wake_rule_update",
+  "comms_wake_sessions_list",
+  "comms_wake_session_close",
 ]);
 
 /** Reviewed Arcana brain verbs an agent may use (version 1): read-only; no write verb exists on the MCP. */
@@ -874,6 +882,9 @@ export type DefaultMcpSetupReason =
   | "template_drift"
   | "template_discovery_failed"
   | "catalog_unreviewed"
+  // Activity-log reason only: the template was published at the current version although the board's catalog lacked
+  // some reviewed tools (a board behind the allowlist version); the sweep re-reads the catalog until they appear.
+  | "catalog_missing_reviewed_tools"
   // Unknown outcome of a non-idempotent POST: terminal, never retried or rotated blindly.
   | "board_unknown"
   | "mint_unknown"
@@ -1120,6 +1131,10 @@ export interface DefaultMcpTemplateClaim {
   secretId: string | null;
   tokenExpiresAt: string | null;
   allowlistVersion: number | null;
+  /** Reviewed tools the board's catalog did not list at the last review (a board behind the allowlist); empty when none. */
+  missingReviewedTools?: string[] | null;
+  /** When the sweep next re-reads the catalog for the missing tools (set only while some are missing). */
+  missingCheckAt?: string | null;
   readyAt: string | null;
   updatedAt: string;
 }
@@ -1152,6 +1167,10 @@ export function readTemplateClaim(config: unknown): DefaultMcpTemplateClaim | nu
     const value = claim[key];
     if (value !== null && value !== undefined && typeof value !== "string") return null;
   }
+  const missing = claim.missingReviewedTools;
+  if (missing !== null && missing !== undefined && !(Array.isArray(missing) && missing.every((name) => typeof name === "string"))) return null;
+  const checkAt = claim.missingCheckAt;
+  if (checkAt !== null && checkAt !== undefined && typeof checkAt !== "string") return null;
   const version = claim.allowlistVersion;
   if (version !== null && version !== undefined && !(Number.isInteger(version) && (version as number) > 0)) return null;
   return claim as unknown as DefaultMcpTemplateClaim;
