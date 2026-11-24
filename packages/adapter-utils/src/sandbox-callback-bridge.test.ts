@@ -4414,3 +4414,62 @@ describe("low-risk company skill routes in the bridge allowlist (TECH-10594)", (
   });
 });
 
+describe("routine management routes in the bridge allowlist (TECH-10594)", () => {
+  const allowed: Array<[string, string]> = [
+    ["GET", "/api/routines/r1/revisions"],
+    ["POST", "/api/routines/r1/revisions/rev1/restore"],
+    ["GET", "/api/routines/r1/description/annotations"],
+    ["GET", "/api/routines/r1/description/annotations/t1"],
+    ["POST", "/api/routines/r1/description/annotations"],
+    ["POST", "/api/routines/r1/description/annotations/t1/comments"],
+    ["PATCH", "/api/routines/r1/description/annotations/t1"],
+    ["POST", "/api/routine-triggers/tr1/rotate-secret"],
+  ];
+
+  it.each(allowed)("admits %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes)).toBeNull();
+    }
+  });
+
+  const denied: Array<[string, string]> = [
+    // Trailing slashes
+    ["GET", "/api/routines/r1/revisions/"],
+    ["POST", "/api/routines/r1/revisions/rev1/restore/"],
+    ["GET", "/api/routines/r1/description/annotations/"],
+    ["GET", "/api/routines/r1/description/annotations/t1/"],
+    ["POST", "/api/routines/r1/description/annotations/"],
+    ["POST", "/api/routines/r1/description/annotations/t1/comments/"],
+    ["PATCH", "/api/routines/r1/description/annotations/t1/"],
+    ["POST", "/api/routine-triggers/tr1/rotate-secret/"],
+
+    // Extra path segments
+    ["GET", "/api/routines/r1/revisions/extra"],
+    ["POST", "/api/routines/r1/revisions/rev1/restore/extra"],
+    ["GET", "/api/routines/r1/description/annotations/t1/extra"],
+    ["POST", "/api/routines/r1/description/annotations/extra"],
+    ["POST", "/api/routines/r1/description/annotations/t1/comments/extra"],
+    ["PATCH", "/api/routines/r1/description/annotations/t1/extra"],
+    ["POST", "/api/routine-triggers/tr1/rotate-secret/extra"],
+
+    // PUT on POST/PATCH paths
+    ["PUT", "/api/routines/r1/revisions/rev1/restore"],
+    ["PUT", "/api/routines/r1/description/annotations"],
+    ["PUT", "/api/routines/r1/description/annotations/t1/comments"],
+    ["PUT", "/api/routines/r1/description/annotations/t1"],
+    ["PUT", "/api/routine-triggers/tr1/rotate-secret"],
+
+    // Public webhook trigger firing (webhook secret only, no actor auth)
+    ["POST", "/api/routine-triggers/public/p1/fire"],
+
+    // Routine deletion is not allowed (no DELETE route on routines)
+    ["DELETE", "/api/routines/r1"],
+  ];
+
+  it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))
+        .toBe(`Route not allowed: ${method} ${requestPath}`);
+    }
+  });
+});
