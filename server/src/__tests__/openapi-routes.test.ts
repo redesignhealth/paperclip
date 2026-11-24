@@ -25,6 +25,7 @@ const apiPrefixes: Record<string, string> = {
   "package-relay.ts": "/api",
   "package-relay-git.ts": "/api",
   "ashby-relay.ts": "/api",
+  "model-relay.ts": "/api",
   "agent-avatars.ts": "/api",
   "agent-profile-avatar.ts": "/api",
   "announcements.ts": "/api",
@@ -136,6 +137,11 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   "POST /api/package-relay/github/{owner}/{repo}/git-upload-pack",
   // The Ashby relay is an internal bridge surface for sandboxed agents (run-JWT only).
   "POST /api/ashby-relay/{operation}",
+  // The model relay is an internal bridge surface for the model provider in a sandbox pod (run-JWT only).
+  "POST /api/model-relay/{provider}/chat/completions",
+  "POST /api/model-relay/{provider}/completions",
+  "POST /api/model-relay/{provider}/responses",
+  "POST /api/model-relay/{provider}/messages",
   "GET /api/customer-success/v1/run-authority",
   "POST /api/customer-success/v1/read",
   // OAuth discovery and protocol endpoints have their own metadata contract;
