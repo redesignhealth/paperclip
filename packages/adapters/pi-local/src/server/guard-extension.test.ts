@@ -292,6 +292,7 @@ describe("guard: builders may not dismiss Argus findings", () => {
     'gh api repos/o/r/pulls/comments/55/replies -f body="/dismiss"',
     'gh api graphql -f query=\'mutation { addComment(input:{subjectId:"x", body:"/dismiss"}) { clientMutationId } }\'',
     'echo hi && gh pr comment 12 --body "/dismiss"',
+    'gh pr comment 12 --body "`echo /dismiss`"',
     'bash -c \'gh pr comment 12 --body "/dismiss"\'',
     'gh pr comment 12 --body "$(cat <<\'EOF\'\n/dismiss\nEOF\n)"',
   ])("blocks %s", (command) => {
@@ -345,6 +346,7 @@ describe("guard: builders may not dismiss Argus findings", () => {
       for (const command of [
         "gh pr comment 12 --body-file /nonexistent/body.md",
         "gh pr comment 12 -F -",
+        "gh pr comment 12 --body-file /dev/stdin",
         "gh pr review 12 --comment --body-file /nonexistent/body.md",
         "gh issue comment 7 -F /nonexistent/body.md",
         "gh api repos/o/r/issues/12/comments --input -",
@@ -378,9 +380,14 @@ describe("guard: builders may not dismiss Argus findings", () => {
     'echo "/dismiss" > /tmp/note.txt',
     'git commit -m "docs: explain /dismiss for reviewers"',
     "gh pr view 12 --comments",
-  ])("does not block %s on /dismiss grounds", (command) => {
-    const verdict = bash(command);
-    expect(verdict?.kind === "deny" && /dismiss/.test(verdict.why)).toBe(false);
+  ])("does not hard-deny %s", (command) => {
+    // gh pr review is simply not on the builder's pre-approved list ("unlisted"); the point here is no /dismiss denial.
+    expect(bash(command)?.kind).not.toBe("deny");
+  });
+
+  it("allows a plain pr comment and a plain issue comment (no verdict at all)", () => {
+    expect(bash('gh pr comment 12 --body "Fixed the null check"')).toBeNull();
+    expect(bash('gh issue comment 7 --body "Started"')).toBeNull();
   });
 
   it("still allows ordinary builder comments end to end", () => {

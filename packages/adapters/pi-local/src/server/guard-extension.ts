@@ -244,13 +244,18 @@ function denyUnreadableBody(flag) {
 
 function readBodyFile(file, state) {
   if (!file || file === "-") return null;
-  try { return fs.readFileSync(path.resolve(state.cwd, file), "utf8"); } catch { return null; }
+  try {
+    // Only a regular file: a FIFO, /dev/stdin or /dev/zero could block or exhaust memory inside the guard.
+    const target = path.resolve(state.cwd, file);
+    if (!fs.statSync(target).isFile()) return null;
+    return fs.readFileSync(target, "utf8");
+  } catch { return null; }
 }
 
 // Literal text is matched directly. Text built by the shell ($VAR, $(...)) cannot be read, so the whole command text is matched instead.
 function checkBodyText(text, state) {
   if (DISMISS_RE.test(text)) return denyDismiss();
-  if (text.includes("$") && DISMISS_RE.test(state.raw)) return denyDismiss();
+  if ((text.includes("$") || text.includes(BT)) && DISMISS_RE.test(state.raw)) return denyDismiss();
   return null;
 }
 
