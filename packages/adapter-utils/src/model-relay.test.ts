@@ -47,6 +47,10 @@ describe("model relay (TECH-10174)", () => {
       expect(DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST.some((rule) => rule.path.test(bad))).toBe(false);
     }
     expect(MODEL_RELAY_ROUTE_POLICIES[0]!.path.test("/api/model-relay/ramp-router/responses")).toBe(true);
+    // Anthropic SDK clients with a host-root baseUrl post to <base>/v1/messages.
+    expect(MODEL_RELAY_ROUTE_POLICIES[0]!.path.test("/api/model-relay/ramp-router-m1/v1/messages")).toBe(true);
+    expect(DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST.filter((rule) => rule.path.test("/api/model-relay/ramp-router-m1/v1/messages")).map((rule) => rule.method)).toEqual(["POST"]);
+    expect(DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST.some((rule) => rule.path.test("/api/model-relay/ramp-router/v1/models"))).toBe(false);
     expect(MODEL_RELAY_ROUTE_POLICIES[0]!.deadlineMs).toBeGreaterThan(300_000);
   });
 });

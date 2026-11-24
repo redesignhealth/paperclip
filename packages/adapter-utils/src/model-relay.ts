@@ -15,7 +15,7 @@ import type { SandboxCallbackBridgeRoutePolicy } from "./sandbox-callback-bridge
 export const MODEL_RELAY_PATH = "/api/model-relay";
 
 /** The provider-relative paths the relay forwards. POST only. Everything else is refused before any upstream call. */
-export const MODEL_RELAY_ALLOWED_SUFFIXES = ["chat/completions", "completions", "responses", "messages"] as const;
+export const MODEL_RELAY_ALLOWED_SUFFIXES = ["chat/completions", "completions", "responses", "messages", "v1/messages"] as const;
 
 /** Give-up deadline for one relayed model request (a long streamed turn is buffered by the bridge). */
 export const MODEL_RELAY_DEADLINE_MS = 480_000;
@@ -28,7 +28,7 @@ export const MODEL_RELAY_POLICY_MARGIN_MS = 10_000;
  */
 export const MODEL_RELAY_ROUTE_POLICIES: readonly SandboxCallbackBridgeRoutePolicy[] = [
   {
-    path: /^\/api\/model-relay\/[a-z0-9][a-z0-9_-]{0,63}\/(?:chat\/completions|completions|responses|messages)$/,
+    path: /^\/api\/model-relay\/[a-z0-9][a-z0-9_-]{0,63}\/(?:chat\/completions|completions|responses|messages|v1\/messages)$/,
     deadlineMs: MODEL_RELAY_DEADLINE_MS + MODEL_RELAY_POLICY_MARGIN_MS,
     maxConcurrent: 4,
   },

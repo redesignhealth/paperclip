@@ -664,7 +664,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           throw new Error("The model relay needs the Paperclip bridge, which did not start; refusing to run with the model key in the sandbox.");
         }
         const localModelsPath = path.join(localAgentConfigDir, "models.json");
-        const rewritten = pointRelayedProvidersAtBridge(await fs.readFile(localModelsPath, "utf8"), relayedProviderNames, apiUrl);
+        const rewritten = pointRelayedProvidersAtBridge(await fs.readFile(localModelsPath, "utf8"), apiUrl);
         if (!rewritten) throw new Error("The model relay provider is missing from the staged Pi config; refusing to run.");
         {
           const written = await runAdapterExecutionTargetProcess(

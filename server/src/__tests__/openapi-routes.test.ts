@@ -142,6 +142,7 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   "POST /api/model-relay/{provider}/completions",
   "POST /api/model-relay/{provider}/responses",
   "POST /api/model-relay/{provider}/messages",
+  "POST /api/model-relay/{provider}/v1/messages",
   "GET /api/customer-success/v1/run-authority",
   "POST /api/customer-success/v1/read",
   // OAuth discovery and protocol endpoints have their own metadata contract;
