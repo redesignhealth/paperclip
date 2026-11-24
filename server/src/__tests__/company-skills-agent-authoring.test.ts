@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
-import { agents, companies, companySkills, createDb } from "@paperclipai/db";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { agents, companies, companySkills, companySkillVersions, createDb } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companySkillService } from "../services/company-skills.ts";
 import { SHARED_SKILLS_SOURCE_KIND } from "../services/shared-skills-source.js";
@@ -34,6 +34,7 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
 
   afterEach(async () => {
     vi.unstubAllEnvs();
+    await db.delete(companySkillVersions);
     await db.delete(companySkills);
     await db.delete(agents);
     await db.delete(companies);
@@ -1031,6 +1032,203 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
       onBehalfOfMemberships: [],
     };
     const err = await svc.forkSkill(companyId, skillId, { reassignAgentIds: [agentId] }, respActor).catch((e) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err.status).toBe(403);
+    expect(err.details).toMatchObject({ code: "skill_agent_reassign_restricted" });
+  });
+
+  it("persists board-user attribution (forkedByUserId) on board fork with genuine actor context", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-attr-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Fork Attr Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/fork-attr-src`,
+      slug: "fork-attr-src",
+      name: "Fork Attr Src",
+      markdown: "---\nname: Fork Attr Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const boardActor = { type: "board" as const, userId: "board-user-42", source: "local_implicit" as const, companyIds: [companyId] };
+    const result = await svc.forkSkill(companyId, skillId, { name: "Board User Fork" }, boardActor);
+
+    const [row] = await db.select().from(companySkills).where(eq(companySkills.id, result.skill.id));
+    const meta = row!.metadata as Record<string, unknown>;
+    expect(meta.forkedByUserId).toBe("board-user-42");
+    expect(meta.forkedByAgentId).toBeNull();
+
+    const [version] = await db.select().from(companySkillVersions).where(eq(companySkillVersions.companySkillId, result.skill.id));
+    expect(version!.authorUserId).toBe("board-user-42");
+    expect(version!.authorAgentId).toBeNull();
+  });
+
+  it("persists agent attribution (forkedByAgentId) on agent fork with genuine actor context", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-agent-attr-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Fork Agent Attr Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/fork-agent-attr-src`,
+      slug: "fork-agent-attr-src",
+      name: "Fork Agent Attr Src",
+      markdown: "---\nname: Fork Agent Attr Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const agentId = await createAgent(companyId);
+    const agentActor = { type: "agent" as const, agentId, companyId, source: "agent_jwt" as const };
+    const result = await svc.forkSkill(companyId, skillId, { name: "Agent User Fork" }, agentActor);
+
+    const [row] = await db.select().from(companySkills).where(eq(companySkills.id, result.skill.id));
+    const meta = row!.metadata as Record<string, unknown>;
+    expect(meta.forkedByAgentId).toBe(agentId);
+    expect(meta.forkedByUserId).toBeNull();
+
+    const [version] = await db.select().from(companySkillVersions).where(eq(companySkillVersions.companySkillId, result.skill.id));
+    expect(version!.authorAgentId).toBe(agentId);
+    expect(version!.authorUserId).toBeNull();
+  });
+
+  it("maintains board attribution on delete-file and rename", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "board-attr-ops");
+    await fs.mkdir(path.join(managedDir, "references"), { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Board Attr Ops\n---\n# Content", "utf8");
+    await fs.writeFile(path.join(managedDir, "references", "guide.md"), "# Guide", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/board-attr-ops`,
+      slug: "board-attr-ops",
+      name: "Board Attr Ops",
+      markdown: "---\nname: Board Attr Ops\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [
+        { path: "SKILL.md", kind: "skill" },
+        { path: "references/guide.md", kind: "reference" },
+      ],
+    });
+
+    const boardActor = { type: "board" as const, userId: "board-user-99", source: "local_implicit" as const, companyIds: [companyId] };
+    await svc.deleteFile(companyId, skillId, { path: "references/guide.md", target: "file" }, boardActor);
+
+    // Verify version created for file deletion attributes board user
+    const [delVersion] = await db.select().from(companySkillVersions)
+      .where(eq(companySkillVersions.companySkillId, skillId))
+      .orderBy(desc(companySkillVersions.revisionNumber));
+    expect(delVersion!.authorUserId).toBe("board-user-99");
+    expect(delVersion!.authorAgentId).toBeNull();
+
+    // Verify board rename preserves operation with board actor
+    const renameRes = await svc.renameSkill(companyId, skillId, { name: "Board Renamed Ops" }, boardActor);
+    expect(renameRes.skill.name).toBe("Board Renamed Ops");
+  });
+
+  it("allows agent to rename own skill when a terminated peer references it, but denies when a live peer references it", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "rename-terminated-peer");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Own Skill\n---\n# Own Skill", "utf8");
+
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/rename-terminated-peer`;
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "rename-terminated-peer",
+      name: "Own Skill",
+      markdown: "---\nname: Own Skill\n---\n# Own Skill",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const callingAgentId = await createAgent(companyId);
+    // Assign skill to calling agent
+    await db.update(agents).set({
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    }).where(eq(agents.id, callingAgentId));
+
+    // Create a TERMINATED peer agent that also references the skill
+    const terminatedPeerId = randomUUID();
+    await db.insert(agents).values({
+      id: terminatedPeerId,
+      companyId,
+      name: "Terminated Peer",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+      status: "terminated",
+    });
+
+    const agentActor = {
+      type: "agent" as const,
+      agentId: callingAgentId,
+      companyId,
+      source: "agent_jwt" as const,
+    };
+
+    // Renaming with only terminated peer referencing should be allowed!
+    const result = await svc.renameSkill(companyId, skillId, { name: "Own Skill Renamed" }, agentActor);
+    expect(result.skill.name).toBe("Own Skill Renamed");
+    expect(result.reassignments.some((r) => r.agentId === terminatedPeerId)).toBe(true);
+
+    // Now create an ACTIVE live peer referencing the new skill key
+    const newSkillKey = result.skill.key;
+    const livePeerId = randomUUID();
+    await db.insert(agents).values({
+      id: livePeerId,
+      companyId,
+      name: "Live Peer",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [newSkillKey] } },
+      status: "idle",
+    });
+
+    // Renaming again when a live peer references it without agents:configure -> 403!
+    const err = await svc.renameSkill(companyId, skillId, { name: "Own Skill Second Rename" }, agentActor).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
     expect(err.status).toBe(403);
     expect(err.details).toMatchObject({ code: "skill_agent_reassign_restricted" });

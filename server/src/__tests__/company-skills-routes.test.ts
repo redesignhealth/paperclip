@@ -1713,7 +1713,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       expect.objectContaining({ sharingScope: "public_link" }),
-      expect.anything(),
+      expect.objectContaining({ type: "board", userId: "user-1", source: "local_implicit" }),
     );
   });
 
@@ -1729,7 +1729,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       expect.objectContaining({ sharingScope: "company", description: "Updated description" }),
-      expect.anything(),
+      expect.objectContaining({ type: "agent", agentId: "55555555-5555-4555-8555-555555555555", companyId: "company-1" }),
     );
   });
 
@@ -1743,7 +1743,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       expect.objectContaining({ sharingScope: "public_link" }),
-      expect.anything(),
+      expect.objectContaining({ type: "board", userId: "user-1", source: "local_implicit" }),
     );
   });
 
@@ -2034,7 +2034,7 @@ describe("company skill mutation permissions", () => {
         categories: ["memory", "review"],
         sharingScope: "company",
       },
-      expect.anything(),
+      expect.objectContaining({ type: "board", userId: "user-1", source: "local_implicit" }),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId: "company-1",
@@ -2082,7 +2082,7 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.deleteFile).toHaveBeenCalledWith("company-1", "skill-1", {
       path: "references",
       target: "folder",
-    }, expect.anything());
+    }, expect.objectContaining({ type: "board", userId: "user-1", source: "local_implicit" }));
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "company.skill_file_deleted",
       entityType: "company_skill",
@@ -2117,7 +2117,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       { slug: "review-fork", reassignAgentIds: ["11111111-1111-4111-8111-111111111111"] },
-      expect.anything(),
+      expect.objectContaining({ type: "board", userId: "user-1", source: "local_implicit" }),
     );
 
     await request(app).get("/api/companies/company-1/skills/skill-1/fork-precheck").expect(200);
@@ -2164,7 +2164,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       { name: "Ship PR", slug: "ship-pr" },
-      expect.anything(),
+      expect.objectContaining({ type: "board", userId: "user-1", source: "local_implicit" }),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "company.skill_renamed",
@@ -2673,7 +2673,7 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith(
       "company-1",
       "skill-1",
-      expect.anything(),
+      expect.objectContaining({ type: "board", userId: "local-board", source: "local_implicit" }),
     );
     expect(mockLogActivity).not.toHaveBeenCalled();
   });

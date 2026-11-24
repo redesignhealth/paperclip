@@ -780,6 +780,7 @@ export function companySkillRoutes(db: Db) {
             agentId: actor.agentId,
             runId: actor.runId,
             agentApiKeyId: actor.agentApiKeyId,
+            issueId: runContext?.issue.id,
             action: "issue.created",
             entityType: "issue",
             entityId: created.id,

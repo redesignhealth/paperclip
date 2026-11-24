@@ -4484,7 +4484,7 @@ describe("guarded company skill routes in the bridge allowlist (TECH-10594 PR-3)
     ["PATCH", "/api/companies/c1/skill-sources/src-1"],
     ["DELETE", "/api/companies/c1/skill-sources/src-1"],
     ["PUT", "/api/companies/c1/skill-policy"],
-    ["POST", "/api/companies/c1/skills/s1/fire"],
+    ["POST", "/api/routine-triggers/public/p1/fire"],
 
     // Trailing slashes
     ["PATCH", "/api/companies/c1/skills/s1/"],
@@ -4508,6 +4508,7 @@ describe("guarded company skill routes in the bridge allowlist (TECH-10594 PR-3)
 
     // Wrong HTTP verbs
     ["PUT", "/api/companies/c1/skills/s1"],
+    ["POST", "/api/companies/c1/skills/s1/files"],
     ["GET", "/api/companies/c1/skills/s1/fork"],
     ["GET", "/api/companies/c1/skills/s1/rename"],
     ["PUT", "/api/companies/c1/skills/s1/test-runs"],

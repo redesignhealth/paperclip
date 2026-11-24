@@ -352,6 +352,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
 
   // Guarded company skill routes (TECH-10594 PR-3): resource updates, deletions,
   // peer-checked fork and rename, test-run orchestration, and workspace enumeration.
+  // Note: scan-projects defaults to mode "import" (creates project-scan skills),
+  // so it is available to pods only with project:read on each target project.
   // The server enforces sharingScope restrictions, managed-local deletion bounds,
   // task-bound-run requirements, project:read authorization, and agent_config:update
   // authorization on affected agents.
