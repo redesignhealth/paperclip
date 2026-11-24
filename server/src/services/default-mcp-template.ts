@@ -180,6 +180,8 @@ type ClaimPatch = Partial<
     | "secretId"
     | "tokenExpiresAt"
     | "allowlistVersion"
+    | "missingReviewedTools"
+    | "missingCheckAt"
     | "readyAt"
     | "ownerUserId"
     | "ownerEmailNorm"
@@ -638,7 +640,7 @@ async function ensureTemplateRow(
 // ---------------------------------------------------------------------------
 
 type StageResult =
-  | { kind: "ready" }
+  | { kind: "ready"; missingTools?: readonly string[] }
   | { kind: "waiting"; reason: DefaultMcpSetupReason }
   | { kind: "retry"; reason: DefaultMcpSetupReason }
   | { kind: "error"; reason: DefaultMcpSetupReason };
@@ -701,6 +703,11 @@ async function applyReviewedAllowlist(
         .where(inArray(toolCatalogEntries.id, rest.map((row) => row.id)));
     }
     if (allowed.length === 0) return { kind: "waiting", reason: "catalog_unreviewed" } as StageResult;
+    // A reviewed tool the board did not list (a board behind this allowlist version) never holds up provisioning:
+    // the present tools are enabled and the template is published at the current version. The absent names are
+    // recorded on the claim, and the sweep re-reads the catalog on its backoff until they appear.
+    const presentNames = new Set(allowed.map((row) => row.toolName));
+    const missingTools = reviewed.allow.filter((name) => !presentNames.has(name));
     await txDb
       .update(toolCatalogEntries)
       .set({ status: "active", reviewedAt: now, quarantinedAt: null, quarantineReason: null, updatedAt: now })
@@ -754,10 +761,19 @@ async function applyReviewedAllowlist(
       });
     }
 
-    const patch: ClaimPatch = { allowlistVersion: reviewed.version, updatedAt: now.toISOString() };
+    if (missingTools.length > 0) {
+      logger.warn({ companyId: fresh.companyId, allowlistVersion: reviewed.version, missingTools }, "default MCP template catalog is missing reviewed tools");
+    }
+    const attempts = freshClaim.attemptCount;
+    const patch: ClaimPatch = {
+      allowlistVersion: reviewed.version,
+      missingReviewedTools: missingTools,
+      missingCheckAt: missingTools.length > 0 ? new Date(now.getTime() + defaultMcpBackoffMs(attempts)).toISOString() : null,
+      updatedAt: now.toISOString(),
+    };
     const ok = await patchUnderClaim(txDb, fresh.id, claimId, patch, { status: "active", enabled: true, healthStatus: "ok" });
     if (!ok) throw new ClaimLostError();
-    return { kind: "ready" } as StageResult;
+    return { kind: "ready", ...(missingTools.length > 0 ? { missingTools } : {}) } as StageResult;
   });
 }
 
@@ -956,15 +972,23 @@ export async function ensureCompanyTemplate(
 
   let connection = l1.connection;
   let claim = readTemplateClaim(connection.config)!;
+  let recheck = false;
   if (claim.state === "ready") {
     const readiness = await verifyTemplateReady(ctx.db, connection, {
       now,
       expectedAllowlistVersion: entry.reviewedTools!.version,
       allowedTools: entry.reviewedTools!.allow,
     });
-    if (readiness === "ok") return { kind: "ready" };
-    // Expired or drifted: terminal, never silently re-issued. A newer reviewed allowlist re-runs discovery + L3 only.
-    if (readiness === "version") {
+    if (readiness === "ok") {
+      // Published with reviewed tools missing from the board's catalog: re-read it once the check is due, so the
+      // tools are enabled when the board lists them. Not due: nothing to do (the sweep only selects due ones).
+      const pendingTools = claim.missingReviewedTools?.length ?? 0;
+      if (pendingTools === 0 || (claim.missingCheckAt ?? "") > now.toISOString()) return { kind: "ready" };
+      recheck = true;
+      await patchIfState(ctx.db, connection.id, "ready", { state: "pending", reason: null, nextAttemptAt: null, updatedAt: now.toISOString() });
+    } else if (readiness === "version") {
+      // Expired or drifted (the final branch) is terminal, never silently re-issued. A newer reviewed allowlist
+      // re-runs discovery + L3 only.
       await patchIfState(ctx.db, connection.id, "ready", { state: "pending", reason: null, nextAttemptAt: null, updatedAt: now.toISOString() });
     } else {
       const reason: DefaultMcpSetupReason = readiness === "expired" ? "template_expired" : "template_drift";
@@ -1000,6 +1024,7 @@ export async function ensureCompanyTemplate(
   let state: DefaultMcpTemplateClaim["state"];
   let nextAttemptAt: string | null = null;
   const reason = result.kind === "ready" ? null : result.reason;
+  const missingTools = result.kind === "ready" ? result.missingTools : undefined;
   if (result.kind === "ready") state = "ready";
   else if (result.kind === "waiting") {
     state = "pending";
@@ -1012,17 +1037,27 @@ export async function ensureCompanyTemplate(
     }
   } else state = "error";
 
+  // A catalog re-read that could not finish (board down) leaves the published template as it was: it never turns a
+  // working template pending or terminal. The next check rides the same backoff.
+  const keepPublished = recheck && (result.kind === "retry" || result.kind === "waiting");
+  if (keepPublished) state = "ready";
   const stored = await patchUnderClaim(ctx.db, connection.id, claim.claimId!, {
     state,
-    reason,
-    nextAttemptAt,
+    reason: keepPublished ? null : reason,
+    nextAttemptAt: keepPublished ? null : nextAttemptAt,
     leaseUntil: null,
     claimId: null,
-    readyAt: state === "ready" ? finished.toISOString() : null,
+    readyAt: state === "ready" ? (keepPublished ? claim.readyAt : finished.toISOString()) : null,
     updatedAt: finished.toISOString(),
+    ...(keepPublished ? { missingCheckAt: new Date(finished.getTime() + defaultMcpBackoffMs(attempts)).toISOString() } : {}),
   });
   if (!stored) return { kind: "not_claimed" };
-  await logTemplateActivity(ctx.db, input.companyId, connection, { state, reason, attemptCount: attempts });
+  await logTemplateActivity(ctx.db, input.companyId, connection, {
+    state,
+    reason: missingTools?.length ? "catalog_missing_reviewed_tools" : reason,
+    attemptCount: attempts,
+    ...(missingTools?.length ? { missingTools } : {}),
+  });
   if (state === "ready") {
     await nudgeWaitingAgents(ctx.db, input.companyId, entry.key, finished);
     return { kind: "ready" };
@@ -1035,7 +1070,7 @@ async function logTemplateActivity(
   db: Db,
   companyId: string,
   connection: Connection,
-  details: { state: string; reason: DefaultMcpSetupReason | null; attemptCount: number },
+  details: { state: string; reason: DefaultMcpSetupReason | null; attemptCount: number; missingTools?: readonly string[] },
 ) {
   try {
     await logActivity(db, {
@@ -1111,6 +1146,12 @@ async function sweepCommsCompanyTemplates(ctx: DefaultMcpTemplateContext & { lim
               -- (no new mint) and republishes it, so agents waiting on template_provisioning are not stuck forever.
               or (${claimJson} ->> 'state' = 'ready'
                 and coalesce(${claimJson} ->> 'allowlistVersion', '') <> ${String(entry.reviewedTools!.version)})
+              -- A READY template published with reviewed tools missing from the board's catalog: re-read the catalog
+              -- once its backoff (missingCheckAt) is due, so the tools are enabled when the board lists them.
+              or (${claimJson} ->> 'state' = 'ready'
+                and jsonb_typeof(${claimJson} -> 'missingReviewedTools') = 'array'
+                and jsonb_array_length(${claimJson} -> 'missingReviewedTools') > 0
+                and coalesce(${claimJson} ->> 'missingCheckAt', '') COLLATE "C" <= ${now}::text COLLATE "C")
             )
         )
       )

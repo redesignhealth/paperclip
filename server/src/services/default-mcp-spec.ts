@@ -882,6 +882,9 @@ export type DefaultMcpSetupReason =
   | "template_drift"
   | "template_discovery_failed"
   | "catalog_unreviewed"
+  // Activity-log reason only: the template was published at the current version although the board's catalog lacked
+  // some reviewed tools (a board behind the allowlist version); the sweep re-reads the catalog until they appear.
+  | "catalog_missing_reviewed_tools"
   // Unknown outcome of a non-idempotent POST: terminal, never retried or rotated blindly.
   | "board_unknown"
   | "mint_unknown"
@@ -1128,6 +1131,10 @@ export interface DefaultMcpTemplateClaim {
   secretId: string | null;
   tokenExpiresAt: string | null;
   allowlistVersion: number | null;
+  /** Reviewed tools the board's catalog did not list at the last review (a board behind the allowlist); empty when none. */
+  missingReviewedTools?: string[] | null;
+  /** When the sweep next re-reads the catalog for the missing tools (set only while some are missing). */
+  missingCheckAt?: string | null;
   readyAt: string | null;
   updatedAt: string;
 }
@@ -1160,6 +1167,10 @@ export function readTemplateClaim(config: unknown): DefaultMcpTemplateClaim | nu
     const value = claim[key];
     if (value !== null && value !== undefined && typeof value !== "string") return null;
   }
+  const missing = claim.missingReviewedTools;
+  if (missing !== null && missing !== undefined && !(Array.isArray(missing) && missing.every((name) => typeof name === "string"))) return null;
+  const checkAt = claim.missingCheckAt;
+  if (checkAt !== null && checkAt !== undefined && typeof checkAt !== "string") return null;
   const version = claim.allowlistVersion;
   if (version !== null && version !== undefined && !(Number.isInteger(version) && (version as number) > 0)) return null;
   return claim as unknown as DefaultMcpTemplateClaim;

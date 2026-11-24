@@ -1117,6 +1117,75 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(fetchMock.calls.mints).toHaveLength(1);
   });
 
+  it("a board behind the allowlist never holds up provisioning: the template is published with the present tools, the missing ones are recorded, and the sweep enables them once the board lists them (TECH-9887)", async () => {
+    enableFeature();
+    const companyId = await seedCompany();
+    const ownerId = await seedMember(companyId);
+    const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+    const v2Allow = COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name));
+    // An older board: it lists the v2 tools (and the restricted ones) but not the wake tools.
+    let boardTools: string[] = [...v2Allow, ...RESTRICTED_TOOLS.filter((name) => !name.includes("wake"))];
+    let boardDown = false;
+    const fetchMock = makeFetch({ tools: () => boardTools });
+    const flaky = vi.fn(async (url: string, init: RequestInit) =>
+      boardDown && url === BOARD_URL && String(init.body).includes("tools/list") ? new Response("down", { status: 503 }) : fetchMock(url, init),
+    );
+    vi.stubGlobal("fetch", flaky);
+    const t0 = Date.now();
+    const at = (minutes: number) => ({
+      ...ctxFor(fetchMock, { now: () => new Date(t0 + minutes * 60_000) }),
+      fetchImpl: flaky as never,
+      toolAccessOptions: { remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 as const }], remoteHttpRequest: async (url: string, init: RequestInit) => flaky(url, init) },
+    });
+    const activeNames = async (connectionId: string) => (await catalogOf(connectionId)).filter((row) => row.status === "active").map((row) => row.toolName).sort();
+
+    // Board behind: still published at the CURRENT version, with the present tools and the missing list recorded.
+    expect(await ensureCompanyTemplate(at(0), { companyId })).toEqual({ kind: "ready" });
+    const published = (await templateRow(companyId))!;
+    const claim = readTemplateClaim(published.config)!;
+    expect(claim).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3 });
+    expect([...claim.missingReviewedTools!].sort()).toEqual(WAKE);
+    expect(Date.parse(claim.missingCheckAt!)).toBeGreaterThan(t0);
+    expect(await activeNames(published.id)).toEqual([...v2Allow].sort());
+    const activity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const logged = activity.find((row) => JSON.stringify(row.details).includes("catalog_missing_reviewed_tools"));
+    expect([...((logged!.details as { missingTools?: string[] }).missingTools ?? [])].sort()).toEqual(WAKE);
+
+    // A new agent is cloned and ready, with the tools that exist.
+    const agent = await createAgent(companyId, ownerId);
+    expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+    const clone = (await connectionsOf(companyId)).find((row) => row.name === `rh-comms-board:${agent.id}`)!;
+    expect(await activeNames(clone.id)).toEqual([...v2Allow].sort());
+
+    // No hot loop: nothing is selected or read before the check is due.
+    const lists = fetchMock.calls.toolsList.length;
+    expect(await sweepCompanyTemplates(at(0))).toBe(0);
+    expect(fetchMock.calls.toolsList.length).toBe(lists);
+
+    // Due, but the board is down: the published template is left exactly as it was and the check is pushed back.
+    boardDown = true;
+    expect(await sweepCompanyTemplates(at(30))).toBe(1);
+    const afterDown = readTemplateClaim((await templateRow(companyId))!.config)!;
+    expect(afterDown).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3 });
+    expect([...afterDown.missingReviewedTools!].sort()).toEqual(WAKE);
+    expect(Date.parse(afterDown.missingCheckAt!)).toBeGreaterThan(t0 + 30 * 60_000);
+    boardDown = false;
+
+    // Due, board still behind: unchanged, pushed back again.
+    expect(await sweepCompanyTemplates(at(300))).toBe(1);
+    expect([...readTemplateClaim((await templateRow(companyId))!.config)!.missingReviewedTools!].sort()).toEqual(WAKE);
+
+    // The board is upgraded: the wake tools are enabled on the template without a version change, and the list clears.
+    boardTools = [...ALL_BOARD_TOOLS];
+    expect(await sweepCompanyTemplates(at(900))).toBe(1);
+    const healed = (await templateRow(companyId))!;
+    expect(readTemplateClaim(healed.config)).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3, missingReviewedTools: [], missingCheckAt: null });
+    expect(await activeNames(healed.id)).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
+    expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 1)).toHaveLength(1);
+    // Idempotent: a healed template is not selected again.
+    expect(await sweepCompanyTemplates(at(2000))).toBe(0);
+  });
+
   it("an operator archive that lands AFTER the activation transaction has read the row can never be flipped back to active", async () => {
     enableFeature();
     const companyId = await seedCompany();

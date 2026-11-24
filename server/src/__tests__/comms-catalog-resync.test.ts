@@ -9,7 +9,7 @@ import { activityLog, agents, authUsers, companies, companyMemberships, companyS
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
 import { secretService } from "../services/secrets.js";
-import { DEFAULT_MCP_TEMPLATE_UID, commsReviewedAllowlist, readDefaultMcpState } from "../services/default-mcp-spec.js";
+import { COMMS_BOARD_REVIEWED_TOOLS, DEFAULT_MCP_TEMPLATE_CONFIG_KEY, DEFAULT_MCP_TEMPLATE_UID, commsReviewedAllowlist, readDefaultMcpState } from "../services/default-mcp-spec.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { waitForScheduledDefaultMcpSetups } from "../services/default-mcp-setup.js";
 import {
@@ -454,6 +454,58 @@ describeEmbeddedPostgres("comms-board catalog resync for existing agents", () =>
     const includes = await cloneIncludes(connectionId);
     for (const name of WAKE) expect(includes).toContain(name);
     for (const name of ADMIN_WAKE) expect(includes).not.toContain(name);
+    expect(outcomeOf(await run(companyId), agent.id)?.result).toBe("already_current");
+  });
+
+  it("reports reviewed tools the template catalog does not list yet, and drops the report once they are listed (TECH-9887)", async () => {
+    const companyId = await seedCompany();
+    const ownerId = await seedOwner(companyId);
+    const v2Tools = COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name));
+    const template = await seedCommsTemplate(companyId, [
+      ...v2Tools.map((name) => ({ name, status: "active" as const })),
+      ...ADMIN_WAKE.map((name) => ({ name, status: "disabled" as const })),
+    ]);
+    const agent = await readyAgent(companyId, ownerId);
+    const connectionId = (await entryOf(agent.id)).binding!.connectionId!;
+    // The template was published at the current version while the board lacked the wake tools: the claim records them.
+    const setMissing = async (missing: string[]) => {
+      const claim = {
+        version: 1, state: "ready", reason: null, attemptCount: 1, nextAttemptAt: null, leaseUntil: null, claimId: null, mintAttemptedAt: null,
+        secretId: null, tokenExpiresAt: null, allowlistVersion: 3, missingReviewedTools: missing, missingCheckAt: null, readyAt: null,
+        updatedAt: new Date().toISOString(), entryKey: "comms-board", principalSub: "sub", ownerUserId: "user", ownerEmailNorm: "owner@example.test",
+      };
+      await db.update(toolConnections).set({ config: { url: TEMPLATE_URL, [DEFAULT_MCP_TEMPLATE_CONFIG_KEY]: claim } }).where(eq(toolConnections.id, template.id));
+    };
+    await setMissing(WAKE);
+
+    // An older board: the template has no wake tools. Dry run and apply both say so; nothing is widened.
+    const dry = await resyncCommsCatalogs(db, { companyId });
+    expect(dry.missingReviewedTools).toEqual(WAKE);
+    expect(dry.reason).toBe("catalog_missing_reviewed_tools");
+    expect(outcomeOf(dry, agent.id)?.result).toBe("already_current");
+    const applied = await run(companyId);
+    expect(applied.missingReviewedTools).toEqual(WAKE);
+    expect(applied.reason).toBe("catalog_missing_reviewed_tools");
+    expect(outcomeOf(applied, agent.id)?.result).toBe("already_current");
+    expect(Object.keys(await cloneStatus(connectionId)).some((name) => WAKE.includes(name))).toBe(false);
+
+    // The board is upgraded and the template re-reviewed: the wake tools are active on the template.
+    const [profile] = await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${template.id}`));
+    for (const name of WAKE) {
+      const [entry] = await db
+        .insert(toolCatalogEntries)
+        .values({ companyId, applicationId: template.applicationId, connectionId: template.id, name, toolName: name, versionHash: "v1", status: "active" })
+        .returning();
+      await db.insert(toolProfileEntries).values({ companyId, profileId: profile!.id, selectorType: "catalog_entry", effect: "include", connectionId: template.id, catalogEntryId: entry!.id });
+    }
+    await setMissing([]);
+    const dryAfter = await resyncCommsCatalogs(db, { companyId });
+    expect(dryAfter.missingReviewedTools).toBeUndefined();
+    expect(dryAfter.reason).toBeUndefined();
+    expect(outcomeOf(dryAfter, agent.id)).toMatchObject({ result: "would_widen", tools: WAKE });
+    const appliedAfter = await run(companyId);
+    expect(outcomeOf(appliedAfter, agent.id)).toMatchObject({ result: "widened", tools: WAKE });
+    expect(appliedAfter.missingReviewedTools).toBeUndefined();
     expect(outcomeOf(await run(companyId), agent.id)?.result).toBe("already_current");
   });
 

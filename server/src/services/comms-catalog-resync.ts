@@ -18,7 +18,7 @@
  *
  * The report carries counts and agent ids only.
  */
-import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -31,7 +31,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { cloneTemplateAccess, commsWiringIntact, resolveTemplate } from "./default-mcp-setup.js";
-import { DEFAULT_MCP_SPEC, readDefaultMcpState, type DefaultMcpEntryState } from "./default-mcp-spec.js";
+import { DEFAULT_MCP_SPEC, readDefaultMcpState, readTemplateClaim, type DefaultMcpEntryState } from "./default-mcp-spec.js";
 
 export const COMMS_CATALOG_RESYNC_ENTRY_KEY = "comms-board";
 export const COMMS_CATALOG_RESYNC_BATCH_LIMIT = 25;
@@ -71,6 +71,15 @@ export interface CommsCatalogResyncReport {
   counts: Record<CommsCatalogResyncResult, number>;
   /** Pass as `afterId` to resume; null once a batch returns fewer rows than `limit`. */
   nextCursor: string | null;
+  /**
+   * Reviewed tools the board's catalog did not list when the company template was last reviewed (a board behind the
+   * allowlist version), as recorded on the template. Present only when there are any; then `reason` is
+   * `catalog_missing_reviewed_tools`. Agents still get every tool the template has; the sweep re-reads the catalog and
+   * enables the missing ones once the board lists them, and a later resync widens the agents. The operator check is
+   * that this field is absent.
+   */
+  missingReviewedTools?: string[];
+  reason?: "catalog_missing_reviewed_tools";
 }
 
 export class CommsCatalogResyncConfirmationError extends Error {
@@ -222,7 +231,26 @@ async function scan(db: Db, options: CommsCatalogResyncOptions, dryRun: boolean)
 
   const counts = emptyCounts();
   for (const outcome of outcomes) counts[outcome.result] += 1;
-  return { dryRun, scanned: rows.length, outcomes, counts, nextCursor: rows.length === limit ? rows[rows.length - 1]!.id : null };
+  const missingReviewedTools = await templateMissingReviewedTools(db, options.companyId);
+  return {
+    dryRun,
+    scanned: rows.length,
+    outcomes,
+    counts,
+    nextCursor: rows.length === limit ? rows[rows.length - 1]!.id : null,
+    ...(missingReviewedTools.length > 0 ? { missingReviewedTools, reason: "catalog_missing_reviewed_tools" as const } : {}),
+  };
+}
+
+/** Reviewed tools recorded as missing from the board's catalog on the company's managed template (see the template claim). */
+async function templateMissingReviewedTools(db: Pick<Db, "select">, companyId: string): Promise<string[]> {
+  const spec = commsSpec();
+  const templates = await db
+    .select({ config: toolConnections.config })
+    .from(toolConnections)
+    .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, spec.connectionName), ne(toolConnections.status, "archived")));
+  if (templates.length !== 1) return [];
+  return [...(readTemplateClaim(templates[0]!.config)?.missingReviewedTools ?? [])].sort();
 }
 
 async function resyncOne(
