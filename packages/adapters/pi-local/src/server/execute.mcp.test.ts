@@ -316,6 +316,42 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     expect(lookupModelRelay("run-mcp", "ramp-router")).toBeNull();
   });
 
+  const runtimeTools = {
+    mcpEndpoint: "https://paperclip.example/api/mcp/runtime-tools",
+    bearerToken: "runtime-tools-token-do-not-leak",
+    expiresAt: "2026-11-24T12:00:00.000Z",
+    rest: { connectionsSearch: "https://paperclip.example/api/runtime-tools/connections/search", connectionRequest: "https://paperclip.example/api/runtime-tools/connections/request" },
+    tools: ["connections_search"],
+    guidance: "Use the runtime tools.",
+  };
+
+  it("serves runtime tools through the relay instead of the env in a sandbox pod (TECH-10174)", async () => {
+    const { env } = await run({ runtimeTools, runtimeMcp: { getServers: () => [] } });
+    expect(Object.keys(env).filter((key) => key.startsWith("PAPERCLIP_RUNTIME_TOOLS_"))).toEqual([]);
+    expect(JSON.stringify(env)).not.toContain("runtime-tools-token-do-not-leak");
+    // The token is held host-side by the relay route, and the pod config names only the relay path.
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relayRoutes: [
+          expect.objectContaining({
+            path: "/paperclip-relay/mcp/paperclip_connections",
+            upstreamUrl: "https://paperclip.example/api/mcp/runtime-tools",
+            token: "runtime-tools-token-do-not-leak",
+          }),
+        ],
+      }),
+    );
+    const written = JSON.parse(syncedMcpJson[0]!) as { mcpServers: Record<string, Record<string, unknown>> };
+    expect(written.mcpServers.paperclip_connections).toMatchObject({ includeTools: ["connections_search"] });
+    expect(JSON.stringify(written)).not.toContain("runtime-tools-token-do-not-leak");
+  });
+
+  it("keeps the runtime tools env on a local target, which has no relay (TECH-10174)", async () => {
+    const { env } = await run({ runtimeTools, executionTarget: undefined, runtimeMcp: { getServers: () => [] } });
+    expect(env.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBe("runtime-tools-token-do-not-leak");
+    expect(env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL).toBe("https://paperclip.example/api/mcp/runtime-tools");
+  });
+
   it("honours the server-side PAPERCLIP_PI_MCP_ADAPTER_PATH but ignores the agent's own env", async () => {
     const agentOnly = await run({
       config: { command: "pi", model: "openai/gpt-5.4-mini", env: { PAPERCLIP_PI_MCP_ADAPTER_PATH: "/agent/chosen.ts" } },
