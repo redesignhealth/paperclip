@@ -2,7 +2,7 @@ import { PI_MCP_CONFIG_FILE } from "./mcp-config.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { preparePiRuntimeConfig } from "./runtime-config.js";
+import { pointRelayedProvidersAtBridge, preparePiRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -335,5 +335,60 @@ describe("preparePiRuntimeConfig", () => {
     expect(prepared.notes.some((n) => n.includes('"ramp-router"') && n.includes("literal key") && n.includes("$NAME"))).toBe(true);
     expect(prepared.notes.join("\n")).not.toContain("sk-secret-value");
     await prepared.cleanup();
+  });
+});
+
+describe("preparePiRuntimeConfig model relay (TECH-10174)", () => {
+  const KEY = "router-secret-key-0123456789";
+  const providers = (apiKey: string) => JSON.stringify({
+    "ramp-router": { baseUrl: "https://api.router.example/v1", apiKey, api: "openai-completions", models: [{ id: "m" }] },
+    other: { baseUrl: "https://other.example/v1", apiKey: "$OTHER_KEY" },
+  });
+
+  it("moves the key and real baseUrl to the relay entry and writes no key into models.json", async () => {
+    const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: providers("$RAMP_ROUTER_API_KEY"), RAMP_ROUTER_API_KEY: KEY, OTHER_KEY: "o" }, modelRelay: true });
+    cleanupPaths.add(prepared.agentConfigDir!);
+    expect(prepared.relayedProviders).toEqual({ "ramp-router": { upstreamBaseUrl: "https://api.router.example/v1", apiKey: KEY } });
+    expect(prepared.droppedEnvKeys).toEqual(["RAMP_ROUTER_API_KEY"]);
+    const raw = await fs.readFile(path.join(prepared.agentConfigDir!, "models.json"), "utf8");
+    expect(raw).not.toContain(KEY);
+    expect(raw).not.toContain("api.router.example");
+    const written = (await readModelsJson(prepared.agentConfigDir!)).providers as Record<string, Record<string, unknown>>;
+    expect(written["ramp-router"]).toMatchObject({ apiKey: "$PAPERCLIP_API_KEY", api: "openai-completions", models: [{ id: "m" }] });
+    expect(written.other).toMatchObject({ baseUrl: "https://other.example/v1", apiKey: "$OTHER_KEY" });
+    expect(prepared.notes.join("\n")).not.toContain("missing or empty");
+    expect(prepared.notes.join("\n")).not.toContain(KEY);
+  });
+
+  it("drops the raw provider config from the pod env when it carries a literal key", async () => {
+    const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: providers(KEY) }, modelRelay: true });
+    cleanupPaths.add(prepared.agentConfigDir!);
+    expect(prepared.relayedProviders["ramp-router"]?.apiKey).toBe(KEY);
+    expect(prepared.droppedEnvKeys).toEqual(["PAPERCLIP_PI_PROVIDERS"]);
+  });
+
+  it("does not relay when not requested, when the key is missing, or when the baseUrl is not https", async () => {
+    const off = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: providers("$RAMP_ROUTER_API_KEY"), RAMP_ROUTER_API_KEY: KEY } });
+    cleanupPaths.add(off.agentConfigDir!);
+    expect(off.relayedProviders).toEqual({});
+    expect(off.droppedEnvKeys).toEqual([]);
+    expect(await fs.readFile(path.join(off.agentConfigDir!, "models.json"), "utf8")).toContain("$RAMP_ROUTER_API_KEY");
+    const noKey = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: providers("$RAMP_ROUTER_API_KEY") }, modelRelay: true });
+    cleanupPaths.add(noKey.agentConfigDir!);
+    expect(noKey.relayedProviders).toEqual({});
+    const http = await preparePiRuntimeConfig({
+      env: { PAPERCLIP_PI_PROVIDERS: providers("$RAMP_ROUTER_API_KEY").replace("https://api.router", "http://api.router"), RAMP_ROUTER_API_KEY: KEY },
+      modelRelay: true,
+    });
+    cleanupPaths.add(http.agentConfigDir!);
+    expect(http.relayedProviders).toEqual({});
+  });
+
+  it("points relayed providers at the bridge URL and leaves others alone", () => {
+    const body = JSON.stringify({ providers: { "ramp-router": { baseUrl: "http://127.0.0.1:0/x", apiKey: "$PAPERCLIP_API_KEY" }, other: { baseUrl: "https://o/v1" } } });
+    const out = JSON.parse(pointRelayedProvidersAtBridge(body, ["ramp-router"], "http://127.0.0.1:4310/")!);
+    expect(out.providers["ramp-router"].baseUrl).toBe("http://127.0.0.1:4310/api/model-relay/ramp-router");
+    expect(out.providers.other.baseUrl).toBe("https://o/v1");
+    expect(pointRelayedProvidersAtBridge(body, ["missing"], "http://127.0.0.1:4310")).toBeNull();
   });
 });

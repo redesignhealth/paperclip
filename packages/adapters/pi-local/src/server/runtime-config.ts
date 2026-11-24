@@ -2,6 +2,7 @@ import { isOpenRouterUrl, openRouterAttributionHeaders } from "@paperclipai/adap
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { modelRelayBaseUrl, modelRelayProviderNameOk, type ModelRelayEntry } from "@paperclipai/adapter-utils/model-relay";
 import { PI_MCP_CONFIG_FILE } from "./mcp-config.js";
 
 type PreparedPiRuntimeConfig = {
@@ -9,6 +10,10 @@ type PreparedPiRuntimeConfig = {
   notes: string[];
   /** The managed agent-config dir, or null when no provider config was written. */
   agentConfigDir: string | null;
+  /** TECH-10174: providers whose key was taken out of the pod. Empty unless `modelRelay` was requested. */
+  relayedProviders: Record<string, ModelRelayEntry>;
+  /** Env names the pod must not receive because their value is now held host-side. */
+  droppedEnvKeys: string[];
   cleanup: () => Promise<void>;
 };
 
@@ -110,6 +115,57 @@ function apiKeyWarnings(providers: Record<string, unknown>, env: Record<string, 
   return out;
 }
 
+/** The in-pod key every relayed provider uses: the run's bridge token, which only the pod's loopback gateway accepts. */
+const RELAY_PROVIDER_API_KEY = "$PAPERCLIP_API_KEY";
+/** Written into models.json until the bridge is up; `pointRelayedProvidersAtBridge` replaces it. */
+const RELAY_PLACEHOLDER_ORIGIN = "http://127.0.0.1:0";
+const ROUTER_PROVIDER_NAME = "ramp-router";
+const ROUTER_KEY_ENV = "RAMP_ROUTER_API_KEY";
+const WHOLE_ENV_REFERENCE = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$/;
+
+// TECH-10174: take the model gateway key out of the pod. A provider is relayed when it is the Ramp Router provider (or reads
+// RAMP_ROUTER_API_KEY), has an https baseUrl, and its key resolves from the run env or is a literal. The key and the real
+// baseUrl move to the host-side relay registry; models.json keeps only the relay path and the bridge token reference.
+function relayProviders(
+  providers: Record<string, unknown>,
+  env: Record<string, string>,
+): { relayed: Record<string, ModelRelayEntry>; droppedEnvKeys: string[] } {
+  const relayed: Record<string, ModelRelayEntry> = {};
+  const droppedEnvKeys: string[] = [];
+  for (const [name, provider] of Object.entries(providers)) {
+    if (!isPlainObject(provider) || !modelRelayProviderNameOk(name)) continue;
+    const apiKey = provider.apiKey;
+    const baseUrl = provider.baseUrl;
+    if (typeof apiKey !== "string" || typeof baseUrl !== "string" || apiKey.startsWith("!")) continue;
+    const reference = WHOLE_ENV_REFERENCE.exec(apiKey);
+    const referencedName = reference ? (reference[1] ?? reference[2]) : null;
+    if (name !== ROUTER_PROVIDER_NAME && referencedName !== ROUTER_KEY_ENV) continue;
+    const value = referencedName ? env[referencedName] : apiKey;
+    if (!value || /[\r\n\0$]/.test(value) || !baseUrl.startsWith("https://")) continue;
+    relayed[name] = { upstreamBaseUrl: baseUrl, apiKey: value };
+    provider.baseUrl = `${RELAY_PLACEHOLDER_ORIGIN}/api/model-relay/${name}`;
+    provider.apiKey = RELAY_PROVIDER_API_KEY;
+    if (referencedName) droppedEnvKeys.push(referencedName);
+  }
+  // The raw provider config can itself carry a literal key; the pod never needs it.
+  const raw = env.PAPERCLIP_PI_PROVIDERS;
+  if (raw && Object.values(relayed).some((entry) => raw.includes(entry.apiKey))) droppedEnvKeys.push("PAPERCLIP_PI_PROVIDERS");
+  return { relayed, droppedEnvKeys: [...new Set(droppedEnvKeys)] };
+}
+
+/** Rewrites the relayed providers in a models.json body to the bridge URL. Returns null when nothing changed. */
+export function pointRelayedProvidersAtBridge(modelsJson: string, relayedNames: readonly string[], apiUrl: string): string | null {
+  const parsed = JSON.parse(modelsJson) as { providers?: Record<string, unknown> };
+  let changed = false;
+  for (const name of relayedNames) {
+    const provider = parsed.providers?.[name];
+    if (!isPlainObject(provider)) continue;
+    provider.baseUrl = modelRelayBaseUrl(apiUrl, name);
+    changed = true;
+  }
+  return changed ? `${JSON.stringify(parsed, null, 2)}\n` : null;
+}
+
 // Materialize custom Pi providers supplied via PAPERCLIP_PI_PROVIDERS (a JSON
 // object in Pi's models.json "providers" shape) into a managed agent-config dir.
 //
@@ -131,6 +187,8 @@ export async function preparePiRuntimeConfig(input: {
   env: Record<string, string>;
   /** TECH-9794: `mcp-adapter.json` body for the pi-mcp-adapter extension. Forces a managed dir even with no providers. */
   mcpConfig?: Record<string, unknown> | null;
+  /** TECH-10174: sandbox pods with the bridge. The model gateway key stays host-side and the provider points at the relay. */
+  modelRelay?: boolean;
 }): Promise<PreparedPiRuntimeConfig> {
   // TECH-7076: `{env:NAME}` placeholders may read the SERVER env only when the provider config
   // itself came from the server env (an operator-authored setting). If it came from the agent's
@@ -144,13 +202,20 @@ export async function preparePiRuntimeConfig(input: {
     input.env.PAPERCLIP_PI_PROVIDERS ?? process.env.PAPERCLIP_PI_PROVIDERS,
     resolveEnv,
   );
-  const keyWarnings = providers ? apiKeyWarnings(providers, input.env) : [];
+  const { relayed, droppedEnvKeys } = providers && input.modelRelay
+    ? relayProviders(providers, input.env)
+    : { relayed: {} as Record<string, ModelRelayEntry>, droppedEnvKeys: [] as string[] };
+  const keyWarnings = providers
+    ? apiKeyWarnings(Object.fromEntries(Object.entries(providers).filter(([name]) => !(name in relayed))), input.env)
+    : [];
   const warnings = [...(parseWarning ? [parseWarning] : []), ...keyWarnings];
   if (!providers && !input.mcpConfig) {
     return {
       env: input.env,
       notes: warnings,
       agentConfigDir: null,
+      relayedProviders: relayed,
+      droppedEnvKeys,
       cleanup: async () => {},
     };
   }
@@ -201,9 +266,14 @@ export async function preparePiRuntimeConfig(input: {
       ...(providers
         ? [`Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed models.json: ${Object.keys(providers).join(", ")}.`]
         : []),
+      ...(Object.keys(relayed).length > 0
+        ? [`Model provider(s) routed through the Paperclip relay; no model key is in the sandbox: ${Object.keys(relayed).join(", ")}.`]
+        : []),
       ...(input.mcpConfig ? ["Wrote a managed mcp-adapter.json (no credentials; servers point at the sandbox bridge relay)."] : []),
     ],
     agentConfigDir,
+    relayedProviders: relayed,
+    droppedEnvKeys,
     cleanup: async () => {
       await fs.rm(agentConfigDir, { recursive: true, force: true });
     },

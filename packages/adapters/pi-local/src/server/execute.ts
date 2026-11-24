@@ -1,6 +1,7 @@
 import { buildAgentChildBaseEnv } from "@paperclipai/adapter-utils/agent-child-env";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
+import { registerModelRelay, MODEL_RELAY_ROUTE_POLICIES } from "@paperclipai/adapter-utils/model-relay";
 import { buildPackageRelayEnv, packageRelayAnyOptedIn, PACKAGE_RELAY_GITHUB_REPOS_ENV, PACKAGE_RELAY_ROUTE_POLICIES } from "@paperclipai/adapter-utils/package-relay-env";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -61,7 +62,7 @@ import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./parse.js";
 import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
-import { preparePiRuntimeConfig } from "./runtime-config.js";
+import { pointRelayedProvidersAtBridge, preparePiRuntimeConfig } from "./runtime-config.js";
 import {
   PI_MCP_TOOL_NAME,
   buildPiMcpConfig,
@@ -298,7 +299,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Build environment
-  const envConfig = parseObject(config.env);
+  // A copy: relayed secrets are removed from it below.
+  const envConfig = { ...parseObject(config.env) };
   const env: Record<string, string> = {
     ...buildPaperclipEnv(agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
@@ -389,7 +391,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const preparedRuntimeConfig = await preparePiRuntimeConfig({
     env,
     mcpConfig: piMcpEnabled ? buildPiMcpConfig(piMcpRelayServers) : null,
+    // TECH-10174: in a sandbox pod the model gateway key stays on the server and model calls go through the relay.
+    modelRelay: mcpRelayAvailable,
   });
+  const relayedProviderNames = Object.keys(preparedRuntimeConfig.relayedProviders);
+  for (const key of preparedRuntimeConfig.droppedEnvKeys) {
+    delete env[key];
+    // The workspace env refresh re-applies envConfig later; the value must not come back.
+    delete envConfig[key];
+  }
+  const disposeModelRelay = relayedProviderNames.length > 0
+    ? registerModelRelay(runId, preparedRuntimeConfig.relayedProviders)
+    : () => {};
   const localAgentConfigDir = preparedRuntimeConfig.agentConfigDir ?? "";
   if (localAgentConfigDir) {
     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
@@ -618,8 +631,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onLog,
         ...(piMcpEnabled ? { relayRoutes: buildPiMcpRelayRoutes(piMcpRelayServers) } : {}),
         // The package relay routes get their own lane and deadline (TECH-9786).
-        ...(packageRelayAnyOptedIn(envConfig) ? { bridgeRoutePolicies: PACKAGE_RELAY_ROUTE_POLICIES } : {}),
+        ...(packageRelayAnyOptedIn(envConfig) || relayedProviderNames.length > 0
+          ? {
+              bridgeRoutePolicies: [
+                ...(packageRelayAnyOptedIn(envConfig) ? PACKAGE_RELAY_ROUTE_POLICIES : []),
+                ...(relayedProviderNames.length > 0 ? MODEL_RELAY_ROUTE_POLICIES : []),
+              ],
+            }
+          : {}),
       });
+      if (relayedProviderNames.length > 0) {
+        // Fail closed: without the bridge the provider would point at nothing, and the key must not fall back into the pod.
+        const apiUrl = paperclipBridge?.env.PAPERCLIP_API_URL;
+        if (!apiUrl || !localAgentConfigDir || !env.PI_CODING_AGENT_DIR) {
+          throw new Error("The model relay needs the Paperclip bridge, which did not start; refusing to run with the model key in the sandbox.");
+        }
+        const localModelsPath = path.join(localAgentConfigDir, "models.json");
+        const rewritten = pointRelayedProvidersAtBridge(await fs.readFile(localModelsPath, "utf8"), relayedProviderNames, apiUrl);
+        if (rewritten) {
+          const written = await runAdapterExecutionTargetProcess(
+            runId,
+            runtimeExecutionTarget,
+            "sh",
+            ["-c", 'cat > "$1"', "sh", path.posix.join(env.PI_CODING_AGENT_DIR, "models.json")],
+            { cwd, env, stdin: rewritten, timeoutSec: 30, graceSec: 5, onLog: async () => {} },
+          );
+          if (written.timedOut || (written.exitCode ?? 1) !== 0) {
+            throw new Error("Could not point the Pi model provider at the Paperclip relay in the sandbox.");
+          }
+        }
+      }
       if (paperclipBridge) {
         Object.assign(env, paperclipBridge.env);
         // Opted-in builder agents install private packages through the server relay (TECH-9786).
@@ -1091,6 +1132,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
+    disposeModelRelay();
     await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup(), guardExtension?.cleanup(), memoryExtension?.cleanup()]);
   }
 }
