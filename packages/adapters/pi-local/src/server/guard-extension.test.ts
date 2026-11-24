@@ -219,7 +219,19 @@ describe("guard: tool_call handler", () => {
     stderr.mockRestore();
   });
 
-  it("aborts the run after repeated blocked calls", async () => {
+  it("does not abort when blocked calls are separated by allowed calls", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const handler = register();
+    const ctx = { cwd: repo, abort: vi.fn() };
+    for (let i = 0; i < PI_GUARD_MAX_BLOCKS * 3; i++) {
+      await handler({ toolName: "bash", input: { command: "docker ps" } }, ctx);
+      await handler({ toolName: "bash", input: { command: "git status" } }, ctx);
+    }
+    expect(ctx.abort).not.toHaveBeenCalled();
+    stderr.mockRestore();
+  });
+
+  it("aborts the run after repeated consecutive blocked calls and records why", async () => {
     const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const handler = register();
     const ctx = { cwd: repo, abort: vi.fn() };
@@ -229,6 +241,7 @@ describe("guard: tool_call handler", () => {
     }
     expect(last.terminate).toBe(true);
     expect(ctx.abort).toHaveBeenCalledTimes(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("[paperclip-guard] stopping run: " + PI_GUARD_MAX_BLOCKS + " consecutive blocked tool calls"));
     stderr.mockRestore();
   });
 });
