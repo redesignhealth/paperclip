@@ -17,18 +17,19 @@ const GITHUB_CREDENTIALS_TTL_SECONDS = 30 * 24 * 60 * 60;
 /** Ceiling for credentials that leave the host (sandbox pods, remote targets). */
 export const REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS = 7 * 24 * 60 * 60;
 
-/** Time after the adapter's own timeout for the run to wind down (grace kill, restore, final callbacks). */
+/** Time after the adapter's own timeout(s) for the run to wind down (grace kill, restore, final callbacks). */
 export const GITHUB_BROKER_RUN_WINDDOWN_SECONDS = 600;
 
 /**
- * Lifetime cap for the GitHub broker token (TECH-10174). A token that leaves the host (sandbox pod, SSH host) is only useful
- * while the run is: cap it at the run's wall-clock timeout plus a wind-down margin, never above the 7 day remote ceiling.
- * A run with no adapter timeout keeps the ceiling. Local runs have no cap here (undefined).
+ * Lifetime cap for a GitHub broker token that leaves the host (sandbox pod, SSH host), TECH-10174: the run's wall-clock
+ * timeout plus a wind-down margin, never above the 7 day remote ceiling, so the token the model can read dies with the run.
+ * The window is two timeouts because some adapters chain steps that each get the full timeout, and the token is minted
+ * before the adapter's own clock starts. A run with no adapter wall-clock timeout (0, or an adapter that does not enforce
+ * one, such as the native runner) keeps the ceiling.
  */
-export function githubBrokerMaxTtlSeconds(input: { remote: boolean; runTimeoutSec: number }): number | undefined {
-  if (!input.remote) return undefined;
-  if (!(Number.isFinite(input.runTimeoutSec) && input.runTimeoutSec > 0)) return REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS;
-  return Math.min(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, Math.ceil(input.runTimeoutSec) + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
+export function githubBrokerMaxTtlSeconds(runTimeoutSec: number): number {
+  if (!(Number.isFinite(runTimeoutSec) && runTimeoutSec > 0)) return REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS;
+  return Math.min(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS, 2 * Math.ceil(runTimeoutSec) + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
 }
 
 function secret() {

@@ -2931,13 +2931,15 @@ export function heartbeatService(
             scope: "github_credentials",
             ...(executionTarget?.kind === "remote"
               ? {
-                  maxTtlSeconds: githubBrokerMaxTtlSeconds({
-                    remote: true,
-                    runTimeoutSec: resolveAdapterExecutionTargetTimeoutSec(
-                      executionTarget,
-                      typeof runtimeConfig.timeoutSec === "number" ? runtimeConfig.timeoutSec : undefined,
-                    ),
-                  }),
+                  // The native runner does not enforce the adapter wall-clock timeout, so it keeps the 7 day ceiling.
+                  maxTtlSeconds: githubBrokerMaxTtlSeconds(
+                    agent.adapterType === "paperclip_runner"
+                      ? 0
+                      : resolveAdapterExecutionTargetTimeoutSec(
+                          executionTarget,
+                          typeof runtimeConfig.timeoutSec === "number" ? runtimeConfig.timeoutSec : undefined,
+                        ),
+                  ),
                 }
               : {}),
           })?.token ?? "",

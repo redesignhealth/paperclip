@@ -60,14 +60,23 @@ describe("runtime connection tools token", () => {
     expect(intents.exp - now).toBe(3600);
   });
 
-  it("caps the broker token at the run timeout plus a wind-down margin for remote runs only (TECH-10174)", () => {
-    expect(githubBrokerMaxTtlSeconds({ remote: false, runTimeoutSec: 3600 })).toBeUndefined();
-    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 14_400 })).toBe(14_400 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
-    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 0.5 })).toBe(1 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
-    // No adapter timeout, or a longer one than the ceiling, keeps the 7 day ceiling.
-    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 0 })).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
-    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: Number.NaN })).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
-    expect(githubBrokerMaxTtlSeconds({ remote: true, runTimeoutSec: 30 * 86400 })).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+  it("caps the broker token at twice the run timeout plus a wind-down margin (TECH-10174)", () => {
+    expect(githubBrokerMaxTtlSeconds(14_400)).toBe(2 * 14_400 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
+    expect(githubBrokerMaxTtlSeconds(0.5)).toBe(2 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
+    // No adapter timeout (or a longer one than the ceiling) keeps the 7 day ceiling.
+    expect(githubBrokerMaxTtlSeconds(0)).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+    expect(githubBrokerMaxTtlSeconds(-1)).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+    expect(githubBrokerMaxTtlSeconds(Number.NaN)).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+    expect(githubBrokerMaxTtlSeconds(30 * 86400)).toBe(REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS);
+  });
+
+  it("mints the capped token with the expected expiry", () => {
+    vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "test-runtime-tools-secret");
+    vi.setSystemTime(new Date("2026-08-26T12:00:00.000Z"));
+    const now = Math.floor(Date.now() / 1000);
+    const base = { agentId: "agent-1", companyId: "company-1", runId: "run-1", responsibleUserId: "user-1", scope: "github_credentials" as const };
+    const minted = createRuntimeToolsToken({ ...base, maxTtlSeconds: githubBrokerMaxTtlSeconds(3600) })!;
+    expect(verifyRuntimeToolsToken(minted.token, "github_credentials")!.exp - now).toBe(2 * 3600 + GITHUB_BROKER_RUN_WINDDOWN_SECONDS);
   });
 
   it("rejects an invalid cap instead of failing open, and floors a fractional one", () => {
