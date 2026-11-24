@@ -2,7 +2,7 @@ import { isOpenRouterUrl, openRouterAttributionHeaders } from "@paperclipai/adap
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { modelRelayBaseUrl, modelRelayProviderNameOk, type ModelRelayEntry } from "@paperclipai/adapter-utils/model-relay";
+import { modelRelayProviderNameOk, type ModelRelayEntry } from "@paperclipai/adapter-utils/model-relay";
 import { PI_MCP_CONFIG_FILE } from "./mcp-config.js";
 
 type PreparedPiRuntimeConfig = {
@@ -126,6 +126,88 @@ const WHOLE_ENV_REFERENCE = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za
 // TECH-10174: take the model gateway key out of the pod. A provider is relayed when it is the Ramp Router provider (or reads
 // RAMP_ROUTER_API_KEY), has an https baseUrl, and its key resolves from the run env or is a literal. The key and the real
 // baseUrl move to the host-side relay registry; models.json keeps only the relay path and the bridge token reference.
+//
+// A model entry (in `models` or `modelOverrides`) may override the provider's `baseUrl` and `apiKey` (Router serves Claude over
+// the Messages API at the host root, so those models carry their own baseUrl). Every such override is rewritten too. Each distinct
+// (baseUrl, key) pair gets its own relay entry: the first is named after the provider, later ones `<provider>-m<N>`.
+// If any part of a provider cannot be relayed safely (a `!command` key, an unresolved env reference, an auth header), the whole
+// provider is left as it was and nothing of it is relayed, so no half-rewritten config is ever produced.
+function resolveRelayKey(apiKey: string, env: Record<string, string>): { value: string; envName: string | null } | null {
+  if (apiKey.startsWith("!")) return null;
+  const reference = WHOLE_ENV_REFERENCE.exec(apiKey);
+  const envName = reference ? (reference[1] ?? reference[2] ?? null) : null;
+  const value = envName ? env[envName] : apiKey;
+  if (!value || /[\r\n\0$]/.test(value)) return null;
+  return { value, envName };
+}
+
+function modelEntries(provider: Record<string, unknown>): Record<string, unknown>[] {
+  return [
+    ...(Array.isArray(provider.models) ? provider.models : []),
+    ...(isPlainObject(provider.modelOverrides) ? Object.values(provider.modelOverrides) : []),
+  ].filter(isPlainObject);
+}
+
+function hasAuthHeader(value: unknown): boolean {
+  return isPlainObject(value) && Object.keys(value).some((name) => /^(authorization|x-api-key|api-key|proxy-authorization)$/i.test(name));
+}
+
+function relayOneProvider(
+  name: string,
+  provider: Record<string, unknown>,
+  env: Record<string, string>,
+): { entries: Record<string, ModelRelayEntry>; droppedEnvKeys: string[] } | null {
+  const apiKey = provider.apiKey;
+  const baseUrl = provider.baseUrl;
+  if (typeof apiKey !== "string" || typeof baseUrl !== "string") return null;
+  const providerKey = resolveRelayKey(apiKey, env);
+  if (!providerKey || !baseUrl.startsWith("https://")) return null;
+  if (name !== ROUTER_PROVIDER_NAME && providerKey.envName !== ROUTER_KEY_ENV) return null;
+  if (hasAuthHeader(provider.headers)) return null;
+
+  const entries: Record<string, ModelRelayEntry> = {};
+  const names = new Map<string, string>();
+  const droppedEnvKeys: string[] = providerKey.envName ? [providerKey.envName] : [];
+  const nameFor = (upstreamBaseUrl: string, key: string): string => {
+    const id = `${upstreamBaseUrl}\n${key}`;
+    let relayName = names.get(id);
+    if (!relayName) {
+      relayName = names.size === 0 ? name : `${name}-m${names.size}`;
+      names.set(id, relayName);
+      entries[relayName] = { upstreamBaseUrl, apiKey: key };
+    }
+    return relayName;
+  };
+  // The provider's own pair is always first, so it keeps the provider name.
+  const providerRelay = nameFor(baseUrl, providerKey.value);
+  const rewrites: Array<() => void> = [() => {
+    provider.baseUrl = `${RELAY_PLACEHOLDER_ORIGIN}/api/model-relay/${providerRelay}`;
+    provider.apiKey = RELAY_PROVIDER_API_KEY;
+  }];
+  for (const model of modelEntries(provider)) {
+    const hasBase = model.baseUrl !== undefined;
+    const hasKey = model.apiKey !== undefined;
+    if (hasAuthHeader(model.headers)) return null;
+    if (!hasBase && !hasKey) continue;
+    if (hasBase && (typeof model.baseUrl !== "string" || !model.baseUrl.startsWith("https://"))) return null;
+    let modelKey = providerKey;
+    if (hasKey) {
+      const resolved = typeof model.apiKey === "string" ? resolveRelayKey(model.apiKey, env) : null;
+      if (!resolved) return null;
+      modelKey = resolved;
+      if (resolved.envName) droppedEnvKeys.push(resolved.envName);
+    }
+    const relayName = nameFor(hasBase ? (model.baseUrl as string) : baseUrl, modelKey.value);
+    rewrites.push(() => {
+      model.baseUrl = `${RELAY_PLACEHOLDER_ORIGIN}/api/model-relay/${relayName}`;
+      if (hasKey) model.apiKey = RELAY_PROVIDER_API_KEY;
+    });
+  }
+  if (Object.keys(entries).some((relayName) => !modelRelayProviderNameOk(relayName))) return null;
+  for (const rewrite of rewrites) rewrite();
+  return { entries, droppedEnvKeys };
+}
+
 function relayProviders(
   providers: Record<string, unknown>,
   env: Record<string, string>,
@@ -134,18 +216,10 @@ function relayProviders(
   const droppedEnvKeys: string[] = [];
   for (const [name, provider] of Object.entries(providers)) {
     if (!isPlainObject(provider) || !modelRelayProviderNameOk(name)) continue;
-    const apiKey = provider.apiKey;
-    const baseUrl = provider.baseUrl;
-    if (typeof apiKey !== "string" || typeof baseUrl !== "string" || apiKey.startsWith("!")) continue;
-    const reference = WHOLE_ENV_REFERENCE.exec(apiKey);
-    const referencedName = reference ? (reference[1] ?? reference[2]) : null;
-    if (name !== ROUTER_PROVIDER_NAME && referencedName !== ROUTER_KEY_ENV) continue;
-    const value = referencedName ? env[referencedName] : apiKey;
-    if (!value || /[\r\n\0$]/.test(value) || !baseUrl.startsWith("https://")) continue;
-    relayed[name] = { upstreamBaseUrl: baseUrl, apiKey: value };
-    provider.baseUrl = `${RELAY_PLACEHOLDER_ORIGIN}/api/model-relay/${name}`;
-    provider.apiKey = RELAY_PROVIDER_API_KEY;
-    if (referencedName) droppedEnvKeys.push(referencedName);
+    const result = relayOneProvider(name, provider, env);
+    if (!result) continue;
+    Object.assign(relayed, result.entries);
+    droppedEnvKeys.push(...result.droppedEnvKeys);
   }
   // The raw provider config can itself carry a literal key; the pod never needs it.
   const raw = env.PAPERCLIP_PI_PROVIDERS;
@@ -153,15 +227,24 @@ function relayProviders(
   return { relayed, droppedEnvKeys: [...new Set(droppedEnvKeys)] };
 }
 
-/** Rewrites the relayed providers in a models.json body to the bridge URL. Returns null when nothing changed. */
-export function pointRelayedProvidersAtBridge(modelsJson: string, relayedNames: readonly string[], apiUrl: string): string | null {
+/**
+ * Rewrites every relay placeholder baseUrl (provider level and per-model) in a models.json body to the bridge URL.
+ * Returns null when nothing changed.
+ */
+export function pointRelayedProvidersAtBridge(modelsJson: string, apiUrl: string): string | null {
   const parsed = JSON.parse(modelsJson) as { providers?: Record<string, unknown> };
+  const origin = apiUrl.trim().replace(/\/+$/, "");
   let changed = false;
-  for (const name of relayedNames) {
-    const provider = parsed.providers?.[name];
+  const point = (target: Record<string, unknown>) => {
+    if (typeof target.baseUrl === "string" && target.baseUrl.startsWith(`${RELAY_PLACEHOLDER_ORIGIN}/`)) {
+      target.baseUrl = `${origin}${target.baseUrl.slice(RELAY_PLACEHOLDER_ORIGIN.length)}`;
+      changed = true;
+    }
+  };
+  for (const provider of Object.values(parsed.providers ?? {})) {
     if (!isPlainObject(provider)) continue;
-    provider.baseUrl = modelRelayBaseUrl(apiUrl, name);
-    changed = true;
+    point(provider);
+    for (const model of modelEntries(provider)) point(model);
   }
   return changed ? `${JSON.stringify(parsed, null, 2)}\n` : null;
 }

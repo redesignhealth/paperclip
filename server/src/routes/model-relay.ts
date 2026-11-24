@@ -110,7 +110,7 @@ export function modelRelayRoutes(db: Db, deps: ModelRelayDeps = {}) {
               "x-api-key": entry.apiKey,
               "content-type": "application/json",
               ...(accept ? { accept } : {}),
-              ...(suffix === "messages" ? { "anthropic-version": ANTHROPIC_VERSION } : {}),
+              ...(suffix.endsWith("messages") ? { "anthropic-version": ANTHROPIC_VERSION } : {}),
             },
             body: new Uint8Array(raw),
             redirect: "manual",
@@ -199,6 +199,8 @@ export function modelRelayRoutes(db: Db, deps: ModelRelayDeps = {}) {
   router.post("/model-relay/:provider/completions", handler("completions"));
   router.post("/model-relay/:provider/responses", handler("responses"));
   router.post("/model-relay/:provider/messages", handler("messages"));
+  // Anthropic SDK clients with a host-root baseUrl (Router serves Claude that way) append /v1/messages.
+  router.post("/model-relay/:provider/v1/messages", handler("v1/messages"));
 
   return router;
 }

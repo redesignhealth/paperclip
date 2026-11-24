@@ -409,7 +409,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/ },
 
   // Model relay (TECH-10174). POST only, a closed list of inference paths; the server adds the model gateway key.
-  { method: "POST", path: /^\/api\/model-relay\/[a-z0-9][a-z0-9_-]{0,63}\/(?:chat\/completions|completions|responses|messages)$/ },
+  { method: "POST", path: /^\/api\/model-relay\/[a-z0-9][a-z0-9_-]{0,63}\/(?:chat\/completions|completions|responses|messages|v1\/messages)$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.

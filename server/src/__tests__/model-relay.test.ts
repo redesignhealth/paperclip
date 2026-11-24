@@ -121,6 +121,24 @@ describe("model relay (TECH-10174)", () => {
     expect(outcome).not.toContain(KEY.slice(0, 10));
   });
 
+  it("serves the Messages API at a host-root upstream with the anthropic headers (Claude on Router)", async () => {
+    disposers.push(registerModelRelay("run-1", { "ramp-router": { upstreamBaseUrl: UPSTREAM, apiKey: KEY }, "ramp-router-m1": { upstreamBaseUrl: "https://api.router.example", apiKey: KEY } }));
+    const { app, fetchImpl } = build({ register: false });
+    // The Anthropic SDK, given the relay base for the host-root upstream, posts to <base>/v1/messages with x-api-key.
+    const res = await request(app).post("/api/model-relay/ramp-router-m1/v1/messages").set("content-type", "application/json").set("x-api-key", "pod-bridge-token").send(BODY).expect(200);
+    expect(res.text).toBe(SSE);
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.router.example/v1/messages");
+    const headers = init.headers as Record<string, string>;
+    expect(headers["x-api-key"]).toBe(KEY);
+    expect(headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(headers["anthropic-version"]).toBe("2023-06-01");
+    expect(JSON.stringify(headers)).not.toContain("pod-bridge-token");
+    // The /v1 provider base serves the Responses API for the non-Claude models.
+    await post(app, "/api/model-relay/ramp-router/responses").expect(200);
+    expect((fetchImpl.mock.calls[1] as [string])[0]).toBe(`${UPSTREAM}/responses`);
+  });
+
   it("serves the other inference paths and refuses an oversized request", async () => {
     const { app, fetchImpl } = build();
     await post(app, "/api/model-relay/ramp-router/completions").expect(200);

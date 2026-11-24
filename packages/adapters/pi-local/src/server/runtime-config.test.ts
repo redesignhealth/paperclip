@@ -385,10 +385,92 @@ describe("preparePiRuntimeConfig model relay (TECH-10174)", () => {
   });
 
   it("points relayed providers at the bridge URL and leaves others alone", () => {
-    const body = JSON.stringify({ providers: { "ramp-router": { baseUrl: "http://127.0.0.1:0/x", apiKey: "$PAPERCLIP_API_KEY" }, other: { baseUrl: "https://o/v1" } } });
-    const out = JSON.parse(pointRelayedProvidersAtBridge(body, ["ramp-router"], "http://127.0.0.1:4310/")!);
+    const body = JSON.stringify({ providers: { "ramp-router": { baseUrl: "http://127.0.0.1:0/api/model-relay/ramp-router", apiKey: "$PAPERCLIP_API_KEY" }, other: { baseUrl: "https://o/v1" } } });
+    const out = JSON.parse(pointRelayedProvidersAtBridge(body, "http://127.0.0.1:4310/")!);
     expect(out.providers["ramp-router"].baseUrl).toBe("http://127.0.0.1:4310/api/model-relay/ramp-router");
     expect(out.providers.other.baseUrl).toBe("https://o/v1");
-    expect(pointRelayedProvidersAtBridge(body, ["missing"], "http://127.0.0.1:4310")).toBeNull();
+    expect(pointRelayedProvidersAtBridge(JSON.stringify({ providers: { other: { baseUrl: "https://o/v1" } } }), "http://127.0.0.1:4310")).toBeNull();
+  });
+
+  // The shape of PAPERCLIP_PI_PROVIDERS in prod and dev (pi_router_providers_env): the provider speaks the Responses API under
+  // /v1, and the Claude models override api and baseUrl to the Messages API at the host root.
+  const routerShape = () => JSON.stringify({
+    "ramp-router": {
+      baseUrl: "https://api.router.com/v1",
+      api: "openai-responses",
+      apiKey: "$RAMP_ROUTER_API_KEY",
+      models: [
+        { id: "gpt-6.1-sol", reasoning: true, input: ["text", "image"], contextWindow: 1050000, maxTokens: 128000 },
+        { id: "gpt-6-luna", reasoning: true, compat: { supportsExplicitPromptCacheMode: true } },
+        { id: "deepseek-v4.1-flash-1017-us", reasoning: true, maxTokens: 128000 },
+        { id: "claude-sonnet-5-5", api: "anthropic-messages", baseUrl: "https://api.router.com", compat: { forceAdaptiveThinking: true } },
+        { id: "claude-opus-5-5", api: "anthropic-messages", baseUrl: "https://api.router.com", compat: { forceAdaptiveThinking: true } },
+      ],
+    },
+  });
+
+  it("relays Claude models that override baseUrl, and models that do not, with no Router URL or key left in models.json", async () => {
+    const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: routerShape(), RAMP_ROUTER_API_KEY: KEY }, modelRelay: true });
+    cleanupPaths.add(prepared.agentConfigDir!);
+    // One relay entry per distinct upstream: the provider's /v1 base, and the host-root base the Claude models use.
+    expect(prepared.relayedProviders).toEqual({
+      "ramp-router": { upstreamBaseUrl: "https://api.router.com/v1", apiKey: KEY },
+      "ramp-router-m1": { upstreamBaseUrl: "https://api.router.com", apiKey: KEY },
+    });
+    expect(prepared.droppedEnvKeys).toEqual(["RAMP_ROUTER_API_KEY"]);
+    const raw = await fs.readFile(path.join(prepared.agentConfigDir!, "models.json"), "utf8");
+    expect(raw).not.toContain(KEY);
+    expect(raw).not.toContain("api.router.com");
+    const staged = pointRelayedProvidersAtBridge(raw, "http://127.0.0.1:4310")!;
+    const provider = (JSON.parse(staged).providers as Record<string, Record<string, unknown>>)["ramp-router"]!;
+    const models = provider.models as Array<Record<string, unknown>>;
+    expect(provider).toMatchObject({ baseUrl: "http://127.0.0.1:4310/api/model-relay/ramp-router", apiKey: "$PAPERCLIP_API_KEY", api: "openai-responses" });
+    // Non-Claude models keep no override and inherit the provider's relay URL.
+    expect(models.find((m) => m.id === "gpt-6-luna")).not.toHaveProperty("baseUrl");
+    expect(models.find((m) => m.id === "deepseek-v4.1-flash-1017-us")).not.toHaveProperty("baseUrl");
+    for (const id of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+      expect(models.find((m) => m.id === id)).toMatchObject({ api: "anthropic-messages", baseUrl: "http://127.0.0.1:4310/api/model-relay/ramp-router-m1" });
+    }
+    expect(JSON.stringify(models)).not.toContain("router.com");
+  });
+
+  it("relays a per-model apiKey override with its own key, and rewrites modelOverrides too", async () => {
+    const providersJson = JSON.stringify({
+      "ramp-router": {
+        baseUrl: "https://api.router.com/v1",
+        apiKey: "$RAMP_ROUTER_API_KEY",
+        models: [{ id: "a", apiKey: "$OTHER_ROUTER_KEY" }, { id: "b", apiKey: "$OTHER_ROUTER_KEY", baseUrl: "https://api.router.com" }],
+        modelOverrides: { c: { baseUrl: "https://api.router.com" } },
+      },
+    });
+    const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: providersJson, RAMP_ROUTER_API_KEY: KEY, OTHER_ROUTER_KEY: "other-router-key-0123456789" }, modelRelay: true });
+    cleanupPaths.add(prepared.agentConfigDir!);
+    expect(Object.values(prepared.relayedProviders).map((e) => `${e.upstreamBaseUrl} ${e.apiKey}`).sort()).toEqual([
+      "https://api.router.com other-router-key-0123456789",
+      "https://api.router.com/v1 other-router-key-0123456789",
+      "https://api.router.com/v1 router-secret-key-0123456789",
+      "https://api.router.com router-secret-key-0123456789",
+    ].sort());
+    expect(prepared.droppedEnvKeys.sort()).toEqual(["OTHER_ROUTER_KEY", "RAMP_ROUTER_API_KEY"]);
+    const raw = await fs.readFile(path.join(prepared.agentConfigDir!, "models.json"), "utf8");
+    expect(raw).not.toContain("router.com");
+    expect(raw).not.toContain("router-key");
+    expect(raw).not.toMatch(/\$(?!PAPERCLIP_API_KEY)[A-Z_]+/);
+  });
+
+  it("leaves a provider entirely unrelayed when one model override cannot be relayed safely", async () => {
+    for (const model of [
+      { id: "x", apiKey: "!op read secret" },
+      { id: "x", apiKey: "$MISSING_KEY" },
+      { id: "x", baseUrl: "http://api.router.com" },
+      { id: "x", headers: { Authorization: "Bearer abc" } },
+    ]) {
+      const providersJson = JSON.stringify({ "ramp-router": { baseUrl: "https://api.router.com/v1", apiKey: "$RAMP_ROUTER_API_KEY", models: [model] } });
+      const prepared = await preparePiRuntimeConfig({ env: { PAPERCLIP_PI_PROVIDERS: providersJson, RAMP_ROUTER_API_KEY: KEY }, modelRelay: true });
+      cleanupPaths.add(prepared.agentConfigDir!);
+      expect(prepared.relayedProviders).toEqual({});
+      expect(prepared.droppedEnvKeys).toEqual([]);
+      expect(await fs.readFile(path.join(prepared.agentConfigDir!, "models.json"), "utf8")).toContain("$RAMP_ROUTER_API_KEY");
+    }
   });
 });
