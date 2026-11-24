@@ -203,3 +203,12 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/routes/comms-wake-admin.ts` instance-admin routes under `/companies/:companyId/comms-wake`
 - `server/src/__tests__/comms-wake-admin.test.ts`
 - `server/src/__tests__/comms-wake-admin-routes.test.ts`
+
+## Ashby API relay (TECH-9966)
+
+- `server/src/routes/ashby-relay.ts` fixed-destination Ashby API relay for opted-in sandbox agents (TECH-9966)
+- `server/src/__tests__/ashby-relay.test.ts`
+- `packages/adapter-utils/src/ashby-relay-env.ts` opt-in bridge environment settings for the Ashby relay
+- `packages/adapter-utils/src/ashby-relay-env.test.ts`
+- `packages/adapters/hermes/src/server/execute-sandbox.ts` Hermes sandbox launch wires Ashby relay env and scrubs stale credentials
+- `packages/adapters/hermes/src/server/execute.sandbox.test.ts`

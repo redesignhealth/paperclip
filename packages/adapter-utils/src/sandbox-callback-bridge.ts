@@ -27,7 +27,7 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
-const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
+export const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
@@ -403,6 +403,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Read-only git smart-HTTP relay to allowlisted GitHub repositories (fetch only; the server refuses pushes).
   { method: "GET", path: /^\/api\/package-relay\/github\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/info\/refs$/ },
   { method: "POST", path: /^\/api\/package-relay\/github\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/git-upload-pack$/ },
+
+  // Fixed-destination Ashby API relay (TECH-9966). POST only; the server checks the operation allowlist,
+  // the agent's opt-in, and resolves the Ashby API key server-side from company secrets.
+  { method: "POST", path: /^\/api\/ashby-relay\/[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)+$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.
@@ -3097,6 +3101,11 @@ function tokensMatch(received) {
   return timingSafeEqual(expected, actual);
 }
 
+function isAshbyRelayPath(url) {
+  const p = (url || "").split("?")[0];
+  return /^\\/api\\/ashby-relay\\/[a-zA-Z0-9]+(?:\\.[a-zA-Z0-9]+)+$/.test(p);
+}
+
 // Read the bridge token a local caller presented. The gateway accepts two
 // header conventions for the same token. "Authorization: Bearer <token>" is the
 // bridge convention. "X-API-Key: <token>" is the convention the public Paperclip
@@ -3111,13 +3120,21 @@ function readBridgeToken(req) {
   if (auth.startsWith("Bearer ")) {
     return auth.slice("Bearer ".length);
   }
-  // HTTP Basic carries the same token as the password (any username). Package installers such as uv can
-  // send credentials only this way, so this is what lets them use the package relay. It is the same constant-time
-  // comparison, and the header allowlist strips it like the others.
+  // HTTP Basic carries the same token as the password (any username, e.g. uv) or as the username (e.g. Ashby API clients: apiKey:).
+  // Package installers such as uv and API clients can send credentials only this way, so this is what lets them use relays.
+  // It is the same constant-time comparison, and the header allowlist strips it like the others.
   if (auth.startsWith("Basic ")) {
     const decoded = Buffer.from(auth.slice("Basic ".length), "base64").toString("utf8");
     const separator = decoded.indexOf(":");
-    if (separator >= 0) return decoded.slice(separator + 1);
+    if (separator >= 0) {
+      const user = decoded.slice(0, separator);
+      const pass = decoded.slice(separator + 1);
+      // Restrict Basic username token matching strictly to Ashby relay routes to preserve
+      // standard password-only (user:token) extraction on all other routes (e.g. package relay uv).
+      if (isAshbyRelayPath(req.url) && tokensMatch(user)) return user;
+      return pass;
+    }
+    return decoded;
   }
   const apiKey = req.headers["x-api-key"];
   return typeof apiKey === "string" ? apiKey : "";
@@ -3227,7 +3244,8 @@ async function runFileGateway() {
         && /^application\\/x-git-upload-pack-request(?:;|$)/i.test(contentType);
       const binaryBody = multipartAttachment || gitUploadPack;
       if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !binaryBody
-        && !url.pathname.startsWith("/paperclip-relay/")) {
+        && !url.pathname.startsWith("/paperclip-relay/")
+        && !url.pathname.startsWith("/api/ashby-relay/")) {
         writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
         return;
       }

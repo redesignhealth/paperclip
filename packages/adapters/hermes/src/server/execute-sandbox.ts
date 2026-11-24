@@ -24,10 +24,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type {
-  AdapterExecutionContext,
-  AdapterExecutionResult,
-  SandboxCallbackBridgeRoutePolicy,
+import {
+  ashbyRelayOptedIn,
+  buildAshbyRelayEnv,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type SandboxCallbackBridgeRoutePolicy,
 } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetDuplexObservabilityRecorder,
@@ -123,6 +125,8 @@ export const HERMES_SANDBOX_RUNTIME_MEMORY_UNSUPPORTED_MESSAGE =
   "Refusing to start: Paperclip runtime memory (per-company database) is not supported for Hermes in sandbox environments. Move the agent to the external memory service or select the local environment.";
 export const HERMES_SANDBOX_MEMORY_BRIDGE_REQUIRED_MESSAGE =
   "Refusing to start: adapterConfig.memoryProvider in a sandbox environment needs the Paperclip callback bridge, which did not start for this run. Remove memoryProvider or select the local environment.";
+export const HERMES_SANDBOX_ASHBY_BRIDGE_REQUIRED_MESSAGE =
+  "Refusing to start: PAPERCLIP_ASHBY_RELAY=on in a sandbox environment needs the Paperclip callback bridge, which did not start for this run. Disable PAPERCLIP_ASHBY_RELAY or select the local environment.";
 /**
  * Bridge policy for the memory relay routes: their own concurrency lane and a 35 s in-pod deadline (Hermes's mem0
  * client waits 30 s; the host abort lands at 33 s and the server relay gives up at 32 s). File bridge only: the
@@ -683,6 +687,15 @@ async function executeHermesInSandbox(
     const envCommentId = cfgString(wakeContext.commentId) || cfgString(wakeContext.wakeCommentId) || cfgString(ctx.config?.commentId);
     if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
     Object.assign(env, bridgeEnv);
+    if (ashbyRelayOptedIn(userEnv)) {
+      if (!bridgeEnv.PAPERCLIP_API_URL || !bridgeEnv.PAPERCLIP_API_KEY) {
+        await refuse(ctx, HERMES_SANDBOX_ASHBY_BRIDGE_REQUIRED_MESSAGE);
+      }
+      // Scrub any stale Ashby credentials or endpoints from user env / prepared home
+      delete env.ASHBY_API_KEY;
+      delete env.ASHBY_API_BASE;
+      Object.assign(env, buildAshbyRelayEnv(userEnv, bridgeEnv));
+    }
     if (memoryProvider === "mem0") {
       if (!bridgeEnv.PAPERCLIP_API_URL || !bridgeEnv.PAPERCLIP_API_KEY) {
         await refuse(ctx, HERMES_SANDBOX_MEMORY_BRIDGE_REQUIRED_MESSAGE);

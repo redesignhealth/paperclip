@@ -154,6 +154,12 @@ export type {
   PaperclipRunnerPermissionOption,
   PaperclipRunnerProvider,
 } from "./paperclip-runner-permissions.js";
+export {
+  ASHBY_RELAY_OPT_IN_ENV_KEY,
+  ASHBY_RELAY_PATH,
+  ashbyRelayOptedIn,
+  buildAshbyRelayEnv,
+} from "./ashby-relay-env.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

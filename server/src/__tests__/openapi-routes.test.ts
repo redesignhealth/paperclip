@@ -24,6 +24,7 @@ const apiPrefixes: Record<string, string> = {
   "agent-memory-relay.ts": "/api",
   "package-relay.ts": "/api",
   "package-relay-git.ts": "/api",
+  "ashby-relay.ts": "/api",
   "agent-avatars.ts": "/api",
   "agent-profile-avatar.ts": "/api",
   "announcements.ts": "/api",
@@ -133,6 +134,8 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   "GET /api/package-relay/gitea/files/{package}/{version}/{filename}",
   "GET /api/package-relay/github/{owner}/{repo}/info/refs",
   "POST /api/package-relay/github/{owner}/{repo}/git-upload-pack",
+  // The Ashby relay is an internal bridge surface for sandboxed agents (run-JWT only).
+  "POST /api/ashby-relay/{operation}",
   "GET /api/customer-success/v1/run-authority",
   "POST /api/customer-success/v1/read",
   // OAuth discovery and protocol endpoints have their own metadata contract;
