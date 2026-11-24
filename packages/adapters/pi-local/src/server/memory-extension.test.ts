@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PI_MEMORY_TOOL_NAMES, findPiMemoryRelayServer, piMemoryExtensionSource } from "./memory-extension.js";
+import { PI_MEMORY_TOOL_NAMES, findPiMemoryRelayServer, piMemoryExtensionSource, resolvePiMemoryToolName } from "./memory-extension.js";
 
 type Handler = (event: Record<string, unknown>, ctx?: unknown) => Promise<unknown> | unknown;
 type Tool = { name: string; execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<{ content: Array<{ text: string }>; details: unknown }> };
@@ -235,5 +235,56 @@ describe("findPiMemoryRelayServer", () => {
     const make = (key: string, allowedTools: string[]) => ({ key, server: { name: key, url: "u", token: "t", connectionId: "c", allowedTools } });
     expect(findPiMemoryRelayServer([make("comms", ["inbox"]), make("mem", ["memory_search", "memory_add"])])?.key).toBe("mem");
     expect(findPiMemoryRelayServer([make("comms", ["inbox"])])).toBeNull();
+  });
+});
+
+// Pods get the agent's assigned MCP connections through one gateway server, whose tool names are namespaced and hyphenated.
+const GATEWAY_TOOLS = [
+  "mcp.app-gallery-linear-43e589c0:save-comment",
+  "mcp.rh-agent-memory-tools-2d639e79:memory-add",
+  "mcp.rh-agent-memory-tools-2d639e79:memory-delete",
+  "mcp.rh-agent-memory-tools-2d639e79:memory-search",
+];
+
+describe("memory tools behind the gateway's namespaced names", () => {
+  it("resolves the memory tools from gateway names, bare names and collision suffixes", () => {
+    expect(resolvePiMemoryToolName(GATEWAY_TOOLS, "memory_search")).toBe("mcp.rh-agent-memory-tools-2d639e79:memory-search");
+    expect(resolvePiMemoryToolName(GATEWAY_TOOLS, "memory_add")).toBe("mcp.rh-agent-memory-tools-2d639e79:memory-add");
+    expect(resolvePiMemoryToolName(["memory_search", "memory-search"], "memory_search")).toBe("memory_search");
+    expect(resolvePiMemoryToolName(["mcp.mem-1234abcd:memory-search-0a1b2c3d"], "memory_search")).toBe("mcp.mem-1234abcd:memory-search-0a1b2c3d");
+    expect(resolvePiMemoryToolName(["mcp.x:memory-search-extra", "mcp.x:recall-memory-search"], "memory_search")).toBeNull();
+    expect(resolvePiMemoryToolName(["mcp.x:save-comment"], "memory_delete")).toBeNull();
+  });
+
+  it("finds the gateway server that lists a namespaced memory tool", () => {
+    const make = (key: string, allowedTools: string[]) => ({ key, server: { name: key, url: "u", token: "t", connectionId: "c", allowedTools } });
+    expect(findPiMemoryRelayServer([make("paperclip_assigned", GATEWAY_TOOLS)])?.key).toBe("paperclip_assigned");
+    expect(findPiMemoryRelayServer([make("paperclip_assigned", ["mcp.app-gallery-linear-43e589c0:save-comment"])])).toBeNull();
+  });
+
+  it("recalls, captures and runs the tools through the namespaced upstream names", async () => {
+    await writeMcpJson({
+      paperclip_assigned: {
+        url: "${TEST_RELAY_URL}/paperclip-relay/mcp/paperclip_assigned",
+        headers: { Authorization: "Bearer ${TEST_BRIDGE_TOKEN}" },
+        includeTools: GATEWAY_TOOLS,
+      },
+    });
+    const search = GATEWAY_TOOLS[3]!;
+    respond = (call) => ({ result: { content: [{ type: "text", text: JSON.stringify(call.name === search ? SEARCH_RESULTS : { results: [{ id: "n1", memory: "saved", event: "ADD" }] }) }] } });
+    const { handlers, tools } = await load();
+    const recalled = (await handlers.get("before_agent_start")!({ prompt: "Fix the auth bug in the api" })) as { message: { content: string } };
+    expect(recalled.message.content).toContain("Prefer pnpm filter builds");
+    await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
+    await tools.get("memory_delete")!.execute("t", { memory_id: "abc" });
+    expect(calls.map((call) => call.name)).toEqual([search, GATEWAY_TOOLS[1], GATEWAY_TOOLS[2]]);
+  });
+
+  it("registers only the tools the server allows", async () => {
+    await writeMcpJson({ mem: { url: "${TEST_RELAY_URL}/x", includeTools: ["mcp.m-1:memory-search"] } });
+    const { handlers, tools } = await load();
+    expect([...tools.keys()]).toEqual(["memory_search"]);
+    await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
+    expect(calls).toEqual([]);
   });
 });

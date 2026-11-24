@@ -383,6 +383,23 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     expect(JSON.stringify({ args, env, written })).not.toContain(MCP_TOKEN);
   });
 
+  it("loads the memory extension when the memory tools arrive as namespaced gateway names (TECH-9800)", async () => {
+    const gatewayServer = {
+      name: "paperclip_assigned",
+      url: "https://paperclip.example/api/mcp/assigned",
+      token: MCP_TOKEN,
+      connectionId: "conn-4",
+      allowedTools: ["mcp.rh-agent-memory-tools-2d639e79:memory-add", "mcp.rh-agent-memory-tools-2d639e79:memory-search"],
+    };
+    const { args, logs } = await run({
+      config: { command: "pi", model: "openai/gpt-5.4-mini", memoryExtension: true },
+      runtimeMcp: { getServers: () => [gatewayServer] },
+    });
+    const extensions = args.flatMap((value, index) => (args[index - 1] === "--extension" ? [value] : []));
+    expect(extensions.some((value) => value.endsWith("/rh-memory.mjs"))).toBe(true);
+    expect(logs.join("")).not.toContain("memory MCP server is not available");
+  });
+
   it("continues without the memory extension, and says so, when the memory server is not in the run", async () => {
     const { args, logs } = await run({ config: { command: "pi", model: "openai/gpt-5.4-mini", memoryExtension: true } });
     expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls,mcp");
