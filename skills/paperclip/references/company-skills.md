@@ -269,9 +269,8 @@ agents lacking skill-creation/agent-configuration grants):
 - Do not retry or fall back to saving the skill to local disk or provider home.
 - Report the restriction in your task comment and name the skill content you wanted to
   save (attach it as a task document).
-- Never ask a human to do what an agent could do: escalate via `chainOfCommand` to a manager
-  agent first where the permission model allows it, so a manager or board user can create
-  and assign the skill.
+- Escalate to a manager agent via `chainOfCommand` first; involve a board user only if
+  no agent in the chain has the permission.
 
 ```sh
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills" \
@@ -283,7 +282,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills"
     "markdown": "---\nname: Custom Skill\ndescription: What this skill does\n---\n\n# Custom Skill\n..."
   }'
 
-curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills/sync" \
+curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/$PAPERCLIP_AGENT_ID/skills/sync" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{

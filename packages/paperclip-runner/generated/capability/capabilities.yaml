@@ -1208,9 +1208,9 @@
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/company-skills.md:297",
+      "id": "skill:skills/paperclip/references/company-skills.md:296",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/company-skills.md#L297:notes",
+      "sourceAnchor": "skills/paperclip/references/company-skills.md#L296:notes",
       "heading": "Notes",
       "primaryDisposition": "control_plane_owned",
       "semanticOperation": "runtime_reconciliation",
