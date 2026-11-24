@@ -1187,6 +1187,94 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(await sweepCompanyTemplates(at(2000))).toBe(0);
   });
 
+  // A catalog re-read only ever adds tools to a published template: any failure leaves it exactly as it was (TECH-9887).
+  describe.each([
+    ["the board is down", "down"],
+    ["the board connection throws", "throws"],
+    ["drift appears while reading", "drift"],
+  ] as const)("a failed catalog re-read (%s)", (_label, failure) => {
+    it("leaves the published template as it was, still cloneable, and schedules the next hourly check", async () => {
+      enableFeature();
+      const companyId = await seedCompany();
+      const ownerId = await seedMember(companyId);
+      const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+      const v2Allow = COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name));
+      const boardTools = [...v2Allow, ...RESTRICTED_TOOLS.filter((name) => !name.includes("wake"))];
+      let failNow = false;
+      const fetchMock = makeFetch({ tools: () => boardTools });
+      const flaky = vi.fn(async (url: string, init: RequestInit) => {
+        if (failNow && url === BOARD_URL && String(init.body).includes("tools/list")) {
+          if (failure === "down") return new Response("down", { status: 503 });
+          if (failure === "throws") throw new Error("network down");
+          // drift: a profile binding lands on the template while the catalog is being read.
+          const template = (await templateRow(companyId))!;
+          const profile = (await profileOf(template.id))!;
+          await db.insert(toolProfileBindings).values({ companyId, profileId: profile.id, targetType: "company", targetId: companyId });
+        }
+        return fetchMock(url, init);
+      });
+      vi.stubGlobal("fetch", flaky);
+      const t0 = Date.now();
+      const at = (minutes: number) => ({
+        ...ctxFor(fetchMock, { now: () => new Date(t0 + minutes * 60_000) }),
+        fetchImpl: flaky as never,
+        toolAccessOptions: { remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 as const }], remoteHttpRequest: async (url: string, init: RequestInit) => flaky(url, init) },
+      });
+      const snapshot = async (connectionId: string) => (await catalogOf(connectionId)).map((row) => `${row.toolName}:${row.status}`).sort();
+
+      expect(await ensureCompanyTemplate(at(0), { companyId })).toEqual({ kind: "ready" });
+      const template = (await templateRow(companyId))!;
+      const before = readTemplateClaim(template.config)!;
+      const toolsBefore = await snapshot(template.id);
+      const profileBefore = (await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, (await profileOf(template.id))!.id))).length;
+
+      failNow = true;
+      expect(await sweepCompanyTemplates(at(61))).toBe(1);
+      failNow = false;
+      const afterRow = (await templateRow(companyId))!;
+      const after = readTemplateClaim(afterRow.config)!;
+      // Unchanged: state, version, reason, attempt budget, enabled tools, profile; connection still active.
+      expect(after).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3, attemptCount: before.attemptCount, readyAt: before.readyAt, claimId: null, leaseUntil: null });
+      expect([...after.missingReviewedTools!].sort()).toEqual(WAKE);
+      expect(afterRow.status).toBe("active");
+      expect(await snapshot(template.id)).toEqual(toolsBefore);
+      expect((await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, (await profileOf(template.id))!.id))).length).toBe(profileBefore);
+      // The next check is scheduled at the fixed hourly cadence, and nothing is selected before it is due.
+      expect(Date.parse(after.missingCheckAt!)).toBe(t0 + 61 * 60_000 + 60 * 60_000);
+      expect(await sweepCompanyTemplates(at(62))).toBe(0);
+      // The failure is on the activity row.
+      const activity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+      expect(activity.some((row) => (row.details as { state?: string; reason?: string }).state === "ready" && typeof (row.details as { reason?: string }).reason === "string")).toBe(true);
+
+      if (failure === "drift") {
+        // The normal path owns drift: it sees it at its normal time (not the re-read).
+        expect(await verifyTemplateReady(db, afterRow, { allowedTools: COMMS_BOARD_REVIEWED_TOOLS })).toBe("drift");
+        const profile = (await profileOf(template.id))!;
+        await db.delete(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
+      }
+      // Still cloneable: a new agent gets a ready clone with the tools that exist.
+      const agent = await createAgent(companyId, ownerId);
+      expect((await agentEntry(agent.id)).setup.state).toBe("ready");
+      const clone = (await connectionsOf(companyId)).find((row) => row.name === `rh-comms-board:${agent.id}`)!;
+      expect((await catalogOf(clone.id)).filter((row) => row.status === "active").map((row) => row.toolName).sort()).toEqual([...v2Allow].sort());
+    });
+  });
+
+  it("a revoked template secret is acted on by the normal setup path, never by the catalog re-read", async () => {
+    enableFeature();
+    const companyId = await seedCompany();
+    await seedMember(companyId);
+    const WAKE = ["comms_wake_rule_add", "comms_wake_rule_update", "comms_wake_rules_list", "comms_wake_session_close", "comms_wake_sessions_list"];
+    const fetchMock = makeFetch({ tools: () => [...COMMS_BOARD_REVIEWED_TOOLS.filter((name) => !WAKE.includes(name)), ...RESTRICTED_TOOLS.filter((name) => !name.includes("wake"))] });
+    const t0 = Date.now();
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock, { now: () => new Date(t0) }), { companyId })).toEqual({ kind: "ready" });
+    const claim = readTemplateClaim((await templateRow(companyId))!.config)!;
+    await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, claim.secretId!));
+    const lists = fetchMock.calls.toolsList.length;
+    expect(await ensureCompanyTemplate(ctxFor(fetchMock, { now: () => new Date(t0 + 61 * 60_000) }), { companyId })).toEqual({ kind: "error", reason: "template_drift" });
+    expect(fetchMock.calls.toolsList.length).toBe(lists); // the re-read never ran
+  });
+
   it("an operator archive that lands AFTER the activation transaction has read the row can never be flipped back to active", async () => {
     enableFeature();
     const companyId = await seedCompany();

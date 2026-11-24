@@ -1001,7 +1001,20 @@ export async function ensureCompanyTemplate(
     return { kind: "error", reason: claim.reason ?? "template_failed" };
   }
 
-  const claimed = await claimTemplate(ctx.db, connection.id, now);
+  // A catalog re-read only ever ADDS tools to a published, working template: whatever goes wrong, the template ends
+  // exactly as it was (state, version, enabled tools, attempt budget) and the next check is scheduled.
+  const activeBefore = recheck
+    ? (await ctx.db.select().from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, connection.id), eq(toolCatalogEntries.status, "active"))))
+    : [];
+  let claimed: DefaultMcpTemplateClaim | null;
+  try {
+    claimed = await claimTemplate(ctx.db, connection.id, now);
+  } catch (err) {
+    if (!recheck) throw err;
+    logger.warn({ companyId: input.companyId, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP template re-read could not start; published template left as it was");
+    await patchIfState(ctx.db, connection.id, "pending", { state: "ready", reason: null, nextAttemptAt: null, updatedAt: now.toISOString() });
+    return { kind: "ready" };
+  }
   if (!claimed) return { kind: "not_claimed" };
   claim = claimed;
   connection = (await ctx.db.select().from(toolConnections).where(eq(toolConnections.id, connection.id)).limit(1))[0] ?? connection;
@@ -1038,10 +1051,22 @@ export async function ensureCompanyTemplate(
     }
   } else state = "error";
 
-  // A catalog re-read that could not finish (board down) leaves the published template as it was: it never turns a
-  // working template pending or terminal. The next check rides the same backoff.
-  const keepPublished = recheck && (result.kind === "retry" || result.kind === "waiting");
-  if (keepPublished) state = "ready";
+  // A re-read that did not end ready (board down, credential or secret unavailable, drift, unexpected error) leaves the
+  // published template as it was. Drift or secret problems are acted on by the normal setup path at its normal time,
+  // never by the re-read. The failure is logged and recorded on the activity row; the next check is hourly.
+  const keepPublished = recheck && result.kind !== "ready";
+  if (keepPublished) {
+    state = "ready";
+    logger.warn({ companyId: input.companyId, result: result.kind, reason }, "default MCP template re-read failed; published template left as it was");
+    // The discovery refresh may have quarantined a tool that was working; a failed re-read must not cost the template any.
+    const wasActive = activeBefore.map((row) => row.id);
+    if (wasActive.length > 0) {
+      await ctx.db
+        .update(toolCatalogEntries)
+        .set({ status: "active", quarantinedAt: null, quarantineReason: null })
+        .where(and(inArray(toolCatalogEntries.id, wasActive), ne(toolCatalogEntries.status, "active")));
+    }
+  }
   const stored = await patchUnderClaim(ctx.db, connection.id, claim.claimId!, {
     state,
     reason: keepPublished ? null : reason,
@@ -1057,7 +1082,7 @@ export async function ensureCompanyTemplate(
   if (!stored) return { kind: "not_claimed" };
   await logTemplateActivity(ctx.db, input.companyId, connection, {
     state,
-    reason: missingTools?.length ? "catalog_missing_reviewed_tools" : keepPublished ? null : reason,
+    reason: missingTools?.length ? "catalog_missing_reviewed_tools" : reason,
     attemptCount: attempts,
     ...(missingTools?.length ? { missingTools } : {}),
   });
