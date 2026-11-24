@@ -10,6 +10,9 @@ import { githubAppJwt, githubBotRequest } from "./chat-github-client.js";
 /** The only permissions this path ever requests. */
 export const GITHUB_APP_TOKEN_PERMISSIONS = { contents: "write", pull_requests: "write" } as const;
 
+/** Read-only clone/fetch access, for the git relay (TECH-9792). Never carries write scope. */
+export const GITHUB_APP_READ_PERMISSIONS = { contents: "read" } as const;
+
 const EXPIRY_SKEW_MS = 5 * 60_000;
 const REPO_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 
@@ -66,6 +69,8 @@ class AppTokenError extends Error {
 /** Mint (or reuse) an installation token for exactly these repositories. */
 export async function mintGitHubAppInstallationToken(input: {
   repositories: unknown;
+  /** Defaults to GITHUB_APP_TOKEN_PERMISSIONS. */
+  permissions?: Record<string, "read" | "write">;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   now?: () => number;
@@ -79,7 +84,9 @@ export async function mintGitHubAppInstallationToken(input: {
   }
   const fetchImpl = input.fetchImpl ?? fetch;
   const now = input.now ?? Date.now;
-  const key = `${config.appId}:${config.installationId}:${scope.fullNames.join(",")}`;
+  const permissions = input.permissions ?? GITHUB_APP_TOKEN_PERMISSIONS;
+  const permissionKey = Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join("+");
+  const key = `${config.appId}:${config.installationId}:${scope.fullNames.join(",")}:${permissionKey}`;
   try {
     const signJwt = () => {
       try { return githubAppJwt(config.appId, config.privateKey, new Date(now())); }
@@ -100,7 +107,7 @@ export async function mintGitHubAppInstallationToken(input: {
         }
         const minted = await githubBotRequest<{ token?: unknown; expires_at?: unknown; repositories?: unknown }>(
           fetchImpl, signJwt(), `/app/installations/${config.installationId}/access_tokens`,
-          { method: "POST", body: { repositories: scope.names, permissions: GITHUB_APP_TOKEN_PERMISSIONS } },
+          { method: "POST", body: { repositories: scope.names, permissions } },
         );
         const expiresAtMs = typeof minted.expires_at === "string" ? Date.parse(minted.expires_at) : Number.NaN;
         if (typeof minted.token !== "string" || !minted.token || !Number.isFinite(expiresAtMs)) throw new AppTokenError("invalid_token_response");

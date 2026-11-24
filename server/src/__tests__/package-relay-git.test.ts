@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
+import { GITHUB_APP_READ_PERMISSIONS } from "../services/github-app-installation.js";
 import type { Db } from "@paperclipai/db";
 import { PACKAGE_RELAY_GITHUB_REPOS_ENV, packageRelayGitRoutes, parseGithubRepoAllowlist } from "../routes/package-relay-git.js";
 
@@ -134,5 +135,57 @@ describe("git relay (TECH-9786)", () => {
     const stream = new ReadableStream<Uint8Array>({ pull(c) { c.enqueue(new Uint8Array(4_000_000)); } });
     const big = build({ fetchImpl: vi.fn(async () => new Response(stream, { status: 200, headers: { "content-type": "application/x-git-upload-pack-result" } })) as unknown as typeof fetch });
     await post(big.app).expect(502);
+  });
+});
+
+// TECH-9792: the default token resolver. Hoisted mocks apply to the whole file; the tests above inject resolveToken.
+const hoisted = vi.hoisted(() => ({ getByKey: vi.fn(), resolveSecretValue: vi.fn(), mint: vi.fn() }));
+vi.mock("../services/secrets.js", () => ({ secretService: () => ({ getByKey: hoisted.getByKey, resolveSecretValue: hoisted.resolveSecretValue }) }));
+vi.mock("../services/github-app-installation.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/github-app-installation.js")>()),
+  mintGitHubAppInstallationToken: hoisted.mint,
+}));
+
+describe("git relay default token (TECH-9792)", () => {
+  function buildDefault() {
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => upstreamFor(String(url)));
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", source: "agent_jwt", agentId: AGENT_A, companyId: COMPANY, runId: "run-1" } as typeof req.actor;
+      next();
+    });
+    app.use("/api", packageRelayGitRoutes({} as Db, { env, fetchImpl: fetchImpl as typeof fetch, isOptedIn: async () => true }));
+    return { app, fetchImpl };
+  }
+  const authOf = (fetchImpl: ReturnType<typeof vi.fn>) =>
+    Buffer.from(((fetchImpl.mock.calls[0] as [string, RequestInit])[1].headers as Record<string, string>).authorization!.replace("Basic ", ""), "base64").toString();
+
+  it("prefers the stored package_relay.github secret", async () => {
+    hoisted.getByKey.mockResolvedValue({ id: "s1", status: "active" });
+    hoisted.resolveSecretValue.mockResolvedValue("stored-token");
+    hoisted.mint.mockReset();
+    const { app, fetchImpl } = buildDefault();
+    await request(app).get(`${BASE}.git/info/refs?service=git-upload-pack`).expect(200);
+    expect(authOf(fetchImpl)).toBe("x-access-token:stored-token");
+    expect(hoisted.mint).not.toHaveBeenCalled();
+  });
+
+  it("without the secret, mints a read-only App token for exactly the requested repository", async () => {
+    hoisted.getByKey.mockResolvedValue(null);
+    hoisted.mint.mockReset();
+    hoisted.mint.mockResolvedValue({ ok: true, value: { token: "app-read-token", identity: { userId: "1", login: "x[bot]" } } });
+    const { app, fetchImpl } = buildDefault();
+    await request(app).get(`${BASE}.git/info/refs?service=git-upload-pack`).expect(200);
+    expect(authOf(fetchImpl)).toBe("x-access-token:app-read-token");
+    expect(hoisted.mint).toHaveBeenCalledWith({ repositories: ["redesignhealth/rh-maiea"], permissions: GITHUB_APP_READ_PERMISSIONS, env });
+  });
+
+  it("answers 403 when there is no secret and the App cannot mint, without calling GitHub", async () => {
+    hoisted.getByKey.mockResolvedValue(null);
+    hoisted.mint.mockReset();
+    hoisted.mint.mockResolvedValue({ ok: false, error: "unavailable" });
+    const { app, fetchImpl } = buildDefault();
+    await request(app).get(`${BASE}.git/info/refs?service=git-upload-pack`).expect(403);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
