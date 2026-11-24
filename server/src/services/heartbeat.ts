@@ -303,6 +303,7 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  resolveAdapterExecutionTargetTimeoutSec,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentInstructionWorkingCopyService } from "./agent-instruction-working-copies.js";
@@ -370,7 +371,7 @@ import {
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 
-import { createRuntimeToolsToken, REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS } from "../runtime-tools-token.js";
+import { createRuntimeToolsToken, githubBrokerMaxTtlSeconds } from "../runtime-tools-token.js";
 import {
   parseObject,
 } from "../adapters/utils.js";
@@ -2920,14 +2921,27 @@ export function heartbeatService(
           cwd: executionWorkspace.cwd,
           env: gitExecutionEnv,
           brokerUrl: configuredPaperclipApiBaseUrl() ?? "",
-          // Use stays gated on a live run; for a sandbox/remote target the exp is also capped at 7 days.
+          // Use stays gated on a live run; for a sandbox/remote target the exp is also capped at the run's timeout
+          // plus a wind-down margin (7 days at most), so the token the model can read dies with the run.
           createBrokerToken: () => createRuntimeToolsToken({
             agentId: agent.id,
             companyId: agent.companyId,
             runId: run.id,
             responsibleUserId: responsibleUserId ?? "",
             scope: "github_credentials",
-            ...(executionTarget?.kind === "remote" ? { maxTtlSeconds: REMOTE_GITHUB_CREDENTIALS_TTL_SECONDS } : {}),
+            ...(executionTarget?.kind === "remote"
+              ? {
+                  // The native runner does not enforce the adapter wall-clock timeout, so it keeps the 7 day ceiling.
+                  maxTtlSeconds: githubBrokerMaxTtlSeconds(
+                    agent.adapterType === "paperclip_runner"
+                      ? 0
+                      : resolveAdapterExecutionTargetTimeoutSec(
+                          executionTarget,
+                          typeof runtimeConfig.timeoutSec === "number" ? runtimeConfig.timeoutSec : undefined,
+                        ),
+                  ),
+                }
+              : {}),
           })?.token ?? "",
         }));
         githubLauncherLocation = githubLaunchers.cleanupLocation;
