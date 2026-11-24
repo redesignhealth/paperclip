@@ -1,11 +1,11 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, lt, ne, or } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { agents, commsWakeEvents, commsWakeRegistrations } from "@paperclipai/db";
 import { HttpError, badRequest, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { commsWakeEventSchema } from "./comms-wake-event.js";
-import { commsWakeIssueService, type CommsWakeHeartbeat } from "./comms-wake-issue.js";
+import { COMMS_WAKE_PROCESSING, commsWakeIssueService, type CommsWakeHeartbeat } from "./comms-wake-issue.js";
 import { parseCommsWakeSecret, precheckCommsWakeHeaders, verifyCommsWakeSignature } from "./comms-wake-signature.js";
 import { secretService } from "./secrets.js";
 
@@ -25,6 +25,9 @@ export type CommsWakeRequest = {
   webhookSignature: string | undefined;
   nowMs?: number;
 };
+
+/** How long a request may hold an event before another delivery may take it over. */
+const COMMS_WAKE_CLAIM_LEASE_MS = 2 * 60 * 1000;
 
 const gone = () => new HttpError(410, "Wake registration not found");
 
@@ -141,22 +144,47 @@ export function commsWakeService(db: Db, deps: { heartbeat: CommsWakeHeartbeat }
         boardSessionRef: event.data.sessionRef,
       })
       .onConflictDoNothing({ target: [commsWakeEvents.agentId, commsWakeEvents.eventId] });
-    const row = await db
-      .select({
-        id: commsWakeEvents.id,
-        issueId: commsWakeEvents.issueId,
-        commentId: commsWakeEvents.commentId,
-        outcome: commsWakeEvents.outcome,
-        sessionRef: commsWakeEvents.sessionRef,
-      })
-      .from(commsWakeEvents)
-      .where(and(eq(commsWakeEvents.agentId, input.agentId), eq(commsWakeEvents.eventId, event.eventId)))
-      .then((rows) => rows[0]!);
+    const readRow = () =>
+      db
+        .select({
+          id: commsWakeEvents.id,
+          issueId: commsWakeEvents.issueId,
+          commentId: commsWakeEvents.commentId,
+          outcome: commsWakeEvents.outcome,
+          sessionRef: commsWakeEvents.sessionRef,
+        })
+        .from(commsWakeEvents)
+        .where(and(eq(commsWakeEvents.agentId, input.agentId), eq(commsWakeEvents.eventId, event.eventId)))
+        .then((rows) => rows[0]!);
+    const row = await readRow();
     if (row.outcome === "accepted") return { status: "duplicate", sessionRef: row.sessionRef };
 
-    const result = await issueFlow.process({ companyId: registration.companyId, agentId: input.agentId, event, eventRow: row });
+    // One request at a time processes an event. The claim is the outcome column itself ("processing"), with the
+    // received_at column as the lease time so a request that died mid-way does not hold the event forever.
+    const leaseCutoff = new Date(Date.now() - COMMS_WAKE_CLAIM_LEASE_MS);
+    const [claimed] = await db
+      .update(commsWakeEvents)
+      .set({ outcome: COMMS_WAKE_PROCESSING, receivedAt: new Date() })
+      .where(
+        and(
+          eq(commsWakeEvents.id, row.id),
+          or(
+            isNull(commsWakeEvents.outcome),
+            and(ne(commsWakeEvents.outcome, "accepted"), ne(commsWakeEvents.outcome, COMMS_WAKE_PROCESSING)),
+            and(eq(commsWakeEvents.outcome, COMMS_WAKE_PROCESSING), lt(commsWakeEvents.receivedAt, leaseCutoff)),
+          ),
+        ),
+      )
+      .returning({ id: commsWakeEvents.id, issueId: commsWakeEvents.issueId, commentId: commsWakeEvents.commentId });
+    if (!claimed) {
+      // Another delivery of this event holds it (or finished it just now). Never overwrite its outcome.
+      const current = await readRow();
+      if (current.outcome === "accepted") return { status: "duplicate", sessionRef: current.sessionRef };
+      return { status: "retry_later", reason: "event_in_progress" };
+    }
+
+    const result = await issueFlow.process({ companyId: registration.companyId, agentId: input.agentId, event, eventRow: claimed });
     if (result.status === "gone") throw gone();
-    if (result.status === "retry_later") return result;
     return result;
   }
 

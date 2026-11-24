@@ -41,10 +41,16 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comms-wake-issue-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+    // The first test otherwise pays for transforming the whole route, issue and heartbeat module graph inside its own
+    // 5 second budget, which a cold cache can exceed.
+    await import("../middleware/index.js");
+    await import("../routes/comms-wake.js");
+    await import("../services/secrets.js");
+  }, 120_000);
 
   afterEach(async () => {
     await db.execute(sql`truncate table ${companies} restart identity cascade`);
+    await db.execute(sql`truncate table ${authUsers} cascade`);
   });
 
   afterAll(async () => {
@@ -289,30 +295,194 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
     expect(comment!.body).not.toContain("Message number");
   });
 
-  it("answers 409 retry_later for a paused agent and, after resume, reuses the issue and comment", async () => {
+  it("leaves no issue or comment for a paused agent and creates exactly one of each after it resumes", async () => {
     const companyId = await seedCompany();
     const a = await seedAgent(companyId);
-    const { heartbeatService } = await import("../services/heartbeat.js");
-    const app = await createApp(heartbeatService(db) as any);
+    const app = await createApp();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, a.agentId));
     const body = eventBody(a.boardAgentId, randomUUID());
 
     const first = await deliver(app, a, body);
     expect(first.status).toBe(409);
     expect(first.body).toEqual({ status: "retry_later", reason: "paused" });
-    expect(await allIssues()).toHaveLength(1);
-    expect(await allComments()).toHaveLength(1);
-    expect((await db.select().from(commsWakeEvents))[0]).toMatchObject({ outcome: "retry_later", sessionRef: null });
+    // Stranded-work recovery would mark an issue assigned to a paused agent blocked, so nothing may exist yet.
+    expect(await allIssues()).toHaveLength(0);
+    expect(await allComments()).toHaveLength(0);
+    expect(await db.select().from(commsWakeConversations)).toHaveLength(0);
+    expect(wakes).toHaveLength(0);
+    expect((await db.select().from(commsWakeEvents))[0]).toMatchObject({ outcome: "retry_later", sessionRef: null, issueId: null, commentId: null });
 
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, a.agentId));
-    // The same event id again, now with a queue that accepts it.
-    const second = await deliver(await createApp(), a, body);
+    const second = await deliver(app, a, body);
     expect(second.status).toBe(200);
     expect(second.body).toMatchObject({ status: "accepted" });
     expect(await allIssues()).toHaveLength(1);
     expect(await allComments()).toHaveLength(1);
     expect(wakes).toHaveLength(1);
     expect((await db.select().from(commsWakeEvents))[0]).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("also leaves no new comment or reopened issue when a paused agent gets a later message", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    const conversationId = randomUUID();
+    const first = await deliver(app, a, eventBody(a.boardAgentId, conversationId));
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, first.body.sessionRef));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, a.agentId));
+    const res = await deliver(app, a, eventBody(a.boardAgentId, conversationId));
+    expect(res.body).toEqual({ status: "retry_later", reason: "paused" });
+    expect((await allIssues())[0]!.status).toBe("done");
+    expect(await allComments()).toHaveLength(1);
+  });
+
+  it("answers retry_later for an inactive company without creating anything", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
+    const res = await deliver(await createApp(), a, eventBody(a.boardAgentId, randomUUID()));
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ status: "retry_later", reason: "company.inactive" });
+    expect(await allIssues()).toHaveLength(0);
+  });
+
+  it("maps a failed or cancelled wake receipt to retry_later and wakes again on the repeat", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    for (const status of ["failed", "cancelled"] as const) {
+      wakes = [];
+      wakeBehavior = async (agentId, opts) => {
+        await db.insert(agentWakeupRequests).values({
+          companyId, agentId, source: "automation", triggerDetail: "system", reason: opts.reason, status,
+          idempotencyKey: opts.idempotencyKey, finishedAt: new Date(),
+        });
+        return null;
+      };
+      const body = eventBody(a.boardAgentId, randomUUID());
+      const res = await deliver(app, a, body);
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ status: "retry_later", reason: `wake_${status}` });
+      expect((await db.select().from(commsWakeEvents).where(eq(commsWakeEvents.eventId, body.eventId)))[0]).toMatchObject({ outcome: "retry_later", sessionRef: null });
+      // The repeat finds no live wake for this event, so it wakes again, reusing the issue and comment.
+      wakeBehavior = async () => ({ id: randomUUID() });
+      const again = await deliver(app, a, body);
+      expect(again.body).toMatchObject({ status: "accepted" });
+      expect(wakes).toHaveLength(2);
+    }
+    expect(await allIssues()).toHaveLength(2);
+    expect(await allComments()).toHaveLength(2);
+  });
+
+  it("produces one comment, one wake and a stable accepted outcome for near-simultaneous deliveries of one event", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    wakeBehavior = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return { id: randomUUID() };
+    };
+    const body = eventBody(a.boardAgentId, randomUUID());
+    const results = await Promise.all([1, 2, 3, 4].map(() => deliver(app, a, body)));
+    for (const res of results) {
+      const ok = res.status === 200 || (res.status === 409 && res.body.reason === "event_in_progress");
+      expect(ok, JSON.stringify(res.body)).toBe(true);
+    }
+    expect(results.filter((res) => res.body.status === "accepted")).toHaveLength(1);
+    expect(await allIssues()).toHaveLength(1);
+    expect(await allComments()).toHaveLength(1);
+    expect(wakes).toHaveLength(1);
+    const [event] = await db.select().from(commsWakeEvents);
+    expect(event).toMatchObject({ outcome: "accepted", sessionRef: (await allIssues())[0]!.id });
+    // A repeat after the dust settles is a plain duplicate and cannot change the outcome.
+    const late = await deliver(app, a, body);
+    expect(late.body).toEqual({ status: "duplicate", sessionRef: event!.sessionRef });
+    expect((await db.select().from(commsWakeEvents))[0]!.outcome).toBe("accepted");
+  });
+
+  it("does not let a repeat overwrite an accepted outcome with retry_later", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    const body = eventBody(a.boardAgentId, randomUUID());
+    await deliver(app, a, body);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, a.agentId));
+    const again = await deliver(app, a, body);
+    expect(again.body).toMatchObject({ status: "duplicate" });
+    expect((await db.select().from(commsWakeEvents))[0]!.outcome).toBe("accepted");
+  });
+
+  it("answers event_in_progress while a fresh claim exists and takes over a stale one", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    wakeBehavior = async (agentId, opts) => {
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", triggerDetail: "system", reason: opts.reason,
+        status: "queued", idempotencyKey: opts.idempotencyKey,
+      });
+      return { id: randomUUID() };
+    };
+    const body = eventBody(a.boardAgentId, randomUUID());
+    await deliver(app, a, body);
+    await db.update(commsWakeEvents).set({ outcome: "processing", receivedAt: new Date(), sessionRef: null });
+    const busy = await deliver(app, a, body);
+    expect(busy.status).toBe(409);
+    expect(busy.body).toEqual({ status: "retry_later", reason: "event_in_progress" });
+    expect((await db.select().from(commsWakeEvents))[0]!.outcome).toBe("processing");
+    await db.update(commsWakeEvents).set({ receivedAt: new Date(Date.now() - 10 * 60 * 1000) });
+    const taken = await deliver(app, a, body);
+    expect(taken.body).toMatchObject({ status: "accepted" });
+    expect(await allComments()).toHaveLength(1);
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("releases the claim when processing fails unexpectedly, so the quick retry is processed", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    wakeBehavior = async () => {
+      throw new Error("boom");
+    };
+    const body = eventBody(a.boardAgentId, randomUUID());
+    const failed = await deliver(app, a, body);
+    expect(failed.status).toBe(500);
+    expect((await db.select().from(commsWakeEvents))[0]!.outcome).toBeNull();
+    wakeBehavior = async () => ({ id: randomUUID() });
+    const retry = await deliver(app, a, body);
+    expect(retry.body).toMatchObject({ status: "accepted" });
+    expect(await allIssues()).toHaveLength(1);
+    expect(await allComments()).toHaveLength(1);
+  });
+
+  it("re-homes the conversation to a new issue when its issue was reassigned, and recreates it when deleted", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const other = await seedAgent(companyId);
+    const app = await createApp();
+    const conversationId = randomUUID();
+    const first = await deliver(app, a, eventBody(a.boardAgentId, conversationId));
+    const oldIssue = first.body.sessionRef as string;
+
+    await db.update(issues).set({ assigneeAgentId: other.agentId }).where(eq(issues.id, oldIssue));
+    const second = await deliver(app, a, eventBody(a.boardAgentId, conversationId));
+    expect(second.status).toBe(200);
+    const rehomed = second.body.sessionRef as string;
+    expect(rehomed).not.toBe(oldIssue);
+    expect((await db.select().from(issues).where(eq(issues.id, oldIssue)))[0]!.assigneeAgentId).toBe(other.agentId);
+    expect((await db.select().from(issues).where(eq(issues.id, rehomed)))[0]).toMatchObject({ assigneeAgentId: a.agentId, originId: conversationId });
+    const mappings = await db.select().from(commsWakeConversations);
+    expect(mappings).toHaveLength(1);
+    expect(mappings[0]).toMatchObject({ issueId: rehomed, agentId: a.agentId });
+
+    const third = await deliver(app, a, eventBody(a.boardAgentId, conversationId));
+    expect(third.body.sessionRef).toBe(rehomed);
+
+    await db.delete(issues).where(eq(issues.id, rehomed));
+    const fourth = await deliver(app, a, eventBody(a.boardAgentId, conversationId));
+    expect(fourth.status).toBe(200);
+    expect([oldIssue, rehomed]).not.toContain(fourth.body.sessionRef);
+    expect(await db.select().from(commsWakeConversations)).toHaveLength(1);
   });
 
   it("maps a skipped wake receipt to retry_later with the skip reason", async () => {
@@ -430,15 +600,6 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
     expect(event!.commentId).not.toBe(foreignComment!.id);
     const [linked] = await db.select().from(issueComments).where(eq(issueComments.id, event!.commentId!));
     expect(linked).toMatchObject({ companyId, issueId: first.body.sessionRef });
-
-    // A mapped issue that now belongs to another agent is not linked or woken.
-    await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, first.body.sessionRef));
-    await db.update(commsWakeEvents).set({ outcome: null });
-    wakes = [];
-    const stale = await deliver(app, a, body);
-    expect(stale.status).toBe(409);
-    expect(stale.body).toEqual({ status: "retry_later", reason: "issue_unavailable" });
-    expect(wakes).toHaveLength(0);
   });
 
   it("answers 410 for a terminated agent and stores nothing", async () => {
