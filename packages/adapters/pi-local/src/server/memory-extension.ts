@@ -64,11 +64,13 @@ function errorName(error) {
 // "Name: message (code)" for the failure lines, one bounded line. Only this client's own short messages ("http 503",
 // "rpc error -32603", "tool error", "no response") are kept; any other message (a parse error, a malformed URL or header
 // complaint) could echo a URL, a token or response content, so only the error name and the cause code are logged for it.
+// A tool error also carries the server's message text (cleaned, one line, 200 characters at most); memory content is never logged.
 function errorSummary(error) {
   const message = error && typeof error === "object" && typeof error.message === "string" ? error.message : "";
   const own = /^(?:http \d{3}|rpc error [-\d]*|tool error|no response)$/.test(message) ? message : "";
+  const detail = own === "tool error" && typeof error.toolMessage === "string" ? error.toolMessage : "";
   const code = error && typeof error === "object" && error.cause && typeof error.cause.code === "string" ? error.cause.code.slice(0, 40) : "";
-  return errorName(error) + (own ? ": " + own : "") + (code ? " (" + code + ")" : "");
+  return errorName(error) + (own ? ": " + own : "") + (detail ? ": " + detail : "") + (code ? " (" + code + ")" : "");
 }
 // The query as logged: a line the capture hygiene would drop (a secret, a token, an internal URL) is dropped here too.
 function loggedQuery(query) {
@@ -186,7 +188,11 @@ function createClient(server) {
   }
   function unwrap(result) {
     const text = (Array.isArray(result?.content) ? result.content : []).filter((part) => part && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n");
-    if (result?.isError) throw new Error("tool error");
+    if (result?.isError) {
+      const failure = new Error("tool error");
+      failure.toolMessage = oneLine(cleanForCapture(text), 200); // the server's own error text, one bounded line
+      throw failure;
+    }
     if (result && result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
     try { return JSON.parse(text); } catch { return { text }; }
   }
