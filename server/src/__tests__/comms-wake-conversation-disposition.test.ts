@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -43,11 +43,54 @@ describe("comms-board conversation issues are closed, not repaired, after a succ
     expect(await f.runs()).toHaveLength(1);
   });
 
+  it("records an activity row for the close, tied to the run", async () => {
+    const f = await fixture("comms_board_conversation");
+    await f.recovery.reconcileLegacyContinuation(f.runId);
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId));
+    expect(rows.some((row) => (row.details as { source?: string } | null)?.source === "recovery.comms_board_conversation_run_finished" && row.runId === f.runId)).toBe(true);
+  });
+
   it("closes it from the stranded-work sweep too", async () => {
     const f = await fixture("comms_board_conversation");
     await f.recovery.reconcileStrandedAssignedIssues();
     expect(await f.status()).toBe("done");
-    expect(f.enqueued).toHaveLength(0);
+    // The sweep runs over the whole shared database; only this issue's wakes matter here.
+    expect(f.enqueued.filter((opts) => JSON.stringify(opts).includes(f.issueId))).toHaveLength(0);
+  });
+
+  it("leaves the issue open while a durable wait exists", async () => {
+    const f = await fixture("comms_board_conversation");
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Continue?" } });
+    await f.recovery.reconcileLegacyContinuation(f.runId);
+    expect(await f.status()).toBe("in_progress");
+  });
+
+  it("leaves the issue open when a run is still queued for it", async () => {
+    const f = await fixture("comms_board_conversation");
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", status: "queued", runtimeMode: "legacy", contextSnapshot: { issueId: f.issueId } });
+    expect(await f.recovery.reconcileLegacyContinuation(f.runId)).toBe("skipped");
+    expect(await f.status()).toBe("in_progress");
+  });
+
+  it("leaves the issue open when the run has no finish time", async () => {
+    const f = await fixture("comms_board_conversation");
+    await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await f.recovery.reconcileLegacyContinuation(f.runId)).toBe("skipped");
+    expect(await f.status()).toBe("in_progress");
+  });
+
+  it("does not count the agent's own later comment as a new message", async () => {
+    const f = await fixture("comms_board_conversation");
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorAgentId: f.agentId, body: "Summary.", createdAt: new Date(Date.now() + 1000) });
+    expect(await f.recovery.reconcileLegacyContinuation(f.runId)).toBe("covered");
+    expect(await f.status()).toBe("done");
+  });
+
+  it("leaves a failed run to the existing recovery logic", async () => {
+    const f = await fixture("comms_board_conversation");
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, f.runId));
+    await f.recovery.reconcileLegacyContinuation(f.runId);
+    expect(await f.status()).toBe("in_progress");
   });
 
   it("leaves the issue open while a follow-up wake is deferred", async () => {

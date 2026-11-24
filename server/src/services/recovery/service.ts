@@ -29,6 +29,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  ne,
   not,
   notExists,
   notInArray,
@@ -3848,6 +3849,7 @@ export function recoveryService(
   async function closeCommsBoardConversationIssue(
     issue: typeof issues.$inferSelect,
     runId: string,
+    agentId: string,
   ): Promise<"covered" | "skipped"> {
     // Another run, a deferred follow-up wake or a newer board message means the conversation is not finished.
     if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) return "skipped";
@@ -3855,21 +3857,23 @@ export function recoveryService(
       .select({ finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, runId)));
-    if (run?.finishedAt) {
-      const [newer] = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, issue.companyId),
-            eq(issueComments.issueId, issue.id),
-            gt(issueComments.createdAt, run.finishedAt),
-            isNull(issueComments.deletedAt),
-          ),
-        )
-        .limit(1);
-      if (newer) return "skipped";
-    }
+    // Without a finish time recovery cannot show that no message arrived after the run.
+    if (!run?.finishedAt) return "skipped";
+    // The agent's own comments (its final summary may be written after the finish time) do not count.
+    const [newer] = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, issue.companyId),
+          eq(issueComments.issueId, issue.id),
+          gt(issueComments.createdAt, run.finishedAt),
+          isNull(issueComments.deletedAt),
+          or(isNull(issueComments.authorAgentId), ne(issueComments.authorAgentId, agentId)),
+        ),
+      )
+      .limit(1);
+    if (newer) return "skipped";
     const updated = await issuesSvc.update(issue.id, { status: "done" });
     if (!updated) return "skipped";
     await logActivity(db, {
@@ -3877,7 +3881,7 @@ export function recoveryService(
       actorType: "system",
       actorId: "system",
       agentId: null,
-      runId: null,
+      runId,
       action: "issue.updated",
       entityType: "issue",
       entityId: issue.id,
@@ -3905,17 +3909,6 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
-
-    // A comms-board conversation issue is closed by whoever ends a run on it, and the next board message reopens it.
-    // A run that succeeded and left it open has nothing left to repair, so close it instead of queueing a repair run.
-    if (
-      current.originKind === COMMS_BOARD_CONVERSATION_ORIGIN_KIND &&
-      latestRun?.status === "succeeded" &&
-      latestRun.agentId === current.assigneeAgentId &&
-      !current.assigneeUserId
-    ) {
-      return closeCommsBoardConversationIssue(current, latestRun.id);
-    }
 
     const episode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
@@ -3947,6 +3940,19 @@ export function recoveryService(
         `durable_path_restored:${state.durablePathReason ?? "unknown"}`,
       );
       return "covered";
+    }
+
+    // A comms-board conversation issue is closed by whoever ends a run on it, and the next board message reopens it.
+    // A run that succeeded and left it open, with no wait, blocker or pending run behind it, has nothing left to repair.
+    if (
+      current.originKind === COMMS_BOARD_CONVERSATION_ORIGIN_KIND &&
+      latestRun?.status === "succeeded" &&
+      latestRun.agentId === current.assigneeAgentId &&
+      !current.assigneeUserId
+    ) {
+      const closed = await closeCommsBoardConversationIssue(current, latestRun.id, latestRun.agentId);
+      if (closed === "covered") await resolveDispositionRepairActionAsCovered(current, "comms_board_conversation_closed");
+      return closed;
     }
 
     const ownerAgentId = current.assigneeAgentId;
