@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { tailnetAwareFetch } from "../services/remote-http-fetch.js";
 import { secretService } from "../services/secrets.js";
+import { GITHUB_APP_READ_PERMISSIONS, mintGitHubAppInstallationToken } from "../services/github-app-installation.js";
 import { PACKAGE_RELAY_OPT_IN_ENV_KEY } from "./package-relay.js";
 
 /**
@@ -13,7 +14,9 @@ import { PACKAGE_RELAY_OPT_IN_ENV_KEY } from "./package-relay.js";
  * `GET .../info/refs?service=git-upload-pack` and `POST .../git-upload-pack`. Pushing (`git-receive-pack`) is refused.
  * Only repositories named in `PAPERCLIP_PACKAGE_RELAY_GITHUB_REPOS` (`owner/name,owner/name`) are served, and the upstream
  * is always `https://github.com/<owner>/<name>.git`. Only agents that opt in (`PAPERCLIP_PACKAGE_RELAY` lists `github`)
- * may use it. The token is the company secret `package_relay.github`. It fails closed (503) when not configured.
+ * may use it. The token is the company secret `package_relay.github` when one is stored. Without it, the server mints a
+ * GitHub App installation token scoped to exactly the requested repository with `contents: read` (TECH-9792), so no
+ * long-lived read token has to be stored. It fails closed (503) when not configured.
  * Same auth and opt-in model as the Gitea package relay (`package-relay.ts`).
  */
 
@@ -36,7 +39,7 @@ export interface PackageRelayGitDeps {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   isOptedIn?: (agentId: string, relay: string) => Promise<boolean>;
-  resolveToken?: (companyId: string) => Promise<string | null>;
+  resolveToken?: (companyId: string, repository: string) => Promise<string | null>;
 }
 
 function fail(res: Response, status: number, detail: string) {
@@ -73,11 +76,14 @@ export function packageRelayGitRoutes(db: Db, deps: PackageRelayGitDeps = {}) {
     const adapterEnv = (agent?.adapterConfig as { env?: Record<string, unknown> } | null | undefined)?.env;
     return parseOptIn(adapterEnv?.[PACKAGE_RELAY_OPT_IN_ENV_KEY]).includes(relay);
   });
-  const resolveToken = deps.resolveToken ?? (async (companyId: string) => {
+  const resolveToken = deps.resolveToken ?? (async (companyId: string, repository: string) => {
     const secrets = secretService(db);
     const secret = await secrets.getByKey(companyId, PACKAGE_RELAY_GITHUB_SECRET_KEY);
-    if (!secret || secret.status !== "active") return null;
-    return secrets.resolveSecretValue(companyId, secret.id, "latest");
+    if (secret && secret.status === "active") return secrets.resolveSecretValue(companyId, secret.id, "latest");
+    // No stored token: a read-only App installation token for this one allowlisted repository.
+    const minted = await mintGitHubAppInstallationToken({ repositories: [repository], permissions: GITHUB_APP_READ_PERMISSIONS, env });
+    if (!minted.ok) logger.warn({ companyId }, "git relay could not mint a GitHub App read token");
+    return minted.ok ? minted.value.token : null;
   });
 
   async function relay(req: Request, res: Response, input: { method: "GET" | "POST"; suffix: string; accept: string; expectType: string; body?: Buffer; contentType?: string }) {
@@ -100,7 +106,7 @@ export function packageRelayGitRoutes(db: Db, deps: PackageRelayGitDeps = {}) {
     let token: string | null;
     try {
       if (!(await isOptedIn(actor.agentId, "github"))) return fail(res, 403, "forbidden");
-      token = await resolveToken(actor.companyId);
+      token = await resolveToken(actor.companyId, `${owner}/${repo}`);
     } catch (err) {
       logger.warn({ agentId: actor.agentId, errorClass: err instanceof Error ? err.constructor.name : typeof err }, "git relay lookup failed");
       return fail(res, 503, "git_relay_unavailable");

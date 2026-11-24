@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  GITHUB_APP_READ_PERMISSIONS,
   GITHUB_APP_TOKEN_PERMISSIONS,
   mintGitHubAppInstallationToken,
   normalizeAppRepositories,
@@ -68,6 +69,30 @@ describe("GitHub App installation credentials", () => {
     });
     expect(GITHUB_APP_TOKEN_PERMISSIONS).toEqual({ contents: "write", pull_requests: "write" });
     expect(mint.auth).toMatch(/^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
+  });
+
+  it("mints a contents:read-only token on request and caches it apart from the write token", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const mint = (permissions?: Record<string, "read" | "write">) =>
+      mintGitHubAppInstallationToken({ repositories: ["redesignhealth/rh-maiea"], permissions, env, fetchImpl, now: () => T0 });
+    const read = await mint(GITHUB_APP_READ_PERMISSIONS);
+    const write = await mint();
+    expect(read).toMatchObject({ ok: true, value: { token: "ghs_test_token_1" } });
+    expect(write).toMatchObject({ ok: true, value: { token: "ghs_test_token_2" } });
+    const bodies = calls.filter((call) => call.url.endsWith("/access_tokens")).map((call) => call.body);
+    expect(bodies).toEqual([
+      { repositories: ["rh-maiea"], permissions: { contents: "read" } },
+      { repositories: ["rh-maiea"], permissions: { contents: "write", pull_requests: "write" } },
+    ]);
+    expect(await mint(GITHUB_APP_READ_PERMISSIONS)).toEqual(read);
+    expect(mints(calls)).toBe(2);
+  });
+
+  it("refuses an empty permissions object instead of asking for every installation permission", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const result = await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/a"], permissions: {}, env, fetchImpl, now: () => T0 });
+    expect(result.ok).toBe(false);
+    expect(calls).toHaveLength(0);
   });
 
   it.each([
