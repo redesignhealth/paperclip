@@ -27,13 +27,13 @@ def seq(*values):
 
 
 class Harness:
-    def __init__(self, heads=(SHA,), reviews=(), argus=(OK_A,), cis=(OK_C,), key="k" * 12, extra_read=None, prs_list=None, **pr_kw):
+    def __init__(self, heads=(SHA,), reviews=(), comments=(), argus=(OK_A,), cis=(OK_C,), key="k" * 12, extra_read=None, prs_list=None, **pr_kw):
         self.log = []
         prs = list(prs_list) if prs_list is not None else [pr(7, sha=h, **pr_kw) for h in heads]
         responses = {PR_PATH: seq(*prs)}
         responses.update(extra_read or {})
         self.read = FakeGitHub(responses)
-        self.app = FakeGitHub({f"{PR_PATH}/reviews": list(reviews)})
+        self.app = FakeGitHub({f"{PR_PATH}/reviews": list(reviews), f"/repos/{R}/issues/7/comments": list(comments)})
         a, c = seq(*argus), seq(*cis)
 
         def argus_check(n, sha, k):
@@ -411,6 +411,85 @@ class ReviewTests(unittest.TestCase):
                 h = Harness(reviews=[r])
                 h.run()
                 self.assertEqual(len(h.posts("/reviews")), 1)
+
+
+DIGEST = "sha256:" + "c" * 64
+SUPPLIED = av.SuppliedDiff(digest=DIGEST, review_id="0b7d2a5e-1111-4222-8333-444455556666", requested_by="svc:dev@example.com")
+DIFF_A = av.ArgusResult("approve", "EXACT_HEAD_APPROVE", "ok", supplied_diff=SUPPLIED)
+
+
+class SuppliedDiffCommentTests(unittest.TestCase):
+    def comments(self, h):
+        return h.posts("/issues/7/comments")
+
+    def test_approve_diff_posts_one_disclosure_comment_with_the_facts(self):
+        h = Harness(argus=(DIFF_A,))
+        self.assertEqual(h.run(), 0)
+        posted = self.comments(h)
+        self.assertEqual(len(posted), 1)
+        body = posted[0][2]["body"]
+        self.assertIn(gr.supplied_diff_marker(SHA), body)
+        for needle in (SHA, DIGEST, SUPPLIED.review_id, SUPPLIED.requested_by, "supplied resolution diff, not the full compare diff",
+                       "outside the resolution diff was not reviewed by Argus"):
+            self.assertIn(needle, body)
+        self.assertEqual(h.app.conclusions()["argus-gate"], ("completed", "success"))
+
+    def test_comment_is_posted_before_success_is_concluded(self):
+        h = Harness(argus=(DIFF_A,))
+        h.run()
+        kinds = [(m, p.rsplit("/", 1)[-1]) for m, p, _ in h.app.writes]
+        first_success = next(i for i, (m, _) in enumerate(kinds) if m == "PATCH" and h.app.writes[i][2].get("conclusion") == "success")
+        self.assertLess(kinds.index(("POST", "comments")), first_success)
+
+    def test_idempotent_per_head_sha_on_rerun(self):
+        existing = [{"user": {"login": gate_lib.APP_BOT_LOGIN}, "body": gr.supplied_diff_comment(SHA, SUPPLIED)}]
+        h = Harness(argus=(DIFF_A,), comments=existing)
+        self.assertEqual(h.run(), 0)
+        self.assertEqual(self.comments(h), [])
+
+    def test_a_comment_for_another_head_or_author_does_not_dedup(self):
+        for c in [{"user": {"login": gate_lib.APP_BOT_LOGIN}, "body": gr.supplied_diff_comment(SHA2, SUPPLIED)},
+                  {"user": {"login": "someone"}, "body": gr.supplied_diff_comment(SHA, SUPPLIED)}]:
+            with self.subTest(c=c):
+                h = Harness(argus=(DIFF_A,), comments=[c])
+                h.run()
+                self.assertEqual(len(self.comments(h)), 1)
+
+    def test_ordinary_approve_posts_no_comment_and_never_lists_comments(self):
+        h = Harness()
+        self.assertEqual(h.run(), 0)
+        self.assertEqual(self.comments(h), [])
+        self.assertFalse([g for g in h.app.gets if "/comments" in g])
+
+    def test_comment_failure_does_not_conclude_success(self):
+        h = Harness(argus=(DIFF_A,))
+        original = h.app.post
+
+        def post(path, body):
+            if path.endswith("/comments"):
+                raise GateError("HTTP_403")
+            return original(path, body)
+
+        h.app.post = post
+        self.assertEqual(h.run(), 1)
+        self.assertNotIn(("completed", "success"), h.app.conclusions().values())
+        self.assertEqual(h.posts("/reviews"), [])
+
+    def test_malformed_digest_fails_closed_and_hostile_text_is_sanitised(self):
+        bad = av.ArgusResult("approve", "X", "ok", supplied_diff=av.SuppliedDiff("sha256:xyz", "r1", "me"))
+        h = Harness(argus=(bad,))
+        self.assertEqual(h.run(), 1)
+        self.assertEqual(self.comments(h), [])
+        body = gr.supplied_diff_comment(SHA, av.SuppliedDiff(DIGEST, "x`\n@team", "a b\n<script>"))
+        self.assertNotIn("@team", body)
+        self.assertNotIn("<script>", body)
+        self.assertEqual(body.count("(unrecognized)"), 2)
+
+    def test_not_approved_posts_nothing(self):
+        pending = av.ArgusResult("pending", "MISSING_REVIEW", "no", supplied_diff=SUPPLIED)
+        h = Harness(argus=(pending,))
+        h.run()
+        self.assertEqual(self.comments(h), [])
 
 
 class HostileMetadataTests(unittest.TestCase):

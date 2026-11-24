@@ -39,6 +39,7 @@ ELIGIBLE_BASE_BRANCHES = frozenset({DEFAULT_BRANCH})
 APP_ID = 5166579
 APP_BOT_LOGIN = "rh-pr-approval-gate[bot]"
 REVIEW_MARKER = "<!-- rh-pr-approval-gate:argus-ci-approved -->"
+SUPPLIED_DIFF_MARKER_PREFIX = "<!-- rh-pr-approval-gate:supplied-diff"
 
 # Legacy contract names kept for the ruleset's required checks.
 CHECK_ARGUS = "argus-gate"
