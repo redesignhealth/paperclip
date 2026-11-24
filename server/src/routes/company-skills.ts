@@ -48,6 +48,7 @@ import {
   heartbeatService,
   issueService,
   logActivity,
+  projectService,
 } from "../services/index.js";
 import { isGitRepoSkillImportSource, parseSkillImportSourceInput } from "../services/company-skills.js";
 import {
@@ -104,6 +105,9 @@ export function companySkillRoutes(db: Db) {
   router.param("skillId", async (req, _res, next, id) => {
     try {
       if (req.actor.type === "none") throw unauthorized("Authentication required");
+      if (req.actor.type === "agent" && req.actor.companyId !== String(req.params.companyId)) {
+        throw forbidden("Agent key cannot access another company", { code: "skill_company_boundary_denied" });
+      }
       assertCompanyAccess(req, String(req.params.companyId));
       if (!await svc.getById(String(req.params.companyId), id)) throw notFound("Skill not found");
       next();
@@ -118,6 +122,7 @@ export function companySkillRoutes(db: Db) {
   const sourceSvc = skillSourceService(db);
   const sourceSync = skillSourceSyncService(db);
   const issues = issueService(db);
+  const projects = projectService(db);
   const heartbeat = heartbeatService(db);
   const skillPolicies = companySkillPolicyService(db);
 
@@ -744,6 +749,8 @@ export function companySkillRoutes(db: Db) {
       await assertCanOrchestrateSkillTestHarness(req, companyId, {
         assigneeAgentId: req.body.agentId,
       });
+      const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+        ? await projectToolContext(db, req.actor, true, "Skill") : null;
       const actor = getActorInfo(req);
       const skill = await svc.getById(companyId, skillId);
       let skillProjectId: string | undefined;
@@ -1040,7 +1047,7 @@ export function companySkillRoutes(db: Db) {
         "skills.edit",
         () => skillPolicyResource({ companyId, skillId }),
       );
-      const result = await svc.renameSkill(companyId, skillId, req.body);
+      const result = await svc.renameSkill(companyId, skillId, req.body, skillActor(req));
       const changed = result.previousName !== result.skill.name
         || result.previousSlug !== result.skill.slug
         || result.previousKey !== result.skill.key;
@@ -1258,7 +1265,14 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
-      const result = await svc.updateSkill(companyId, skillId, req.body);
+      if (req.actor.type === "agent") {
+        if (req.body.sharingScope !== undefined && req.body.sharingScope !== "company") {
+          throw forbidden("Agents can only set 'company' sharing scope on company skills", {
+            code: "skill_agent_field_restricted",
+          });
+        }
+      }
+      const result = await svc.updateSkill(companyId, skillId, req.body, skillActor(req));
 
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -1381,6 +1395,8 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+        ? await projectToolContext(db, req.actor, true, "Skill") : null;
       const result = await svc.deleteFile(companyId, skillId, req.body, skillActor(req));
 
       const actor = getActorInfo(req);
@@ -1391,6 +1407,7 @@ export function companySkillRoutes(db: Db) {
         agentId: actor.agentId,
         runId: actor.runId,
         agentApiKeyId: actor.agentApiKeyId,
+        issueId: runContext?.issue.id,
         action: "company.skill_file_deleted",
         entityType: "company_skill",
         entityId: skillId,
@@ -1492,6 +1509,18 @@ export function companySkillRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.import", { sourceType: "workspace" });
+      if (req.actor.type === "agent") {
+        const decision = await access.decide({
+          actor: req.actor,
+          action: "project:read",
+          resource: { type: "project", companyId, projectId: req.body.projectId },
+        });
+        if (!decision.allowed) {
+          throw forbidden("Project read access denied", {
+            code: "skill_agent_project_read_restricted",
+          });
+        }
+      }
       const result = await svc.browseProjectWorkspace(companyId, req.body);
       res.json(result);
     },
@@ -1503,6 +1532,23 @@ export function companySkillRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.import", { sourceType: "workspace" });
+      if (req.actor.type === "agent") {
+        const targetProjectIds = req.body.projectIds?.length
+          ? req.body.projectIds
+          : (await projects.list(companyId)).map((p) => p.id);
+        for (const projectId of targetProjectIds) {
+          const decision = await access.decide({
+            actor: req.actor,
+            action: "project:read",
+            resource: { type: "project", companyId, projectId },
+          });
+          if (!decision.allowed) {
+            throw forbidden("Project read access denied", {
+              code: "skill_agent_project_read_restricted",
+            });
+          }
+        }
+      }
       const result = await svc.scanProjectWorkspaces(companyId, req.body);
 
       const actor = getActorInfo(req);
@@ -1537,7 +1583,9 @@ export function companySkillRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     const skillId = req.params.skillId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.remove", () => skillPolicyResource({ companyId, skillId }));
-    const result = await svc.deleteSkill(companyId, skillId);
+    const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+      ? await projectToolContext(db, req.actor, true, "Skill") : null;
+    const result = await svc.deleteSkill(companyId, skillId, skillActor(req));
     if (!result) {
       res.status(404).json({ error: "Skill not found" });
       return;
@@ -1551,6 +1599,7 @@ export function companySkillRoutes(db: Db) {
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
+      issueId: runContext?.issue.id,
       action: "company.skill_deleted",
       entityType: "company_skill",
       entityId: result.id,

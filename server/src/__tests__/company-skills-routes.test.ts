@@ -39,6 +39,7 @@ const mockCompanySkillService = vi.hoisted(() => ({
   updateSkill: vi.fn(),
   updateFile: vi.fn(),
   deleteFile: vi.fn(),
+  browseProjectWorkspace: vi.fn(),
   scanProjectWorkspaces: vi.fn(),
   deleteSkill: vi.fn(),
   auditSkill: vi.fn(),
@@ -81,6 +82,11 @@ const mockCatalogService = vi.hoisted(() => ({
   listCatalogSkillsOrEmpty: vi.fn(),
   getCatalogSkillOrThrow: vi.fn(),
   readCatalogSkillFile: vi.fn(),
+}));
+
+const mockProjectService = vi.hoisted(() => ({
+  list: vi.fn(),
+  listByIds: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -212,6 +218,7 @@ function registerModuleMocks() {
     companySkillService: () => mockCompanySkillService,
     issueService: () => mockIssueService,
     heartbeatService: () => mockHeartbeatService,
+    projectService: () => mockProjectService,
     logActivity: mockLogActivity,
   }));
 }
@@ -321,6 +328,17 @@ describe("company skill mutation permissions", () => {
     mockCompanySkillService.importFromSource.mockResolvedValue({
       imported: [],
       warnings: [],
+    });
+    mockProjectService.list.mockResolvedValue([]);
+    mockProjectService.listByIds.mockResolvedValue([]);
+    mockCompanySkillService.browseProjectWorkspace.mockResolvedValue({
+      projectId: "p-1",
+      workspaceId: "w-1",
+      workspaceName: "ws",
+      path: ".",
+      parentPath: null,
+      entries: [],
+      truncated: false,
     });
     mockCompanySkillService.scanProjectWorkspaces.mockResolvedValue({
       scannedProjects: 0,
@@ -552,6 +570,7 @@ describe("company skill mutation permissions", () => {
       updated: [],
       skipped: [],
       conflicts: [],
+      candidates: [],
       warnings: [],
     });
     mockCompanySkillService.deleteSkill.mockResolvedValue({
@@ -1637,6 +1656,198 @@ describe("company skill mutation permissions", () => {
     );
   });
 
+  it("denies agents from updating skills with public_link and global sharingScope", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const publicRes = await request(await createApp(assignedAgentActor()))
+      .patch("/api/companies/company-1/skills/skill-1")
+      .send({ sharingScope: "public_link" });
+
+    expect(publicRes.status, JSON.stringify(publicRes.body)).toBe(403);
+    expect(publicRes.body).toMatchObject({
+      code: "skill_agent_field_restricted",
+      error: "Agents can only set 'company' sharing scope on company skills",
+    });
+
+    const globalRes = await request(await createApp(assignedAgentActor()))
+      .patch("/api/companies/company-1/skills/skill-1")
+      .send({ sharingScope: "global" });
+
+    expect(globalRes.status).toBe(400);
+    expect(mockCompanySkillService.updateSkill).not.toHaveBeenCalled();
+  });
+
+  it("allows agents to update skills with company sharingScope", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .patch("/api/companies/company-1/skills/skill-1")
+      .send({ sharingScope: "company", description: "Updated description" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.updateSkill).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      expect.objectContaining({ sharingScope: "company", description: "Updated description" }),
+      expect.anything(),
+    );
+  });
+
+  it("allows board users to update skills with public_link sharingScope", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "user-1" }))
+      .patch("/api/companies/company-1/skills/skill-1")
+      .send({ sharingScope: "public_link" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.updateSkill).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      expect.objectContaining({ sharingScope: "public_link" }),
+      expect.anything(),
+    );
+  });
+
+  it("rejects file deletion from an agent-JWT run that is not task-bound", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }))
+      .delete("/api/companies/company-1/skills/skill-1/files")
+      .send({ path: "references/guide.md", target: "file" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Skill tools require a task-bound run",
+    });
+    expect(mockCompanySkillService.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects skill deletion from an agent-JWT run that is not task-bound", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }))
+      .delete("/api/companies/company-1/skills/skill-1");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Skill tools require a task-bound run",
+    });
+    expect(mockCompanySkillService.deleteSkill).not.toHaveBeenCalled();
+  });
+
+  it("rejects test run creation from an agent-JWT run that is not task-bound", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }))
+      .post("/api/companies/company-1/skills/skill-1/test-runs")
+      .send({ agentId: "55555555-5555-4555-8555-555555555555", content: "Test content" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Skill tools require a task-bound run",
+    });
+    expect(mockCompanySkillService.createTestRun).not.toHaveBeenCalled();
+  });
+
+  it("denies agent browse-project when project:read is not allowed", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "project:read") {
+        return { allowed: false, action: "project:read", reason: "deny_no_grant", explanation: "Project read denied." };
+      }
+      return allowSkillChangeDecision();
+    });
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills/browse-project")
+      .send({ projectId: "11111111-1111-4111-8111-111111111111", workspaceId: "22222222-2222-4222-8222-222222222222" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      code: "skill_agent_project_read_restricted",
+    });
+    expect(mockCompanySkillService.browseProjectWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("allows agent browse-project when project:read is allowed", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "project:read") {
+        return { allowed: true, action: "project:read", reason: "allow", explanation: "Allowed." };
+      }
+      return denySkillChangeDecision();
+    });
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills/browse-project")
+      .send({ projectId: "11111111-1111-4111-8111-111111111111", workspaceId: "22222222-2222-4222-8222-222222222222" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.browseProjectWorkspace).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ projectId: "11111111-1111-4111-8111-111111111111" }),
+    );
+  });
+
+  it("allows board browse-project without agent project:read check", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "user-1" }))
+      .post("/api/companies/company-1/skills/browse-project")
+      .send({ projectId: "11111111-1111-4111-8111-111111111111", workspaceId: "22222222-2222-4222-8222-222222222222" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.browseProjectWorkspace).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ projectId: "11111111-1111-4111-8111-111111111111" }),
+    );
+  });
+
+  it("denies agent scan-projects when project:read is not allowed for any project", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "project:read") {
+        return { allowed: false, action: "project:read", reason: "deny_no_grant", explanation: "Project read denied." };
+      }
+      return allowSkillChangeDecision();
+    });
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills/scan-projects")
+      .send({ projectIds: ["11111111-1111-4111-8111-111111111111"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      code: "skill_agent_project_read_restricted",
+    });
+    expect(mockCompanySkillService.scanProjectWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it("allows agent scan-projects when project:read is allowed", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "project:read") {
+        return { allowed: true, action: "project:read", reason: "allow", explanation: "Allowed." };
+      }
+      return denySkillChangeDecision();
+    });
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills/scan-projects")
+      .send({ projectIds: ["11111111-1111-4111-8111-111111111111"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.scanProjectWorkspaces).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ projectIds: ["11111111-1111-4111-8111-111111111111"] }),
+    );
+  });
+
+  it("allows board scan-projects without agent project:read check", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "user-1" }))
+      .post("/api/companies/company-1/skills/scan-projects")
+      .send({ projectIds: ["11111111-1111-4111-8111-111111111111"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.scanProjectWorkspaces).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ projectIds: ["11111111-1111-4111-8111-111111111111"] }),
+    );
+  });
+
   it("rejects file patch without idempotencyKey from an agent-JWT run that is not task-bound", async () => {
     mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
 
@@ -1776,10 +1987,18 @@ describe("company skill mutation permissions", () => {
       categories: ["memory", "review"],
       sharingScope: "company",
     });
-    expect(mockCompanySkillService.updateSkill).toHaveBeenCalledWith("company-1", "skill-1", {
-      categories: ["memory", "review"],
-      sharingScope: "company",
-    });
+    expect(mockCompanySkillService.updateSkill).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      {
+        categories: ["memory", "review"],
+        sharingScope: "company",
+      },
+      {
+        type: "user",
+        userId: "user-1",
+      },
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId: "company-1",
       actorType: "user",
@@ -1914,6 +2133,10 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       { name: "Ship PR", slug: "ship-pr" },
+      {
+        type: "user",
+        userId: "user-1",
+      },
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "company.skill_renamed",
@@ -2419,7 +2642,14 @@ describe("company skill mutation permissions", () => {
     expect(res.body).toEqual({
       error: 'Cannot delete skill "Find Skills" while it is still used by Builder, Reviewer. Detach it from those agents first.',
     });
-    expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith("company-1", "skill-1");
+    expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      {
+        type: "user",
+        userId: "local-board",
+      },
+    );
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
@@ -2532,6 +2762,73 @@ describe("company skill mutation permissions", () => {
 
         const res = await req;
         expect(res.status, JSON.stringify(res.body)).toBe(403);
+      });
+    });
+  });
+
+  describe("guarded company skill mutation permissions for agents (TECH-10594 PR-3)", () => {
+    const guardedSkillMutatingRoutes = [
+      { name: "patch skill", method: "patch", path: "/api/companies/:cid/skills/skill-1", body: { description: "Updated" }, successStatus: 200 },
+      { name: "delete file", method: "delete", path: "/api/companies/:cid/skills/skill-1/files", body: { path: "references/guide.md", target: "file" }, successStatus: 200 },
+      { name: "delete skill", method: "delete", path: "/api/companies/:cid/skills/skill-1", body: undefined, successStatus: 200 },
+      { name: "fork skill", method: "post", path: "/api/companies/:cid/skills/skill-1/fork", body: { name: "Forked" }, successStatus: 201 },
+      { name: "rename skill", method: "post", path: "/api/companies/:cid/skills/skill-1/rename", body: { name: "Renamed" }, successStatus: 200 },
+      { name: "create test run", method: "post", path: "/api/companies/:cid/skills/skill-1/test-runs", body: { agentId: "55555555-5555-4555-8555-555555555555", content: "Test content" }, successStatus: 201 },
+      { name: "browse project", method: "post", path: "/api/companies/:cid/skills/browse-project", body: { projectId: "11111111-1111-4111-8111-111111111111", workspaceId: "22222222-2222-4222-8222-222222222222" }, successStatus: 200 },
+      { name: "scan projects", method: "post", path: "/api/companies/:cid/skills/scan-projects", body: { projectIds: ["11111111-1111-4111-8111-111111111111"] }, successStatus: 200 },
+    ] as const;
+
+    describe.each(guardedSkillMutatingRoutes)("$name", ({ method, path, body, successStatus }) => {
+      it("allows standard agents without skills grants", async () => {
+        mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+          if (input.action === "project:read" || input.action === "agent_config:update" || input.action === "tasks:assign") {
+            return { allowed: true, action: input.action, reason: "allow", explanation: "Allowed." };
+          }
+          return denySkillChangeDecision();
+        });
+
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("denies low-trust agents with 403 skill_actor_restricted", async () => {
+        mockAccessService.decide.mockResolvedValue(denySkillChangeDecision(
+          "deny_low_trust_boundary",
+          "Low-trust agents cannot use company-wide skill APIs.",
+        ));
+
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body).toMatchObject({
+          code: "skill_actor_restricted",
+          details: { reason: "platform_invariant" },
+        });
+      });
+
+      it("denies cross-company agents with 403 skill_company_boundary_denied", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-2");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body).toMatchObject({
+          code: "skill_company_boundary_denied",
+        });
       });
     });
   });

@@ -1,6 +1,6 @@
 import { ensureSkillCacheDirectory, touchSkillVersionCache, withSkillVersionCacheLock } from "./skill-version-cache.js";
 import { retainProjectSkillAccess, skillAccessService } from "./skill-access.js";
-import type { AuthorizationActor } from "./authorization.js";
+import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { updateAgentConfigurationInTransaction } from "./agent-configuration-transaction.js";
 import { logger } from "../middleware/logger.js";
 import { removeRuntimeSkillCache, resolveRuntimeSkillCache, runtimeSkillCacheSpec } from "./runtime-skill-cache.js";
@@ -4023,6 +4023,33 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     });
   }
 
+  async function assertCanReassignSkillToAgents(
+    companyId: string,
+    actor: SkillActor | null,
+    affectedAgentIds: string[],
+  ) {
+    if (actor?.type !== "agent") return;
+    const authActor: AuthorizationActor = {
+      type: "agent",
+      agentId: actor.agentId ?? undefined,
+      companyId,
+      source: "agent_key",
+    };
+    const auth = authorizationService(db);
+    for (const agentId of affectedAgentIds) {
+      const decision = await auth.decide({
+        actor: authActor,
+        action: "agent_config:update",
+        resource: { type: "agent", companyId, agentId },
+      });
+      if (!decision.allowed) {
+        throw forbidden("Agents can only reassign skills for agents they can configure", {
+          code: "skill_agent_reassign_restricted",
+        });
+      }
+    }
+  }
+
   async function applySkillReassignments(
     companyId: string,
     source: CompanySkill,
@@ -4115,6 +4142,11 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     const forkName = input.name?.trim() || `${source.name} Fork`;
     const forkKey = `company/${companyId}/${forkSlug}`;
     const plannedReassignments = await planSkillReassignments(companyId, source, forkKey, input.reassignAgentIds);
+    await assertCanReassignSkillToAgents(
+      companyId,
+      actor,
+      plannedReassignments.map((item) => item.agentId),
+    );
     const managedRoot = resolveManagedSkillsRoot(companyId);
     await fs.mkdir(managedRoot, { recursive: true });
     const forkDir = await fs.mkdtemp(path.join(managedRoot, `${forkSlug}-fork-`));
@@ -4205,6 +4237,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     companyId: string,
     skillId: string,
     input: CompanySkillRenameRequest,
+    actor: SkillActor | null = null,
   ): Promise<CompanySkillRenameResult> {
     await ensureSkillInventoryCurrent(companyId);
     if (!await getById(companyId, skillId)) throw notFound("Skill not found");
@@ -4277,6 +4310,12 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
               resolveDesiredSkillEntries(referenceSkills, agent.adapterConfig as Record<string, unknown>)
                 .some((entry) => entry.key === previousKey))
             .map((agent) => ({ agentId: agent.id, previousSkillKey: previousKey, nextSkillKey: newKey }));
+
+          await assertCanReassignSkillToAgents(
+            companyId,
+            actor,
+            plannedReassignments.map((item) => item.agentId),
+          );
 
           // Reversible filesystem stage: capture the original SKILL.md so a failed DB
           // transaction can be rolled back to the pre-rename on-disk state.
@@ -4550,10 +4589,17 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     companyId: string,
     skillId: string,
     input: CompanySkillUpdateRequest = {},
+    actor: SkillActor | null = null,
   ): Promise<CompanySkill> {
     await ensureSkillInventoryCurrent(companyId);
     const skill = await getById(companyId, skillId);
     if (!skill) throw notFound("Skill not found");
+
+    if (actor?.type === "agent" && input.sharingScope !== undefined && input.sharingScope !== "company") {
+      throw forbidden("Agents can only set 'company' sharing scope on company skills", {
+        code: "skill_agent_field_restricted",
+      });
+    }
 
     if (skill.accessSourceId && input.sharingScope === "public_link") throw forbidden("Project skills cannot be published through a public link.");
     const sharingScope = Object.prototype.hasOwnProperty.call(input, "sharingScope")
@@ -4902,6 +4948,12 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     actor: SkillActor | null = null,
   ): Promise<CompanySkillFileDeleteResult> {
     return withSkillFileMutation(companyId, skillId, async (skill, tx) => {
+
+      if (actor?.type === "agent" && !isPaperclipManagedLocalSkill(skill)) {
+        throw forbidden("Agents can only delete files from managed local skills", {
+          code: "skill_agent_delete_restricted",
+        });
+      }
 
       const source = deriveSkillSourceInfo(skill);
       if (!source.editable || skill.sourceType !== "local_path") {
@@ -7432,6 +7484,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     companyId: string, skillIds: string[],
     onDelete?: (tx: DbTransaction, deleted: CompanySkill[]) => Promise<void>,
     beforeDelete?: (tx: DbTransaction) => Promise<void>,
+    actor: SkillActor | null = null,
   ): Promise<CompanySkill[]> {
     const initial = (await Promise.all([...new Set(skillIds)].sort().map(id => getById(companyId, id))))
       .filter((skill): skill is CompanySkill => Boolean(skill));
@@ -7443,7 +7496,15 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
         { skillId: skill.id, skillKey: skill.key, usedByAgents: usedByAgents.map(({ id, name, urlKey, adapterType }) => ({ id, name, urlKey, adapterType })) },
       );
     }
-    for (const skill of initial) await assertUnused(skill);
+    for (const skill of initial) {
+      assertSkillNotShared(skill);
+      if (actor?.type === "agent" && !isPaperclipManagedLocalSkill(skill)) {
+        throw forbidden("Agents can only delete managed local skills", {
+          code: "skill_agent_delete_restricted",
+        });
+      }
+      await assertUnused(skill);
+    }
     const managedRoot = resolveManagedSkillsRoot(companyId);
     const moved: Array<{ source: string; quarantine: string }> = [];
     async function restoreSources() {
@@ -7465,6 +7526,12 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
             const skill = await getById(companyId, before.id, tx);
             if (!skill) continue;
             if (skill.slug !== before.slug) throw conflict("Skill changed during deletion. Retry the request.");
+            assertSkillNotShared(skill);
+            if (actor?.type === "agent" && !isPaperclipManagedLocalSkill(skill)) {
+              throw forbidden("Agents can only delete managed local skills", {
+                code: "skill_agent_delete_restricted",
+              });
+            }
             await assertUnused(skill);
             await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
             if (isPaperclipManagedRenameTarget(skill)) {
@@ -7505,8 +7572,8 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     return deleted;
   }
 
-  async function deleteSkill(companyId: string, skillId: string): Promise<CompanySkill | null> {
-    return (await deleteSkills(companyId, [skillId]))[0] ?? null;
+  async function deleteSkill(companyId: string, skillId: string, actor: SkillActor | null = null): Promise<CompanySkill | null> {
+    return (await deleteSkills(companyId, [skillId], undefined, undefined, actor))[0] ?? null;
   }
 
   return {
