@@ -230,6 +230,21 @@ describeEmbeddedPostgres("comms-board wake operator tools for existing agents (T
       expect(await registrationOf(agent.id)).toEqual(before);
     });
 
+    it("a ready comms-wake entry whose registration is gone is rebuilt, not reported as done", async () => {
+      const { companyId, ownerId } = await seedCompany(true);
+      const agent = await existingAgent(companyId, ownerId);
+      const fetchImpl = boardFetch();
+      await enrol(db, fetchImpl, { companyId, agentId: agent.id, ...real });
+      const gone = (await registrationOf(agent.id))!;
+      await db.delete(commsWakeRegistrations).where(eq(commsWakeRegistrations.agentId, agent.id));
+      await secretService(db).remove(gone.signingSecretId); // everything of the registration is gone, only the entry remains
+      expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("ready");
+      const report = await enrol(db, fetchImpl, { companyId, agentId: agent.id, ...real });
+      expect(report.outcomes).toEqual([{ agentId: agent.id, result: "enrolled" }]);
+      expect(fetchImpl.sets()).toHaveLength(2);
+      expect(await registrationOf(agent.id)).not.toBeNull();
+    });
+
     it("works on an agent created while the setting was on (it already has a pending entry) and on one with the setting never touched", async () => {
       const { companyId, ownerId } = await seedCompany(true);
       const created = await existingAgent(companyId, ownerId); // has a pending comms-wake entry from creation

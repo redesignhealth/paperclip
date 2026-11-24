@@ -286,7 +286,7 @@ export async function enrolCommsWakeAgents(
       const board = await resolveCommsBoardBinding(db, options.companyId, row.id);
       if (!board?.boardAgentId) { push("skipped_board_not_ready"); continue; }
       if (dryRun) { push("would_enrol"); continue; }
-      const outcome = await exclusive(row.id, () => enrolOne(db, options.companyId, row.id, ctx));
+      const outcome = await exclusive(row.id, () => enrolOne(db, options.companyId, row.id, registered.has(row.id), ctx));
       push(outcome.result, outcome.reason);
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: errorClass(err) }, "comms wake enrolment item failed");
@@ -305,7 +305,7 @@ export async function enrolCommsWakeAgents(
   };
 }
 
-async function enrolOne(db: Db, companyId: string, agentId: string, ctx: CommsWakeAdminContext): Promise<CommsWakeEnrolOutcome> {
+async function enrolOne(db: Db, companyId: string, agentId: string, hasRegistration: boolean, ctx: CommsWakeAdminContext): Promise<CommsWakeEnrolOutcome> {
   const spec = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === COMMS_WAKE_ENTRY_KEY);
   if (!spec) throw new Error("comms-wake spec missing");
   const nowIso = new Date().toISOString();
@@ -342,14 +342,15 @@ async function enrolOne(db: Db, companyId: string, agentId: string, ctx: CommsWa
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId), sql`${agents.metadata} #> ${entryPath()} is null`));
   } else if (existing.setup.state === "in_progress") {
     return { agentId, result: "pending", reason: "in_progress" };
-  } else if (existing.setup.state !== "ready") {
-    // An operator run retries now: a backoff, an earlier terminal error or an unsubscribe does not hold it back.
+  } else if (existing.setup.state !== "ready" || !hasRegistration) {
+    // An operator run retries now: a backoff or an earlier terminal error does not hold it back. A `ready` entry whose
+    // registration is gone is run again too (the sweep never claims a ready entry), so it is rebuilt, not reported done.
     await patchWakeSetup(
       db,
       companyId,
       agentId,
       { state: "pending", reason: null, attemptCount: 0, nextAttemptAt: null, updatedAt: nowIso },
-      ["pending", "error", "not_required"],
+      ["pending", "error", "not_required", "ready"],
     );
   }
 
