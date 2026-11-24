@@ -3725,9 +3725,9 @@ registry.registerPath({
   path: "/api/companies/{companyId}/comms-wake/agents/{agentId}/unsubscribe",
   tags: ["comms-board"],
   summary: "Remove an agent's comms board wake subscription",
-  description: "Removes the board's wake address for the agent first, then the registration row and the signing secret, and stops the default-MCP sweep from registering it again. If the board cannot remove the address (502, or 503 when the board credential is not configured) nothing is changed and the call can be repeated. Calling it for an agent that is not registered is a no-op that still removes a signing secret left behind by an interrupted registration. Reports states only, never a secret. Instance admin only.",
+  description: "Removes the board's wake address for the agent first, then the registration row and the signing secret, and stops the default-MCP sweep from registering it again. If the board cannot remove the address (502, or 503 when the board credential is not configured) no state is changed and the call can be repeated. Calling it for an agent that is not registered is a no-op that still removes a signing secret left behind by an interrupted registration. Reports states only, never a secret. Instance admin only.",
   request: { params: z.object({ companyId: z.string(), agentId: z.string().uuid() }) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 502: { description: "The board could not remove the address; nothing was changed", content: { "application/json": { schema: z.object({}).passthrough() } } }, 503: { description: "The board credential is not configured", content: { "application/json": { schema: z.object({}).passthrough() } } } },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 502: { description: "The board could not remove the address; no state was changed", content: { "application/json": { schema: z.object({}).passthrough() } } }, 503: { description: "The board credential is not configured", content: { "application/json": { schema: z.object({}).passthrough() } } } },
 });
 
 registry.registerPath({
