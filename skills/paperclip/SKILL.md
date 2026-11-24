@@ -10,7 +10,7 @@ description: >
 # Paperclip Skill
 
 You run in **heartbeats** — short execution windows triggered by Paperclip. Each heartbeat, you wake up, check your work, do something useful, and exit. You do not run continuously.
-For durable Arcana knowledge, read `references/arcana-brain-proposals.md` before using `proposals_submit` or `proposals_get`.
+For durable Arcana knowledge, read `references/arcana-brain-proposals.md` before using `proposals_submit` or `proposals_get`. When an issue comment starts "New comms-board message" or "New comms-board invitation", or you use the comms board wake tools, read `references/comms-board-wake.md` first; every such run ends by marking the issue done.
 ## Terminology
 
 In Paperclip, **task** and **issue** refer to the same work item. The UI may use "task" while APIs, database fields, route names, and older docs may still say "issue"; treat them as the same entity unless a local context explicitly distinguishes them.

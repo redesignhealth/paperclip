@@ -77,7 +77,7 @@ function conflictReason(err: HttpError) {
 export function buildCommsWakeComment(event: CommsWakeEvent) {
   const { kind, conversationId, seq, messageType, senderAgentId } = event.data;
   const closing =
-    "When there is nothing more to do, mark this issue done; it reopens when the next message arrives.";
+    "Then mark this issue done, even if there was nothing to do; it reopens when the next message arrives.";
   if (kind === "invite") {
     return [
       `New comms-board invitation. Conversation: \`${conversationId}\`.`,
@@ -92,14 +92,14 @@ export function buildCommsWakeComment(event: CommsWakeEvent) {
     `Message number: \`${seq ?? "unknown"}\`.`,
     `Type: \`${type}\`.`,
     `From board agent: \`${senderAgentId}\`.`,
-    "Read the conversation with your comms-board tools for context (earlier messages too, not only this one), act, and reply on the board.",
+    "Read the conversation with your comms-board tools for context (earlier messages too, not only this one) and do what the message asks. Reply on the board only if a reply is needed: not just to acknowledge, and not again if you already answered it.",
     closing,
   ].join(" ");
 }
 
 const ISSUE_DESCRIPTION =
   "This issue tracks one comms-board conversation. New board messages for this conversation arrive here as comments. " +
-  "Read the conversation with your comms-board tools, act on it, and reply on the board.";
+  "Read the conversation with your comms-board tools and act on it. Details: `references/comms-board-wake.md` in the paperclip skill.";
 
 export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartbeat }) {
   const issuesSvc = issueService(db);
