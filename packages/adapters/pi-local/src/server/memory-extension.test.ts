@@ -84,7 +84,7 @@ afterEach(async () => {
 });
 
 async function writeMcpJson(mcpServers: Record<string, unknown>) {
-  await writeFile(path.join(configDir, "mcp.json"), JSON.stringify({ mcpServers }), "utf8");
+  await writeFile(path.join(configDir, "mcp-adapter.json"), JSON.stringify({ mcpServers }), "utf8");
 }
 
 async function load() {
@@ -218,14 +218,14 @@ describe("Pi memory extension: failure path", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   });
 
-  it("is inert when mcp.json has no memory server or a missing variable", async () => {
+  it("is inert when mcp-adapter.json has no memory server or a missing variable", async () => {
     await writeMcpJson({ comms: { url: "${TEST_RELAY_URL}/x", includeTools: ["inbox"] } });
     const inert = await load();
     expect(inert.handlers.size).toBe(0);
     expect(inert.tools.size).toBe(0);
     await writeMcpJson({ mem: { url: "${NOT_SET_ANYWHERE}/x", includeTools: ["memory_search"] } });
     expect((await load()).handlers.size).toBe(0);
-    await rm(path.join(configDir, "mcp.json"));
+    await rm(path.join(configDir, "mcp-adapter.json"));
     expect((await load()).handlers.size).toBe(0);
   });
 });
