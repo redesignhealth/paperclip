@@ -42,6 +42,7 @@ import {
 } from "../native-runtime/native-board-response-wait.js";
 import { authorizeChatConversationForBoundRun } from "../native-runtime/chat-attachment-reuse.js";
 import {
+  COMMS_BOARD_CONVERSATION_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
@@ -3844,6 +3845,51 @@ export function recoveryService(
     return reconcileDispositionRepair(issue, run, { legacyEpisode: legacyDispositionEpisode(run) });
   }
 
+  async function closeCommsBoardConversationIssue(
+    issue: typeof issues.$inferSelect,
+    runId: string,
+  ): Promise<"covered" | "skipped"> {
+    // Another run, a deferred follow-up wake or a newer board message means the conversation is not finished.
+    if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) return "skipped";
+    const [run] = await db
+      .select({ finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, runId)));
+    if (run?.finishedAt) {
+      const [newer] = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, issue.companyId),
+            eq(issueComments.issueId, issue.id),
+            gt(issueComments.createdAt, run.finishedAt),
+            isNull(issueComments.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (newer) return "skipped";
+    }
+    const updated = await issuesSvc.update(issue.id, { status: "done" });
+    if (!updated) return "skipped";
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        identifier: issue.identifier,
+        status: "done",
+        source: "recovery.comms_board_conversation_run_finished",
+      },
+    });
+    return "covered";
+  }
+
   async function reconcileDispositionRepair(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
@@ -3859,6 +3905,17 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
+
+    // A comms-board conversation issue is closed by whoever ends a run on it, and the next board message reopens it.
+    // A run that succeeded and left it open has nothing left to repair, so close it instead of queueing a repair run.
+    if (
+      current.originKind === COMMS_BOARD_CONVERSATION_ORIGIN_KIND &&
+      latestRun?.status === "succeeded" &&
+      latestRun.agentId === current.assigneeAgentId &&
+      !current.assigneeUserId
+    ) {
+      return closeCommsBoardConversationIssue(current, latestRun.id);
+    }
 
     const episode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
