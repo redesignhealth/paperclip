@@ -668,6 +668,12 @@ export function environmentRunOrchestrator(
     cancelActiveWork?: boolean;
     /** Explicit paperclip_runner resource lifecycle. Omitted for legacy adapters. */
     providerResourceDisposition?: ProviderResourceDisposition;
+    /**
+     * Set when `stop_and_retain` was derived from a failed warm lease rather than requested to preserve
+     * unexported work. If a lease's provider has no stop-only cleanup, release it normally instead of
+     * stranding it in pending_cleanup (TECH-10085).
+     */
+    releaseWhenStopUnsupported?: boolean;
     nativeLifecycleTelemetry?: {
       provider: string;
       harness: string;
@@ -679,6 +685,11 @@ export function environmentRunOrchestrator(
     };
   }): Promise<EnvironmentReleaseResult> {
     const status = input.status ?? "released";
+    let providerResourceDisposition = input.providerResourceDisposition;
+    if (input.releaseWhenStopUnsupported && providerResourceDisposition === "stop_and_retain"
+        && !(await environmentRuntime.canStopAndRetainRunLeases?.(input.heartbeatRunId) ?? true)) {
+      providerResourceDisposition = undefined;
+    }
     const result: EnvironmentReleaseResult = { released: [], errors: [] };
 
     let releasedLeases: EnvironmentRuntimeLeaseRecord[];
@@ -687,7 +698,7 @@ export function environmentRunOrchestrator(
         input.heartbeatRunId,
         status,
         (leaseId, error) => result.errors.push({ leaseId, error }),
-        input.providerResourceDisposition,
+        providerResourceDisposition,
         ...(input.cancelActiveWork ? [true] as const : []),
       );
     } catch (err) {
@@ -718,7 +729,7 @@ export function environmentRunOrchestrator(
             cleanupStatus: released.lease.cleanupStatus,
             failureReason: input.failureReason ?? released.lease.failureReason,
             providerResourceDisposition:
-              input.providerResourceDisposition ?? "legacy_default",
+              providerResourceDisposition ?? "legacy_default",
           },
         });
       } catch {

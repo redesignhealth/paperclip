@@ -38,7 +38,6 @@ import { agentExecutionsHaveStopped, LEGACY_ADAPTER_NOT_ENTERED_RECEIPT } from "
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
-  providerResourceDispositionForTerminalRun,
   createHeartbeatRunControl,
   type CancelRunOptions,
 } from "./heartbeat/run-control.js";
@@ -3727,11 +3726,8 @@ export function heartbeatService(
         nativeOwnershipHeld =
           nativeOwnershipHeld ||
           Boolean(latestRun && isNativeRunnerOwnershipHeld(latestRun));
-        providerResourceDispositionForRun =
-          providerResourceDispositionForTerminalRun(
-            providerResourceDispositionForRun,
-            latestRun?.status,
-          );
+        // The failed-run conversion to stop_and_retain happens in the lease release itself, which also knows
+        // whether the provider can stop (TECH-10085).
         if (
           !nativeSessionResumeScheduled &&
           !nativeWorkspaceFinalizeScheduled &&

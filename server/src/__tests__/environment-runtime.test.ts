@@ -32,6 +32,7 @@ import { applyReuseLeaseScope, isIssueThreadReplyTurn, resolveRunnerEnvironmentF
 import { environmentService } from "../services/environments.ts";
 import { remoteExecutionHasStopped } from "../services/remote-execution-termination.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.ts";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import {
@@ -912,6 +913,50 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(call.mock.calls.every(entry => entry[1] === "environmentStopLease")).toBe(true);
     },
   );
+
+  it.each(["unsupported", "supported"])(
+    "a failed warm lease is released normally only when its provider cannot stop it: %s", async outcome => {
+      const seeded = await seedReusablePluginSandboxLease();
+      const lease = seeded.reusableLease;
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, seeded.runId));
+      const call = vi.fn(async (_id: string, method: string) => ({
+        providerLeaseId: lease.providerLeaseId, state: method === "environmentStopLease" ? "stopped" : "destroyed",
+      }));
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call,
+        getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease",
+          ...(outcome === "supported" ? ["environmentStopLease"] : [])] }),
+      } as unknown as PluginWorkerManager });
+      expect(await runtime.canStopAndRetainRunLeases(seeded.runId)).toBe(outcome === "supported");
+      const orchestrator = environmentRunOrchestrator(db, { environmentRuntime: runtime });
+      await orchestrator.releaseForRun({
+        heartbeatRunId: seeded.runId, companyId: seeded.companyId, agentId: seeded.agentId, status: "failed",
+        providerResourceDisposition: "stop_and_retain", releaseWhenStopUnsupported: true,
+      });
+      if (outcome === "unsupported") {
+        expect(call.mock.calls.map(entry => entry[1])).toEqual(["environmentReleaseLease"]);
+        expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({ status: "failed", cleanupStatus: "success" });
+      } else {
+        expect(call.mock.calls.every(entry => entry[1] === "environmentStopLease")).toBe(true);
+        expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({ status: "released" });
+      }
+    },
+  );
+
+  it("an explicit stop-and-retain request still never falls back to release when the provider cannot stop", async () => {
+    const seeded = await seedReusablePluginSandboxLease();
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, seeded.runId));
+    const call = vi.fn(async () => ({ providerLeaseId: seeded.reusableLease.providerLeaseId, state: "destroyed" }));
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    await environmentRunOrchestrator(db, { environmentRuntime: runtime }).releaseForRun({
+      heartbeatRunId: seeded.runId, companyId: seeded.companyId, agentId: seeded.agentId, status: "failed",
+      providerResourceDisposition: "stop_and_retain",
+    });
+    expect(call).not.toHaveBeenCalled();
+    expect(await environmentService(db).getLeaseById(seeded.reusableLease.id)).toMatchObject({ status: "pending_cleanup" });
+  });
 
   it("reports an unwired manager separately from a stopped sandbox worker", async () => {
     const { companyId, environment, runId } = await seedReusablePluginSandboxLease();
