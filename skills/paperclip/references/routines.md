@@ -9,7 +9,7 @@ A routine has:
 - A catch-up policy (what to do with missed scheduled runs)
 - An activity gate policy (whether quiet scheduled ticks should be skipped)
 
-**Authorization:** Agents can read all routines in their company but can only create or manage routines assigned to themselves. Board operators have full access, including reassignment.
+**Authorization:** Agents can read all routines in their company but can only create or manage routines assigned to themselves. Board operators have full access, including reassignment. Revisions, revision restore, description annotations, and trigger secret rotation are available to the routine's assignee from any runtime, sandboxed or not.
 
 ---
 
