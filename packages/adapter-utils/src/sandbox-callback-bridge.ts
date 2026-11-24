@@ -440,6 +440,18 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/routines\/[^/]+\/triggers$/ },
   { method: "PATCH", path: /^\/api\/routine-triggers\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/routine-triggers\/[^/]+$/ },
+  // Routine revisions, description annotations, and trigger secret rotation (TECH-10594).
+  // The server still requires the caller to be the routine's assignee; board-only permission
+  // checks are not a factor because assertBoardCanAssignTasks no-ops for agent actors.
+  // POST /api/routine-triggers/public/:publicId/fire is deliberately not forwarded (webhook secret only, no actor auth).
+  { method: "GET", path: /^\/api\/routines\/[^/]+\/revisions$/ },
+  { method: "POST", path: /^\/api\/routines\/[^/]+\/revisions\/[^/]+\/restore$/ },
+  { method: "GET", path: /^\/api\/routines\/[^/]+\/description\/annotations$/ },
+  { method: "GET", path: /^\/api\/routines\/[^/]+\/description\/annotations\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/routines\/[^/]+\/description\/annotations$/ },
+  { method: "POST", path: /^\/api\/routines\/[^/]+\/description\/annotations\/[^/]+\/comments$/ },
+  { method: "PATCH", path: /^\/api\/routines\/[^/]+\/description\/annotations\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/routine-triggers\/[^/]+\/rotate-secret$/ },
 
   // Hermes native mem0 memory (TECH-8908). Four fixed routes, memory id a strict UUID. The server relays them to the
   // configured memory service with the calling agent's own token. The Hermes adapter registers their deadline and

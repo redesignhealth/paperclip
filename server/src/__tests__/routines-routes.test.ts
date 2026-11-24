@@ -97,6 +97,56 @@ const trigger = {
   updatedAt: new Date("2026-03-20T00:00:00.000Z"),
 };
 
+const annotationThread = {
+  id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  companyId,
+  issueId: null,
+  routineId,
+  documentId: "99999999-9999-4999-8999-999999999999",
+  documentKey: "description",
+  status: "open",
+  anchorState: "active",
+  anchorConfidence: "exact",
+  originalRevisionId: revisionId,
+  originalRevisionNumber: 1,
+  currentRevisionId: revisionId,
+  currentRevisionNumber: 1,
+  selectedText: "selected text",
+  prefixText: "Alpha ",
+  suffixText: " omega",
+  normalizedStart: 6,
+  normalizedEnd: 19,
+  markdownStart: 6,
+  markdownEnd: 19,
+  anchorSelector: {
+    quote: { exact: "selected text", prefix: "Alpha ", suffix: " omega" },
+    position: { normalizedStart: 6, normalizedEnd: 19, markdownStart: 6, markdownEnd: 19 },
+  },
+  createdByAgentId: null,
+  createdByUserId: "board-user",
+  resolvedByAgentId: null,
+  resolvedByUserId: null,
+  resolvedAt: null,
+  createdAt: new Date("2026-03-20T00:00:00.000Z"),
+  updatedAt: new Date("2026-03-20T00:00:00.000Z"),
+  comments: [{
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    companyId,
+    threadId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    issueId: null,
+    routineId,
+    documentId: "99999999-9999-4999-8999-999999999999",
+    body: "Please review",
+    authorType: "user",
+    authorAgentId: null,
+    authorUserId: "board-user",
+    createdByRunId: null,
+    issueCommentId: null,
+    createdAt: new Date("2026-03-20T00:00:00.000Z"),
+    updatedAt: new Date("2026-03-20T00:00:00.000Z"),
+  }],
+};
+
 const mockRoutineService = vi.hoisted(() => ({
   list: vi.fn(),
   get: vi.fn(),
@@ -246,56 +296,15 @@ describe("routine routes", () => {
       updatedAt: new Date("2026-03-20T00:00:00.000Z"),
     });
     mockAnnotationService.listThreadsForRoutineDocument.mockResolvedValue([]);
-    mockAnnotationService.getThreadForRoutineDocument.mockResolvedValue(null);
-    const annotationThread = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId,
-      issueId: null,
-      routineId,
-      documentId: "99999999-9999-4999-8999-999999999999",
-      documentKey: "description",
-      status: "open",
-      anchorState: "active",
-      anchorConfidence: "exact",
-      originalRevisionId: revisionId,
-      originalRevisionNumber: 1,
-      currentRevisionId: revisionId,
-      currentRevisionNumber: 1,
-      selectedText: "selected text",
-      prefixText: "Alpha ",
-      suffixText: " omega",
-      normalizedStart: 6,
-      normalizedEnd: 19,
-      markdownStart: 6,
-      markdownEnd: 19,
-      anchorSelector: {
-        quote: { exact: "selected text", prefix: "Alpha ", suffix: " omega" },
-        position: { normalizedStart: 6, normalizedEnd: 19, markdownStart: 6, markdownEnd: 19 },
+    mockAnnotationService.getThreadForRoutineDocument.mockResolvedValue(annotationThread);
+    mockRoutineService.rotateTriggerSecret.mockResolvedValue({
+      trigger,
+      secretMaterial: {
+        webhookUrl: "http://localhost:3100/api/routine-triggers/public/pub-1/fire",
+        webhookSecret: "whsec_new_secret_1234567890",
       },
-      createdByAgentId: null,
-      createdByUserId: "board-user",
-      resolvedByAgentId: null,
-      resolvedByUserId: null,
-      resolvedAt: null,
-      createdAt: new Date("2026-03-20T00:00:00.000Z"),
-      updatedAt: new Date("2026-03-20T00:00:00.000Z"),
-      comments: [{
-        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-        companyId,
-        threadId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        issueId: null,
-        routineId,
-        documentId: "99999999-9999-4999-8999-999999999999",
-        body: "Please review",
-        authorType: "user",
-        authorAgentId: null,
-        authorUserId: "board-user",
-        createdByRunId: null,
-        issueCommentId: null,
-        createdAt: new Date("2026-03-20T00:00:00.000Z"),
-        updatedAt: new Date("2026-03-20T00:00:00.000Z"),
-      }],
-    };
+      revision,
+    });
     mockAnnotationService.createRoutineThread.mockResolvedValue(annotationThread);
     mockAnnotationService.addRoutineComment.mockResolvedValue({
       id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -697,5 +706,190 @@ describe("routine routes", () => {
       });
       throw error;
     }
+  });
+
+  describe("agent routine management access (TECH-10594)", () => {
+    const assigneeApp = () => createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "88888888-8888-4888-8888-888888888888",
+    });
+
+    const otherAgentApp = () => createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const crossCompanyApp = () => createApp({
+      type: "agent",
+      agentId,
+      companyId: "99999999-9999-4999-8999-999999999999",
+    });
+
+    const annotationBody = {
+      baseRevisionId: revisionId,
+      baseRevisionNumber: 1,
+      selector: {
+        quote: { exact: "selected text", prefix: "Alpha ", suffix: " omega" },
+        position: { normalizedStart: 6, normalizedEnd: 19, markdownStart: 6, markdownEnd: 19 },
+      },
+      body: "Agent annotation",
+    };
+
+    it("allows assignee agent to list routine revisions, while denying cross-company agent", async () => {
+      const app = await assigneeApp();
+      const res = await request(app).get(`/api/routines/${routineId}/revisions`);
+      expect(res.status).toBe(200);
+      expect(mockRoutineService.listRevisions).toHaveBeenCalledWith(routineId);
+
+      const crossApp = await crossCompanyApp();
+      const crossRes = await request(crossApp).get(`/api/routines/${routineId}/revisions`);
+      expect(crossRes.status).toBe(404);
+    });
+
+    it("denies non-assignee same-company agent and cross-company agent from restoring revisions", async () => {
+      const app = await otherAgentApp();
+      const res = await request(app).post(`/api/routines/${routineId}/revisions/${revisionId}/restore`).send({});
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const crossApp = await crossCompanyApp();
+      const crossRes = await request(crossApp).post(`/api/routines/${routineId}/revisions/${revisionId}/restore`).send({});
+      expect(crossRes.status).toBe(404);
+    });
+
+    it("allows assignee agent to read routine description annotations and threads, denying other and cross-company agents", async () => {
+      const app = await assigneeApp();
+      const listRes = await request(app).get(`/api/routines/${routineId}/description/annotations`);
+      expect(listRes.status).toBe(200);
+
+      const threadRes = await request(app).get(`/api/routines/${routineId}/description/annotations/${annotationThread.id}`);
+      expect(threadRes.status).toBe(200);
+      expect(threadRes.body.id).toBe(annotationThread.id);
+
+      const otherApp = await otherAgentApp();
+      const otherListRes = await request(otherApp).get(`/api/routines/${routineId}/description/annotations`);
+      expect(otherListRes.status).toBe(403);
+      expect(otherListRes.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const otherThreadRes = await request(otherApp).get(`/api/routines/${routineId}/description/annotations/${annotationThread.id}`);
+      expect(otherThreadRes.status).toBe(403);
+      expect(otherThreadRes.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const crossApp = await crossCompanyApp();
+      const crossListRes = await request(crossApp).get(`/api/routines/${routineId}/description/annotations`);
+      expect(crossListRes.status).toBe(404);
+
+      const crossThreadRes = await request(crossApp).get(`/api/routines/${routineId}/description/annotations/${annotationThread.id}`);
+      expect(crossThreadRes.status).toBe(404);
+    });
+
+    it("allows assignee agent to create annotations, add comments, and update annotation threads", async () => {
+      const app = await assigneeApp();
+
+      const createRes = await request(app)
+        .post(`/api/routines/${routineId}/description/annotations`)
+        .send(annotationBody);
+      expect(createRes.status).toBe(201);
+      expect(mockAnnotationService.createRoutineThread).toHaveBeenCalledWith(
+        routineId,
+        "description",
+        expect.objectContaining({ body: "Agent annotation" }),
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+
+      const commentRes = await request(app)
+        .post(`/api/routines/${routineId}/description/annotations/${annotationThread.id}/comments`)
+        .send({ body: "Agent comment" });
+      expect(commentRes.status).toBe(201);
+      expect(mockAnnotationService.addRoutineComment).toHaveBeenCalledWith(
+        routineId,
+        "description",
+        annotationThread.id,
+        expect.objectContaining({ body: "Agent comment" }),
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+
+      const patchRes = await request(app)
+        .patch(`/api/routines/${routineId}/description/annotations/${annotationThread.id}`)
+        .send({ status: "resolved" });
+      expect(patchRes.status).toBe(200);
+      expect(mockAnnotationService.updateRoutineThread).toHaveBeenCalledWith(
+        routineId,
+        "description",
+        annotationThread.id,
+        expect.objectContaining({ status: "resolved" }),
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+
+      const otherApp = await otherAgentApp();
+      const otherCreate = await request(otherApp)
+        .post(`/api/routines/${routineId}/description/annotations`)
+        .send(annotationBody);
+      expect(otherCreate.status).toBe(403);
+      expect(otherCreate.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const otherComment = await request(otherApp)
+        .post(`/api/routines/${routineId}/description/annotations/${annotationThread.id}/comments`)
+        .send({ body: "Agent comment" });
+      expect(otherComment.status).toBe(403);
+      expect(otherComment.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const otherPatch = await request(otherApp)
+        .patch(`/api/routines/${routineId}/description/annotations/${annotationThread.id}`)
+        .send({ status: "resolved" });
+      expect(otherPatch.status).toBe(403);
+      expect(otherPatch.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const crossApp = await crossCompanyApp();
+      const crossCreate = await request(crossApp)
+        .post(`/api/routines/${routineId}/description/annotations`)
+        .send(annotationBody);
+      expect(crossCreate.status).toBe(404);
+
+      const crossComment = await request(crossApp)
+        .post(`/api/routines/${routineId}/description/annotations/${annotationThread.id}/comments`)
+        .send({ body: "Agent comment" });
+      expect(crossComment.status).toBe(404);
+
+      const crossPatch = await request(crossApp)
+        .patch(`/api/routines/${routineId}/description/annotations/${annotationThread.id}`)
+        .send({ status: "resolved" });
+      expect(crossPatch.status).toBe(404);
+    });
+
+    it("allows assignee agent to rotate routine trigger secrets, returning new secret material", async () => {
+      const app = await assigneeApp();
+      const res = await request(app)
+        .post(`/api/routine-triggers/${trigger.id}/rotate-secret`)
+        .send({});
+      expect(res.status).toBe(200);
+      expect(res.body.secretMaterial.webhookSecret).toBe("whsec_new_secret_1234567890");
+      expect(mockRoutineService.rotateTriggerSecret).toHaveBeenCalledWith(trigger.id, {
+        agentId,
+        userId: null,
+        runId: "88888888-8888-4888-8888-888888888888",
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "routine.trigger_secret_rotated",
+        entityType: "routine_trigger",
+        entityId: trigger.id,
+      }));
+
+      const otherApp = await otherAgentApp();
+      const otherRes = await request(otherApp)
+        .post(`/api/routine-triggers/${trigger.id}/rotate-secret`)
+        .send({});
+      expect(otherRes.status).toBe(403);
+      expect(otherRes.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+      const crossApp = await crossCompanyApp();
+      const crossRes = await request(crossApp)
+        .post(`/api/routine-triggers/${trigger.id}/rotate-secret`)
+        .send({});
+      expect(crossRes.status).toBe(404);
+    });
   });
 });
