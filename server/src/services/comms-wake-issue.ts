@@ -315,6 +315,9 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
   async function cannotRunNow(companyId: string, agentId: string): Promise<CommsWakeIssueResult | null> {
     const [agent] = await db.select().from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
     if (!agent) return { status: "gone" };
+    // The company setting is a real off switch: read on every event (never cached), before anything is created.
+    const [setting] = await db.select({ enabled: companies.commsBoardWakeEnabled }).from(companies).where(eq(companies.id, companyId));
+    if (setting && !setting.enabled) return { status: "retry_later", reason: "wake_disabled" };
     const invokability = await evaluateAgentInvokabilityFromDb(db, isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
     if (!invokability.invokable) {
       if (GONE_REASONS.has(invokability.reason)) return { status: "gone" };
