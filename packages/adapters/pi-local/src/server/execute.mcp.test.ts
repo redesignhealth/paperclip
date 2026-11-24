@@ -76,6 +76,7 @@ vi.mock("./models.js", async () => {
   };
 });
 
+import { lookupModelRelay } from "@paperclipai/adapter-utils/model-relay";
 import { execute } from "./execute.js";
 
 const BRIDGE_ENV = {
@@ -253,6 +254,66 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     expect(podVisible).not.toContain(MCP_TOKEN);
     expect(podVisible).not.toContain(RUN_JWT);
     expect(env.PAPERCLIP_API_KEY).toBe("bridge-token");
+  });
+
+  it("keeps the Router key out of the pod: relay entry host-side, models.json pointed at the bridge (TECH-10174)", async () => {
+    const ROUTER_KEY = "router-secret-key-do-not-leak-0123456789";
+    const providers = JSON.stringify({
+      "ramp-router": {
+        baseUrl: "https://api.router.example/v1",
+        apiKey: "$RAMP_ROUTER_API_KEY",
+        api: "openai-completions",
+        models: [{ id: "claude-sonnet-5-5" }],
+      },
+    });
+    let relayDuringRun: unknown = null;
+    let policiesDuringRun: unknown = null;
+    startAdapterExecutionTargetPaperclipBridge.mockImplementation((async (input: { bridgeRoutePolicies?: unknown }) => {
+      relayDuringRun = lookupModelRelay("run-mcp", "ramp-router");
+      policiesDuringRun = input.bridgeRoutePolicies;
+      return { env: { ...BRIDGE_ENV }, stop: async () => {} };
+    }) as never);
+    const writes: Array<{ args?: string[]; stdin?: string }> = [];
+    const target = sandboxTarget(0) as unknown as { runner: { execute: (input: never) => Promise<unknown> } };
+    const inner = target.runner.execute;
+    target.runner.execute = (async (input: { args?: string[]; stdin?: string }) => {
+      if (input.args?.join(" ").includes("cat >")) writes.push(input);
+      return inner(input as never);
+    }) as never;
+
+    const { env } = await run({
+      config: {
+        command: "pi",
+        model: "ramp-router/claude-sonnet-5-5",
+        env: { PAPERCLIP_PI_PROVIDERS: providers, RAMP_ROUTER_API_KEY: ROUTER_KEY },
+      },
+      executionTarget: target,
+    });
+
+    expect(relayDuringRun).toEqual({ upstreamBaseUrl: "https://api.router.example/v1", apiKey: ROUTER_KEY });
+    expect(policiesDuringRun).toEqual([expect.objectContaining({ maxConcurrent: 4 })]);
+    expect(env.RAMP_ROUTER_API_KEY).toBeUndefined();
+    expect(JSON.stringify(env)).not.toContain(ROUTER_KEY);
+    expect(writes).toHaveLength(1);
+    const written = JSON.parse(writes[0]!.stdin!) as { providers: Record<string, { baseUrl: string; apiKey: string }> };
+    expect(written.providers["ramp-router"]).toMatchObject({
+      baseUrl: "http://127.0.0.1:4310/api/model-relay/ramp-router",
+      apiKey: "$PAPERCLIP_API_KEY",
+    });
+    expect(JSON.stringify({ writes, sync: prepareAdapterExecutionTargetRuntime.mock.calls })).not.toContain(ROUTER_KEY);
+    // The registry entry does not outlive the run.
+    expect(lookupModelRelay("run-mcp", "ramp-router")).toBeNull();
+  });
+
+  it("leaves the Router key and provider untouched on a local target (TECH-10174)", async () => {
+    const providers = JSON.stringify({ "ramp-router": { baseUrl: "https://api.router.example/v1", apiKey: "$RAMP_ROUTER_API_KEY" } });
+    const { env } = await run({
+      config: { command: "pi", model: "ramp-router/claude-sonnet-5-5", env: { PAPERCLIP_PI_PROVIDERS: providers, RAMP_ROUTER_API_KEY: "router-local-key-0123456789" } },
+      executionTarget: undefined,
+      runtimeMcp: { getServers: () => [] },
+    });
+    expect(env.RAMP_ROUTER_API_KEY).toBe("router-local-key-0123456789");
+    expect(lookupModelRelay("run-mcp", "ramp-router")).toBeNull();
   });
 
   it("honours the server-side PAPERCLIP_PI_MCP_ADAPTER_PATH but ignores the agent's own env", async () => {
