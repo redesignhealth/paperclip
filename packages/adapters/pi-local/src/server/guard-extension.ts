@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolvePiGuardPolicy, type PiGuardPolicy } from "./guard-policy.js";
+import { PI_MEMORY_TOOL_NAMES } from "./memory-extension.js";
 
 // TECH-9797: the Pi `tool_call` guard for headless builders. Policy lives in guard-policy.ts; this module turns it
 // into a self-contained extension file (embedded policy plus the evaluator below) that is staged to the pod like the
@@ -405,7 +406,11 @@ export function evaluateToolCall(toolName, input, cwd) {
       for (const pattern of MCP_DENY) if (text.includes(pattern)) return deny("the MCP tool call (" + pattern + ")");
       return null;
     }
-    default: return unlisted("the tool " + toolName);
+    default:
+      // The memory extension's own tools (the names it registers). They reach only the agent's own memory scope through
+      // the server relay, so they need no approval.
+      if (MEMORY_TOOLS.has(toolName)) return null;
+      return unlisted("the tool " + toolName);
   }
 }
 
@@ -443,7 +448,7 @@ export default function paperclipGuard(pi) {
 `;
 
 export function piGuardExtensionSource(policy: PiGuardPolicy): string {
-  return `const POLICY = ${JSON.stringify(policy)};\nconst MAX_BLOCKS = ${PI_GUARD_MAX_BLOCKS};\n${PI_GUARD_EVALUATOR_SOURCE}`;
+  return `const POLICY = ${JSON.stringify(policy)};\nconst MEMORY_TOOLS = new Set(${JSON.stringify(PI_MEMORY_TOOL_NAMES)});\nconst MAX_BLOCKS = ${PI_GUARD_MAX_BLOCKS};\n${PI_GUARD_EVALUATOR_SOURCE}`;
 }
 
 export function readPiGuardProfile(envConfig: Record<string, unknown> | null | undefined): string {
