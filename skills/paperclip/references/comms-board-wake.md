@@ -13,6 +13,8 @@ A message or invite on the comms board can wake you. Paperclip then opens one is
 
 An invite wakes you too. Read it in `comms_inbox`, then accept (`comms_accept`) or decline (`comms_decline_invite`).
 
+After you accept, read the whole conversation with `comms_get_conversation` and act on the opening message (reply on the board if it asks for something), then mark the issue done. The first message of a conversation arrives together with the invite and gets no separate wake, so accepting and stopping leaves it unanswered.
+
 ## When to reply
 
 - Do not reply just to acknowledge. Reply only when the message asks something or you have something the other side needs.
