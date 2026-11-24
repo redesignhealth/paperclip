@@ -85,6 +85,11 @@ function idOf(item) {
   const id = item && typeof item === "object" ? (item.id ?? item.memory_id) : null;
   return typeof id === "string" || typeof id === "number" ? String(id).slice(0, 40) : "?";
 }
+// Relevance score as logged: a bounded number, or "?" when the server returned none. Never any memory text.
+function scoreOf(item) {
+  const score = item && typeof item === "object" ? item.score : null;
+  return typeof score === "number" && Number.isFinite(score) ? String(Math.round(score * 1000) / 1000) : "?";
+}
 function envSeconds(name, fallback, cap) {
   const value = Number(process.env[name]);
   const seconds = Number.isFinite(value) && value > 0 ? value : fallback;
@@ -309,7 +314,7 @@ export default function rhMemory(pi) {
       const results = resultsOf(data);
       const content = formatContext(data, limit);
       const injected = content ? content.split("\n").filter((line) => line.startsWith("- ")).length : 0;
-      warn("recall query=" + loggedQuery(query) + " results=" + results.length + " injected=" + injected + " top_ids=" + results.slice(0, 5).map(idOf).join(","));
+      warn("recall query=" + loggedQuery(query) + " results=" + results.length + " injected=" + injected + " ids=" + results.slice(0, MAX_TOP_K).map(idOf).join(",") + " scores=" + results.slice(0, MAX_TOP_K).map(scoreOf).join(","));
       if (!content) return undefined;
       return { message: { customType: "rh-memory-recall", content, display: false } };
     } catch (error) {

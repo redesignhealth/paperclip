@@ -298,9 +298,19 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     await handlers.get("before_agent_start")!({ prompt: "Fix the\nauth bug   in the api" });
     expect(lines(stderr)).toEqual([
       "[rh-memory] loaded: search=memory_search add=memory_add delete=memory_delete\n",
-      // m3 repeats m1's text, so 7 results become 5 injected lines; top_ids are the first five returned (not necessarily the injected ones)
-      '[rh-memory] recall query="Fix the auth bug in the api" results=7 injected=5 top_ids=m1,m2,m3,m4,m5\n',
+      // m3 repeats m1's text, so 7 results become 5 injected lines; ids and scores cover every returned result, in order
+      '[rh-memory] recall query="Fix the auth bug in the api" results=7 injected=5 ids=m1,m2,m3,m4,m5,m6,m7 scores=0.9,0.8,0.7,0.6,0.5,0.4,0.3\n',
     ]);
+  });
+
+  it("logs ids and scores per result, with a placeholder for a missing score, and never the memory text", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify({ results: [{ id: "a1", memory: "SECRET MEMORY TEXT one", score: 0.123456 }, { memory_id: "a2", memory: "SECRET MEMORY TEXT two" }, { id: "a3", memory: "SECRET MEMORY TEXT three", score: "high" }] }) }] } });
+    const { handlers } = await load();
+    await handlers.get("before_agent_start")!({ prompt: "Fix the retry bug" });
+    const line = lines(stderr).at(-1)!;
+    expect(line).toBe('[rh-memory] recall query="Fix the retry bug" results=3 injected=3 ids=a1,a2,a3 scores=0.123,?,?\n');
+    expect(line).not.toContain("SECRET");
   });
 
   it("logs zero results, a short prompt and a bounded query", async () => {
@@ -311,7 +321,7 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     expect(await handlers.get("before_agent_start")!({ prompt: "a".repeat(500) })).toBeUndefined();
     const out = lines(stderr);
     expect(out).toContain("[rh-memory] recall skipped: prompt too short\n");
-    expect(out.at(-1)).toBe(`[rh-memory] recall query="${"a".repeat(200)}..." results=0 injected=0 top_ids=\n`);
+    expect(out.at(-1)).toBe(`[rh-memory] recall query="${"a".repeat(200)}..." results=0 injected=0 ids= scores=\n`);
     expect(calls).toHaveLength(1);
   });
 
@@ -334,7 +344,7 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     const { handlers } = await load();
     await handlers.get("before_agent_start")!({ prompt: "api_key: abcdef123456\nFix the retry bug" });
     const line = lines(stderr).at(-1)!;
-    expect(line).toBe('[rh-memory] recall query="Fix the retry bug" results=0 injected=0 top_ids=\n');
+    expect(line).toBe('[rh-memory] recall query="Fix the retry bug" results=0 injected=0 ids= scores=\n');
     respond = () => ({ result: { content: [{ type: "text", text: "x" }], isError: true } });
     await handlers.get("before_agent_start")!({ prompt: "Fix the retry bug" });
     expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error query="Fix the retry bug"\n');
