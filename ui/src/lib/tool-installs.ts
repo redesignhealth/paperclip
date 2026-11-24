@@ -147,6 +147,8 @@ export function defaultMcpPendingEntries(
       if (typeof entry.key !== "string" || entry.connectionId) return false;
       // The agent-memory entry (TECH-8409) is not an app: it provisions agent config and has no connection to show.
       if (entry.key === "agent-memory") return false;
+      // Likewise comms-wake (TECH-9912): it registers a wake address with the board and has no connection to show.
+      if (entry.key === "comms-wake") return false;
       const setup = (entry.setup ?? {}) as { state?: unknown; reason?: unknown };
       if (setup.state === "not_required" && setup.reason === "operator_excluded") return false;
       if (setup.state === "not_required" && connections) {

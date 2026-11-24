@@ -10,6 +10,7 @@ import { readPlatformDefaultRouterKey } from "../secrets/platform-default-router
 import { logActivity } from "./activity-log.js";
 import type { ActivityPublication } from "../types/activity-publication.js";
 import { agentMemoryExcludedSetupKeys } from "./default-mcp-agent-memory.js";
+import { commsWakeExcludedSetupKeys } from "./comms-wake-registration.js";
 import { isDefaultMcpSpecEnabled, stripReservedDefaultMcpMetadata } from "./default-mcp-spec.js";
 import { assertAgentMetadataShape, protectedMetadataReplacement } from "./agent-metadata-protection.js";
 import { bindDefaultMcpOwnerForApproval, resolveCreatorOwnerUserId, snapshotDefaultMcpForNewAgent } from "./default-mcp-setup.js";
@@ -243,6 +244,8 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
     ).onConflictDoNothing();
   }
   if (isDefaultMcpSpecEnabled()) {
+    // Comms-board wake (TECH-9912): offered only while the company's rollout setting is on.
+    const commsWakeExcluded = await commsWakeExcludedSetupKeys(txDb, companyId);
     // Durable per-agent default (OFF unless the spec says otherwise), committed with the agent row.
     await snapshotDefaultMcpForNewAgent(txDb, {
       companyId,
@@ -261,6 +264,7 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
       // server enables it; the memory tools (TECH-8832) only to Claude and Codex agents while their own flag is on.
       ...(() => {
         const excluded = agentMemoryExcludedSetupKeys(created.adapterType, created.adapterConfig);
+        for (const key of commsWakeExcluded) excluded.add(key);
         return excluded.size > 0 ? { excludedSetupKeys: excluded } : {};
       })(),
     });

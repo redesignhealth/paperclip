@@ -84,6 +84,14 @@ describe("default-MCP aware install state", () => {
     expect(defaultMcpPendingEntries(metadata)).toEqual([]);
   });
 
+  it("never lists the connection-less comms-wake entry as an app being set up", () => {
+    const metadata = { defaultMcp: { version: 1, entries: {
+      ready: { key: "comms-wake", templateKey: "rh-comms-wake", connectionId: null, setup: { state: "ready", reason: null } },
+      pending: { key: "comms-wake", templateKey: "rh-comms-wake", connectionId: null, setup: { state: "pending", reason: "board_not_ready" } },
+    } } };
+    expect(defaultMcpPendingEntries(metadata)).toEqual([]);
+  });
+
   it("lists default entries without a connection as pending rows", () => {
     const metadata = { defaultMcp: { version: 1, entries: {
       comms: { key: "comms", templateKey: "rh-comms-board", dedicated: true, connectionId: null, setup: { state: "pending", reason: "owner_required" } },

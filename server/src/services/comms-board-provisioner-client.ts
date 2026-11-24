@@ -566,6 +566,130 @@ export async function setCommsBoardAgentShared(
 }
 
 // ---------------------------------------------------------------------------
+// Board wake target (TECH-9912)
+// ---------------------------------------------------------------------------
+
+/**
+ * `rejected`: the admin credential was refused (401/403 or `access_denied`). `invalid_request` / `misconfigured`: the board
+ * refused the url, secret or its own wake settings (for example a host that is not on its allowlist). `failed`: anything
+ * else, including an outcome that cannot be known. The call replaces any earlier target, so every non-ok result is safe to
+ * re-run. The outcome never carries the secret, the url or any board text.
+ */
+export type BoardWakeTargetOutcome =
+  | { ok: true; result: "created" | "replaced" | null }
+  | { ok: false; reason: "rejected" | "invalid_request" | "misconfigured" | "failed" };
+
+const WAKE_SECRET_PATTERN = /^whsec_[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Registers or replaces where the board delivers wake events for one board agent (`comms_admin_wake_target_set`). Same admin
+ * credential, MCP handshake and single `tools/call` as `registerCommsBoardAgent`; nothing is retried. A url that is not https
+ * or a secret that is not `whsec_` + base64 is refused locally before any call.
+ */
+export async function setCommsBoardWakeTarget(
+  config: CommsBoardProvisionerConfig,
+  request: { boardAgentId: string; url: string; secret: string; system: string },
+  fetchImpl: FetchLike = tailnetAwareFetch,
+  opts: { timeoutMs?: number } = {},
+): Promise<BoardWakeTargetOutcome> {
+  if (!UUID_PATTERN.test(request.boardAgentId)) return { ok: false, reason: "failed" };
+  if (!WAKE_SECRET_PATTERN.test(request.secret)) return { ok: false, reason: "failed" };
+  try {
+    if (new URL(request.url).protocol !== "https:") return { ok: false, reason: "failed" };
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+  const timeoutMs = opts.timeoutMs ?? COMMS_BOARD_REQUEST_TIMEOUT_MS;
+  const adminHeaders: Record<string, string> = { authorization: `Bearer ${config.boardAdminToken}` };
+  const send = (init: RequestInit) => {
+    const signal = init.signal
+      ? (typeof AbortSignal.any === "function" ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)]) : init.signal)
+      : AbortSignal.timeout(timeoutMs);
+    return fetchImpl(config.boardMcpUrl, {
+      ...init,
+      headers: { ...(init.headers as Record<string, string> | undefined), ...adminHeaders },
+      redirect: "error",
+      signal,
+    });
+  };
+
+  let sessionHeaders: Record<string, string>;
+  try {
+    sessionHeaders = await initializeMcpHttpSession({
+      send,
+      headers: adminHeaders,
+      requestId: randomUUID(),
+      strict: true,
+      maxResponseBytes: MAX_RESPONSE_BYTES,
+      supportedVersions: ["2025-06-18", "2025-03-26"],
+    });
+  } catch (error) {
+    if (error instanceof McpHttpInitializationError && (error.status === 401 || error.status === 403)) {
+      return { ok: false, reason: "rejected" };
+    }
+    return { ok: false, reason: "failed" };
+  }
+
+  try {
+    const callId = 1;
+    let response: Response;
+    try {
+      response = await fetchImpl(config.boardMcpUrl, {
+        method: "POST",
+        headers: { ...sessionHeaders, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify(
+          buildMcpToolCallRequest(callId, "comms_admin_wake_target_set", {
+            agent_id: request.boardAgentId,
+            url: request.url,
+            secret: request.secret,
+            system: request.system,
+          }),
+        ),
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch {
+      return { ok: false, reason: "failed" };
+    }
+    if (response.status !== 200) {
+      if (response.body) {
+        try {
+          await response.body.cancel();
+        } catch {}
+      }
+      return { ok: false, reason: response.status === 401 || response.status === 403 ? "rejected" : "failed" };
+    }
+    let responseText: string | null;
+    try {
+      responseText = await readMcpHttpResponseText(response, MAX_RESPONSE_BYTES);
+    } catch {
+      return { ok: false, reason: "failed" };
+    }
+    if (responseText === null) return { ok: false, reason: "failed" };
+    const envelope = findJsonRpcResponse(response.headers.get("content-type"), responseText, callId);
+    if (!envelope || "error" in envelope) return { ok: false, reason: "failed" };
+    const toolResult = extractMcpToolCallResult(envelope.result);
+    if (!toolResult) return { ok: false, reason: "failed" };
+    if (toolResult.isError) {
+      // Only the leading error code is read; the text itself is never returned or logged.
+      const code = toolResult.content.slice(0, 256).trim().match(/^([a-z_]{1,48})(?::|\s|$)/)?.[1] ?? "";
+      if (code === "access_denied" || code === "insufficient_scope") return { ok: false, reason: "rejected" };
+      if (code === "invalid_request") return { ok: false, reason: "invalid_request" };
+      if (code === "misconfigured") return { ok: false, reason: "misconfigured" };
+      return { ok: false, reason: "failed" };
+    }
+    let result: "created" | "replaced" | null = null;
+    try {
+      const parsed = JSON.parse(toolResult.content) as { result?: unknown };
+      if (parsed?.result === "created" || parsed?.result === "replaced") result = parsed.result;
+    } catch {}
+    return { ok: true, result };
+  } finally {
+    await terminateMcpHttpSession({ send, headers: sessionHeaders, timeoutMs: 3000 });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Board credential mint
 // ---------------------------------------------------------------------------
 
