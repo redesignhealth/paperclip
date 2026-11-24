@@ -534,6 +534,7 @@ Authorized managers can install company skills independently of hiring, then ass
 - Install and inspect company skills with the company skills API.
 - Assign skills to existing agents with `POST /api/agents/{agentId}/skills/sync` and an explicit `add`, `remove`, or `replace` mode. Prefer `add`; `replace` overwrites the complete desired skill set.
 - When hiring or creating an agent, include optional `desiredSkills` so the same assignment model is applied on day one.
+- When you author or substantially change a skill, create it in the company library (`POST /api/companies/{companyId}/skills`, managed local create) and assign it to yourself with `POST /api/agents/{agentId}/skills/sync` (mode `add`) if permitted, reporting the resulting skill key in your comment. If denied (403), do not retry or fall back to local disk; report the restriction in your task comment and attach the skill content as a task document so a manager agent (escalating via chainOfCommand where permissions allow) or board user can create and assign it. Files written to Hermes/provider-home paths (`~/.hermes/skills`, `$HERMES_HOME`) are runtime-managed and deleted when the run ends (task workspace files are durable). Only company-created skills (key `company/<companyId>/<slug>`) are editable; bundled, GitHub, and URL skills are read-only, so to change one, create a new company skill with the content.
 
 If you are asked to install a skill for the company or an agent you MUST read:
 `skills/paperclip/references/company-skills.md`
