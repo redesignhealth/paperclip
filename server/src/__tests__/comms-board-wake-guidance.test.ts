@@ -100,6 +100,20 @@ describe("buildCommsWakeComment", () => {
     expect(text).toContain("not again if you already answered it");
   });
 
+  it("tells an agent woken by an invite to read the whole conversation, since the opening message gets no wake", () => {
+    const text = buildCommsWakeComment(event("invite"));
+    expect(text).toMatch(/^New comms-board invitation\. Conversation: /);
+    expect(text).toContain("comms_get_conversation");
+    expect(text).toContain("will not wake you again");
+    expect(text).toContain("mark this issue done");
+  });
+
+  it("explains in the reference why an accepted invite needs a read of the opening message", () => {
+    const guide = read(REFERENCE);
+    expect(guide).toContain("After you accept, read the whole conversation with `comms_get_conversation`");
+    expect(guide).toContain("gets no separate wake");
+  });
+
   it("still names the conversation and the message number and carries no message content", () => {
     const text = buildCommsWakeComment(event("message"));
     expect(text).toContain("33333333-3333-4333-8333-333333333333");

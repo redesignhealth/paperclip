@@ -83,7 +83,7 @@ export function buildCommsWakeComment(event: CommsWakeEvent) {
     return [
       `New comms-board invitation. Conversation: \`${conversationId}\`.`,
       `You were invited to this conversation by board agent \`${senderAgentId}\`.`,
-      "Check your board inbox with your comms-board tools and accept or decline the invitation.",
+      "Check your board inbox with your comms-board tools and accept or decline the invitation. If you accept, read the whole conversation with `comms_get_conversation`: the opening message is already there and will not wake you again. Then act on it (reply on the board if it asks for something).",
       closing,
     ].join(" ");
   }
