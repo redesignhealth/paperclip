@@ -4238,14 +4238,10 @@ describe("company skill authoring routes in the bridge allowlist (TECH-10534)", 
 
   const denied: Array<[string, string]> = [
     ["POST", "/api/companies/c1/skills/import"],
-    ["POST", "/api/companies/c1/skills/install-catalog"],
     ["POST", "/api/companies/c1/skills/scan-projects"],
     ["POST", "/api/companies/c1/skills/browse-project"],
-    ["POST", "/api/companies/c1/skills/s1/install-update"],
-    ["POST", "/api/companies/c1/skills/s1/reset"],
     ["POST", "/api/companies/c1/skills/s1/fork"],
     ["POST", "/api/companies/c1/skills/s1/rename"],
-    ["POST", "/api/companies/c1/skills/s1/versions"],
     ["DELETE", "/api/companies/c1/skills/s1"],
     ["DELETE", "/api/companies/c1/skills/s1/files"],
     ["PATCH", "/api/companies/c1/skills/s1"],
@@ -4256,6 +4252,160 @@ describe("company skill authoring routes in the bridge allowlist (TECH-10534)", 
     ["POST", "/api/companies/c1/skills?x=1"],
     ["POST", "/api/companies/c1/../secrets/skills"],
   ];
+  it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))
+        .toBe(`Route not allowed: ${method} ${requestPath}`);
+    }
+  });
+});
+
+describe("low-risk company skill routes in the bridge allowlist (TECH-10594)", () => {
+  const allowed: Array<[string, string]> = [
+    // Reads
+    ["GET", "/api/companies/c1/skills/s1/fork-precheck"],
+    ["GET", "/api/companies/c1/skills/s1/versions"],
+    ["GET", "/api/companies/c1/skills/s1/versions/v1"],
+    ["GET", "/api/companies/c1/skills/s1/update-status"],
+    ["GET", "/api/companies/c1/skill-sources"],
+    ["GET", "/api/companies/c1/skill-sources/src-1"],
+    ["GET", "/api/companies/c1/skill-policy"],
+
+    // Versioning, catalog, update, reset
+    ["POST", "/api/companies/c1/skills/s1/versions"],
+    ["POST", "/api/companies/c1/skills/install-catalog"],
+    ["POST", "/api/companies/c1/skills/s1/install-update"],
+    ["POST", "/api/companies/c1/skills/s1/reset"],
+
+    // Test inputs, templates, test runs
+    ["GET", "/api/companies/c1/skills/s1/test-inputs"],
+    ["POST", "/api/companies/c1/skills/s1/test-inputs"],
+    ["PATCH", "/api/companies/c1/skills/s1/test-inputs/in-1"],
+    ["DELETE", "/api/companies/c1/skills/s1/test-inputs/in-1"],
+    ["GET", "/api/companies/c1/skill-test-run-templates"],
+    ["POST", "/api/companies/c1/skill-test-run-templates"],
+    ["PATCH", "/api/companies/c1/skill-test-run-templates/tmpl-1"],
+    ["DELETE", "/api/companies/c1/skill-test-run-templates/tmpl-1"],
+    ["GET", "/api/companies/c1/skills/s1/test-runs"],
+    ["GET", "/api/companies/c1/skills/s1/test-runs/run-1"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs/run-1/cancel"],
+    ["DELETE", "/api/companies/c1/skills/s1/test-runs/run-1"],
+
+    // Social: stars and comments
+    ["POST", "/api/companies/c1/skills/s1/star"],
+    ["DELETE", "/api/companies/c1/skills/s1/star"],
+    ["GET", "/api/companies/c1/skills/s1/comments"],
+    ["POST", "/api/companies/c1/skills/s1/comments"],
+    ["PATCH", "/api/companies/c1/skills/s1/comments/cm-1"],
+    ["DELETE", "/api/companies/c1/skills/s1/comments/cm-1"],
+  ];
+
+  it.each(allowed)("admits %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes)).toBeNull();
+    }
+  });
+
+  const denied: Array<[string, string]> = [
+    // Still blocked routes
+    ["POST", "/api/companies/c1/skills/import"],
+    ["POST", "/api/companies/c1/skills/scan-projects"],
+    ["POST", "/api/companies/c1/skills/browse-project"],
+    ["POST", "/api/companies/c1/skills/s1/fork"],
+    ["POST", "/api/companies/c1/skills/s1/rename"],
+    ["DELETE", "/api/companies/c1/skills/s1"],
+    ["DELETE", "/api/companies/c1/skills/s1/files"],
+    ["PATCH", "/api/companies/c1/skills/s1"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs"],
+    ["POST", "/api/companies/c1/skill-sources"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1"],
+    ["DELETE", "/api/companies/c1/skill-sources/src-1"],
+    ["POST", "/api/companies/c1/skill-sources/adopt-project"],
+    ["POST", "/api/companies/c1/skill-sources/discover"],
+    ["POST", "/api/companies/c1/skill-sources/preview"],
+    ["POST", "/api/companies/c1/skill-sources/src-1/refresh"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1/settings"],
+    ["PUT", "/api/companies/c1/skill-policy"],
+    ["DELETE", "/api/companies/c1/skill-policy"],
+    ["POST", "/api/companies/c1/skill-policy/evaluate"],
+
+    // Trailing slashes
+    ["GET", "/api/companies/c1/skills/s1/fork-precheck/"],
+    ["GET", "/api/companies/c1/skills/s1/versions/"],
+    ["GET", "/api/companies/c1/skills/s1/versions/v1/"],
+    ["GET", "/api/companies/c1/skills/s1/update-status/"],
+    ["GET", "/api/companies/c1/skill-sources/"],
+    ["GET", "/api/companies/c1/skill-sources/src-1/"],
+    ["GET", "/api/companies/c1/skill-policy/"],
+    ["POST", "/api/companies/c1/skills/s1/versions/"],
+    ["POST", "/api/companies/c1/skills/install-catalog/"],
+    ["POST", "/api/companies/c1/skills/s1/install-update/"],
+    ["POST", "/api/companies/c1/skills/s1/reset/"],
+    ["GET", "/api/companies/c1/skills/s1/test-inputs/"],
+    ["POST", "/api/companies/c1/skills/s1/test-inputs/"],
+    ["PATCH", "/api/companies/c1/skills/s1/test-inputs/in-1/"],
+    ["DELETE", "/api/companies/c1/skills/s1/test-inputs/in-1/"],
+    ["GET", "/api/companies/c1/skill-test-run-templates/"],
+    ["POST", "/api/companies/c1/skill-test-run-templates/"],
+    ["PATCH", "/api/companies/c1/skill-test-run-templates/tmpl-1/"],
+    ["DELETE", "/api/companies/c1/skill-test-run-templates/tmpl-1/"],
+    ["GET", "/api/companies/c1/skills/s1/test-runs/"],
+    ["GET", "/api/companies/c1/skills/s1/test-runs/run-1/"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs/run-1/cancel/"],
+    ["DELETE", "/api/companies/c1/skills/s1/test-runs/run-1/"],
+    ["POST", "/api/companies/c1/skills/s1/star/"],
+    ["DELETE", "/api/companies/c1/skills/s1/star/"],
+    ["GET", "/api/companies/c1/skills/s1/comments/"],
+    ["POST", "/api/companies/c1/skills/s1/comments/"],
+    ["PATCH", "/api/companies/c1/skills/s1/comments/cm-1/"],
+    ["DELETE", "/api/companies/c1/skills/s1/comments/cm-1/"],
+
+    // Extra suffixes
+    ["GET", "/api/companies/c1/skills/s1/fork-precheck/extra"],
+    ["GET", "/api/companies/c1/skills/s1/versions/v1/extra"],
+    ["GET", "/api/companies/c1/skills/s1/versions/v1/extra/deep"],
+    ["GET", "/api/companies/c1/skills/s1/update-status/extra"],
+    ["GET", "/api/companies/c1/skill-sources/src-1/extra"],
+    ["GET", "/api/companies/c1/skill-sources/src-1/extra/deep"],
+    ["GET", "/api/companies/c1/skill-policy/extra"],
+    ["POST", "/api/companies/c1/skills/s1/versions/extra"],
+    ["POST", "/api/companies/c1/skills/install-catalog/extra"],
+    ["POST", "/api/companies/c1/skills/s1/install-update/extra"],
+    ["POST", "/api/companies/c1/skills/s1/reset/extra"],
+    ["GET", "/api/companies/c1/skills/s1/test-inputs/extra"],
+    ["POST", "/api/companies/c1/skills/s1/test-inputs/extra"],
+    ["PATCH", "/api/companies/c1/skills/s1/test-inputs/in-1/extra"],
+    ["DELETE", "/api/companies/c1/skills/s1/test-inputs/in-1/extra"],
+    ["GET", "/api/companies/c1/skill-test-run-templates/extra"],
+    ["POST", "/api/companies/c1/skill-test-run-templates/extra"],
+    ["PATCH", "/api/companies/c1/skill-test-run-templates/tmpl-1/extra"],
+    ["DELETE", "/api/companies/c1/skill-test-run-templates/tmpl-1/extra"],
+    ["GET", "/api/companies/c1/skills/s1/test-runs/run-1/extra"],
+    ["GET", "/api/companies/c1/skills/s1/test-runs/run-1/extra/deep"],
+    ["POST", "/api/companies/c1/skills/s1/test-runs/run-1/cancel/extra"],
+    ["DELETE", "/api/companies/c1/skills/s1/test-runs/run-1/extra"],
+    ["POST", "/api/companies/c1/skills/s1/star/extra"],
+    ["DELETE", "/api/companies/c1/skills/s1/star/extra"],
+    ["GET", "/api/companies/c1/skills/s1/comments/extra"],
+    ["POST", "/api/companies/c1/skills/s1/comments/extra"],
+    ["PATCH", "/api/companies/c1/skills/s1/comments/cm-1/extra"],
+    ["DELETE", "/api/companies/c1/skills/s1/comments/cm-1/extra"],
+
+    // Wrong methods (PUT on each POST/PATCH path)
+    ["PUT", "/api/companies/c1/skills/s1/versions"],
+    ["PUT", "/api/companies/c1/skills/install-catalog"],
+    ["PUT", "/api/companies/c1/skills/s1/install-update"],
+    ["PUT", "/api/companies/c1/skills/s1/reset"],
+    ["PUT", "/api/companies/c1/skills/s1/test-inputs"],
+    ["PUT", "/api/companies/c1/skills/s1/test-inputs/in-1"],
+    ["PUT", "/api/companies/c1/skill-test-run-templates"],
+    ["PUT", "/api/companies/c1/skill-test-run-templates/tmpl-1"],
+    ["PUT", "/api/companies/c1/skills/s1/test-runs/run-1/cancel"],
+    ["PUT", "/api/companies/c1/skills/s1/star"],
+    ["PUT", "/api/companies/c1/skills/s1/comments"],
+    ["PUT", "/api/companies/c1/skills/s1/comments/cm-1"],
+  ];
+
   it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
     for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))

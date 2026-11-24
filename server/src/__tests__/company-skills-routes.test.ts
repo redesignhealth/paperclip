@@ -2422,4 +2422,117 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith("company-1", "skill-1");
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
+
+  describe("low-risk company skill mutation permissions for agents (TECH-10594)", () => {
+    const skillGatedMutatingRoutes = [
+      { name: "create version", method: "post", path: "/api/companies/:cid/skills/skill-1/versions", body: { label: "v2" }, successStatus: 201 },
+      { name: "install catalog", method: "post", path: "/api/companies/:cid/skills/install-catalog", body: { catalogSkillId: "paperclipai:bundled:software-development:review" }, successStatus: 201 },
+      { name: "install update", method: "post", path: "/api/companies/:cid/skills/skill-1/install-update", body: {}, successStatus: 200 },
+      { name: "reset skill", method: "post", path: "/api/companies/:cid/skills/skill-1/reset", body: {}, successStatus: 200 },
+      { name: "create test input", method: "post", path: "/api/companies/:cid/skills/skill-1/test-inputs", body: { name: "smoke/input", content: "Try it" }, successStatus: 201 },
+      { name: "update test input", method: "patch", path: "/api/companies/:cid/skills/skill-1/test-inputs/11111111-1111-4111-8111-111111111111", body: { name: "smoke/renamed" }, successStatus: 200 },
+      { name: "delete test input", method: "delete", path: "/api/companies/:cid/skills/skill-1/test-inputs/11111111-1111-4111-8111-111111111111", body: undefined, successStatus: 200 },
+      { name: "create test run template", method: "post", path: "/api/companies/:cid/skill-test-run-templates", body: { name: "Tmpl", body: "Run {{skillName}}" }, successStatus: 201 },
+      { name: "update test run template", method: "patch", path: "/api/companies/:cid/skill-test-run-templates/66666666-6666-4666-8666-666666666666", body: { name: "Renamed" }, successStatus: 200 },
+      { name: "delete test run template", method: "delete", path: "/api/companies/:cid/skill-test-run-templates/66666666-6666-4666-8666-666666666666", body: undefined, successStatus: 200 },
+      { name: "cancel test run", method: "post", path: "/api/companies/:cid/skills/skill-1/test-runs/22222222-2222-4222-8222-222222222222/cancel", body: {}, successStatus: 200 },
+      { name: "delete test run", method: "delete", path: "/api/companies/:cid/skills/skill-1/test-runs/22222222-2222-4222-8222-222222222222", body: undefined, successStatus: 200 },
+    ] as const;
+
+    const companyAccessMutatingRoutes = [
+      { name: "star skill", method: "post", path: "/api/companies/:cid/skills/skill-1/star", body: undefined, successStatus: 200 },
+      { name: "unstar skill", method: "delete", path: "/api/companies/:cid/skills/skill-1/star", body: undefined, successStatus: 200 },
+      { name: "create comment", method: "post", path: "/api/companies/:cid/skills/skill-1/comments", body: { body: "Looks good" }, successStatus: 201 },
+      { name: "update comment", method: "patch", path: "/api/companies/:cid/skills/skill-1/comments/comment-1", body: { body: "Updated" }, successStatus: 200 },
+      { name: "delete comment", method: "delete", path: "/api/companies/:cid/skills/skill-1/comments/comment-1", body: undefined, successStatus: 200 },
+    ] as const;
+
+    beforeEach(() => {
+      mockCompanySkillService.getTestRunDetail.mockResolvedValue({
+        id: "22222222-2222-4222-8222-222222222222",
+        companyId: "company-1",
+        skillId: "skill-1",
+        issueId: null,
+      });
+      mockCompanySkillService.cancelTestRun.mockResolvedValue({
+        id: "22222222-2222-4222-8222-222222222222",
+      });
+      mockCompanySkillService.deleteTestRun.mockResolvedValue({
+        id: "22222222-2222-4222-8222-222222222222",
+      });
+    });
+
+    describe.each(skillGatedMutatingRoutes)("$name", ({ method, path, body, successStatus }) => {
+      it("allows standard agents without skills grants", async () => {
+        mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+          if (input.action === "tasks:assign") return { allowed: true, action: "tasks:assign", reason: "allow", explanation: "Allowed." };
+          return denySkillChangeDecision();
+        });
+
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("denies low-trust agents with 403 skill_actor_restricted", async () => {
+        mockAccessService.decide.mockResolvedValue(denySkillChangeDecision(
+          "deny_low_trust_boundary",
+          "Low-trust agents cannot use company-wide skill APIs.",
+        ));
+
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body).toMatchObject({
+          code: "skill_actor_restricted",
+          details: { reason: "platform_invariant" },
+        });
+      });
+
+      it("denies cross-company agents with 403", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-2");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+      });
+    });
+
+    describe.each(companyAccessMutatingRoutes)("$name", ({ method, path, body, successStatus }) => {
+      it("allows same-company agents", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("denies cross-company agents with 403", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-2");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+      });
+    });
+  });
 });
