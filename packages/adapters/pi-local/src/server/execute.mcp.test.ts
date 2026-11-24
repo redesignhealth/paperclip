@@ -325,10 +325,25 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     guidance: "Use the runtime tools.",
   };
 
-  it("does not put the runtime tools token or its URLs in a sandbox pod that has the MCP relay (TECH-10174)", async () => {
-    const { env } = await run({ runtimeTools });
+  it("serves runtime tools through the relay instead of the env in a sandbox pod (TECH-10174)", async () => {
+    const { env } = await run({ runtimeTools, runtimeMcp: { getServers: () => [] } });
     expect(Object.keys(env).filter((key) => key.startsWith("PAPERCLIP_RUNTIME_TOOLS_"))).toEqual([]);
     expect(JSON.stringify(env)).not.toContain("runtime-tools-token-do-not-leak");
+    // The token is held host-side by the relay route, and the pod config names only the relay path.
+    expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relayRoutes: [
+          expect.objectContaining({
+            path: "/paperclip-relay/mcp/paperclip_connections",
+            upstreamUrl: "https://paperclip.example/api/mcp/runtime-tools",
+            token: "runtime-tools-token-do-not-leak",
+          }),
+        ],
+      }),
+    );
+    const written = JSON.parse(syncedMcpJson[0]!) as { mcpServers: Record<string, Record<string, unknown>> };
+    expect(written.mcpServers.paperclip_connections).toMatchObject({ includeTools: ["connections_search"] });
+    expect(JSON.stringify(written)).not.toContain("runtime-tools-token-do-not-leak");
   });
 
   it("keeps the runtime tools env on a local target, which has no relay (TECH-10174)", async () => {

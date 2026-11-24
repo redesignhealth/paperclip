@@ -7,7 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult, type AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetIsSandbox,
@@ -308,9 +308,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ...buildPaperclipEnv(agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
-  // TECH-10174: with the MCP relay the pod reaches runtime tools through the bridge, which holds the token host-side. The
-  // runtime tools token (and its URLs and guidance) must not also sit in the env the model can read for the whole run.
-  if (mcpRelayAvailable) {
+  // TECH-10174: pi_local gets runtime tools by environment, not as a runtime MCP server. In a sandbox pod with the MCP relay
+  // they are served as a relayed MCP server instead (below), so the bridge holds the token host-side and the token, URLs and
+  // guidance are not also in the env the model can read for the whole run.
+  if (mcpRelayAvailable && ctx.runtimeTools) {
     for (const key of Object.keys(env)) {
       if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) delete env[key];
     }
@@ -377,7 +378,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // and the spawned Pi process resolve models against the managed models.json.
   // TECH-9794: runtime MCP servers reach Pi only through the sandbox bridge relay, so no MCP token or run
   // token is written to the pod. Targets without the bridge (and local runs) continue without them.
-  const allRuntimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const runtimeToolsRelayServer: AdapterRuntimeMcpServer[] = mcpRelayAvailable && ctx.runtimeTools
+    ? [{
+        name: "Paperclip connections",
+        url: ctx.runtimeTools.mcpEndpoint,
+        token: ctx.runtimeTools.bearerToken,
+        connectionId: "paperclip-runtime-tools",
+        allowedTools: [...ctx.runtimeTools.tools],
+      }]
+    : [];
+  const allRuntimeMcpServers = [...runtimeToolsRelayServer, ...(ctx.runtimeMcp?.getServers() ?? [])];
   const { relayServers: piMcpRelayServers, skipped: piMcpSkipped } = mcpRelayAvailable
     ? selectPiMcpRelayServers(allRuntimeMcpServers)
     : { relayServers: [], skipped: [] };
