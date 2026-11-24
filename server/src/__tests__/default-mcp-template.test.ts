@@ -1269,6 +1269,19 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
       expect(JSON.stringify(activity)).not.toContain(TEMPLATE_TOKEN);
     });
 
+    it("makes the template's application active again when archiving the template had archived it", async () => {
+      const { companyId, fetchMock, template } = await readyCompany();
+      await archiveTemplate(companyId);
+      const [archivedApp] = await db.select().from(toolApplications).where(eq(toolApplications.id, template.applicationId));
+      expect(archivedApp!.status).toBe("archived");
+      const { db: _unused, ...templateCtx } = ctxFor(fetchMock);
+      expect(await reprovision(companyId, templateCtx, { dryRun: false, confirm: COMMS_TEMPLATE_REPROVISION_CONFIRMATION })).toMatchObject({ result: "restored" });
+      await waitForScheduledCompanyTemplates();
+      const [app] = await db.select().from(toolApplications).where(eq(toolApplications.id, template.applicationId));
+      expect(app).toMatchObject({ status: "active", archivedAt: null });
+      expect(readTemplateClaim((await templateRow(companyId))!.config)).toMatchObject({ state: "ready", allowlistVersion: 3 });
+    });
+
     it("refuses, and changes nothing, when a precondition does not hold", async () => {
       // No template at all.
       enableFeature();

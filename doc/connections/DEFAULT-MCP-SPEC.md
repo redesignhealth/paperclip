@@ -217,7 +217,7 @@ A ready template is trusted only while its token is unexpired, its single header
 
 ### Expiry is honest, not automatic
 
-The template token lives 365 days. Nothing re-issues it silently. When it expires, or when the template drifts, the claim becomes terminal (`template_expired` / `template_drift`) and NEW agents wait with `template_expired` / `template_failed` instead of cloning a bad template. Existing per-agent clones are unaffected because each has its own token. Re-issuing the template credential is an explicit operator action, and standing issuance infrastructure is a separate ticket (TECH-7269). The same holds for every terminal template state (`mint_unknown`, `ownership_conflict`, `secret_store_failed`, `secret_unavailable`, `template_drift`, `template_expired`, `template_revoked`): the sweep never retries them, archiving the template does not recreate it, and recovery is an explicit operator action outside this feature (an unknown mint may have left a live registry row, which is why it is never repeated). Agents waiting on a template that has just become ready (`template_not_found`, `template_provisioning`, `template_unsupported`, `template_ambiguous`) get a path-only `nextAttemptAt` nudge so the next sweep picks them up; no other agent metadata is touched.
+The template token lives 365 days. Nothing re-issues it silently. When it expires, or when the template drifts, the claim becomes terminal (`template_expired` / `template_drift`) and NEW agents wait with `template_expired` / `template_failed` instead of cloning a bad template. Existing per-agent clones are unaffected because each has its own token. Re-issuing the template credential is an explicit operator action, and standing issuance infrastructure is a separate ticket (TECH-7269). The same holds for every terminal template state (`mint_unknown`, `ownership_conflict`, `secret_store_failed`, `secret_unavailable`, `template_drift`, `template_expired`, `template_revoked`): the sweep never retries them, archiving the template does not recreate it, and recovery is an explicit operator action (an archived template is restored with the action described in "Restoring an archived managed template") (an unknown mint may have left a live registry row, which is why it is never repeated). Agents waiting on a template that has just become ready (`template_not_found`, `template_provisioning`, `template_unsupported`, `template_ambiguous`) get a path-only `nextAttemptAt` nudge so the next sweep picks them up; no other agent metadata is touched.
 
 ### Scope and rollout
 
@@ -785,9 +785,9 @@ Memory tokens last 90 days and the registry never revokes. The 60-second setup s
 
 ## Restoring an archived managed template (existing org with no usable template)
 
-Archiving the managed template is terminal: the sweep reads it as revoked and the connection update API refuses to touch
-it. A company can then have no usable template (new agents wait as `template_not_found`, or `template_unsupported` when an
-org-authored connection with the same name uses a non-`api_key` method). `server/src/services/comms-template-reprovision.ts`
+Archiving the managed template is terminal for the sweep (it reads it as revoked) and the connection update API refuses to
+touch it; the only way back is this operator action. A company can then have no usable template (new agents wait as `template_not_found`, or `template_unsupported` when an
+org-authored connection with the same name is not an active `api_key` MCP connection with a header credential). `server/src/services/comms-template-reprovision.ts`
 restores it in place, instance admin only:
 
 `POST /companies/:companyId/default-mcp/comms-template-reprovision`. Body: `dryRun` (default `true`), `confirm`. A real run
@@ -796,10 +796,12 @@ needs `dryRun: false` and `"confirm": "reprovision-comms-board-template"`.
 A real run moves the SAME template row from archived to draft, resets its claim to pending (fresh attempt budget, allowlist
 version cleared) and clears its header credential refs; the normal template review then rebuilds them from the stored
 vault secret, re-runs discovery and the reviewed allowlist, publishes the template and wakes waiting agents. No token is
-minted and no write reaches the board; no agent, agent connection, grant, secret or board identity is touched. Undo:
-archive the template again.
+minted and no write reaches the board; no agent, agent connection, grant, secret or board identity is changed. The
+template's application is made active again if archiving the template archived it. Undo: archive the template again,
+which stops the template but does not undo what the review did meanwhile for waiting agents (their own connections,
+credentials and secrets).
 
-It refuses with a closed reason (`refused_*`) when the template is not archived, no managed template exists, a non-archived
+It refuses with a closed reason (`refused_*`) when the feature is off, the template is not archived, no managed template exists or it is invalid, a non-archived
 connection already uses the template name (`competing` lists its id, status and auth method: rename or retire it first,
 for example with an ordinary connection update; do not archive it, which revokes its grants), the stored credential is
 missing or expired, the company is inactive or out of scope, the feature is off, an agent's comms-board entry points at

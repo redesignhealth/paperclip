@@ -12,8 +12,10 @@
  * is written to the board. The normal template review then re-runs discovery and the reviewed allowlist, publishes
  * the template at the current version, and wakes agents that wait on it.
  *
- * It never touches an agent, an agent's connection, grant, secret or board identity. It refuses, and reports why, when
- * the preconditions do not hold (see `CommsTemplateReprovisionResult`). Undo: archive the template again.
+ * It never changes an agent, an agent's connection, grant, secret or board identity (it only reads each agent's comms-board
+ * entry to refuse when one points at the template row). It refuses, and reports why, when the preconditions do not hold
+ * (see `CommsTemplateReprovisionResult`). Undo: archive the template again; that stops the template, but does not undo
+ * what the review did meanwhile for waiting agents (their own connections, credentials and secrets).
  *
  * The report carries ids, counts and closed reason codes only.
  */
@@ -21,6 +23,7 @@ import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import {
   agents,
   companies,
+  toolApplications,
   toolConnectionInstalls,
   toolConnections,
   toolProfileBindings,
@@ -72,7 +75,7 @@ export interface CommsTemplateReprovisionReport {
   boundAgents?: string[];
   /** What a restore does to the row, in plain terms. Present on `would_restore` and `restored`. */
   changes?: string[];
-  /** How many agents have a comms-board entry. None of them is read or changed by this action. */
+  /** How many agents have a comms-board entry. None of them is changed by this action. */
   agentsLeftUntouched: number;
 }
 
@@ -99,7 +102,7 @@ function commsSpec() {
 }
 
 const CHANGES = [
-  "template connection: archived -> draft (same row, same secret, same board principal)",
+  "template connection: archived -> draft (same row, same secret, same board principal); its application is made active again if archiving the template archived it",
   "template claim: pending, attempt budget reset, allowlist version cleared so the review re-runs",
   "template header credential refs: cleared, rebuilt by the review from the stored secret",
   "no token is minted, nothing is written to the board, no agent connection, grant, secret or board identity is touched",
@@ -228,6 +231,12 @@ export async function reprovisionCommsTemplate(
         missingCheckAt: null,
         updatedAt: nowIso,
       };
+      // Archiving the last connection of an application archives the application too: put it back, or the review
+      // (which only reads the template row) would publish a template whose application is still archived.
+      await txDb
+        .update(toolApplications)
+        .set({ status: "active", archivedAt: null, updatedAt: now })
+        .where(and(eq(toolApplications.id, row.applicationId), eq(toolApplications.companyId, options.companyId), eq(toolApplications.status, "archived")));
       await txDb
         .update(toolConnections)
         .set({
