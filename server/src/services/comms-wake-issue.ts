@@ -1,5 +1,6 @@
 import { and, desc, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { COMMS_BOARD_CONVERSATION_ORIGIN_KIND } from "@paperclipai/shared";
 import { agentWakeupRequests, agents, commsWakeConversations, commsWakeEvents, companies, issueComments, issues } from "@paperclipai/db";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
@@ -12,7 +13,7 @@ import { issueService } from "./issues.js";
 import { resolveRoutineResponsibleUserId } from "./routines.js";
 
 /** Origin kind that marks an issue as the carrier of one comms-board conversation. */
-export const COMMS_WAKE_ISSUE_ORIGIN_KIND = "comms_board_conversation";
+export const COMMS_WAKE_ISSUE_ORIGIN_KIND = COMMS_BOARD_CONVERSATION_ORIGIN_KIND;
 /** Wake reason for a comms-board event. Distinct from `issue_assigned` (resets the session) and from comment reasons. */
 export const COMMS_WAKE_REASON = "comms_board_message_received";
 const COMMS_WAKE_ACTOR_ID = "comms_board_wake";
