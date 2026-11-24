@@ -203,8 +203,8 @@ describe("Pi memory extension: failure path", () => {
     await expect(handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] })).resolves.toBeUndefined();
     const tool = await tools.get("memory_search")!.execute("t", { query: "x" });
     expect(tool.content[0]!.text).toContain("Memory service unavailable");
-    expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toMatch(/\[rh-memory\] recall skipped: Error/);
-    expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toMatch(/capture skipped/);
+    expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toMatch(/\[rh-memory\] recall failed: Error: http 503 query="needs memory"/);
+    expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toMatch(/capture failed: Error: http 503/);
   });
 
   it("fails open when the service is unreachable or slow", async () => {
@@ -286,5 +286,78 @@ describe("memory tools behind the gateway's namespaced names", () => {
     expect([...tools.keys()]).toEqual(["memory_search"]);
     await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
     expect(calls).toEqual([]);
+  });
+});
+
+describe("Pi memory extension: log lines for scoring recall", () => {
+  const lines = (stderr: { mock: { calls: unknown[][] } }) => stderr.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("[rh-memory]"));
+
+  it("logs what was loaded and one recall line per prompt with the query, counts and top ids", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { handlers } = await load();
+    await handlers.get("before_agent_start")!({ prompt: "Fix the\nauth bug   in the api" });
+    expect(lines(stderr)).toEqual([
+      "[rh-memory] loaded: search=memory_search add=memory_add delete=memory_delete\n",
+      // m3 repeats m1's text, so 7 results become 5 injected lines; top_ids are the first five returned (not necessarily the injected ones)
+      '[rh-memory] recall query="Fix the auth bug in the api" results=7 injected=5 top_ids=m1,m2,m3,m4,m5\n',
+    ]);
+  });
+
+  it("logs zero results, a short prompt and a bounded query", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify({ results: [] }) }] } });
+    const { handlers } = await load();
+    expect(await handlers.get("before_agent_start")!({ prompt: "x" })).toBeUndefined();
+    expect(await handlers.get("before_agent_start")!({ prompt: "a".repeat(500) })).toBeUndefined();
+    const out = lines(stderr);
+    expect(out).toContain("[rh-memory] recall skipped: prompt too short\n");
+    expect(out.at(-1)).toBe(`[rh-memory] recall query="${"a".repeat(200)}..." results=0 injected=0 top_ids=\n`);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("names the failure on an error line that carries the query, and logs a stored capture", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    respond = () => ({ result: { isError: true, content: [{ type: "text", text: "boom" }] } });
+    const { handlers } = await load();
+    await handlers.get("before_agent_start")!({ prompt: "needs memory" });
+    expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error query="needs memory"\n');
+    respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify({ results: [{ id: "n1", memory: "saved", event: "ADD" }] }) }] } });
+    await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
+    expect(lines(stderr).at(-1)).toMatch(/^\[rh-memory\] capture stored chars=\d+\n$/);
+    await handlers.get("agent_end")!({ messages: [] });
+    expect(lines(stderr).at(-1)).toBe("[rh-memory] capture skipped: nothing worth storing\n");
+  });
+
+  it("keeps secrets and non-client error text out of the lines", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    respond = () => ({ result: { content: [{ type: "text", text: "not json" }] } });
+    const { handlers } = await load();
+    await handlers.get("before_agent_start")!({ prompt: "api_key: abcdef123456\nFix the retry bug" });
+    const line = lines(stderr).at(-1)!;
+    expect(line).toBe('[rh-memory] recall query="Fix the retry bug" results=0 injected=0 top_ids=\n');
+    respond = () => ({ result: { content: [{ type: "text", text: "x" }], isError: true } });
+    await handlers.get("before_agent_start")!({ prompt: "Fix the retry bug" });
+    expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error query="Fix the retry bug"\n');
+    // a SyntaxError-style message is not echoed
+    const stderr2 = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    stderr2.mockClear();
+    respond = () => ({ status: 200, result: undefined });
+    await handlers.get("before_agent_start")!({ prompt: "Fix the retry bug" });
+    expect(lines(stderr2).at(-1)).not.toMatch(/Unexpected|JSON|token|http:/);
+  });
+
+  it("logs when capture is skipped because the server lists no memory_add tool", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await writeMcpJson({ mem: { url: "${TEST_RELAY_URL}/x", includeTools: ["memory_search"] } });
+    const { handlers } = await load();
+    await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
+    expect(lines(stderr).at(-1)).toBe("[rh-memory] capture skipped: the server lists no memory_add tool\n");
+  });
+
+  it("says why it did not load", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await writeMcpJson({ comms: { url: "${TEST_RELAY_URL}/x", includeTools: ["inbox"] } });
+    await load();
+    expect(lines(stderr)).toEqual(["[rh-memory] not loaded: no memory server in mcp-adapter.json\n"]);
   });
 });
