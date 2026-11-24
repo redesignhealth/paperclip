@@ -40,6 +40,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { AGENT_MEMORY_ENTRY_KEY, agentMemoryHook, agentMemoryToolsEnabled, agentMemoryToolsHarness } from "./default-mcp-agent-memory.js";
 import { commsWakeRegistrationHook } from "./comms-wake-registration.js";
+import { backfillCommsWakeEntries } from "./comms-wake-admin.js";
 import { sweepAgentMemoryRotation } from "./agent-memory-rotation.js";
 import { ownerEmailFor } from "./default-mcp-owner.js";
 import { isCompanyInDefaultMcpTemplateScope, readDefaultMcpTemplateScope } from "../secrets/default-mcp-template-scope.js";
@@ -817,6 +818,10 @@ export function startDefaultMcpSetupSweep(db: Db, ctx: Omit<DefaultMcpSetupConte
       toolAccessOptions: ctx.toolAccessOptions,
     })
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP template sweep failed"))
+      // Existing agents with a ready board entry and no comms-wake entry get the pending entry (TECH-10684); the sweep right
+      // after claims and runs it. A failure here never blocks the setup sweep.
+      .then(() => backfillCommsWakeEntries(db, { now: ctx.now, templateScope: ctx.templateScope }))
+      .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "comms wake back-fill failed"))
       .then(() => sweepDefaultMcpSetups({ db, ...ctx }))
       .catch((err) => logger.warn({ errorClass: err instanceof Error ? err.constructor.name : typeof err }, "default MCP setup sweep failed"))
       // After setup, so an entry that just became ready is installed in the same tick (`installByDefault`).
