@@ -94,6 +94,7 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      commsBoardWakeEnabled: true,
     });
     return companyId;
   }
@@ -334,6 +335,42 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
     expect(res.body).toEqual({ status: "retry_later", reason: "paused" });
     expect((await allIssues())[0]!.status).toBe("done");
     expect(await allComments()).toHaveLength(1);
+  });
+
+  it("answers retry_later wake_disabled with nothing created when the company setting is off, and processes the same event once it is back on", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    const app = await createApp();
+    await db.update(companies).set({ commsBoardWakeEnabled: false }).where(eq(companies.id, companyId));
+    const body = eventBody(a.boardAgentId, randomUUID());
+
+    const first = await deliver(app, a, body);
+    expect(first.status).toBe(409);
+    expect(first.body).toEqual({ status: "retry_later", reason: "wake_disabled" });
+    expect(await allIssues()).toHaveLength(0);
+    expect(await allComments()).toHaveLength(0);
+    expect(await db.select().from(commsWakeConversations)).toHaveLength(0);
+    expect(wakes).toHaveLength(0);
+    expect((await db.select().from(commsWakeEvents))[0]).toMatchObject({ outcome: "retry_later", sessionRef: null, issueId: null, commentId: null });
+
+    await db.update(companies).set({ commsBoardWakeEnabled: true }).where(eq(companies.id, companyId));
+    const second = await deliver(app, a, body);
+    expect(second.status).toBe(200);
+    expect(second.body).toMatchObject({ status: "accepted" });
+    expect(await allIssues()).toHaveLength(1);
+    expect(await allComments()).toHaveLength(1);
+    expect(wakes).toHaveLength(1);
+    expect((await db.select().from(commsWakeEvents))[0]).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("still answers 401 for a bad signature when the company setting is off, without revealing the setting", async () => {
+    const companyId = await seedCompany();
+    const a = await seedAgent(companyId);
+    await db.update(companies).set({ commsBoardWakeEnabled: false }).where(eq(companies.id, companyId));
+    const res = await deliver(await createApp(), { ...a, key: randomBytes(32) }, eventBody(a.boardAgentId, randomUUID()));
+    expect(res.status).toBe(401);
+    expect(JSON.stringify(res.body)).not.toContain("wake_disabled");
+    expect(await db.select().from(commsWakeEvents)).toHaveLength(0);
   });
 
   it("answers retry_later for an inactive company without creating anything", async () => {
@@ -666,7 +703,7 @@ describeEmbeddedPostgres("comms board wake: cheap checks precede the vault read"
     app.use(errorHandler);
 
     const companyId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "P", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+    await db.insert(companies).values({ id: companyId, name: "P", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false, commsBoardWakeEnabled: true });
     const agentId = randomUUID();
     const boardAgentId = randomUUID();
     const key = randomBytes(32);

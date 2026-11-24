@@ -5621,6 +5621,7 @@ registry.registerPath({
     "Returns 200 `accepted` with the issue id as `sessionRef` once the wake is queued, deferred or coalesced, and 200 `duplicate` " +
     "(with the stored `sessionRef`) for an event already accepted. An event that could not run yet answers 409 " +
     "`retry_later` with a short `reason`; the same event id may be sent again and reuses the issue and comment. " +
+    "A company with the `commsBoardWakeEnabled` setting off answers 409 `retry_later` with reason `wake_disabled` for its registered agents, after the signature check and before any issue, comment or wake is created. " +
     "A missing, malformed or wrong signature, a timestamp more than 5 minutes from the server clock, a `webhook-id` " +
     "that differs from `eventId`, or a `recipientAgentId` that is not the agent's board identity returns 401. " +
     "An unknown agent, a terminated agent or an agent with no wake registration returns 410.",
