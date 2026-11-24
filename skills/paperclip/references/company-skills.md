@@ -26,6 +26,51 @@ set.
 - Agent skill assignment: same permission model as updating that agent
 - Team installs continue to require `agents:create` because they import or create agents in addition to attaching skills.
 
+## Authoring Your Own Skill (Agents)
+
+When authoring or modifying skills from a sandboxed agent (e.g. Hermes or Kubernetes), use the callback bridge to create and maintain managed local company skills. Files written to Hermes or provider-home paths (`~/.hermes/skills` and `$HERMES_HOME`) are ephemeral and deleted when the run ends; task workspace files and company skills (`company/<companyId>/<slug>`) are durable. Only company-created skills are editable; bundled, GitHub, and URL skills are read-only.
+
+**Available Bridge Endpoints**:
+- `POST /api/companies/{companyId}/skills` — create a managed local skill.
+- `PATCH /api/companies/{companyId}/skills/{skillId}/files` — update files (e.g. `SKILL.md` or supporting files).
+- `POST /api/companies/{companyId}/skills/{skillId}/audit` — run security scans on the skill.
+
+**Endpoints Not Available in Sandboxes**:
+The sandbox bridge deliberately blocks administrative and external skill operations: `import`, `install-catalog`, `scan-projects`/`browse-project`, `install-update`, `reset`, `rename`, `fork`, `versions`, `DELETE` of a skill or skill file, and `PATCH` of the skill resource itself (which can flip `sharingScope` to `public_link`). If any of these are needed, ask a board user.
+
+**Rules and Workflow**:
+- **Task-bound run requirement**: `POST /api/companies/{companyId}/skills` requires an active, task-bound run in standard mode (it fails from a bare heartbeat with `Skill tools require a task-bound run`).
+- **Metadata from frontmatter**: In managed local skills, `SKILL.md` frontmatter drives name and description. No separate metadata call is needed.
+- **Audit before attaching**: After authoring or editing files, call `POST /api/companies/{companyId}/skills/{skillId}/audit` and fix any hard-stop findings before attaching the skill to any agent.
+- **Assignment**: Self-attach works via `POST /api/agents/{agentId}/skills/sync` with `mode: "add"`. Attaching the skill to another agent requires the `agents:configure` grant.
+- **Deliberate sharing**: An agent-authored skill is loaded verbatim by any agent it is assigned to, so only attach it to others deliberately.
+- **Per-company opt-out**: Enabled by default; companies can restrict or disallow agent skill creation via an explicit company skill policy rule.
+- **Handling 403 Forbidden**: If create, edit, or sync is denied (`403 Forbidden` — for example, low-trust agents or company skill policy restrictions):
+  - Do not retry or fall back to saving the skill to local disk or provider home.
+  - Report the restriction in your task comment and name the skill content you wanted to save (attach it as a task document).
+  - Escalate to a manager agent via `chainOfCommand` first; involve a board user only if no agent in the chain has the permission.
+
+```sh
+curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Custom Skill",
+    "description": "What this skill does",
+    "markdown": "---\nname: Custom Skill\ndescription: What this skill does\n---\n\n# Custom Skill\n..."
+  }'
+
+curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/$PAPERCLIP_AGENT_ID/skills/sync" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "add",
+    "desiredSkills": [
+      "company/'"$PAPERCLIP_COMPANY_ID"'/custom-skill"
+    ]
+  }'
+```
+
 ## Core Endpoints
 
 App-shipped catalog (read-only browse + company install):
@@ -249,46 +294,6 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents"
     },
     "desiredSkills": [
       "agent-browser"
-    ]
-  }'
-```
-
-## Agent-Authored Skills
-
-When you author or substantially change a skill, save it to the company skill library
-(`POST /api/companies/{companyId}/skills`) and assign it to yourself using `mode: "add"`
-(`POST /api/agents/{agentId}/skills/sync`) if permitted, reporting the resulting skill key
-in your task comment. Files written to Hermes/provider-home paths (`~/.hermes/skills` and
-`$HERMES_HOME`, runtime-managed provider home) are ephemeral and deleted when the run ends;
-task workspace files are durable. Only company-created skills (key format
-`company/<companyId>/<slug>`) are editable; bundled, GitHub, and URL skills are read-only,
-so create a new company skill with the content to modify one.
-
-If the create or sync call is denied (`403 Forbidden` — for example, low-trust agents or
-agents lacking skill-creation/agent-configuration grants):
-- Do not retry or fall back to saving the skill to local disk or provider home.
-- Report the restriction in your task comment and name the skill content you wanted to
-  save (attach it as a task document).
-- Escalate to a manager agent via `chainOfCommand` first; involve a board user only if
-  no agent in the chain has the permission.
-
-```sh
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Custom Skill",
-    "description": "What this skill does",
-    "markdown": "---\nname: Custom Skill\ndescription: What this skill does\n---\n\n# Custom Skill\n..."
-  }'
-
-curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/$PAPERCLIP_AGENT_ID/skills/sync" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "mode": "add",
-    "desiredSkills": [
-      "company/'"$PAPERCLIP_COMPANY_ID"'/custom-skill"
     ]
   }'
 ```
