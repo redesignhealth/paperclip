@@ -2,6 +2,7 @@ import { isOpenRouterUrl, openRouterAttributionHeaders } from "@paperclipai/adap
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PI_MCP_CONFIG_FILE } from "./mcp-config.js";
 
 type PreparedPiRuntimeConfig = {
   env: Record<string, string>;
@@ -128,7 +129,7 @@ function apiKeyWarnings(providers: Record<string, unknown>, env: Record<string, 
 // and repoints PI_CODING_AGENT_DIR at the in-sandbox copy.
 export async function preparePiRuntimeConfig(input: {
   env: Record<string, string>;
-  /** TECH-9794: `mcp.json` body for the pi-mcp-adapter extension. Forces a managed dir even with no providers. */
+  /** TECH-9794: `mcp-adapter.json` body for the pi-mcp-adapter extension. Forces a managed dir even with no providers. */
   mcpConfig?: Record<string, unknown> | null;
 }): Promise<PreparedPiRuntimeConfig> {
   // TECH-7076: `{env:NAME}` placeholders may read the SERVER env only when the provider config
@@ -178,7 +179,7 @@ export async function preparePiRuntimeConfig(input: {
     }
     if (input.mcpConfig) {
       await fs.writeFile(
-        path.join(agentConfigDir, "mcp.json"),
+        path.join(agentConfigDir, PI_MCP_CONFIG_FILE),
         `${JSON.stringify(input.mcpConfig, null, 2)}\n`,
         "utf8",
       );
@@ -200,7 +201,7 @@ export async function preparePiRuntimeConfig(input: {
       ...(providers
         ? [`Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed models.json: ${Object.keys(providers).join(", ")}.`]
         : []),
-      ...(input.mcpConfig ? ["Wrote a managed mcp.json (no credentials; servers point at the sandbox bridge relay)."] : []),
+      ...(input.mcpConfig ? ["Wrote a managed mcp-adapter.json (no credentials; servers point at the sandbox bridge relay)."] : []),
     ],
     agentConfigDir,
     cleanup: async () => {

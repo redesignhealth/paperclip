@@ -7,7 +7,7 @@ import type { PiMcpRelayServer } from "./mcp-config.js";
 // (like the OpenRouter attribution one) that recalls on each prompt and captures at the end of the turn.
 //
 // It talks to the memory MCP server (`memory_search`, `memory_add`, `memory_delete`) through the same
-// credential-free relay route that TECH-9794 writes into `$PI_CODING_AGENT_DIR/mcp.json`. The only credential in
+// credential-free relay route that TECH-9794 writes into `$PI_CODING_AGENT_DIR/mcp-adapter.json`. The only credential in
 // the pod is the bridge token the other MCP servers already use; the memory token stays on the Paperclip server.
 // Recall and capture mirror the Claude Code and Codex hook (`docker/claude/rh-memory-hook`): top 5 results, the same
 // RH_MEMORY_* tuning variables, and fail open on any error. Unlike those hooks, capture is ON unless
@@ -60,11 +60,11 @@ function expand(value) {
   return String(value).replace(/[$][{]([A-Za-z_][A-Za-z0-9_]*)[}]/g, (_all, name) => process.env[name] ?? "");
 }
 
-// The memory server as the adapter wrote it into mcp.json (placeholders resolved from the pod env).
+// The memory server as the adapter wrote it into mcp-adapter.json (placeholders resolved from the pod env).
 function loadServer() {
   const dir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
   let config;
-  try { config = JSON.parse(fs.readFileSync(path.join(dir, "mcp.json"), "utf8")); } catch { return null; }
+  try { config = JSON.parse(fs.readFileSync(path.join(dir, "mcp-adapter.json"), "utf8")); } catch { return null; }
   const servers = config && typeof config === "object" ? config.mcpServers : null;
   if (!servers || typeof servers !== "object") return null;
   for (const entry of Object.values(servers)) {

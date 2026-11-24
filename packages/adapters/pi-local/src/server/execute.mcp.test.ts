@@ -158,7 +158,7 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     prepareAdapterExecutionTargetRuntime.mockReset().mockImplementation((async (input: { target: AdapterExecutionTarget; assets?: Array<{ key: string; localDir: string }> }) => {
       for (const asset of input.assets ?? []) {
         if (asset.key !== "agentConfig") continue;
-        try { syncedMcpJson.push(await readFile(path.join(asset.localDir, "mcp.json"), "utf8")); } catch { /* none */ }
+        try { syncedMcpJson.push(await readFile(path.join(asset.localDir, "mcp-adapter.json"), "utf8")); } catch { /* none */ }
       }
       return {
         target: input.target,
@@ -216,7 +216,7 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     }
   });
 
-  it("writes a credential-free mcp.json, registers relay routes, and loads the adapter extension", async () => {
+  it("writes a credential-free mcp-adapter.json, registers relay routes, and loads the adapter extension", async () => {
     const { args, env, logs } = await run();
 
     expect(syncedMcpJson).toHaveLength(1);

@@ -1,3 +1,4 @@
+import { PI_MCP_CONFIG_FILE } from "./mcp-config.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -42,24 +43,33 @@ describe("preparePiRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("writes only mcp.json into a managed dir when there are no providers", async () => {
+  it("writes only mcp-adapter.json into a managed dir when there are no providers", async () => {
     const mcpConfig = { mcpServers: { argus: { url: "${PAPERCLIP_API_URL}/paperclip-relay/mcp/argus" } } };
     const prepared = await preparePiRuntimeConfig({ env: { FOO: "bar" }, mcpConfig });
     cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
     expect(prepared.agentConfigDir).toBe(prepared.env.PI_CODING_AGENT_DIR);
-    expect(JSON.parse(await fs.readFile(path.join(prepared.agentConfigDir!, "mcp.json"), "utf8"))).toEqual(mcpConfig);
+    expect(JSON.parse(await fs.readFile(path.join(prepared.agentConfigDir!, "mcp-adapter.json"), "utf8"))).toEqual(mcpConfig);
     await expect(fs.access(path.join(prepared.agentConfigDir!, "models.json"))).rejects.toThrow();
     await prepared.cleanup();
   });
 
-  it("writes models.json and mcp.json together when both are configured", async () => {
+  it("writes the MCP config under the name pi-mcp-adapter 7.x reads, not mcp.json (TECH-10096)", async () => {
+    const prepared = await preparePiRuntimeConfig({ env: {}, mcpConfig: { mcpServers: {} } });
+    cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
+    expect(PI_MCP_CONFIG_FILE).toBe("mcp-adapter.json");
+    expect(await fs.readdir(prepared.agentConfigDir!)).toEqual(["mcp-adapter.json"]);
+    expect(prepared.env.PI_CODING_AGENT_DIR).toBe(prepared.agentConfigDir);
+    await prepared.cleanup();
+  });
+
+  it("writes models.json and mcp-adapter.json together when both are configured", async () => {
     const mcpConfig = { mcpServers: {} };
     const prepared = await preparePiRuntimeConfig({
       env: { PAPERCLIP_PI_PROVIDERS: JSON.stringify({ other: { baseUrl: "https://other.example/v1" } }) },
       mcpConfig,
     });
     cleanupPaths.add(prepared.env.PI_CODING_AGENT_DIR);
-    expect(JSON.parse(await fs.readFile(path.join(prepared.agentConfigDir!, "mcp.json"), "utf8"))).toEqual(mcpConfig);
+    expect(JSON.parse(await fs.readFile(path.join(prepared.agentConfigDir!, "mcp-adapter.json"), "utf8"))).toEqual(mcpConfig);
     expect(Object.keys((await readModelsJson(prepared.agentConfigDir!)).providers as object)).toEqual(["other"]);
     await prepared.cleanup();
   });
