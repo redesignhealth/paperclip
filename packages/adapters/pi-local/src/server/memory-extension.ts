@@ -39,14 +39,16 @@ export function findPiMemoryRelayServer(servers: readonly PiMcpRelayServer[]): P
 
 // The source is plain ESM with no imports of Pi packages. It avoids backticks, "${" and "\\" sequences so it can
 // live in a String.raw template. Tests load it from a data: URL against a fake `pi` and a local HTTP server.
-export function piMemoryExtensionSource(): string {
-  return String.raw`import fs from "node:fs";
+export function piMemoryExtensionSource(options: { taskQuery?: string } = {}): string {
+  const taskQuery = typeof options.taskQuery === "string" ? options.taskQuery : "";
+  return "const TASK_QUERY = " + JSON.stringify(taskQuery) + ";\n" + String.raw`import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_TOP_K = 5;
 const MAX_TOP_K = 20;
 const MAX_QUERY_CHARS = 6000;
+const MAX_TASK_QUERY_CHARS = 1500;
 const MAX_CONTEXT_CHARS = 4000;
 const MAX_TASK_CHARS = 600;
 const MAX_OUTCOME_CHARS = 3000;
@@ -247,6 +249,23 @@ export function cleanForCapture(text) {
   return String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !JUNK_LINE.some((pattern) => pattern.test(line))).join("\n");
 }
 
+// The recall query. The prompt opens with platform text (the fast-response receipt note, wake guidance) that matches no
+// lesson, so a whole-prompt query searches boilerplate. Order: the task the adapter staged (issue title and description),
+// then the issue line and description found in the prompt, then the prompt with the known receipt note removed.
+const RECEIPT_NOTE = /Paperclip may post a short platform-generated fast-response receipt[\s\S]*?generic acknowledgement[.]?/g;
+export function buildRecallQuery(prompt) {
+  const staged = String(TASK_QUERY).replace(RECEIPT_NOTE, " ").trim();
+  if (staged.length >= 3) return staged.slice(0, MAX_TASK_QUERY_CHARS);
+  const text = String(prompt ?? "").replace(RECEIPT_NOTE, " ");
+  const parts = [];
+  const issue = /^- issue:[ \t]*(.+)$/m.exec(text);
+  if (issue) parts.push(issue[1].trim());
+  const description = /^Issue description:\r?\n[\x60]{3}[a-z]*\r?\n([\s\S]*?)\r?\n[\x60]{3}/m.exec(text);
+  if (description && description[1].trim()) parts.push(description[1].trim());
+  const task = parts.join("\n").trim();
+  return task.length >= 3 ? task.slice(0, MAX_TASK_QUERY_CHARS) : text.trim().slice(0, MAX_QUERY_CHARS);
+}
+
 function textOf(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -282,7 +301,8 @@ export default function rhMemory(pi) {
   pi.on("before_agent_start", async (event) => {
     const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
     if (prompt.length < 3) { warn("recall skipped: prompt too short"); return undefined; }
-    const query = prompt.slice(0, MAX_QUERY_CHARS);
+    const query = buildRecallQuery(prompt);
+    if (query.length < 3) { warn("recall skipped: no task text in the prompt"); return undefined; }
     try {
       const limit = topK();
       const data = await client.call(server.tools.search, { query, top_k: limit }, { seconds: callSeconds() });
@@ -349,11 +369,20 @@ export default function rhMemory(pi) {
 `;
 }
 
-export async function preparePiMemoryExtension() {
+/** The recall query for a run: the issue title and description from the wake payload (empty when it has none). */
+export function buildPiMemoryTaskQuery(wake: unknown): string {
+  const issue = wake && typeof wake === "object" ? (wake as { issue?: unknown }).issue : null;
+  if (!issue || typeof issue !== "object") return "";
+  const { title, description } = issue as { title?: unknown; description?: unknown };
+  const parts = [typeof title === "string" ? title.trim() : "", typeof description === "string" ? description.trim() : ""];
+  return parts.filter(Boolean).join("\n").slice(0, 1500);
+}
+
+export async function preparePiMemoryExtension(options: { taskQuery?: string } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-memory-"));
   const extensionPath = path.join(directory, PI_MEMORY_EXTENSION_FILE);
   try {
-    await fs.writeFile(extensionPath, piMemoryExtensionSource(), "utf8");
+    await fs.writeFile(extensionPath, piMemoryExtensionSource(options), "utf8");
   } catch (error) {
     await fs.rm(directory, { recursive: true, force: true });
     throw error;

@@ -70,7 +70,7 @@ import {
   resolvePiMcpAdapterPath,
   selectPiMcpRelayServers,
 } from "./mcp-config.js";
-import { PI_MEMORY_EXTENSION_FILE, PI_MEMORY_TOOL_NAMES, findPiMemoryRelayServer, preparePiMemoryExtension } from "./memory-extension.js";
+import { PI_MEMORY_EXTENSION_FILE, PI_MEMORY_TOOL_NAMES, buildPiMemoryTaskQuery, findPiMemoryRelayServer, preparePiMemoryExtension } from "./memory-extension.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { PI_GUARD_EXTENSION_FILE, preparePiGuardExtension, readPiGuardProfile } from "./guard-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -442,7 +442,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let memoryExtensionPath: string | null = null;
     if (config.memoryExtension === true) {
       if (findPiMemoryRelayServer(piMcpRelayServers)) {
-        memoryExtension = await preparePiMemoryExtension();
+        memoryExtension = await preparePiMemoryExtension({ taskQuery: buildPiMemoryTaskQuery(context.paperclipWake) });
         memoryExtensionPath = memoryExtension.extensionPath;
       } else {
         await onLog("stdout", "[paperclip] Warning: memory is enabled for this agent but its memory MCP server is not available in this run; continuing without memory.\n");
