@@ -452,6 +452,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         status: leaseReleaseStatusForRunStatus(status),
         failureReason: input.failureReason ?? undefined,
         providerResourceDisposition,
+        // A legacy run copies its workspace back every turn, so a failed warm lease holds nothing to retain.
+        releaseWhenStopUnsupported: input.providerResourceDisposition === "keep_running"
+          && providerResourceDisposition === "stop_and_retain" && leaseOwnerRun?.runtimeMode === "legacy",
         nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
       })
       .catch((err) => {

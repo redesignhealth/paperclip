@@ -4240,6 +4240,30 @@ export function environmentRuntimeService(
       };
     },
 
+    /**
+     * Whether every active sandbox lease of the run can be stopped and retained. A warm lease that failed is
+     * normally stopped, not destroyed, so the next acquisition resumes it. A provider with no stop-only
+     * cleanup (the Kubernetes plugin: its pods cannot be restarted) can only fail that request, which strands
+     * the lease in pending_cleanup and blocks the issue (TECH-10085). Leases that are not sandbox leases do
+     * not take the stop-only path and never make this false.
+     */
+    async canStopAndRetainRunLeases(heartbeatRunId: string): Promise<boolean> {
+      const rows = await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.heartbeatRunId, heartbeatRunId), eq(environmentLeases.status, "active")));
+      for (const lease of rows) {
+        const provider = lease.provider ?? (typeof lease.metadata?.provider === "string" ? lease.metadata.provider : null);
+        if (!provider || provider === "local") continue;
+        if (isBuiltinSandboxProvider(provider)) {
+          if (typeof getBuiltinSandboxProvider(provider)?.stopLease !== "function") return false;
+          continue;
+        }
+        const pluginId = readString(lease.metadata?.pluginId);
+        const advertised = options.pluginWorkerManager?.getWorker(pluginId ?? "")?.supportedMethods ?? [];
+        if (!pluginId || !advertised.includes("environmentStopLease")) return false;
+      }
+      return true;
+    },
+
     async releaseRunLeases(
       heartbeatRunId: string,
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> = "released",
