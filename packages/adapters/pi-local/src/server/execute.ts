@@ -69,6 +69,7 @@ import {
   resolvePiMcpAdapterPath,
   selectPiMcpRelayServers,
 } from "./mcp-config.js";
+import { PI_MEMORY_EXTENSION_FILE, PI_MEMORY_TOOL_NAMES, findPiMemoryRelayServer, preparePiMemoryExtension } from "./memory-extension.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { PI_GUARD_EXTENSION_FILE, preparePiGuardExtension, readPiGuardProfile } from "./guard-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -398,6 +399,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // deny list, fail fast on the rest). Local runs keep Pi's own behaviour.
   let guardExtension: Awaited<ReturnType<typeof preparePiGuardExtension>> | undefined;
   let guardExtensionPath: string | null = null;
+  let memoryExtension: Awaited<ReturnType<typeof preparePiMemoryExtension>> | undefined;
   try {
     attributionExtension = await preparePiOpenRouterExtension();
     if (executionTargetIsRemote) {
@@ -405,6 +407,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       guardExtensionPath = guardExtension.extensionPath;
     }
     let attributionExtensionPath = attributionExtension.extensionPath;
+    // TECH-9796: enrolled agents (adapterConfig.memoryExtension, set by the memory profile) get the recall/capture
+    // extension. It needs the memory MCP server from the relay, so without one the run continues without memory.
+    let memoryExtensionPath: string | null = null;
+    if (config.memoryExtension === true) {
+      if (findPiMemoryRelayServer(piMcpRelayServers)) {
+        memoryExtension = await preparePiMemoryExtension();
+        memoryExtensionPath = memoryExtension.extensionPath;
+      } else {
+        await onLog("stdout", "[paperclip] Warning: memory is enabled for this agent but its memory MCP server is not available in this run; continuing without memory.\n");
+      }
+    }
     // Prepend installed skill `bin/` dirs to PATH so an agent's bash tool can
     // invoke skill binaries (e.g. `paperclip-get-issue`) by name. Without this,
     // any pi_local agent whose AGENTS.md calls a skill command via bash hits
@@ -508,6 +521,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 localDir: guardExtension.directory,
               }]
               : []),
+            ...(memoryExtension
+              ? [{
+                key: "memory",
+                localDir: memoryExtension.directory,
+              }]
+              : []),
             {
               key: "skills",
               localDir: localSkillsDir,
@@ -551,6 +570,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           if (!remoteGuardDir) throw new Error("Pi guard extension was not staged to the execution target.");
           guardExtensionPath = path.posix.join(remoteGuardDir, PI_GUARD_EXTENSION_FILE);
         }
+        if (memoryExtension) {
+          const remoteMemoryDir = preparedRemoteRuntime.assetDirs.memory;
+          if (!remoteMemoryDir) throw new Error("Pi memory extension was not staged to the execution target.");
+          memoryExtensionPath = path.posix.join(remoteMemoryDir, PI_MEMORY_EXTENSION_FILE);
+        }
         if (localAgentConfigDir && preparedRemoteRuntime.assetDirs.agentConfig) {
           env.PI_CODING_AGENT_DIR = preparedRemoteRuntime.assetDirs.agentConfig;
         }
@@ -565,6 +589,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ).catch(() => null);
           if (!probe || probe.timedOut || (probe.exitCode ?? 1) !== 0) {
             piMcpEnabled = false;
+            memoryExtensionPath = null; // memory is delivered as MCP tools, so it goes with MCP
             await onLog(
               "stdout",
               `[paperclip] Warning: the Pi MCP adapter extension was not found at ${piMcpAdapterPath} in the execution target image; this run continues without runtime MCP servers.\n`,
@@ -785,7 +810,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (modelId) args.push("--model", modelId);
       if (thinking) args.push("--thinking", thinking);
 
-      args.push("--tools", piMcpEnabled ? `read,bash,edit,write,grep,find,ls,${PI_MCP_TOOL_NAME}` : "read,bash,edit,write,grep,find,ls");
+      args.push(
+        "--tools",
+        [
+          "read,bash,edit,write,grep,find,ls",
+          ...(piMcpEnabled ? [PI_MCP_TOOL_NAME] : []),
+          ...(memoryExtensionPath ? PI_MEMORY_TOOL_NAMES : []),
+        ].join(","),
+      );
       args.push("--session", sessionFile);
       args.push("--skill", remoteSkillsDir ?? PI_AGENT_SKILLS_DIR);
 
@@ -793,6 +825,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--extension", attributionExtensionPath);
       if (guardExtensionPath) args.push("--extension", guardExtensionPath);
       if (piMcpEnabled) args.push("--extension", piMcpAdapterPath);
+      if (memoryExtensionPath) args.push("--extension", memoryExtensionPath);
 
       // Add the user prompt as the last argument
       args.push(userPrompt);
@@ -1058,6 +1091,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
-    await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup(), guardExtension?.cleanup()]);
+    await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup(), guardExtension?.cleanup(), memoryExtension?.cleanup()]);
   }
 }

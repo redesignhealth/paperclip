@@ -167,6 +167,7 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
         assetDirs: {
           attribution: `${RUNTIME_ROOT}/attribution`,
           guard: `${RUNTIME_ROOT}/guard`,
+          memory: `${RUNTIME_ROOT}/memory`,
           skills: `${RUNTIME_ROOT}/skills`,
           agentConfig: `${RUNTIME_ROOT}/agentConfig`,
         },
@@ -299,5 +300,39 @@ describe("pi runtime MCP servers through the sandbox relay", () => {
     const { args, logs } = await run({ executionTransport: undefined, executionTarget: undefined });
     expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls");
     expect(logs.join("")).toContain("only sandbox pod targets have");
+  });
+  it("loads the memory extension and its tools for an enrolled agent with a memory MCP server", async () => {
+    const memoryServer = {
+      name: "rh-agent-memory-tools",
+      url: "https://paperclip.example/api/mcp/memory",
+      token: MCP_TOKEN,
+      connectionId: "conn-3",
+      allowedTools: ["memory_search", "memory_add", "memory_delete"],
+    };
+    const { args, env, logs } = await run({
+      config: { command: "pi", model: "openai/gpt-5.4-mini", memoryExtension: true },
+      runtimeMcp: { getServers: () => [memoryServer] },
+    });
+    const written = JSON.parse(syncedMcpJson[0]!) as { mcpServers: Record<string, Record<string, unknown>> };
+    expect(written.mcpServers.rh_agent_memory_tools).toMatchObject({ includeTools: ["memory_search", "memory_add", "memory_delete"] });
+    expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls,mcp,memory_search,memory_add,memory_delete");
+    const extensions = args.flatMap((value, index) => (args[index - 1] === "--extension" ? [value] : []));
+    expect(extensions.some((value) => value.endsWith("/rh-memory.mjs"))).toBe(true);
+    expect(logs.join("")).not.toContain("memory MCP server is not available");
+    expect(JSON.stringify({ args, env, written })).not.toContain(MCP_TOKEN);
+  });
+
+  it("continues without the memory extension, and says so, when the memory server is not in the run", async () => {
+    const { args, logs } = await run({ config: { command: "pi", model: "openai/gpt-5.4-mini", memoryExtension: true } });
+    expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls,mcp");
+    expect(args.some((value) => value.endsWith("/rh-memory.mjs"))).toBe(false);
+    expect(logs.join("")).toContain("memory MCP server is not available");
+  });
+
+  it("does not load the memory extension for an agent that is not enrolled", async () => {
+    const memoryServer = { name: "rh-agent-memory-tools", url: "https://paperclip.example/api/mcp/memory", token: MCP_TOKEN, connectionId: "c", allowedTools: ["memory_search"] };
+    const { args } = await run({ runtimeMcp: { getServers: () => [memoryServer] } });
+    expect(args.some((value) => value.endsWith("/rh-memory.mjs"))).toBe(false);
+    expect(args[args.indexOf("--tools") + 1]).toBe("read,bash,edit,write,grep,find,ls,mcp");
   });
 });
