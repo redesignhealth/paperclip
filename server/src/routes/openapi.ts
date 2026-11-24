@@ -1439,6 +1439,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
   "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  "POST /api/companies/{companyId}/default-mcp/comms-template-reprovision",
   "POST /api/companies/{companyId}/comms-wake/enrol",
   "GET /api/companies/{companyId}/comms-wake/status",
   "POST /api/companies/{companyId}/comms-wake/agents/{agentId}/unsubscribe",
@@ -3677,6 +3678,24 @@ registry.registerPath({
         confirm: z.string().optional(),
         limit: z.number().int().min(1).max(COMMS_CATALOG_RESYNC_BATCH_LIMIT).optional(),
         afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/default-mcp/comms-template-reprovision",
+  tags: ["agents"],
+  summary: "Restore an archived managed comms-board template",
+  description: "Puts the company's archived managed comms-board template back through the template review: the same connection row returns to draft, its claim becomes pending with a fresh attempt budget, and the review republishes it at the current reviewed allowlist from the credential already stored for it. No token is minted, no write reaches the board, and no agent connection, grant, secret or board identity is touched. Refuses, with a closed reason, when the template is not archived, a non-archived connection already uses the template name (the operator renames or retires it first), the stored credential is missing or expired, the company is not active or in scope, an agent entry points at the template row itself, or the template has installs or bindings. Defaults to a dry run that lists what would change; a real run needs dryRun=false and the confirmation string. Undo by archiving the template again. Instance admin only.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
       }),
     ),
   },

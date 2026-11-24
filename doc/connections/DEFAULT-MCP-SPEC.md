@@ -782,3 +782,26 @@ The flag gates creating the template, new-agent provisioning, enrolment and setu
 ### Rotation
 
 Memory tokens last 90 days and the registry never revokes. The 60-second setup sweep rotates every ready `agent-memory` entry whose `binding.tokenExpiresAt` is within 14 days (`agent-memory-rotation.ts`), when agent memory is configured and `PAPERCLIP_DEFAULT_MCP_SPEC_ENABLED` is `true`: one registry rotate per agent (`POST {ownership API}/agents/agent-memory-<id>/rotate`, memory scopes, 90 days), then a new version of the agent's secret (the env reference is `version: "latest"`, so runs pick it up), then the new expiry is recorded. Any failure leaves `binding.rotation = { state: "failed", ... }` (codes and a timestamp only) and the old token keeps working; the agent is retried after one hour. A registry reply with no usable expiry is refused before anything is stored. A disabled or deleted secret is never rotated or revived. Each rotation writes an `agent.agent_memory.rotated` activity row with no secret data.
+
+## Restoring an archived managed template (existing org with no usable template)
+
+Archiving the managed template is terminal: the sweep reads it as revoked and the connection update API refuses to touch
+it. A company can then have no usable template (new agents wait as `template_not_found`, or `template_unsupported` when an
+org-authored connection with the same name uses a non-`api_key` method). `server/src/services/comms-template-reprovision.ts`
+restores it in place, instance admin only:
+
+`POST /companies/:companyId/default-mcp/comms-template-reprovision`. Body: `dryRun` (default `true`), `confirm`. A real run
+needs `dryRun: false` and `"confirm": "reprovision-comms-board-template"`.
+
+A real run moves the SAME template row from archived to draft, resets its claim to pending (fresh attempt budget, allowlist
+version cleared) and clears its header credential refs; the normal template review then rebuilds them from the stored
+vault secret, re-runs discovery and the reviewed allowlist, publishes the template and wakes waiting agents. No token is
+minted and no write reaches the board; no agent, agent connection, grant, secret or board identity is touched. Undo:
+archive the template again.
+
+It refuses with a closed reason (`refused_*`) when the template is not archived, no managed template exists, a non-archived
+connection already uses the template name (`competing` lists its id, status and auth method: rename or retire it first,
+for example with an ordinary connection update; do not archive it, which revokes its grants), the stored credential is
+missing or expired, the company is inactive or out of scope, the feature is off, an agent's comms-board entry points at
+the template row itself, or the template has installs or profile bindings. After a restore, run the dry-run catalog
+resync: `skipped_template_unavailable` should be gone.
