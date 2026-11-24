@@ -7,13 +7,11 @@ import {
   ASHBY_RELAY_API_KEY_ENV,
   ASHBY_RELAY_BASE_URL_ENV,
   ASHBY_RELAY_DEADLINE_MS,
-  ASHBY_RELAY_FALLBACK_AGENTS_ENV,
   ASHBY_RELAY_FALLBACK_COMPANIES_ENV,
   ASHBY_RELAY_OPERATIONS_ENV,
   ASHBY_RELAY_SECRET_KEY,
   ASHBY_RELAY_WRITE_OPERATIONS_ENV,
   ASHBY_UPSTREAM_ORIGIN,
-  DEFAULT_ASHBY_RELAY_FALLBACK_AGENTS,
   DEFAULT_ASHBY_RELAY_FALLBACK_COMPANIES,
   KNOWN_ASHBY_RELAY_READ_OPERATIONS,
   KNOWN_ASHBY_RELAY_WRITE_OPERATIONS,
@@ -29,9 +27,7 @@ const AGENT_A = "11111111-1111-4111-8111-111111111111";
 const AGENT_B = "22222222-2222-4222-8222-222222222222";
 const COMPANY = "33333333-3333-4333-8333-333333333333";
 const RH_COMPANY = "e8c7983e-ee86-46f6-99b1-99fd4ad9cef6";
-const TALENT_AGENT = "9c3e3539-a132-4be6-97a3-24cf64090d51";
 const FOREIGN_COMPANY = "44444444-4444-4444-8444-444444444444";
-const OTHER_AGENT = "55555555-5555-4555-8555-555555555555";
 const API_KEY = "ashby-secret-key-xyz-123";
 
 const defaultEnv = {
@@ -255,7 +251,7 @@ describe("ashby relay (TECH-9966)", () => {
     expect(activeRun.fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves token via company secret first and falls back to PAPERCLIP_ASHBY_RELAY_API_KEY with strict tenant isolation", async () => {
+  it("resolves token via company secret first and falls back to PAPERCLIP_ASHBY_RELAY_API_KEY with strict company tenant isolation", async () => {
     const mockDb = {} as Db;
     const mockSecrets = {
       getByKey: vi.fn(),
@@ -271,17 +267,17 @@ describe("ashby relay (TECH-9966)", () => {
 
     const tokenFromSecret = await resolveAshbyToken(
       mockDb,
-      { companyId: FOREIGN_COMPANY, agentId: OTHER_AGENT },
+      FOREIGN_COMPANY,
       { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
       mockSecrets,
     );
     expect(tokenFromSecret).toBe("company-secret-value");
 
-    // 2. Company secret is absent -> authorized RH company and Talent agent fall back to env key
+    // 2. Company secret is absent -> authorized RH company falls back to env key
     mockSecrets.getByKey = vi.fn(async () => null) as typeof mockSecrets.getByKey;
     const tokenFromEnv = await resolveAshbyToken(
       mockDb,
-      { companyId: RH_COMPANY, agentId: TALENT_AGENT },
+      RH_COMPANY,
       { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
       mockSecrets,
     );
@@ -290,38 +286,28 @@ describe("ashby relay (TECH-9966)", () => {
     // 3. Tenant isolation: foreign company without its own secret is DENIED the SSM fallback key
     const tokenDeniedForeignCompany = await resolveAshbyToken(
       mockDb,
-      { companyId: FOREIGN_COMPANY, agentId: TALENT_AGENT },
+      FOREIGN_COMPANY,
       { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
       mockSecrets,
     );
     expect(tokenDeniedForeignCompany).toBeNull();
 
-    // 4. Tenant isolation: other agent in RH without its own secret is DENIED the SSM fallback key
-    const tokenDeniedOtherAgent = await resolveAshbyToken(
-      mockDb,
-      { companyId: RH_COMPANY, agentId: OTHER_AGENT },
-      { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
-      mockSecrets,
-    );
-    expect(tokenDeniedOtherAgent).toBeNull();
-
-    // 5. Configurable allowlist: custom company and agent UUIDs get the fallback key
+    // 4. Configurable allowlist: custom company UUID gets the fallback key
     const tokenCustomAllowlist = await resolveAshbyToken(
       mockDb,
-      { companyId: FOREIGN_COMPANY, agentId: OTHER_AGENT },
+      FOREIGN_COMPANY,
       {
         [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key",
         [ASHBY_RELAY_FALLBACK_COMPANIES_ENV]: FOREIGN_COMPANY,
-        [ASHBY_RELAY_FALLBACK_AGENTS_ENV]: OTHER_AGENT,
       } as NodeJS.ProcessEnv,
       mockSecrets,
     );
     expect(tokenCustomAllowlist).toBe("env-fallback-key");
 
-    // 6. Malformed UUID in fallback allowlist fails closed
+    // 5. Malformed UUID in fallback allowlist fails closed
     const tokenMalformedAllowlist = await resolveAshbyToken(
       mockDb,
-      { companyId: RH_COMPANY, agentId: TALENT_AGENT },
+      RH_COMPANY,
       {
         [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key",
         [ASHBY_RELAY_FALLBACK_COMPANIES_ENV]: "not-a-uuid",
@@ -330,42 +316,42 @@ describe("ashby relay (TECH-9966)", () => {
     );
     expect(tokenMalformedAllowlist).toBeNull();
 
-    // 7. Secret lookup error (DB/network throws) -> must rethrow and NOT fall through to env!
+    // 6. Secret lookup error (DB/network throws) -> must rethrow and NOT fall through to env!
     mockSecrets.getByKey = vi.fn(async () => {
       throw new Error("DB connection failure");
     }) as typeof mockSecrets.getByKey;
     await expect(
       resolveAshbyToken(
         mockDb,
-        { companyId: RH_COMPANY, agentId: TALENT_AGENT },
+        RH_COMPANY,
         { [ASHBY_RELAY_API_KEY_ENV]: "env-fallback-key" } as NodeJS.ProcessEnv,
         mockSecrets,
       ),
     ).rejects.toThrow("DB connection failure");
 
-    // 8. Neither secret nor env key exists -> returns null
+    // 7. Neither secret nor env key exists -> returns null
     mockSecrets.getByKey = vi.fn(async () => null) as typeof mockSecrets.getByKey;
     const tokenNeither = await resolveAshbyToken(
       mockDb,
-      { companyId: RH_COMPANY, agentId: TALENT_AGENT },
+      RH_COMPANY,
       {} as NodeJS.ProcessEnv,
       mockSecrets,
     );
     expect(tokenNeither).toBeNull();
 
-    // 9. Env key is blank or whitespace -> returns null
+    // 8. Env key is blank or whitespace -> returns null
     const tokenBlank = await resolveAshbyToken(
       mockDb,
-      { companyId: RH_COMPANY, agentId: TALENT_AGENT },
+      RH_COMPANY,
       { [ASHBY_RELAY_API_KEY_ENV]: "   " } as NodeJS.ProcessEnv,
       mockSecrets,
     );
     expect(tokenBlank).toBeNull();
 
-    // 10. Env key has control characters / CRLF -> returns null
+    // 9. Env key has control characters / CRLF -> returns null
     const tokenControl = await resolveAshbyToken(
       mockDb,
-      { companyId: RH_COMPANY, agentId: TALENT_AGENT },
+      RH_COMPANY,
       { [ASHBY_RELAY_API_KEY_ENV]: "bad\r\nkey" } as NodeJS.ProcessEnv,
       mockSecrets,
     );

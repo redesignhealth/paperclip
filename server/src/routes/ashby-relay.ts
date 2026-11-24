@@ -30,21 +30,16 @@ export const ASHBY_RELAY_WRITE_OPERATIONS_ENV = "PAPERCLIP_ASHBY_RELAY_WRITE_OPE
 export const ASHBY_RELAY_SECRET_KEY = "ashby_relay.api_key";
 export const ASHBY_RELAY_API_KEY_ENV = "PAPERCLIP_ASHBY_RELAY_API_KEY";
 export const ASHBY_RELAY_FALLBACK_COMPANIES_ENV = "PAPERCLIP_ASHBY_RELAY_FALLBACK_COMPANIES";
-export const ASHBY_RELAY_FALLBACK_AGENTS_ENV = "PAPERCLIP_ASHBY_RELAY_FALLBACK_AGENTS";
 export { ASHBY_RELAY_OPT_IN_ENV_KEY };
 
 export const ASHBY_UPSTREAM_ORIGIN = "https://api.ashbyhq.com";
 
 /**
- * Default authorized tenant IDs for server-wide SSM fallback key.
- * A single production key injected from SSM must never be available to another company or agent.
+ * Default authorized tenant company ID for server-wide SSM fallback key.
+ * A single production key injected from SSM must never be available to another company.
  */
 export const DEFAULT_ASHBY_RELAY_FALLBACK_COMPANIES = [
   "e8c7983e-ee86-46f6-99b1-99fd4ad9cef6",
-] as const;
-
-export const DEFAULT_ASHBY_RELAY_FALLBACK_AGENTS = [
-  "9c3e3539-a132-4be6-97a3-24cf64090d51",
 ] as const;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -89,7 +84,7 @@ export interface AshbyRelayDeps {
   /** True when the agent opted in to the Ashby relay. Replaceable in tests. */
   isOptedIn?: (agentId: string) => Promise<boolean>;
   /** The Ashby API key, or null when none is stored/configured. Replaceable in tests. */
-  resolveToken?: (companyId: string, agentId: string) => Promise<string | null>;
+  resolveToken?: (companyId: string) => Promise<string | null>;
   /** Verifies that the run is an actual active, non-terminal run scoped to this agent/company. */
   assertActiveRun?: (input: { companyId: string; agentId: string; runId: string }) => Promise<boolean>;
 }
@@ -134,19 +129,17 @@ export function parseIdAllowlist(
  * 1. Looks up company secret `ashby_relay.api_key`. Company secrets are strictly company-scoped.
  * 2. If absent (clear not-found: null, non-active, or empty), falls back to server env `PAPERCLIP_ASHBY_RELAY_API_KEY`
  *    (injected as an ECS container secret from SSM).
- * 3. Tenant isolation: the SSM fallback key is strictly restricted to authorized company and agent allowlists
- *    (default: company `e8c7983e-ee86-46f6-99b1-99fd4ad9cef6` and Talent agent `9c3e3539-a132-4be6-97a3-24cf64090d51`).
- *    Any other company or agent without its own company secret fails closed.
+ * 3. Tenant isolation: the SSM fallback key is strictly restricted to authorized company allowlist
+ *    (default: company `e8c7983e-ee86-46f6-99b1-99fd4ad9cef6`). Any other company without its own company secret fails closed.
  * 4. A database or secret-store error does NOT fall through to env (it rethrows).
  * 5. Blank/whitespace keys or keys with control characters/CRLF are rejected.
  */
 export async function resolveAshbyToken(
   db: Db,
-  input: { companyId: string; agentId: string },
+  companyId: string,
   env: NodeJS.ProcessEnv,
   secrets = secretService(db),
 ): Promise<string | null> {
-  const { companyId, agentId } = input;
   let secret;
   try {
     secret = await secrets.getByKey(companyId, ASHBY_RELAY_SECRET_KEY);
@@ -165,27 +158,18 @@ export async function resolveAshbyToken(
     if (validated) return validated;
   }
 
-  // Tenant isolation check for SSM fallback key
+  // Tenant isolation check for SSM fallback key: company-level scoping
   const fallbackCompanies = parseIdAllowlist(
     env[ASHBY_RELAY_FALLBACK_COMPANIES_ENV],
     DEFAULT_ASHBY_RELAY_FALLBACK_COMPANIES,
   );
-  const fallbackAgents = parseIdAllowlist(
-    env[ASHBY_RELAY_FALLBACK_AGENTS_ENV],
-    DEFAULT_ASHBY_RELAY_FALLBACK_AGENTS,
-  );
 
-  if (!fallbackCompanies || !fallbackAgents) {
+  if (!fallbackCompanies) {
     return null;
   }
 
   const normalizedCompanyId = companyId.trim().toLowerCase();
-  const normalizedAgentId = agentId.trim().toLowerCase();
-
-  if (
-    !fallbackCompanies.has(normalizedCompanyId) ||
-    !fallbackAgents.has(normalizedAgentId)
-  ) {
+  if (!fallbackCompanies.has(normalizedCompanyId)) {
     return null;
   }
 
@@ -267,7 +251,7 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
     return ashbyRelayOptedIn(adapterEnv);
   });
 
-  const resolveToken = deps.resolveToken ?? ((companyId: string, agentId: string) => resolveAshbyToken(db, { companyId, agentId }, env));
+  const resolveToken = deps.resolveToken ?? ((companyId: string) => resolveAshbyToken(db, companyId, env));
 
   const assertActiveRun = deps.assertActiveRun ?? (async (input: { companyId: string; agentId: string; runId: string }) => {
     const { heartbeatRuns } = await import("@paperclipai/db");
@@ -334,7 +318,7 @@ export function ashbyRelayRoutes(db: Db, deps: AshbyRelayDeps = {}) {
         if (!(await isOptedIn(actor.agentId))) {
           return fail(res, 403, "forbidden");
         }
-        apiKey = await resolveToken(actor.companyId, actor.agentId);
+        apiKey = await resolveToken(actor.companyId);
       } catch (err) {
         logger.warn(
           { method: req.method, path: req.path, errorClass: err instanceof Error ? err.constructor.name : typeof err },
