@@ -352,7 +352,7 @@ async function frozenOwnerStillEligible(db: Pick<Db, "select">, companyId: strin
 const secretDescription = (principalSub: string) =>
   `Managed default-MCP comms-board template token for ${principalSub}. Read-only discovery credential provisioned by Paperclip.`;
 
-async function vaultSecretUsable(db: Pick<Db, "select">, companyId: string, secretId: string): Promise<boolean> {
+export async function vaultSecretUsable(db: Pick<Db, "select">, companyId: string, secretId: string): Promise<boolean> {
   const [secret] = await db
     .select({ id: companySecrets.id })
     .from(companySecrets)
