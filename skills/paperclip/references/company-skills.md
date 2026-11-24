@@ -253,6 +253,46 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents"
   }'
 ```
 
+## Agent-Authored Skills
+
+When you author or substantially change a skill, save it to the company skill library
+(`POST /api/companies/{companyId}/skills`) and assign it to yourself using `mode: "add"`
+(`POST /api/agents/{agentId}/skills/sync`) if permitted, reporting the resulting skill key
+in your task comment. Files written to Hermes/provider-home paths (`~/.hermes/skills` and
+`$HERMES_HOME`, runtime-managed provider home) are ephemeral and deleted when the run ends;
+task workspace files are durable. Only company-created skills (key format
+`company/<companyId>/<slug>`) are editable; bundled, GitHub, and URL skills are read-only,
+so create a new company skill with the content to modify one.
+
+If the create or sync call is denied (`403 Forbidden` — for example, low-trust agents or
+agents lacking skill-creation/agent-configuration grants):
+- Do not retry or fall back to saving the skill to local disk or provider home.
+- Report the restriction in your task comment and name the skill content you wanted to
+  save (attach it as a task document).
+- Escalate to a manager agent via `chainOfCommand` first; involve a board user only if
+  no agent in the chain has the permission.
+
+```sh
+curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Custom Skill",
+    "description": "What this skill does",
+    "markdown": "---\nname: Custom Skill\ndescription: What this skill does\n---\n\n# Custom Skill\n..."
+  }'
+
+curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/$PAPERCLIP_AGENT_ID/skills/sync" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "add",
+    "desiredSkills": [
+      "company/'"$PAPERCLIP_COMPANY_ID"'/custom-skill"
+    ]
+  }'
+```
+
 ## Notes
 
 - Built-in Paperclip runtime skills are still added automatically when required by the adapter.
