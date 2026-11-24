@@ -33,6 +33,7 @@ import { builtInAgentService } from "./built-in-agents.js";
 import { scheduleCompanyTemplateEnsure } from "./default-mcp-template.js";
 import { scheduleCompanyDefaultMcpOAuthSeedsEnsure } from "./default-mcp-oauth-seed.js";
 import { companyMemoryDatabaseService, sanitizeDbError } from "./company-memory-databases.js";
+import { cleanupCommsWakeAfterDeletion, readCommsWakeCleanupTargets, type CommsWakeAdminContext } from "./comms-wake-admin.js";
 import { logger } from "../middleware/logger.js";
 
 
@@ -51,7 +52,7 @@ const SYSTEM_COMPANY_ACTOR: CompanyActivityActor = {
   runId: null,
 };
 
-export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
+export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}, commsWakeCleanup: CommsWakeAdminContext = {}) {
   const environmentsSvc = environmentService(db);
   const builtInAgents = builtInAgentService(db);
 
@@ -575,7 +576,13 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       return result.company;
     },
 
-    remove: (id: string) => deleteCompany(db, id),
+    remove: async (id: string) => {
+      // Registrations and secrets go with the company; the board addresses are read first and removed after (TECH-9914).
+      const wakeTargets = await readCommsWakeCleanupTargets(db, { companyId: id });
+      const removed = await deleteCompany(db, id);
+      if (removed) await cleanupCommsWakeAfterDeletion(db, wakeTargets, { removeSecret: false, recordActivity: false }, commsWakeCleanup);
+      return removed;
+    },
 
     stats: () =>
       Promise.all([

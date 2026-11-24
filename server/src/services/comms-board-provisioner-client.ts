@@ -581,24 +581,19 @@ export type BoardWakeTargetOutcome =
 
 const WAKE_SECRET_PATTERN = /^whsec_[A-Za-z0-9+/]+={0,2}$/;
 
+type BoardAdminToolOutcome = { ok: true; text: string } | { ok: false; reason: Exclude<BoardWakeTargetOutcome, { ok: true }>["reason"] };
+
 /**
- * Registers or replaces where the board delivers wake events for one board agent (`comms_admin_wake_target_set`). Same admin
- * credential, MCP handshake and single `tools/call` as `registerCommsBoardAgent`; nothing is retried. A url that is not https
- * or a secret that is not `whsec_` + base64 is refused locally before any call.
+ * One admin `tools/call` on the board (MCP handshake, a single call, session closed). Shared by the wake target set and
+ * remove calls. Nothing is retried, and the outcome never carries the arguments or any board text beyond a successful result.
  */
-export async function setCommsBoardWakeTarget(
+async function callBoardAdminTool(
   config: CommsBoardProvisionerConfig,
-  request: { boardAgentId: string; url: string; secret: string; system: string },
-  fetchImpl: FetchLike = tailnetAwareFetch,
-  opts: { timeoutMs?: number } = {},
-): Promise<BoardWakeTargetOutcome> {
-  if (!UUID_PATTERN.test(request.boardAgentId)) return { ok: false, reason: "failed" };
-  if (!WAKE_SECRET_PATTERN.test(request.secret)) return { ok: false, reason: "failed" };
-  try {
-    if (new URL(request.url).protocol !== "https:") return { ok: false, reason: "failed" };
-  } catch {
-    return { ok: false, reason: "failed" };
-  }
+  toolName: string,
+  args: Record<string, unknown>,
+  fetchImpl: FetchLike,
+  opts: { timeoutMs?: number },
+): Promise<BoardAdminToolOutcome> {
   const timeoutMs = opts.timeoutMs ?? COMMS_BOARD_REQUEST_TIMEOUT_MS;
   const adminHeaders: Record<string, string> = { authorization: `Bearer ${config.boardAdminToken}` };
   const send = (init: RequestInit) => {
@@ -637,14 +632,7 @@ export async function setCommsBoardWakeTarget(
       response = await fetchImpl(config.boardMcpUrl, {
         method: "POST",
         headers: { ...sessionHeaders, "content-type": "application/json", accept: "application/json, text/event-stream" },
-        body: JSON.stringify(
-          buildMcpToolCallRequest(callId, "comms_admin_wake_target_set", {
-            agent_id: request.boardAgentId,
-            url: request.url,
-            secret: request.secret,
-            system: request.system,
-          }),
-        ),
+        body: JSON.stringify(buildMcpToolCallRequest(callId, toolName, args)),
         redirect: "error",
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -678,15 +666,70 @@ export async function setCommsBoardWakeTarget(
       if (code === "misconfigured") return { ok: false, reason: "misconfigured" };
       return { ok: false, reason: "failed" };
     }
-    let result: "created" | "replaced" | null = null;
-    try {
-      const parsed = JSON.parse(toolResult.content) as { result?: unknown };
-      if (parsed?.result === "created" || parsed?.result === "replaced") result = parsed.result;
-    } catch {}
-    return { ok: true, result };
+    return { ok: true, text: toolResult.content };
   } finally {
     await terminateMcpHttpSession({ send, headers: sessionHeaders, timeoutMs: 3000 });
   }
+}
+
+/**
+ * Registers or replaces where the board delivers wake events for one board agent (`comms_admin_wake_target_set`). Same admin
+ * credential, MCP handshake and single `tools/call` as `registerCommsBoardAgent`; nothing is retried. A url that is not https
+ * or a secret that is not `whsec_` + base64 is refused locally before any call.
+ */
+export async function setCommsBoardWakeTarget(
+  config: CommsBoardProvisionerConfig,
+  request: { boardAgentId: string; url: string; secret: string; system: string },
+  fetchImpl: FetchLike = tailnetAwareFetch,
+  opts: { timeoutMs?: number } = {},
+): Promise<BoardWakeTargetOutcome> {
+  if (!UUID_PATTERN.test(request.boardAgentId)) return { ok: false, reason: "failed" };
+  if (!WAKE_SECRET_PATTERN.test(request.secret)) return { ok: false, reason: "failed" };
+  try {
+    if (new URL(request.url).protocol !== "https:") return { ok: false, reason: "failed" };
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+  const outcome = await callBoardAdminTool(
+    config,
+    "comms_admin_wake_target_set",
+    { agent_id: request.boardAgentId, url: request.url, secret: request.secret, system: request.system },
+    fetchImpl,
+    opts,
+  );
+  if (!outcome.ok) return outcome;
+  let result: "created" | "replaced" | null = null;
+  try {
+    const parsed = JSON.parse(outcome.text) as { result?: unknown };
+    if (parsed?.result === "created" || parsed?.result === "replaced") result = parsed.result;
+  } catch {}
+  return { ok: true, result };
+}
+
+/** `removed` is false when the board had no target for the agent (the call is then a no-op), null when its answer cannot be read. */
+export type BoardWakeTargetRemoveOutcome =
+  | { ok: true; removed: boolean | null }
+  | { ok: false; reason: "rejected" | "invalid_request" | "misconfigured" | "failed" };
+
+/**
+ * Removes where the board delivers wake events for one board agent (`comms_admin_wake_target_remove`). Removing a target
+ * that does not exist is a no-op on the board, so every non-ok result is safe to run again.
+ */
+export async function removeCommsBoardWakeTarget(
+  config: CommsBoardProvisionerConfig,
+  request: { boardAgentId: string },
+  fetchImpl: FetchLike = tailnetAwareFetch,
+  opts: { timeoutMs?: number } = {},
+): Promise<BoardWakeTargetRemoveOutcome> {
+  if (!UUID_PATTERN.test(request.boardAgentId)) return { ok: false, reason: "failed" };
+  const outcome = await callBoardAdminTool(config, "comms_admin_wake_target_remove", { agent_id: request.boardAgentId }, fetchImpl, opts);
+  if (!outcome.ok) return outcome;
+  let removed: boolean | null = null;
+  try {
+    const parsed = JSON.parse(outcome.text) as { removed?: unknown };
+    if (typeof parsed?.removed === "boolean") removed = parsed.removed;
+  } catch {}
+  return { ok: true, removed };
 }
 
 // ---------------------------------------------------------------------------

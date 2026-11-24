@@ -1441,6 +1441,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
   "POST /api/companies/{companyId}/comms-wake/enrol",
   "GET /api/companies/{companyId}/comms-wake/status",
+  "POST /api/companies/{companyId}/comms-wake/agents/{agentId}/unsubscribe",
+  "POST /api/companies/{companyId}/comms-wake/agents/{agentId}/rotate-secret",
   "POST /api/companies/{companyId}/default-mcp/comms-owner-assignment",
   "POST /api/companies/{companyId}/default-mcp/comms-identity-reissue",
   "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
@@ -3716,6 +3718,26 @@ registry.registerPath({
     }),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/comms-wake/agents/{agentId}/unsubscribe",
+  tags: ["comms-board"],
+  summary: "Remove an agent's comms board wake subscription",
+  description: "Removes the board's wake address for the agent first, then the registration row and the signing secret, and stops the default-MCP sweep from registering it again. If the board cannot remove the address (502, or 503 when the board credential is not configured) no state is changed and the call can be repeated. Calling it for an agent that is not registered is a no-op that still removes a signing secret left behind by an interrupted registration. Reports states only, never a secret. Instance admin only.",
+  request: { params: z.object({ companyId: z.string(), agentId: z.string().uuid() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 502: { description: "The board could not remove the address; no state was changed", content: { "application/json": { schema: z.object({}).passthrough() } } }, 503: { description: "The board credential is not configured", content: { "application/json": { schema: z.object({}).passthrough() } } } },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/comms-wake/agents/{agentId}/rotate-secret",
+  tags: ["comms-board"],
+  summary: "Rotate an agent's comms board wake signing secret on both sides",
+  description: "Sends a new signing secret to the board and, only once the board accepted it, stores it as a new vault version, so the two never disagree. If the board refuses or cannot be reached (502) the vault is untouched and the old secret stays in force; the report says what the board is believed to hold. 409 when the agent is not registered or its board identity is not ready, 503 when the board credential or the public base URL is not configured. Reports states and the vault version only, never a secret. Instance admin only.",
+  request: { params: z.object({ companyId: z.string(), agentId: z.string().uuid() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 502: { description: "The board refused or could not be reached; the old secret is still in force", content: { "application/json": { schema: z.object({}).passthrough() } } }, 503: { description: "The board credential or the public base URL is not configured", content: { "application/json": { schema: z.object({}).passthrough() } } } },
 });
 
 registry.registerPath({
