@@ -137,6 +137,17 @@ describeEmbeddedPostgres("companyService", () => {
     expect(fetched?.visibility).toBe("private");
   });
 
+  it("creates a company with the comms board wake setting on, and keeps an explicit false (TECH-10684)", async () => {
+    const svc = companyService(db);
+    const byDefault = await svc.create({ name: "Wake Default On" });
+    expect(byDefault.commsBoardWakeEnabled).toBe(true);
+    expect((await svc.getById(byDefault.id))?.commsBoardWakeEnabled).toBe(true);
+
+    const switchedOff = await svc.create({ name: "Wake Explicitly Off", commsBoardWakeEnabled: false });
+    expect(switchedOff.commsBoardWakeEnabled).toBe(false);
+    expect((await svc.getById(switchedOff.id))?.commsBoardWakeEnabled).toBe(false);
+  });
+
   it("eagerly provisions memory in allowlist mode for eligible companies, but skips eager provisioning in 'all' mode", async () => {
     const memoryModule = await import("../services/company-memory-databases.js");
     const ensureProvisionedSpy = vi.fn();

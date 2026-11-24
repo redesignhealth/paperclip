@@ -534,7 +534,7 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
     // Comms-board wake subscription (TECH-9912). Not an MCP connection: once the agent's own `comms-board` identity is
     // ready, the hook stores a signing secret, records the wake registration and tells the board where to deliver wake
     // events. `connectionName` names no real connection (no template, no install). New agents only, and only written
-    // for a company whose `commsBoardWakeEnabled` setting is on (the entry is otherwise absent, see agent-hiring).
+    // for a company whose `commsBoardWakeEnabled` setting is on (on by default; the entry is absent when an operator turned it off, see agent-hiring).
     key: "comms-wake",
     displayName: "Comms Board Wake",
     connectionName: "rh-comms-wake",

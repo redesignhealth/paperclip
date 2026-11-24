@@ -807,3 +807,11 @@ for example with an ordinary connection update; do not archive it, which revokes
 missing or expired, the company is inactive or out of scope, the feature is off, an agent's comms-board entry points at
 the template row itself, or the template has installs or profile bindings. After a restore, run the dry-run catalog
 resync: `skipped_template_unavailable` should be gone.
+
+## Comms-board wake entry (`comms-wake`, TECH-9912, TECH-10684)
+
+Not an MCP connection: it registers a wake address and a signing secret for the agent with the comms board, so a board message or invite opens or reopens one issue per board conversation and wakes the agent. Setup hook `comms_wake`; `newAgentsOnly`; the registration is stored in `comms_wake_registrations`.
+
+The per-company setting `commsBoardWakeEnabled` (`companies.comms_board_wake_enabled`) is on by default for new companies, so every new agent of such a company is subscribed when its dedicated comms-board entry is ready. The setting is the per-org stop, not a rollout gate: turning it off (instance admin only) makes the org's wake route answer 409 `retry_later` with reason `wake_disabled`, and the board holds those wakes for up to 24 hours. Agents already subscribed stay registered. Migration 0392 only changes the column default and does not touch existing rows, so existing companies are switched on by an operator through the company API, and a company switched off on purpose is never switched back on by a deploy.
+
+Existing agents are subscribed by the operator command `POST /api/companies/:companyId/comms-wake/enrol` (dry run by default). `POST /api/companies/:companyId/comms-wake/agents/:agentId/unsubscribe` removes one agent's registration and stops the default-MCP sweep from registering it again.

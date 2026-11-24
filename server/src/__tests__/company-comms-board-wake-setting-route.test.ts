@@ -28,7 +28,7 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
 }));
 
-const company = { id: "company-1", name: "Paperclip", status: "active", requireBoardApprovalForNewAgents: false, commsBoardWakeEnabled: false };
+const company = { id: "company-1", name: "Paperclip", status: "active", requireBoardApprovalForNewAgents: false, commsBoardWakeEnabled: true };
 
 async function createApp(actor: Record<string, unknown>) {
   const [{ companyRoutes }, { errorHandler }] = await Promise.all([

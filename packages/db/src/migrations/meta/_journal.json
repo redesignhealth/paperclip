@@ -2731,6 +2731,13 @@
       "when": 1795500000000,
       "tag": "0391_company_comms_board_wake",
       "breakpoints": true
+    },
+    {
+      "idx": 392,
+      "version": "7",
+      "when": 1795600000000,
+      "tag": "0392_company_comms_board_wake_default_on",
+      "breakpoints": true
     }
   ]
 }
