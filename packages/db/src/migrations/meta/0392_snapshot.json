@@ -16187,7 +16187,7 @@
         "comms_board_wake_enabled": {
           "name": "comms_board_wake_enabled",
           "type": "boolean",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true,
           "default": true
         },
