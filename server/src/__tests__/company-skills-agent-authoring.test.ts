@@ -543,7 +543,12 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
       status: "idle",
     });
 
-    const agentActor = { type: "agent" as const, agentId: callingAgentId };
+    const agentActor = {
+      type: "agent" as const,
+      agentId: callingAgentId,
+      companyId,
+      source: "agent_jwt" as const,
+    };
     const err = await svc.forkSkill(companyId, skillId, { reassignAgentIds: [peerAgentId] }, agentActor).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
     expect(err.status).toBe(403);
@@ -591,7 +596,12 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
       status: "idle",
     });
 
-    const agentActor = { type: "agent" as const, agentId: callingAgentId };
+    const agentActor = {
+      type: "agent" as const,
+      agentId: callingAgentId,
+      companyId,
+      source: "agent_jwt" as const,
+    };
     const result = await svc.forkSkill(companyId, skillId, { reassignAgentIds: [callingAgentId] }, agentActor);
     expect(result).toMatchObject({
       reassignments: [
@@ -641,7 +651,12 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
       status: "idle",
     });
 
-    const agentActor = { type: "agent" as const, agentId: callingAgentId };
+    const agentActor = {
+      type: "agent" as const,
+      agentId: callingAgentId,
+      companyId,
+      source: "agent_jwt" as const,
+    };
     const err = await svc.renameSkill(companyId, skillId, { name: "Renamed Peer Skill" }, agentActor).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
     expect(err.status).toBe(403);
@@ -697,5 +712,327 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
       previousName: "Board Renamed Skill",
       skill: expect.objectContaining({ name: "New Name For Skill" }),
     });
+  });
+
+  it("allows board user to delete company-local shared skill row without touching central content", async () => {
+    const companyId = await createCompany();
+    const sharedDir = await fs.mkdtemp(path.join(os.tmpdir(), "shared-skill-board-del-"));
+    cleanupDirs.add(sharedDir);
+    await fs.writeFile(path.join(sharedDir, "SKILL.md"), "# Central Shared Skill", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `shared/central-shared-skill`,
+      slug: "central-shared-skill",
+      name: "Central Shared Skill",
+      markdown: "# Central Shared Skill",
+      sourceType: "local_path",
+      sourceLocator: sharedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: SHARED_SKILLS_SOURCE_KIND },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const boardActor = { type: "user" as const, userId: "board-user" };
+    const result = await svc.deleteSkill(companyId, skillId, boardActor);
+    expect(result).toMatchObject({ id: skillId });
+
+    // DB row deleted
+    const remaining = await db.select().from(companySkills).where(eq(companySkills.id, skillId));
+    expect(remaining).toHaveLength(0);
+
+    // Central content untouched
+    const centralFileExists = await fs.stat(path.join(sharedDir, "SKILL.md")).then(() => true).catch(() => false);
+    expect(centralFileExists).toBe(true);
+  });
+
+  it("allows bulk delete of company-local shared skill rows by board without touching central content", async () => {
+    const companyId = await createCompany();
+    const sharedDir = await fs.mkdtemp(path.join(os.tmpdir(), "shared-skill-bulk-del-"));
+    cleanupDirs.add(sharedDir);
+    await fs.writeFile(path.join(sharedDir, "SKILL.md"), "# Shared Content", "utf8");
+
+    const skillId1 = randomUUID();
+    const skillId2 = randomUUID();
+    await db.insert(companySkills).values([
+      {
+        id: skillId1,
+        companyId,
+        key: `shared/bulk-shared-skill-1`,
+        slug: "bulk-shared-skill-1",
+        name: "Bulk Shared Skill 1",
+        markdown: "# Shared Content",
+        sourceType: "local_path",
+        sourceLocator: sharedDir,
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        metadata: { sourceKind: SHARED_SKILLS_SOURCE_KIND },
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      },
+      {
+        id: skillId2,
+        companyId,
+        key: `shared/bulk-shared-skill-2`,
+        slug: "bulk-shared-skill-2",
+        name: "Bulk Shared Skill 2",
+        markdown: "# Shared Content",
+        sourceType: "local_path",
+        sourceLocator: sharedDir,
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        metadata: { sourceKind: SHARED_SKILLS_SOURCE_KIND },
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      },
+    ]);
+
+    const boardActor = { type: "user" as const, userId: "board-user" };
+    const deleted = await svc.deleteSkills(companyId, [skillId1, skillId2], undefined, undefined, boardActor);
+    expect(deleted).toHaveLength(2);
+
+    const remaining = await db.select().from(companySkills).where(eq(companySkills.companyId, companyId));
+    expect(remaining.filter((s) => s.id === skillId1 || s.id === skillId2)).toHaveLength(0);
+
+    const centralFileExists = await fs.stat(path.join(sharedDir, "SKILL.md")).then(() => true).catch(() => false);
+    expect(centralFileExists).toBe(true);
+  });
+
+  it("denies agent fork with explicit public_link sharingScope in service", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-scope-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Fork Scope Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/fork-scope-src`,
+      slug: "fork-scope-src",
+      name: "Fork Scope Src",
+      markdown: "---\nname: Fork Scope Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const agentActor = {
+      type: "agent" as const,
+      agentId: await createAgent(companyId),
+      companyId,
+      source: "agent_jwt" as const,
+    };
+    const err = await svc.forkSkill(companyId, skillId, { sharingScope: "public_link" }, agentActor).catch((e) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err.status).toBe(403);
+    expect(err.details).toMatchObject({ code: "skill_agent_field_restricted" });
+  });
+
+  it("ensures omitted sharingScope on agent fork becomes company scope even for public_link source", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-pub-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Fork Pub Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/fork-pub-src`,
+      slug: "fork-pub-src",
+      name: "Fork Pub Src",
+      markdown: "---\nname: Fork Pub Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      sharingScope: "public_link",
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const agentActor = {
+      type: "agent" as const,
+      agentId: await createAgent(companyId),
+      companyId,
+      source: "agent_jwt" as const,
+    };
+    const result = await svc.forkSkill(companyId, skillId, {}, agentActor);
+    expect(result.skill.sharingScope).toBe("company");
+
+    const [row] = await db.select().from(companySkills).where(eq(companySkills.id, result.skill.id));
+    expect(row!.sharingScope).toBe("company");
+  });
+
+  it("allows board fork with explicit public_link sharingScope", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-board-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Board Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/fork-board-src`,
+      slug: "fork-board-src",
+      name: "Board Src",
+      markdown: "---\nname: Board Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const boardActor = { type: "user" as const, userId: "board-user" };
+    const result = await svc.forkSkill(companyId, skillId, { sharingScope: "public_link" }, boardActor);
+    expect(result.skill.sharingScope).toBe("public_link");
+  });
+
+  it("fails closed when agent fork reassignment lacks required principal context", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-ctx-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Ctx Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/fork-ctx-src`;
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "fork-ctx-src",
+      name: "Ctx Src",
+      markdown: "---\nname: Ctx Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const agentId = await createAgent(companyId);
+    await db.update(agents).set({
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    }).where(eq(agents.id, agentId));
+
+    // Bare SkillActor lacking source and companyId
+    const bareActor = { type: "agent" as const, agentId };
+    const err = await svc.forkSkill(companyId, skillId, { reassignAgentIds: [agentId] }, bareActor).catch((e) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err.status).toBe(403);
+    expect(err.details).toMatchObject({ code: "skill_agent_reassign_restricted" });
+    expect(err.message).toBe("Reassignment requires authenticated agent context");
+  });
+
+  it("denies reassignment when genuine AuthorizationActor has a scoped token denying config updates", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-scoped-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Scoped Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/fork-scoped-src`;
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "fork-scoped-src",
+      name: "Scoped Src",
+      markdown: "---\nname: Scoped Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const agentId = await createAgent(companyId);
+    await db.update(agents).set({
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    }).where(eq(agents.id, agentId));
+
+    // Scoped AuthorizationActor with skill_test scope that denies agent_config:update
+    const scopedActor = {
+      type: "agent" as const,
+      agentId,
+      companyId,
+      source: "agent_jwt" as const,
+      keyScope: { kind: "skill_test" as const, skillId },
+    };
+    const err = await svc.forkSkill(companyId, skillId, { reassignAgentIds: [agentId] }, scopedActor).catch((e) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err.status).toBe(403);
+    expect(err.details).toMatchObject({ code: "skill_agent_reassign_restricted" });
+  });
+
+  it("denies reassignment when responsible user is unavailable in the company", async () => {
+    const companyId = await createCompany();
+    const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
+    const managedDir = path.join(managedRoot, "fork-resp-src");
+    await fs.mkdir(managedDir, { recursive: true });
+    cleanupDirs.add(managedDir);
+    await fs.writeFile(path.join(managedDir, "SKILL.md"), "---\nname: Resp Src\n---\n# Content", "utf8");
+
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/fork-resp-src`;
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "fork-resp-src",
+      name: "Resp Src",
+      markdown: "---\nname: Resp Src\n---\n# Content",
+      sourceType: "local_path",
+      sourceLocator: managedDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      metadata: { sourceKind: "managed_local" },
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+
+    const agentId = await createAgent(companyId);
+    await db.update(agents).set({
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    }).where(eq(agents.id, agentId));
+
+    // Agent with onBehalfOfUserId that has no membership in companyId
+    const respActor = {
+      type: "agent" as const,
+      agentId,
+      companyId,
+      source: "agent_jwt" as const,
+      onBehalfOfUserId: "non-member-user-id",
+      onBehalfOfMemberships: [],
+    };
+    const err = await svc.forkSkill(companyId, skillId, { reassignAgentIds: [agentId] }, respActor).catch((e) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err.status).toBe(403);
+    expect(err.details).toMatchObject({ code: "skill_agent_reassign_restricted" });
   });
 });

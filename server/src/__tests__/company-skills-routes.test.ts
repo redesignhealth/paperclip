@@ -1677,6 +1677,46 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.updateSkill).not.toHaveBeenCalled();
   });
 
+  it("denies agents from forking skills with explicit non-company sharingScope", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const publicRes = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills/skill-1/fork")
+      .send({ sharingScope: "public_link" });
+
+    expect(publicRes.status, JSON.stringify(publicRes.body)).toBe(403);
+    expect(publicRes.body).toMatchObject({
+      code: "skill_agent_field_restricted",
+      error: "Agents can only fork skills with 'company' sharing scope",
+    });
+
+    const privateRes = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills/skill-1/fork")
+      .send({ sharingScope: "private" });
+
+    expect(privateRes.status, JSON.stringify(privateRes.body)).toBe(403);
+    expect(privateRes.body).toMatchObject({
+      code: "skill_agent_field_restricted",
+      error: "Agents can only fork skills with 'company' sharing scope",
+    });
+
+    expect(mockCompanySkillService.forkSkill).not.toHaveBeenCalled();
+  });
+
+  it("allows board users to fork skills with explicit public_link sharingScope", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "user-1" }))
+      .post("/api/companies/company-1/skills/skill-1/fork")
+      .send({ sharingScope: "public_link" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockCompanySkillService.forkSkill).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      expect.objectContaining({ sharingScope: "public_link" }),
+      expect.anything(),
+    );
+  });
+
   it("allows agents to update skills with company sharingScope", async () => {
     mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
 
@@ -1994,10 +2034,7 @@ describe("company skill mutation permissions", () => {
         categories: ["memory", "review"],
         sharingScope: "company",
       },
-      {
-        type: "user",
-        userId: "user-1",
-      },
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId: "company-1",
@@ -2045,10 +2082,7 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.deleteFile).toHaveBeenCalledWith("company-1", "skill-1", {
       path: "references",
       target: "folder",
-    }, {
-      type: "user",
-      userId: "user-1",
-    });
+    }, expect.anything());
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "company.skill_file_deleted",
       entityType: "company_skill",
@@ -2083,10 +2117,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       { slug: "review-fork", reassignAgentIds: ["11111111-1111-4111-8111-111111111111"] },
-      {
-        type: "user",
-        userId: "user-1",
-      },
+      expect.anything(),
     );
 
     await request(app).get("/api/companies/company-1/skills/skill-1/fork-precheck").expect(200);
@@ -2133,10 +2164,7 @@ describe("company skill mutation permissions", () => {
       "company-1",
       "skill-1",
       { name: "Ship PR", slug: "ship-pr" },
-      {
-        type: "user",
-        userId: "user-1",
-      },
+      expect.anything(),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "company.skill_renamed",
@@ -2645,10 +2673,7 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith(
       "company-1",
       "skill-1",
-      {
-        type: "user",
-        userId: "local-board",
-      },
+      expect.anything(),
     );
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
