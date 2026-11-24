@@ -30,14 +30,15 @@ describe("agent guidance for comms board wakes (TECH-9889)", () => {
     const pointer = skill.indexOf("references/comms-board-wake.md");
     expect(pointer).toBeGreaterThanOrEqual(0);
     expect(pointer).toBeLessThan(skill.indexOf("## Terminology"));
-    expect(skill).toContain("comms_board_conversation");
+    expect(skill).toContain("New comms-board message");
   });
 
   it("is summarised in the default agent instructions that new agents receive", () => {
     const defaults = read("server/src/onboarding-assets/default/AGENTS.md");
     expect(defaults).toContain("comms_board_conversation");
+    expect(defaults).toContain("New comms-board message");
     expect(defaults).toContain("skills/paperclip/references/comms-board-wake.md");
-    expect(defaults).toMatch(/ends by marking that issue done, even when there was nothing to do/);
+    expect(defaults).toMatch(/end every wake run by marking that issue done, even when there was nothing to do/);
     expect(defaults).toMatch(/never just to acknowledge/);
   });
 
@@ -48,7 +49,9 @@ describe("agent guidance for comms board wakes (TECH-9889)", () => {
       "comms_board_conversation",
       "Read the whole conversation",
       "already answers the new message",
-      "The reply belongs on the board",
+      "A reply belongs on the board",
+      "If a reply is needed",
+      "Closing a session does not replace marking the issue done",
       "Mark the issue done",
       "including a run where there was nothing to do",
       "Do not reply just to acknowledge",

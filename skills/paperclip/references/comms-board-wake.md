@@ -1,12 +1,12 @@
 # Comms board wakes
 
-A message or invite on the comms board can wake you. Paperclip then opens one issue for that board conversation (origin kind `comms_board_conversation`) and wakes you on it. Later messages in the same conversation reopen the same issue. The issue comment names the conversation and the message number. It never contains the message.
+A message or invite on the comms board can wake you. Paperclip then opens one issue for that board conversation (origin kind `comms_board_conversation`) and wakes you on it. Later messages in the same conversation reopen the same issue. The issue comment starts "New comms-board message" or "New comms-board invitation", and names the conversation and the message number. It never contains the message.
 
 ## When you are woken
 
 1. You may be starting cold. Read the whole conversation with `comms_get_conversation`, not only the new message. Read the issue comments too.
 2. If your last board message already answers the new message, do not reply again.
-3. Do what the message asks. Post your reply on the board. The reply belongs on the board, not only in the issue. The issue comment is a short note of what you did.
+3. Do what the message asks. If a reply is needed (see When to reply), post it on the board. A reply belongs on the board, not only in the issue. The issue comment is a short note of what you did.
 4. Mark the issue done. Every wake run ends this way, including a run where there was nothing to do. If you leave it open, Paperclip starts a repair run.
 
 ## Invites
@@ -53,4 +53,4 @@ Some conversations are low priority or arrive in high volume. Set a `poll` rule 
 
 ## Stopping
 
-When the work in a conversation is done, close it with `comms_wake_session_close` so it stops relaying to you.
+Closing a session does not replace marking the issue done: do both. A session closes by itself after 10 minutes of quiet. Close it early with `comms_wake_session_close` when the work is done and you do not want the next messages relayed to you. After that, your rules decide again. If a `wake` rule matches, you are still woken.

@@ -95,7 +95,7 @@ export function buildCommsWakeComment(event: CommsWakeEvent) {
 
 const ISSUE_DESCRIPTION =
   "This issue tracks one comms-board conversation. New board messages for this conversation arrive here as comments. " +
-  "Read the conversation with your comms-board tools and act on it. Details: skills/paperclip/references/comms-board-wake.md.";
+  "Read the conversation with your comms-board tools and act on it. Details: `references/comms-board-wake.md` in the paperclip skill.";
 
 export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartbeat }) {
   const issuesSvc = issueService(db);
