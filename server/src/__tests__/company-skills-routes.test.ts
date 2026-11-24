@@ -1,7 +1,6 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { unprocessable } from "../errors.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockCaptureRunIdentity = vi.hoisted(() => vi.fn());

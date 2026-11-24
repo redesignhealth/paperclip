@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import { agents, companies, companySkills, createDb } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companySkillService } from "../services/company-skills.ts";
+import { SHARED_SKILLS_SOURCE_KIND } from "../services/shared-skills-source.js";
 import { HttpError } from "../errors.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -17,22 +18,22 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
   let svc!: ReturnType<typeof companySkillService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let home: string;
-  let oldHome: string | undefined;
-  let oldInstance: string | undefined;
   const cleanupDirs = new Set<string>();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-skill-authoring-");
-    oldHome = process.env.PAPERCLIP_HOME;
-    oldInstance = process.env.PAPERCLIP_INSTANCE_ID;
     home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-agent-skill-home-"));
-    process.env.PAPERCLIP_HOME = home;
-    process.env.PAPERCLIP_INSTANCE_ID = "default";
     db = createDb(tempDb.connectionString);
     svc = companySkillService(db);
   }, 20_000);
 
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "default");
+  });
+
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await db.delete(companySkills);
     await db.delete(agents);
     await db.delete(companies);
@@ -41,10 +42,6 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
   });
 
   afterAll(async () => {
-    if (oldHome === undefined) delete process.env.PAPERCLIP_HOME;
-    else process.env.PAPERCLIP_HOME = oldHome;
-    if (oldInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
-    else process.env.PAPERCLIP_INSTANCE_ID = oldInstance;
     if (home) await fs.rm(home, { recursive: true, force: true });
     await tempDb?.cleanup();
   });
@@ -122,16 +119,16 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
       sourceLocator: sharedDir,
       trustLevel: "markdown_only",
       compatibility: "compatible",
-      metadata: { sourceKind: "shared" },
+      metadata: { sourceKind: SHARED_SKILLS_SOURCE_KIND },
       fileInventory: [{ path: "SKILL.md", kind: "skill" }],
     });
 
     const agentActor = { type: "agent" as const, agentId: randomUUID() };
     const err = await svc.updateFile(companyId, skillId, "SKILL.md", "# Edited Content", agentActor).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
-    expect(err.status).toBe(403);
-    expect(err.message).toBe("Agents can only edit managed local skills");
-    expect(err.details).toMatchObject({ code: "skill_agent_edit_restricted" });
+    expect(err.status).toBe(422);
+    expect(err.message).toBe("Shared skills are managed centrally and are read-only. Fork this skill to edit your own copy.");
+    expect(err.details).toMatchObject({ code: "shared_skill_read_only", skillId });
   });
 
   it("denies agent PATCH files on bundled skill", async () => {
@@ -167,6 +164,7 @@ describeEmbeddedPostgres("company skill agent authoring and edit guards", () => 
   it("allows agent PATCH files on managed_local skill", async () => {
     const companyId = await createCompany();
     const managedRoot = path.join(home, "instances", "default", "skills", companyId);
+    cleanupDirs.add(managedRoot);
     const managedDir = path.join(managedRoot, "agent-managed-skill");
     await fs.mkdir(managedDir, { recursive: true });
     cleanupDirs.add(managedDir);
