@@ -301,10 +301,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Build environment
   // A copy: relayed secrets are removed from it below.
   const envConfig = { ...parseObject(config.env) };
+  // Sandbox pods only: they run the runtime image that carries the pinned extension. SSH hosts also use the bridge
+  // but do not have it.
+  const mcpRelayAvailable = adapterExecutionTargetIsSandbox(executionTarget) && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
   const env: Record<string, string> = {
     ...buildPaperclipEnv(agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
+  // TECH-10174: with the MCP relay the pod reaches runtime tools through the bridge, which holds the token host-side. The
+  // runtime tools token (and its URLs and guidance) must not also sit in the env the model can read for the whole run.
+  if (mcpRelayAvailable) {
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("PAPERCLIP_RUNTIME_TOOLS_")) delete env[key];
+    }
+  }
   env.PAPERCLIP_RUN_ID = runId;
 
   const wakeTaskId =
@@ -368,9 +378,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // TECH-9794: runtime MCP servers reach Pi only through the sandbox bridge relay, so no MCP token or run
   // token is written to the pod. Targets without the bridge (and local runs) continue without them.
   const allRuntimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
-  // Sandbox pods only: they run the runtime image that carries the pinned extension. SSH hosts also use the bridge
-  // but do not have it.
-  const mcpRelayAvailable = adapterExecutionTargetIsSandbox(executionTarget) && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
   const { relayServers: piMcpRelayServers, skipped: piMcpSkipped } = mcpRelayAvailable
     ? selectPiMcpRelayServers(allRuntimeMcpServers)
     : { relayServers: [], skipped: [] };
