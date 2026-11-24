@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { preparePiGuardExtension, readPiGuardProfile, PI_GUARD_MAX_BLOCKS } from "./guard-extension.js";
+import { PI_MEMORY_TOOL_NAMES } from "./memory-extension.js";
 import { BUILDER_GUARD_POLICY, resolvePiGuardPolicy } from "./guard-policy.js";
 
 type Verdict = { kind: "deny"; why: string } | { kind: "unlisted"; what: string } | null;
@@ -82,6 +83,18 @@ describe("guard: pre-approved builder flow", () => {
     expect(guard.evaluateToolCall("grep", { pattern: "x", path: "src" }, repo)).toBeNull();
     expect(guard.evaluateToolCall("read", { path: ".env.example" }, repo)).toBeNull();
     expect(guard.evaluateToolCall("mcp", { tool: "comms_board_post_message", args: {} }, repo)).toBeNull();
+  });
+});
+
+describe("guard: memory tools", () => {
+  it.each(PI_MEMORY_TOOL_NAMES)("allows the memory extension tool %s", (tool) => {
+    expect(guard.evaluateToolCall(tool, { query: "x", text: "x", memory_id: "x" }, repo)).toBeNull();
+  });
+
+  it("still refuses other unlisted tools, including look-alike memory names", () => {
+    expect(guard.evaluateToolCall("memory_update", {}, repo)?.kind).toBe("unlisted");
+    expect(guard.evaluateToolCall("memory-search", {}, repo)?.kind).toBe("unlisted");
+    expect(guard.evaluateToolCall("some_other_tool", {}, repo)?.kind).toBe("unlisted");
   });
 });
 
