@@ -1,6 +1,8 @@
 import { and, desc, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, agents, commsWakeConversations, commsWakeEvents, issueComments, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, commsWakeConversations, commsWakeEvents, companies, issueComments, issues } from "@paperclipai/db";
+import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import type { CommsWakeEvent } from "./comms-wake-event.js";
@@ -15,6 +17,8 @@ export const COMMS_WAKE_ISSUE_ORIGIN_KIND = "comms_board_conversation";
 export const COMMS_WAKE_REASON = "comms_board_message_received";
 const COMMS_WAKE_ACTOR_ID = "comms_board_wake";
 const COMMS_BOARD_ENTRY_KEY = "comms-board";
+/** Outcome written while one request holds an event; see `claimCommsWakeEvent`. */
+export const COMMS_WAKE_PROCESSING = "processing";
 
 type WakeOptions = {
   source: "automation";
@@ -114,10 +118,16 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
     return resolveRoutineResponsibleUserId(db, companyId, null);
   }
 
-  async function findMapping(companyId: string, agentId: string, boardConversationId: string) {
-    const [row] = await db
-      .select({ issueId: commsWakeConversations.issueId })
+  /**
+   * The conversation's mapped issue, and whether it can still carry the conversation: it must exist in this company and
+   * still be assigned to this agent. A mapped issue that was reassigned or unassigned is re-homed to a new issue
+   * (deletion needs no handling: the mapping row is deleted with the issue).
+   */
+  async function findMapping(reader: Pick<Db, "select">, companyId: string, agentId: string, boardConversationId: string) {
+    const [row] = await reader
+      .select({ id: commsWakeConversations.id, issueId: commsWakeConversations.issueId, assigneeAgentId: issues.assigneeAgentId })
       .from(commsWakeConversations)
+      .leftJoin(issues, and(eq(issues.id, commsWakeConversations.issueId), eq(issues.companyId, commsWakeConversations.companyId)))
       .where(
         and(
           eq(commsWakeConversations.companyId, companyId),
@@ -125,7 +135,8 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
           eq(commsWakeConversations.boardConversationId, boardConversationId),
         ),
       );
-    return row?.issueId ?? null;
+    if (!row) return null;
+    return { id: row.id, issueId: row.issueId, usable: row.assigneeAgentId === agentId };
   }
 
   /** A board-supplied session reference is only usable if it names an unmapped issue of this agent in this company. */
@@ -146,8 +157,8 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
   async function findOrCreateIssueId(input: ProcessInput) {
     const { companyId, agentId, event } = input;
     const boardConversationId = event.data.conversationId;
-    const existing = await findMapping(companyId, agentId, boardConversationId);
-    if (existing) return existing;
+    const existing = await findMapping(db, companyId, agentId, boardConversationId);
+    if (existing?.usable) return existing.issueId;
 
     const responsibleUserId = await resolveResponsibleUserId(companyId, agentId);
     const attempt = () =>
@@ -156,11 +167,8 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${`comms-wake-conversation:${agentId}:${boardConversationId}`}, 0))`,
         );
-        const [mapped] = await tx
-          .select({ issueId: commsWakeConversations.issueId })
-          .from(commsWakeConversations)
-          .where(and(eq(commsWakeConversations.agentId, agentId), eq(commsWakeConversations.boardConversationId, boardConversationId)));
-        if (mapped) return mapped.issueId;
+        const mapped = await findMapping(tx, companyId, agentId, boardConversationId);
+        if (mapped?.usable) return mapped.issueId;
 
         let issueId = await adoptableIssueId(tx, companyId, agentId, event.data.sessionRef);
         if (!issueId) {
@@ -181,6 +189,14 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
           );
           issueId = created.id;
         }
+        if (mapped) {
+          // Re-home: the previously mapped issue no longer belongs to this agent. It stays with whoever has it.
+          await tx
+            .update(commsWakeConversations)
+            .set({ issueId, updatedAt: new Date() })
+            .where(eq(commsWakeConversations.id, mapped.id));
+          return issueId;
+        }
         const inserted = await tx
           .insert(commsWakeConversations)
           .values({ companyId, agentId, boardConversationId, issueId })
@@ -193,9 +209,9 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
       return await attempt();
     } catch (err) {
       if (!(err instanceof MappingRaceError)) throw err;
-      const winner = await findMapping(companyId, agentId, boardConversationId);
+      const winner = await findMapping(db, companyId, agentId, boardConversationId);
       if (!winner) throw err;
-      return winner;
+      return winner.issueId;
     }
   }
 
@@ -235,7 +251,7 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
         .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
         .from(agentWakeupRequests)
         .where(and(eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey)))
-        .orderBy(desc(agentWakeupRequests.createdAt))
+        .orderBy(desc(agentWakeupRequests.requestedAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
 
@@ -277,16 +293,46 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
     const receipt = await latest();
     if (!receipt) return { queued: false, reason: "wake_not_recorded" };
     if (receipt.status === "skipped") return { queued: false, reason: safeCode(receipt.reason, "wake_skipped") };
+    // Paperclip's own wake request ended without a run: the board must not be told it was accepted.
+    if (receipt.status === "failed") return { queued: false, reason: "wake_failed" };
+    if (receipt.status === "cancelled") return { queued: false, reason: "wake_cancelled" };
     return { queued: true };
   }
 
+  /** Only the request holding the claim (outcome "processing") may write the outcome, so a late repeat never overwrites it. */
   async function finish(eventRowId: string, patch: Partial<typeof commsWakeEvents.$inferInsert>) {
-    await db.update(commsWakeEvents).set(patch).where(eq(commsWakeEvents.id, eventRowId));
+    await db
+      .update(commsWakeEvents)
+      .set(patch)
+      .where(and(eq(commsWakeEvents.id, eventRowId), eq(commsWakeEvents.outcome, COMMS_WAKE_PROCESSING)));
+  }
+
+  /**
+   * Nothing is created for an agent that cannot run now: an issue assigned to a paused agent would be picked up by
+   * stranded-work recovery and marked blocked. Mirrors the checks the wake queue makes before it accepts a wake.
+   */
+  async function cannotRunNow(companyId: string, agentId: string): Promise<CommsWakeIssueResult | null> {
+    const [agent] = await db.select().from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
+    if (!agent) return { status: "gone" };
+    const invokability = await evaluateAgentInvokabilityFromDb(db, isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
+    if (!invokability.invokable) {
+      if (GONE_REASONS.has(invokability.reason)) return { status: "gone" };
+      return { status: "retry_later", reason: safeCode(invokability.reason, "agent_not_runnable") };
+    }
+    const [company] = await db.select({ status: companies.status }).from(companies).where(eq(companies.id, companyId));
+    if (!company || company.status !== "active") return { status: "retry_later", reason: "company.inactive" };
+    return null;
   }
 
   async function process(input: ProcessInput): Promise<CommsWakeIssueResult> {
-    let step = "issue";
+    let step = "precheck";
     try {
+      const blocked = await cannotRunNow(input.companyId, input.agentId);
+      if (blocked) {
+        await finish(input.eventRow.id, { outcome: blocked.status === "gone" ? "gone" : "retry_later" });
+        return blocked;
+      }
+      step = "issue";
       const issueId = await findOrCreateIssueId(input);
       // The issue_id foreign key is single-column, so check in code that the issue is this agent's, in this company.
       const [ownIssue] = await db
@@ -312,10 +358,16 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
       return { status: "accepted", sessionRef: issueId };
     } catch (err) {
       if (err instanceof HttpError) {
-        if (err.status === 404 && step === "wake") return { status: "gone" };
+        if (err.status === 404 && step === "wake") {
+          await finish(input.eventRow.id, { outcome: "gone" });
+          return { status: "gone" };
+        }
         if (err.status === 409) {
           const reason = conflictReason(err);
-          if (reason === "gone") return { status: "gone" };
+          if (reason === "gone") {
+            await finish(input.eventRow.id, { outcome: "gone" });
+            return { status: "gone" };
+          }
           await finish(input.eventRow.id, { outcome: "retry_later" });
           return { status: "retry_later", reason };
         }
@@ -325,6 +377,8 @@ export function commsWakeIssueService(db: Db, deps: { heartbeat: CommsWakeHeartb
           return { status: "retry_later", reason: "responsible_user_unresolved" };
         }
       }
+      // Release the claim so the board's quick retry for a 5xx is processed, not told the event is in progress.
+      await finish(input.eventRow.id, { outcome: null }).catch(() => undefined);
       logger.error(
         { agentId: input.agentId, eventId: input.event.eventId, step, errorClass: err instanceof Error ? err.constructor.name : typeof err },
         "comms wake processing failed",

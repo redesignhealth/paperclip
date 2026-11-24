@@ -5632,7 +5632,7 @@ registry.registerPath({
     200: r.ok(z.object({ status: z.enum(["accepted", "duplicate"]), sessionRef: z.string().nullable() })),
     400: r.badRequest,
     401: r.unauthorized,
-    409: { description: "The agent cannot run now; retry the same event later", content: { "application/json": { schema: z.object({ status: z.literal("retry_later"), reason: z.string() }) } } },
+    409: { description: "The agent cannot run now, or the same event is still being processed; retry the same event later", content: { "application/json": { schema: z.object({ status: z.literal("retry_later"), reason: z.string() }) } } },
     410: { description: "Unknown or terminated agent, or no wake registration", content: { "application/json": { schema: ErrorSchema } } },
   },
 });
