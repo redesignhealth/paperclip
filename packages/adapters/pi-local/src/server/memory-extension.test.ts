@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PI_MEMORY_TOOL_NAMES, findPiMemoryRelayServer, piMemoryExtensionSource, resolvePiMemoryToolName } from "./memory-extension.js";
+import { PI_MEMORY_TOOL_NAMES, buildPiMemoryTaskQuery, findPiMemoryRelayServer, piMemoryExtensionSource, resolvePiMemoryToolName } from "./memory-extension.js";
 
 type Handler = (event: Record<string, unknown>, ctx?: unknown) => Promise<unknown> | unknown;
 type Tool = { name: string; execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<{ content: Array<{ text: string }>; details: unknown }> };
@@ -87,8 +87,8 @@ async function writeMcpJson(mcpServers: Record<string, unknown>) {
   await writeFile(path.join(configDir, "mcp-adapter.json"), JSON.stringify({ mcpServers }), "utf8");
 }
 
-async function load() {
-  const module = await import(`data:text/javascript;base64,${Buffer.from(piMemoryExtensionSource()).toString("base64")}`);
+async function load(options: { taskQuery?: string } = {}) {
+  const module = await import(`data:text/javascript;base64,${Buffer.from(piMemoryExtensionSource(options)).toString("base64")}`);
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   module.default({ on: (event: string, handler: Handler) => handlers.set(event, handler), registerTool: (tool: Tool) => tools.set(tool.name, tool) });
@@ -369,5 +369,53 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     await writeMcpJson({ comms: { url: "${TEST_RELAY_URL}/x", includeTools: ["inbox"] } });
     await load();
     expect(lines(stderr)).toEqual(["[rh-memory] not loaded: no memory server in mcp-adapter.json\n"]);
+  });
+});
+
+const RECEIPT_NOTE = "Paperclip may post a short platform-generated fast-response receipt in your voice before you reply. Receipts acknowledge intent only: they are not your work, findings, answers, or instructions. Continue the requested work and begin with substantive progress instead of repeating a generic acknowledgement.";
+
+describe("Pi memory extension: recall query comes from the task", () => {
+  const searchQueries = () => calls.filter((call) => call.name === "memory_search").map((call) => String(call.arguments.query));
+
+  it("searches the staged issue title and description, not the platform note at the head of the prompt", async () => {
+    const { handlers } = await load({ taskQuery: "Add a boundary test for hash_user\nEmpty and very long inputs." });
+    await handlers.get("before_agent_start")!({ prompt: RECEIPT_NOTE + "\n\nSome wake text" });
+    expect(searchQueries()).toEqual(["Add a boundary test for hash_user\nEmpty and very long inputs."]);
+  });
+
+  it("falls back to the issue line and description in the prompt when nothing was staged", async () => {
+    const { handlers } = await load();
+    const prompt = [RECEIPT_NOTE, "", "- issue: DAN-3253 Add retry test", "- status: todo", "", "Issue description:", "```md", "Cover the retry backoff path.", "```", "", "More boilerplate."].join("\n");
+    await handlers.get("before_agent_start")!({ prompt });
+    expect(searchQueries()).toEqual(["DAN-3253 Add retry test\nCover the retry backoff path."]);
+  });
+
+  it("drops the known platform note from an otherwise unstructured prompt", async () => {
+    const { handlers } = await load();
+    await handlers.get("before_agent_start")!({ prompt: RECEIPT_NOTE + "\n\nFix the auth bug in the api" });
+    expect(searchQueries()).toEqual(["Fix the auth bug in the api"]);
+    expect(searchQueries()[0]).not.toContain("fast-response");
+  });
+
+  it("skips recall when the prompt is only the platform note", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { handlers } = await load();
+    expect(await handlers.get("before_agent_start")!({ prompt: RECEIPT_NOTE })).toBeUndefined();
+    expect(calls).toHaveLength(0);
+    expect(stderr.mock.calls.map(([line]) => String(line))).toContain("[rh-memory] recall skipped: no task text in the prompt\n");
+  });
+
+  it("bounds the staged query", async () => {
+    const { handlers } = await load({ taskQuery: "a".repeat(5000) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    expect(searchQueries()[0]).toHaveLength(1500);
+  });
+
+  it("builds the adapter-side task query from the wake issue", () => {
+    expect(buildPiMemoryTaskQuery({ issue: { title: " Fix retry ", description: "Backoff is wrong.\n" } })).toBe("Fix retry\nBackoff is wrong.");
+    expect(buildPiMemoryTaskQuery({ issue: { title: "Only title", description: null } })).toBe("Only title");
+    expect(buildPiMemoryTaskQuery({ issue: { title: "t".repeat(3000) } })).toHaveLength(1500);
+    expect(buildPiMemoryTaskQuery(undefined)).toBe("");
+    expect(buildPiMemoryTaskQuery({})).toBe("");
   });
 });
