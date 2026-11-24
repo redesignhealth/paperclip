@@ -968,7 +968,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const rawExitCode = attempt.proc.exitCode;
       const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
       const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
-      const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+      // The guard aborts Pi after repeated blocked calls; Pi then reports only a bare "This operation was aborted".
+      // Surface the guard's own stop line so the run record says why (TECH-10085).
+      const guardStopLine = attempt.proc.stderr.split(/\r?\n/).find((line) => line.startsWith("[paperclip-guard] stopping run:"))?.trim();
+      const fallbackErrorMessage = guardStopLine || parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
 
       return {
         exitCode: effectiveExitCode,
