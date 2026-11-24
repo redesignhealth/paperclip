@@ -4220,3 +4220,47 @@ describe("ashby relay routes in the bridge allowlist (TECH-9966)", () => {
       .toBe(`Route not allowed: ${method} ${requestPath}`);
   });
 });
+
+describe("company skill authoring routes in the bridge allowlist (TECH-10534)", () => {
+  const allowed: Array<[string, string]> = [
+    ["POST", "/api/companies/c1/skills"],
+    ["PATCH", "/api/companies/c1/skills/s1/files"],
+    ["POST", "/api/companies/c1/skills/s1/audit"],
+    ["GET", "/api/companies/c1/skills"],
+    ["GET", "/api/companies/c1/skills/s1"],
+    ["GET", "/api/companies/c1/skills/s1/files"],
+  ];
+  it.each(allowed)("admits %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes)).toBeNull();
+    }
+  });
+
+  const denied: Array<[string, string]> = [
+    ["POST", "/api/companies/c1/skills/import"],
+    ["POST", "/api/companies/c1/skills/install-catalog"],
+    ["POST", "/api/companies/c1/skills/scan-projects"],
+    ["POST", "/api/companies/c1/skills/browse-project"],
+    ["POST", "/api/companies/c1/skills/s1/install-update"],
+    ["POST", "/api/companies/c1/skills/s1/reset"],
+    ["POST", "/api/companies/c1/skills/s1/fork"],
+    ["POST", "/api/companies/c1/skills/s1/rename"],
+    ["POST", "/api/companies/c1/skills/s1/versions"],
+    ["DELETE", "/api/companies/c1/skills/s1"],
+    ["DELETE", "/api/companies/c1/skills/s1/files"],
+    ["PATCH", "/api/companies/c1/skills/s1"],
+    ["PUT", "/api/companies/c1/skills/s1/files"],
+    ["POST", "/api/companies/c1/skills/"],
+    ["POST", "/api/companies/c1/skills/extra/deep"],
+    ["PATCH", "/api/companies/c1/skills/s1/files/extra"],
+    ["POST", "/api/companies/c1/skills?x=1"],
+    ["POST", "/api/companies/c1/../secrets/skills"],
+  ];
+  it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))
+        .toBe(`Route not allowed: ${method} ${requestPath}`);
+    }
+  });
+});
+

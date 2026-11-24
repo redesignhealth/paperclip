@@ -271,7 +271,8 @@ function serializeRoutePolicies(
 // still enforces actor-level permissions on top of this allowlist; the list
 // exists to bound the surface area a compromised CLI could reach via the
 // reverse bridge. Keep this in sync with the Paperclip skill in
-// `skills/paperclip/SKILL.md` and `references/api-reference.md`.
+// `skills/paperclip/SKILL.md`, `references/api-reference.md`, and
+// `references/company-skills.md`.
 export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCallbackBridgeRouteRule[] = [
   // Runtime capability authentication is independently checked by the controller.
   { method: "POST", path: /^\/runtime-tools\/github\/credentials$/ },
@@ -301,6 +302,15 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/files$/ },
+  // Agent-authored company skills. The server still enforces the company boundary,
+  // company skill policy, low-trust denial, editable/read-only check, and
+  // task-bound-run on create. Deliberately NOT allowed from the sandbox: import,
+  // install-catalog, browse-project/scan-projects, install-update, reset, rename,
+  // fork, versions, DELETE skill or skill file, and PATCH of the skill resource
+  // (which can flip sharingScope to public_link).
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills$/ },
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/files$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/audit$/ },
   { method: "GET", path: /^\/api\/projects\/[^/]+$/ },
   { method: "GET", path: /^\/api\/goals\/[^/]+$/ },
 

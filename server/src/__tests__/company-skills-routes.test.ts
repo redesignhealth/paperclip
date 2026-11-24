@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { unprocessable } from "../errors.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockCaptureRunIdentity = vi.hoisted(() => vi.fn());
@@ -1496,6 +1497,113 @@ describe("company skill mutation permissions", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(mockCompanySkillService.installFromCatalog).not.toHaveBeenCalled();
+  });
+
+  it("allows standard agents without skills:create grant to create local skills when no policy exists", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockCompanySkillService.createLocalSkill).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ name: "Custom Agent Skill" }),
+      expect.anything(),
+    );
+  });
+
+  it("allows standard agents without skills:create grant to patch skill files when no policy exists", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .patch("/api/companies/company-1/skills/skill-1/files")
+      .send({ path: "SKILL.md", content: "# Custom Skill" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.updateFile).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      "SKILL.md",
+      "# Custom Skill",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("blocks cross-company agents from creating company skills", async () => {
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-2/skills")
+      .send({ name: "Custom Agent Skill" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      code: "skill_company_boundary_denied",
+    });
+    expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
+  });
+
+  it("denies low-trust agents from creating skills with platform invariant error", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision(
+      "deny_low_trust_boundary",
+      "Low-trust agents cannot use company-wide skill APIs.",
+    ));
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      code: "skill_actor_restricted",
+      details: { reason: "platform_invariant" },
+    });
+    expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
+  });
+
+  it("rejects editing files on a non-editable skill with 422", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+    mockCompanySkillService.updateFile.mockRejectedValueOnce(unprocessable("This skill cannot be edited."));
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .patch("/api/companies/company-1/skills/skill-1/files")
+      .send({ path: "SKILL.md", content: "# Edited Content" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "This skill cannot be edited.",
+    });
+  });
+
+  it("blocks skill creation when an explicit skill policy denies skills.create for agents", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+    mockCompanySkillPolicyService.evaluate.mockResolvedValue(denySkillPolicy("skills.create"));
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      code: "skill_policy_denied",
+      error: "Skill action denied by company policy",
+    });
+    expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
+  });
+
+  it("rejects skill creation from an agent-JWT run that is not task-bound", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Skill tools require a task-bound run",
+    });
+    expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
   });
 
   it("passes store list filters and category count requests to the service", async () => {

@@ -910,6 +910,58 @@ describe("agent skill routes", () => {
     );
   });
 
+  it("allows an agent to sync skills to its own configuration with mode add", async () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    mockAgentService.getById.mockResolvedValue(makeAgent("claude_local"));
+    mockAccessService.decide.mockImplementation(async ({ actor, action, resource }) => {
+      if (actor.type === "agent" && action === "agent_config:update") {
+        if (actor.agentId === resource.agentId) {
+          return { allowed: true, reason: "allow_self", explanation: "Allowed self update" };
+        }
+        return { allowed: false, reason: "deny_no_grant", explanation: "Missing permission: agents:configure" };
+      }
+      return { allowed: true, reason: "allow_explicit_grant", explanation: "Allowed" };
+    });
+
+    const res = await requestApp(
+      await createApp(undefined, { type: "agent", agentId, companyId: "company-1" }),
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/skills/sync?companyId=company-1`)
+        .send({ desiredSkills: ["paperclipai/paperclip/paperclip"], mode: "add" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("blocks an agent from syncing skills to a different agent without agents:configure", async () => {
+    const callerAgentId = "11111111-1111-4111-8111-111111111111";
+    const targetAgentId = "22222222-2222-4222-8222-222222222222";
+    mockAgentService.getById.mockImplementation(async (id: string) => ({
+      ...makeAgent("claude_local"),
+      id,
+    }));
+    mockAccessService.decide.mockImplementation(async ({ actor, action, resource }) => {
+      if (actor.type === "agent" && action === "agent_config:update") {
+        if (actor.agentId === resource.agentId) {
+          return { allowed: true, reason: "allow_self", explanation: "Allowed self update" };
+        }
+        return { allowed: false, reason: "deny_no_grant", explanation: "Missing permission: agents:configure" };
+      }
+      return { allowed: true, reason: "allow_explicit_grant", explanation: "Allowed" };
+    });
+
+    const res = await requestApp(
+      await createApp(undefined, { type: "agent", agentId: callerAgentId, companyId: "company-1" }),
+      (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${targetAgentId}/skills/sync?companyId=company-1`)
+        .send({ desiredSkills: ["paperclipai/paperclip/paperclip"], mode: "add" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
   it("syncs skills without resolving required user-secret env bindings", async () => {
     const adapterConfig = {
       env: {
