@@ -9,7 +9,10 @@ import { resolvePiGuardPolicy, type PiGuardPolicy } from "./guard-policy.js";
 // contain a backtick or a dollar-brace sequence.
 export const PI_GUARD_PROFILE_ENV = "PAPERCLIP_PI_GUARD_PROFILE";
 export const PI_GUARD_EXTENSION_FILE = "paperclip-guard.mjs";
-/** After this many blocked calls the run is aborted instead of letting the agent keep retrying. */
+/**
+ * After this many blocked calls IN A ROW the run is aborted instead of letting the agent keep retrying. An allowed
+ * call resets the count, so a long productive session is not stopped by a few unrelated refusals (TECH-10085).
+ */
 export const PI_GUARD_MAX_BLOCKS = 3;
 
 export const PI_GUARD_EVALUATOR_SOURCE = String.raw`
@@ -422,11 +425,15 @@ export default function paperclipGuard(pi) {
     } catch (error) {
       result = deny("a guard error (" + (error && error.message ? error.message : "unknown") + "); failing closed");
     }
-    if (!result) return undefined;
+    if (!result) {
+      blocks = 0;
+      return undefined;
+    }
     blocks++;
     const reason = blockMessage(result);
     console.error("[paperclip-guard] blocked " + event.toolName + ": " + (result.why || result.what));
     if (blocks >= MAX_BLOCKS) {
+      console.error("[paperclip-guard] stopping run: " + blocks + " consecutive blocked tool calls (last: " + (result.why || result.what) + ")");
       try { ctx.abort(); } catch { /* best effort */ }
       return { block: true, reason: reason + " Repeated blocked calls: this run is being stopped.", terminate: true };
     }
