@@ -88,6 +88,13 @@ describe("GitHub App installation credentials", () => {
     expect(mints(calls)).toBe(2);
   });
 
+  it("refuses an empty permissions object instead of asking for every installation permission", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const result = await mintGitHubAppInstallationToken({ repositories: ["redesignhealth/a"], permissions: {}, env, fetchImpl, now: () => T0 });
+    expect(result.ok).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
   it.each([
     ["empty list", []],
     ["missing list", undefined],

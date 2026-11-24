@@ -82,6 +82,7 @@ export function packageRelayGitRoutes(db: Db, deps: PackageRelayGitDeps = {}) {
     if (secret && secret.status === "active") return secrets.resolveSecretValue(companyId, secret.id, "latest");
     // No stored token: a read-only App installation token for this one allowlisted repository.
     const minted = await mintGitHubAppInstallationToken({ repositories: [repository], permissions: GITHUB_APP_READ_PERMISSIONS, env });
+    if (!minted.ok) logger.warn({ companyId }, "git relay could not mint a GitHub App read token");
     return minted.ok ? minted.value.token : null;
   });
 

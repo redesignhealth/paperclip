@@ -7,7 +7,7 @@ import { githubAppJwt, githubBotRequest } from "./chat-github-client.js";
  * in a short-lived in-memory cache, and never logged, persisted, or placed in run identity.
  */
 
-/** The only permissions this path ever requests. */
+/** The default permissions for managed git/gh operations; the git relay requests GITHUB_APP_READ_PERMISSIONS instead. */
 export const GITHUB_APP_TOKEN_PERMISSIONS = { contents: "write", pull_requests: "write" } as const;
 
 /** Read-only clone/fetch access, for the git relay (TECH-9792). Never carries write scope. */
@@ -85,6 +85,8 @@ export async function mintGitHubAppInstallationToken(input: {
   const fetchImpl = input.fetchImpl ?? fetch;
   const now = input.now ?? Date.now;
   const permissions = input.permissions ?? GITHUB_APP_TOKEN_PERMISSIONS;
+  // GitHub treats an empty permissions object as "all installation permissions"; never send one.
+  if (Object.keys(permissions).length === 0) return { ok: false, error: "A GitHub App token request needs explicit permissions" };
   const permissionKey = Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join("+");
   const key = `${config.appId}:${config.installationId}:${scope.fullNames.join(",")}:${permissionKey}`;
   try {
