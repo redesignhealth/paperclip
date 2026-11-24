@@ -295,7 +295,11 @@ describe("company skill mutation permissions", () => {
     return { companySkillRoutes, errorHandler };
   });
 
-  function createApp(actor: Record<string, unknown>, onResponse?: (res: express.Response) => void) {
+  function createApp(
+    actor: Record<string, unknown>,
+    onResponse?: (res: express.Response) => void,
+    dbOverride?: any,
+  ) {
     const { companySkillRoutes, errorHandler } = routeModules.value;
     const app = express();
     app.use(express.json());
@@ -304,7 +308,7 @@ describe("company skill mutation permissions", () => {
       onResponse?.(res);
       next();
     });
-    app.use("/api", companySkillRoutes({} as any));
+    app.use("/api", companySkillRoutes(dbOverride ?? ({} as any)));
     app.use(errorHandler);
     return app;
   }
@@ -1562,18 +1566,154 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
   });
 
-  it("rejects editing files on a non-editable skill with 422", async () => {
+  it("denies agents from creating skills with forkedFromSkillId", async () => {
     mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
-    mockCompanySkillService.updateFile.mockRejectedValueOnce(unprocessable("This skill cannot be edited."));
 
     const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill", forkedFromSkillId: "11111111-1111-4111-8111-111111111111" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      code: "skill_agent_field_restricted",
+      error: "Agents cannot fork skills when creating a company skill",
+    });
+    expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
+  });
+
+  it("denies agents from creating skills with public_link and global sharingScope", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const publicRes = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill", sharingScope: "public_link" });
+
+    expect(publicRes.status, JSON.stringify(publicRes.body)).toBe(403);
+    expect(publicRes.body).toMatchObject({
+      code: "skill_agent_field_restricted",
+      error: "Agents can only create company skills with 'company' sharing scope",
+    });
+
+    const globalRes = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill", sharingScope: "global" });
+
+    expect(globalRes.status).toBe(400);
+    expect(mockCompanySkillService.createLocalSkill).not.toHaveBeenCalled();
+  });
+
+  it("allows agents to create skills with company sharingScope", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+
+    const res = await request(await createApp(assignedAgentActor()))
+      .post("/api/companies/company-1/skills")
+      .send({ name: "Custom Agent Skill", sharingScope: "company" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockCompanySkillService.createLocalSkill).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ name: "Custom Agent Skill", sharingScope: "company" }),
+      expect.anything(),
+    );
+  });
+
+  it("allows board users to create skills with public_link and forkedFromSkillId", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "user-1" }))
+      .post("/api/companies/company-1/skills")
+      .send({
+        name: "Board Forked Skill",
+        sharingScope: "public_link",
+        forkedFromSkillId: "11111111-1111-4111-8111-111111111111",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockCompanySkillService.createLocalSkill).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        name: "Board Forked Skill",
+        sharingScope: "public_link",
+        forkedFromSkillId: "11111111-1111-4111-8111-111111111111",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("rejects file patch without idempotencyKey from an agent-JWT run that is not task-bound", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }))
       .patch("/api/companies/company-1/skills/skill-1/files")
       .send({ path: "SKILL.md", content: "# Edited Content" });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body).toMatchObject({
-      error: "This skill cannot be edited.",
+      error: "Skill tools require a task-bound run",
     });
+    expect(mockCompanySkillService.updateFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects file patch from an Ask or Plan mode task", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({
+      run: { id: "run-1", responsibleUserId: "validated-owner", nativeIssueId: "issue-1" },
+    });
+    const askDb = {
+      select: () => ({
+        from: () => ({
+          where: async () => [{ id: "issue-1", companyId: "company-1", workMode: "ask", conversationSessionGeneration: 0 }],
+        }),
+      }),
+    };
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }, undefined, askDb))
+      .patch("/api/companies/company-1/skills/skill-1/files")
+      .send({ path: "SKILL.md", content: "# Edited Content" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Skill creation is unavailable in Ask or Plan mode",
+    });
+    expect(mockCompanySkillService.updateFile).not.toHaveBeenCalled();
+  });
+
+  it("allows file patch from a skill_test mode task", async () => {
+    mockAccessService.decide.mockResolvedValue(denySkillChangeDecision());
+    mockCaptureRunIdentity.mockResolvedValueOnce({
+      run: { id: "run-1", responsibleUserId: "validated-owner", nativeIssueId: "issue-1" },
+    });
+    const skillTestDb = {
+      select: () => ({
+        from: () => ({
+          where: async () => [{ id: "issue-1", companyId: "company-1", workMode: "skill_test", conversationSessionGeneration: 0 }],
+        }),
+      }),
+    };
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }, undefined, skillTestDb))
+      .patch("/api/companies/company-1/skills/skill-1/files")
+      .send({ path: "SKILL.md", content: "# Edited Content" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockCompanySkillService.updateFile).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      "SKILL.md",
+      "# Edited Content",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("rejects skill audit from an agent-JWT run that is not task-bound", async () => {
+    mockCaptureRunIdentity.mockResolvedValueOnce({ run: { responsibleUserId: "validated-owner" } });
+
+    const res = await request(await createApp({ ...assignedAgentActor(), source: "agent_jwt" }))
+      .post("/api/companies/company-1/skills/skill-1/audit");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "Skill tools require a task-bound run",
+    });
+    expect(mockCompanySkillService.auditSkill).not.toHaveBeenCalled();
   });
 
   it("blocks skill creation when an explicit skill policy denies skills.create for agents", async () => {

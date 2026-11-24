@@ -2436,7 +2436,7 @@ function resolveManagedSkillsRoot(companyId: string) {
  * reserved subtrees, project-scanned skills, unmanaged `local_path` skills, and
  * all remote source types, which keep their own identity/update semantics.
  */
-function isPaperclipManagedRenameTarget(skill: CompanySkill): boolean {
+export function isPaperclipManagedLocalSkill(skill: CompanySkill): boolean {
   if (skill.sourceType !== "local_path") return false;
   if (getSkillMeta(skill).sourceKind !== "managed_local") return false;
   const skillDir = normalizeSkillDirectory(skill);
@@ -2448,6 +2448,8 @@ function isPaperclipManagedRenameTarget(skill: CompanySkill): boolean {
   // Managed skills are a direct child of the root; reject reserved `__*` dirs.
   return segments.length === 1 && !segments[0]!.startsWith("__");
 }
+
+const isPaperclipManagedRenameTarget = isPaperclipManagedLocalSkill;
 
 function resolveLocalSkillFilePath(skill: CompanySkill, relativePath: string) {
   const normalized = normalizePortablePath(relativePath);
@@ -4817,6 +4819,12 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
 
       if (format.expectedVersionId !== undefined && skill.currentVersionId !== format.expectedVersionId) {
         throw conflict("Skill version changed. Read the current version before retrying.");
+      }
+
+      if (actor?.type === "agent" && !isPaperclipManagedLocalSkill(skill)) {
+        throw forbidden("Agents can only edit managed local skills", {
+          code: "skill_agent_edit_restricted",
+        });
       }
 
       const source = deriveSkillSourceInfo(skill);

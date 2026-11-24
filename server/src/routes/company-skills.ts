@@ -1193,6 +1193,18 @@ export function companySkillRoutes(db: Db) {
       await assertCanMutateCompanySkills(req, companyId, "skills.create", {
         sourceType: "generated",
       });
+      if (req.actor.type === "agent") {
+        if (req.body.forkedFromSkillId != null) {
+          throw forbidden("Agents cannot fork skills when creating a company skill", {
+            code: "skill_agent_field_restricted",
+          });
+        }
+        if (req.body.sharingScope !== undefined && req.body.sharingScope !== "company") {
+          throw forbidden("Agents can only create company skills with 'company' sharing scope", {
+            code: "skill_agent_field_restricted",
+          });
+        }
+      }
       const { idempotencyKey, ...input } = req.body;
       const actor = getActorInfo(req);
       const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
@@ -1277,11 +1289,11 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+        ? await projectToolContext(db, req.actor, true, "Skill") : null;
       const { idempotencyKey, expectedVersionId, ...input } = req.body;
       if (idempotencyKey) {
         const actor = getActorInfo(req);
-        const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
-          ? await projectToolContext(db, req.actor, true, "Skill") : null;
         const receiptKey = `skill-file:${companyId}:${actor.actorId}:${runContext?.issue.id ?? "board"}:${skillId}:${idempotencyKey}`;
         const fingerprint = createHash("sha256").update(JSON.stringify({ ...input, expectedVersionId })).digest("hex");
         const rollbackState: { current: { restore: () => Promise<void>; versionId: string | null } | null } = { current: null };
@@ -1347,12 +1359,14 @@ export function companySkillRoutes(db: Db) {
         agentId: actor.agentId,
         runId: actor.runId,
         agentApiKeyId: actor.agentApiKeyId,
+        issueId: runContext?.issue.id,
         action: "company.skill_file_updated",
         entityType: "company_skill",
         entityId: skillId,
         details: {
           path: result.path,
           markdown: result.markdown,
+          sourceIssueId: runContext?.issue.id ?? null,
         },
       });
 
@@ -1555,6 +1569,8 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.test", () => skillPolicyResource({ companyId, skillId }));
+      const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+        ? await projectToolContext(db, req.actor, true, "Skill") : null;
       const result = await svc.auditSkill(companyId, skillId);
       if (!result) {
         res.status(404).json({ error: "Skill not found" });
@@ -1569,6 +1585,7 @@ export function companySkillRoutes(db: Db) {
         agentId: actor.agentId,
         runId: actor.runId,
         agentApiKeyId: actor.agentApiKeyId,
+        issueId: runContext?.issue.id,
         action: "company.skill_audited",
         entityType: "company_skill",
         entityId: skillId,
@@ -1578,6 +1595,7 @@ export function companySkillRoutes(db: Db) {
           installedHash: result.installedHash,
           originHash: result.originHash,
           scanVersion: result.scanVersion,
+          sourceIssueId: runContext?.issue.id ?? null,
         },
       });
 

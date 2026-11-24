@@ -28,7 +28,7 @@ set.
 
 ## Authoring Your Own Skill (Agents)
 
-When authoring or modifying skills from a sandboxed agent (e.g. Hermes or Kubernetes), use the callback bridge to create and maintain managed local company skills. Files written to Hermes or provider-home paths (`~/.hermes/skills` and `$HERMES_HOME`) are ephemeral and deleted when the run ends; task workspace files and company skills (`company/<companyId>/<slug>`) are durable. Only company-created skills are editable; bundled, GitHub, and URL skills are read-only.
+When authoring or modifying skills from a sandboxed agent (e.g. Hermes or Kubernetes), use the callback bridge to create and maintain managed local company skills. Agents can only edit managed-local skills (key form `company/<companyId>/<slug>`) via the sandbox; bundled, shared, GitHub/skills.sh/URL, and project-scanned skills are read-only to agents. Files written to Hermes or provider-home paths (`~/.hermes/skills` and `$HERMES_HOME`) are ephemeral and deleted when the run ends; task workspace files and managed local company skills are durable.
 
 **Available Bridge Endpoints**:
 - `POST /api/companies/{companyId}/skills` — create a managed local skill.
@@ -39,7 +39,7 @@ When authoring or modifying skills from a sandboxed agent (e.g. Hermes or Kubern
 The sandbox bridge deliberately blocks administrative and external skill operations: `import`, `install-catalog`, `scan-projects`/`browse-project`, `install-update`, `reset`, `rename`, `fork`, `versions`, `DELETE` of a skill or skill file, and `PATCH` of the skill resource itself (which can flip `sharingScope` to `public_link`). If any of these are needed, ask a board user.
 
 **Rules and Workflow**:
-- **Task-bound run requirement**: `POST /api/companies/{companyId}/skills` requires an active, task-bound run in standard mode (it fails from a bare heartbeat with `Skill tools require a task-bound run`).
+- **Task-bound runs and company scope**: Create, file edits, and audit require an active, task-bound run in standard or skill_test mode; agent-created skills are always company-scoped (`sharingScope: "company"`, no fork or public sharing).
 - **Metadata from frontmatter**: In managed local skills, `SKILL.md` frontmatter drives name and description. No separate metadata call is needed.
 - **Audit before attaching**: After authoring or editing files, call `POST /api/companies/{companyId}/skills/{skillId}/audit` and fix any hard-stop findings before attaching the skill to any agent.
 - **Assignment**: Self-attach works via `POST /api/agents/{agentId}/skills/sync` with `mode: "add"`. Attaching the skill to another agent requires the `agents:configure` grant.
