@@ -18,6 +18,11 @@ import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { managedInstallCheck } from "../services/default-mcp-install-gate.js";
 import { cloneTemplateAccess } from "../services/default-mcp-setup.js";
+import {
+  COMMS_TEMPLATE_REPROVISION_CONFIRMATION,
+  CommsTemplateReprovisionConfirmationError,
+  reprovisionCommsTemplate,
+} from "../services/comms-template-reprovision.js";
 import type { Db } from "@paperclipai/db";
 import {
   COMMS_BOARD_REVIEWED_TOOLS,
@@ -1185,6 +1190,138 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
     expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 1)).toHaveLength(1);
     // Idempotent: a healed template is not selected again.
     expect(await sweepCompanyTemplates(at(2000))).toBe(0);
+  });
+
+  describe("restoring an archived managed template (comms-template-reprovision)", () => {
+    const operator = { actorType: "user", actorId: "operator" } as never;
+    const archiveTemplate = async (companyId: string) => {
+      const template = (await templateRow(companyId))!;
+      await toolAccessService(db).archiveConnection(template.id, companyId, operator);
+      return (await templateRow(companyId)) ?? template;
+    };
+    /** An org-authored connection that shadows the template name (what an OAuth reconnect left behind in prod). */
+    async function handMadeTemplate(companyId: string) {
+      const [application] = await db
+        .insert(toolApplications)
+        .values({ companyId, applicationKey: `hand-${randomUUID().slice(0, 6)}`, name: `hand made ${randomUUID().slice(0, 4)}`, type: "mcp_http", status: "active" })
+        .returning();
+      const [connection] = await db
+        .insert(toolConnections)
+        .values({ companyId, applicationId: application!.id, name: "rh-comms-board", uid: `hand/${randomUUID()}`, transport: "mcp_remote", authKind: "oauth", credentialPolicy: "shared", status: "active", enabled: true, config: { url: "https://8.8.8.8/mcp" }, transportConfig: { url: "https://8.8.8.8/mcp" } })
+        .returning();
+      return connection!;
+    }
+    const commsEntry = async (agentId: string) => JSON.stringify(((await agentRow(agentId)).metadata as { defaultMcp: { entries: Record<string, unknown> } }).defaultMcp.entries["comms-board"]);
+    const reprovision = (companyId: string, ctx: Parameters<typeof reprovisionCommsTemplate>[2] = {}, extra: { dryRun?: boolean; confirm?: string } = {}) =>
+      reprovisionCommsTemplate(db, { companyId, ...extra }, { scope: { mode: "all" }, ...ctx });
+
+    it("refuses while a competing connection holds the name, then restores the SAME row with no mint and no change to any working agent", async () => {
+      const { companyId, ownerId, fetchMock, template } = await readyCompany();
+      vi.stubGlobal("fetch", fetchMock);
+      const working = await createAgent(companyId, ownerId);
+      expect((await agentEntry(working.id)).setup.state).toBe("ready");
+      const entryBefore = await commsEntry(working.id);
+      const claimBefore = readTemplateClaim(template.config)!;
+      await archiveTemplate(companyId);
+      const archived = (await templateRow(companyId))!;
+      expect(archived.status).toBe("archived");
+      const competitor = await handMadeTemplate(companyId);
+
+      // A new agent cannot be provisioned: the name resolves to the unsupported OAuth connection.
+      const stuck = await createAgent(companyId, ownerId);
+      expect((await agentEntry(stuck.id)).setup).toMatchObject({ state: "pending", reason: "template_unsupported" });
+
+      // Dry run names the blocker and changes nothing.
+      const blocked = await reprovision(companyId);
+      expect(blocked).toMatchObject({ dryRun: true, result: "refused_competing_template", agentsLeftUntouched: 2 });
+      expect(blocked.competing).toEqual([{ id: competitor.id, name: "rh-comms-board", status: "active", authKind: "oauth" }]);
+
+      // The operator renames the hand-made connection (an ordinary update); the dry run now describes the restore.
+      await db.update(toolConnections).set({ name: "rh-comms-board (hand-made, retired)" }).where(eq(toolConnections.id, competitor.id));
+      const dry = await reprovision(companyId);
+      expect(dry).toMatchObject({ dryRun: true, result: "would_restore", template: { id: template.id, status: "archived" } });
+      expect(dry.changes?.length).toBeGreaterThan(0);
+      expect((await templateRow(companyId))!.status).toBe("archived");
+
+      await expect(reprovision(companyId, {}, { dryRun: false })).rejects.toBeInstanceOf(CommsTemplateReprovisionConfirmationError);
+      const { db: _unused, ...templateCtx } = ctxFor(fetchMock);
+      const done = await reprovision(companyId, templateCtx, { dryRun: false, confirm: COMMS_TEMPLATE_REPROVISION_CONFIRMATION });
+      expect(done).toMatchObject({ dryRun: false, result: "restored", template: { id: template.id, status: "draft" } });
+      await waitForScheduledCompanyTemplates();
+
+      // Same row, republished at the current version from the stored credential; nothing was minted.
+      const restored = (await templateRow(companyId))!;
+      expect(restored.id).toBe(template.id);
+      expect(restored.status).toBe("active");
+      expect(readTemplateClaim(restored.config)).toMatchObject({ state: "ready", allowlistVersion: 3, secretId: claimBefore.secretId, principalSub: claimBefore.principalSub, tokenExpiresAt: claimBefore.tokenExpiresAt });
+      expect(fetchMock.calls.mints.filter((mint) => mint.scopes.length === 1)).toHaveLength(1);
+      expect((await catalogOf(restored.id)).filter((row) => row.status === "active").map((row) => row.toolName).sort()).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
+
+      // The working agent is byte-for-byte what it was (binding, board identity, connection).
+      expect(await commsEntry(working.id)).toBe(entryBefore);
+      // The agent that was stuck is provisioned from the restored template on its next retry.
+      await runDefaultMcpSetupForAgent({ db, fetchImpl: fetchMock, now: () => new Date(Date.now() + 3 * 3_600_000) }, { companyId, agentId: stuck.id });
+      expect((await agentEntry(stuck.id)).setup.state).toBe("ready");
+      // A second run is refused: the template is no longer archived.
+      expect(await reprovision(companyId, {}, { dryRun: false, confirm: COMMS_TEMPLATE_REPROVISION_CONFIRMATION })).toMatchObject({ result: "refused_template_not_archived" });
+      const activity = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "company.default_mcp_template_reprovisioned")));
+      expect(activity).toHaveLength(1);
+      expect(JSON.stringify(activity)).not.toContain(TEMPLATE_TOKEN);
+    });
+
+    it("makes the template's application active again when archiving the template had archived it", async () => {
+      const { companyId, fetchMock, template } = await readyCompany();
+      await archiveTemplate(companyId);
+      const [archivedApp] = await db.select().from(toolApplications).where(eq(toolApplications.id, template.applicationId));
+      expect(archivedApp!.status).toBe("archived");
+      const { db: _unused, ...templateCtx } = ctxFor(fetchMock);
+      expect(await reprovision(companyId, templateCtx, { dryRun: false, confirm: COMMS_TEMPLATE_REPROVISION_CONFIRMATION })).toMatchObject({ result: "restored" });
+      await waitForScheduledCompanyTemplates();
+      const [app] = await db.select().from(toolApplications).where(eq(toolApplications.id, template.applicationId));
+      expect(app).toMatchObject({ status: "active", archivedAt: null });
+      expect(readTemplateClaim((await templateRow(companyId))!.config)).toMatchObject({ state: "ready", allowlistVersion: 3 });
+    });
+
+    it("refuses, and changes nothing, when a precondition does not hold", async () => {
+      // No template at all.
+      enableFeature();
+      const bare = await seedCompany();
+      expect(await reprovision(bare)).toMatchObject({ result: "refused_no_template" });
+      // Archived company.
+      const gone = await seedCompany({ status: "archived" });
+      expect(await reprovision(gone)).toMatchObject({ result: "refused_company_inactive" });
+      // Feature off.
+      const off = await reprovision(bare, { env: {} as NodeJS.ProcessEnv });
+      expect(off).toMatchObject({ result: "refused_feature_disabled" });
+
+      // Template still live.
+      const live = await readyCompany();
+      expect(await reprovision(live.companyId)).toMatchObject({ result: "refused_template_not_archived" });
+
+      // Archived, but its stored credential is gone / expired / an agent points at the template row.
+      const gen = async () => {
+        const c = await readyCompany();
+        await archiveTemplate(c.companyId);
+        return c;
+      };
+      const noSecret = await gen();
+      const claim = readTemplateClaim((await templateRow(noSecret.companyId))!.config)!;
+      await db.update(companySecrets).set({ deletedAt: new Date() }).where(eq(companySecrets.id, claim.secretId!));
+      expect(await reprovision(noSecret.companyId)).toMatchObject({ result: "refused_secret_unavailable" });
+
+      const expired = await gen();
+      expect(await reprovision(expired.companyId, { now: () => new Date("2030-01-01T00:00:00Z") })).toMatchObject({ result: "refused_token_expired" });
+
+      const bound = await gen();
+      vi.stubGlobal("fetch", bound.fetchMock);
+      const agent = await createAgent(bound.companyId, bound.ownerId);
+      const row = await agentRow(agent.id);
+      const metadata = JSON.parse(JSON.stringify(row.metadata));
+      metadata.defaultMcp.entries["comms-board"].connectionId = bound.template.id;
+      await db.update(agents).set({ metadata }).where(eq(agents.id, agent.id));
+      expect(await reprovision(bound.companyId)).toMatchObject({ result: "refused_agent_bound_to_template", boundAgents: [agent.id] });
+      expect((await templateRow(bound.companyId))!.status).toBe("archived");
+    });
   });
 
   // A catalog re-read only ever adds tools to a published template: any failure leaves it exactly as it was (TECH-9887).

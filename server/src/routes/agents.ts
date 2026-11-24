@@ -134,6 +134,7 @@ import {
   CommsCatalogResyncInProgressError,
   resyncCommsCatalogs,
 } from "../services/comms-catalog-resync.js";
+import { CommsTemplateReprovisionConfirmationError, CommsTemplateReprovisionInProgressError, reprovisionCommsTemplate } from "../services/comms-template-reprovision.js";
 import {
   COMMS_SHARED_SYNC_BATCH_LIMIT,
   CommsSharedSyncConfirmationError,
@@ -4246,6 +4247,34 @@ export function agentRoutes(
     } catch (err) {
       if (err instanceof CommsCatalogResyncConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
       if (err instanceof CommsCatalogResyncInProgressError) throw conflict("A catalog resync run is already in progress for this company");
+      throw err;
+    }
+  });
+
+  // Instance-admin only, company-scoped. Restores a company's ARCHIVED managed comms-board template in place (same row,
+  // same stored credential, no mint, no agent touched) and re-runs the template review. Dry run by default and it
+  // reports exactly what it would change or why it refuses; a real run needs dryRun:false plus the confirmation string.
+  router.post("/companies/:companyId/default-mcp/comms-template-reprovision", async (req, res) => {
+    assertBoard(req);
+    assertInstanceAdmin(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const actor = getActorInfo(req);
+    const body = (req.body ?? {}) as { dryRun?: unknown; confirm?: unknown };
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") throw badRequest("dryRun must be a boolean");
+    if (body.confirm !== undefined && typeof body.confirm !== "string") throw badRequest("confirm must be a string");
+    try {
+      res.json(
+        await reprovisionCommsTemplate(db, {
+          companyId,
+          dryRun: body.dryRun !== false,
+          confirm: typeof body.confirm === "string" ? body.confirm : undefined,
+          actorId: actor.actorId,
+        }),
+      );
+    } catch (err) {
+      if (err instanceof CommsTemplateReprovisionConfirmationError) throw badRequest("A real run requires dryRun=false and the confirmation string");
+      if (err instanceof CommsTemplateReprovisionInProgressError) throw conflict("A template reprovision run is already in progress for this company");
       throw err;
     }
   });
