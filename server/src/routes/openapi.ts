@@ -3,6 +3,7 @@ import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAutho
 import { commsWakeEventSchema } from "../services/comms-wake-event.js";
 import { MISSING_ENTRY_BATCH_LIMIT } from "../services/default-mcp-missing-entry-enrollment.js";
 import { COMMS_CATALOG_RESYNC_BATCH_LIMIT } from "../services/comms-catalog-resync.js";
+import { COMMS_WAKE_BATCH_LIMIT, COMMS_WAKE_STATUS_LIMIT } from "../services/comms-wake-admin.js";
 import { COMMS_OWNER_ASSIGNMENT_MAX_AGENTS } from "../services/comms-owner-assignment.js";
 import { COMMS_IDENTITY_REISSUE_MAX_AGENTS } from "../services/comms-identity-reissue.js";
 import { BRAIN_BINDING_BATCH_LIMIT } from "../services/arcana-brain-binding.js";
@@ -1438,6 +1439,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/default-mcp/arcana-brain-backfill",
   "POST /api/companies/{companyId}/default-mcp/comms-credential-rescope",
   "POST /api/companies/{companyId}/default-mcp/comms-catalog-resync",
+  "POST /api/companies/{companyId}/comms-wake/enrol",
+  "GET /api/companies/{companyId}/comms-wake/status",
   "POST /api/companies/{companyId}/default-mcp/comms-owner-assignment",
   "POST /api/companies/{companyId}/default-mcp/comms-identity-reissue",
   "POST /api/companies/{companyId}/default-mcp/comms-shared-sync",
@@ -3676,6 +3679,43 @@ registry.registerPath({
     ),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/comms-wake/enrol",
+  tags: ["comms-board"],
+  summary: "Enrol existing agents in comms board wakes",
+  description: "Registers existing agents with the board wake feature through the same registration as new agents: a vault signing secret, a registration row and the board's wake address. Targets one agent (`agentId`) or a batch of the company's agents (follow `nextCursor` as `afterId`). Requires the company setting `commsBoardWakeEnabled`; agents whose board identity is not ready, terminated agents and agents already registered are skipped or reported without any change. A registration that cannot finish stays pending with a reason and the default-MCP sweep retries it. Defaults to a dry run; a real run needs dryRun=false and the confirmation string. Reports agent ids, results and reasons only, never a secret. Instance admin only.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z.object({
+        agentId: z.string().uuid().optional(),
+        dryRun: z.boolean().optional(),
+        confirm: z.string().optional(),
+        limit: z.number().int().min(1).max(COMMS_WAKE_BATCH_LIMIT).optional(),
+        afterId: z.string().uuid().optional(),
+      }),
+    ),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/comms-wake/status",
+  tags: ["comms-board"],
+  summary: "Report comms board wake registration status of a company's agents",
+  description: "Per agent: registered, pending (with the reason), not enrolled (with `board_not_ready` when its board identity is not ready) or not eligible (terminated, awaiting approval), plus counts and whether the company setting is on. Paged with `limit` and `afterId`. Never returns a secret. Instance admin only.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      limit: z.coerce.number().int().min(1).max(COMMS_WAKE_STATUS_LIMIT).optional(),
+      afterId: z.string().uuid().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({

@@ -196,3 +196,10 @@ any new fork patch; remove one when the patch is upstreamed.
 - `server/src/services/comms-wake-signature.ts` Standard Webhooks verification
 - `server/src/__tests__/comms-wake-routes.test.ts`
 - `server/src/__tests__/comms-wake-signature.test.ts`
+
+## Comms board wake for existing agents (TECH-9914)
+
+- `server/src/services/comms-wake-admin.ts` operator enrolment of existing agents and the status report
+- `server/src/routes/comms-wake-admin.ts` instance-admin routes under `/companies/:companyId/comms-wake`
+- `server/src/__tests__/comms-wake-admin.test.ts`
+- `server/src/__tests__/comms-wake-admin-routes.test.ts`

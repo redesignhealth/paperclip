@@ -114,6 +114,7 @@ import { caseHandoffRoutes } from "./routes/case-handoffs.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { routineRoutes } from "./routes/routines.js";
 import { commsWakeRoutes } from "./routes/comms-wake.js";
+import { commsWakeAdminRoutes } from "./routes/comms-wake-admin.js";
 import { environmentRoutes } from "./routes/environments.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
@@ -927,6 +928,7 @@ export async function createApp(
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(commsWakeRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(commsWakeAdminRoutes(db));
   api.use(
     environmentRoutes(db, {
       pluginWorkerManager: workerManager,
