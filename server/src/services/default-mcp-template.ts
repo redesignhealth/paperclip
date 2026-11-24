@@ -69,6 +69,7 @@ import {
   type FetchLike,
 } from "./comms-board-provisioner-client.js";
 import {
+  DEFAULT_MCP_BACKOFF_MAX_MS,
   DEFAULT_MCP_LEASE_MS,
   DEFAULT_MCP_MANAGED_CONFIG_KEY,
   DEFAULT_MCP_MAX_ATTEMPTS,
@@ -182,6 +183,7 @@ type ClaimPatch = Partial<
     | "allowlistVersion"
     | "missingReviewedTools"
     | "missingCheckAt"
+    | "attemptCount"
     | "readyAt"
     | "ownerUserId"
     | "ownerEmailNorm"
@@ -764,11 +766,10 @@ async function applyReviewedAllowlist(
     if (missingTools.length > 0) {
       logger.warn({ companyId: fresh.companyId, allowlistVersion: reviewed.version, missingTools }, "default MCP template catalog is missing reviewed tools");
     }
-    const attempts = freshClaim.attemptCount;
     const patch: ClaimPatch = {
       allowlistVersion: reviewed.version,
       missingReviewedTools: missingTools,
-      missingCheckAt: missingTools.length > 0 ? new Date(now.getTime() + defaultMcpBackoffMs(attempts)).toISOString() : null,
+      missingCheckAt: missingTools.length > 0 ? new Date(now.getTime() + DEFAULT_MCP_BACKOFF_MAX_MS).toISOString() : null,
       updatedAt: now.toISOString(),
     };
     const ok = await patchUnderClaim(txDb, fresh.id, claimId, patch, { status: "active", enabled: true, healthStatus: "ok" });
@@ -1049,12 +1050,14 @@ export async function ensureCompanyTemplate(
     claimId: null,
     readyAt: state === "ready" ? (keepPublished ? claim.readyAt : finished.toISOString()) : null,
     updatedAt: finished.toISOString(),
-    ...(keepPublished ? { missingCheckAt: new Date(finished.getTime() + defaultMcpBackoffMs(attempts)).toISOString() } : {}),
+    ...(keepPublished ? { missingCheckAt: new Date(finished.getTime() + DEFAULT_MCP_BACKOFF_MAX_MS).toISOString() } : {}),
+    // A catalog re-read is not a provisioning attempt: it must not use up the attempt budget a later real failure needs.
+    ...(recheck ? { attemptCount: Math.max(0, claim.attemptCount - 1) } : {}),
   });
   if (!stored) return { kind: "not_claimed" };
   await logTemplateActivity(ctx.db, input.companyId, connection, {
     state,
-    reason: missingTools?.length ? "catalog_missing_reviewed_tools" : reason,
+    reason: missingTools?.length ? "catalog_missing_reviewed_tools" : keepPublished ? null : reason,
     attemptCount: attempts,
     ...(missingTools?.length ? { missingTools } : {}),
   });
@@ -1149,8 +1152,8 @@ async function sweepCommsCompanyTemplates(ctx: DefaultMcpTemplateContext & { lim
               -- A READY template published with reviewed tools missing from the board's catalog: re-read the catalog
               -- once its backoff (missingCheckAt) is due, so the tools are enabled when the board lists them.
               or (${claimJson} ->> 'state' = 'ready'
-                and jsonb_typeof(${claimJson} -> 'missingReviewedTools') = 'array'
-                and jsonb_array_length(${claimJson} -> 'missingReviewedTools') > 0
+                and (case when jsonb_typeof(${claimJson} -> 'missingReviewedTools') = 'array'
+                          then jsonb_array_length(${claimJson} -> 'missingReviewedTools') else 0 end) > 0
                 and coalesce(${claimJson} ->> 'missingCheckAt', '') COLLATE "C" <= ${now}::text COLLATE "C")
             )
         )

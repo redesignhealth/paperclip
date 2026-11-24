@@ -1164,20 +1164,21 @@ describeEmbeddedPostgres("managed company template for the default MCP spec (TEC
 
     // Due, but the board is down: the published template is left exactly as it was and the check is pushed back.
     boardDown = true;
-    expect(await sweepCompanyTemplates(at(30))).toBe(1);
+    expect(await sweepCompanyTemplates(at(61))).toBe(1);
     const afterDown = readTemplateClaim((await templateRow(companyId))!.config)!;
     expect(afterDown).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3 });
     expect([...afterDown.missingReviewedTools!].sort()).toEqual(WAKE);
-    expect(Date.parse(afterDown.missingCheckAt!)).toBeGreaterThan(t0 + 30 * 60_000);
+    expect(Date.parse(afterDown.missingCheckAt!)).toBeGreaterThan(t0 + 61 * 60_000);
+    expect(afterDown.attemptCount).toBe(claim.attemptCount);
     boardDown = false;
 
     // Due, board still behind: unchanged, pushed back again.
-    expect(await sweepCompanyTemplates(at(300))).toBe(1);
+    expect(await sweepCompanyTemplates(at(125))).toBe(1);
     expect([...readTemplateClaim((await templateRow(companyId))!.config)!.missingReviewedTools!].sort()).toEqual(WAKE);
 
     // The board is upgraded: the wake tools are enabled on the template without a version change, and the list clears.
     boardTools = [...ALL_BOARD_TOOLS];
-    expect(await sweepCompanyTemplates(at(900))).toBe(1);
+    expect(await sweepCompanyTemplates(at(200))).toBe(1);
     const healed = (await templateRow(companyId))!;
     expect(readTemplateClaim(healed.config)).toMatchObject({ state: "ready", reason: null, allowlistVersion: 3, missingReviewedTools: [], missingCheckAt: null });
     expect(await activeNames(healed.id)).toEqual([...COMMS_BOARD_REVIEWED_TOOLS].sort());
