@@ -17,9 +17,24 @@ import type { PiMcpRelayServer } from "./mcp-config.js";
 export const PI_MEMORY_TOOL_NAMES = ["memory_search", "memory_add", "memory_delete"] as const;
 export const PI_MEMORY_EXTENSION_FILE = "rh-memory.mjs";
 
+/**
+ * The upstream tool name a relay server exposes for one of the memory tools. Servers that deliver an agent's assigned
+ * MCP connections through the gateway list namespaced, hyphenated names (`mcp.rh-agent-memory-tools-2d639e79:memory-search`,
+ * with an 8-hex suffix when two connections share a name), not the bare `memory_search`. A bare name wins when listed.
+ * The extension source below carries the same matching rule (`resolveTool`); a test keeps the two in step.
+ */
+export function resolvePiMemoryToolName(allowedTools: readonly string[], base: (typeof PI_MEMORY_TOOL_NAMES)[number]): string | null {
+  if (allowedTools.includes(base)) return base;
+  const wanted = base.replace(/_/g, "-");
+  return allowedTools.find((name) => {
+    const slug = name.toLowerCase().slice(Math.max(name.lastIndexOf(":"), name.lastIndexOf("/")) + 1).replace(/_/g, "-");
+    return slug === wanted || (slug.startsWith(wanted + "-") && /^[0-9a-f]{8}$/.test(slug.slice(wanted.length + 1)));
+  }) ?? null;
+}
+
 /** The relay server that carries the memory tools, or null when the run has none (agent not enrolled). */
 export function findPiMemoryRelayServer(servers: readonly PiMcpRelayServer[]): PiMcpRelayServer | null {
-  return servers.find(({ server }) => server.allowedTools.includes("memory_search")) ?? null;
+  return servers.find(({ server }) => resolvePiMemoryToolName(server.allowedTools, "memory_search") !== null) ?? null;
 }
 
 // The source is plain ESM with no imports of Pi packages. It avoids backticks, "${" and "\\" sequences so it can
@@ -56,6 +71,17 @@ function topK() {
 function captureEnabled() {
   return !["off", "false", "0", "no"].includes((process.env.RH_MEMORY_CAPTURE ?? "").trim().toLowerCase());
 }
+// Gateway tool names are namespaced and hyphenated ("mcp.<connection>-<id>:memory-search", plus an 8-hex suffix on a name
+// collision); a dedicated server lists the bare "memory_search". Same rule as resolvePiMemoryToolName.
+function resolveTool(names, base) {
+  if (names.includes(base)) return base;
+  const wanted = base.replace(/_/g, "-");
+  return names.find((name) => {
+    const text = String(name).toLowerCase();
+    const slug = text.slice(Math.max(text.lastIndexOf(":"), text.lastIndexOf("/")) + 1).replace(/_/g, "-");
+    return slug === wanted || (slug.startsWith(wanted + "-") && /^[0-9a-f]{8}$/.test(slug.slice(wanted.length + 1)));
+  }) ?? null;
+}
 function expand(value) {
   return String(value).replace(/[$][{]([A-Za-z_][A-Za-z0-9_]*)[}]/g, (_all, name) => process.env[name] ?? "");
 }
@@ -69,12 +95,13 @@ function loadServer() {
   if (!servers || typeof servers !== "object") return null;
   for (const entry of Object.values(servers)) {
     if (!entry || typeof entry.url !== "string" || !Array.isArray(entry.includeTools)) continue;
-    if (!entry.includeTools.includes("memory_search")) continue;
+    const tools = { search: resolveTool(entry.includeTools, "memory_search"), add: resolveTool(entry.includeTools, "memory_add"), delete: resolveTool(entry.includeTools, "memory_delete") };
+    if (!tools.search) continue;
     const url = expand(entry.url);
     if (!/^https?:[/][/][^/]/.test(url)) return null;
     const headers = {};
     for (const [name, value] of Object.entries(entry.headers ?? {})) headers[name] = expand(value);
-    return { url, headers };
+    return { url, headers, tools };
   }
   return null;
 }
@@ -232,7 +259,7 @@ export default function rhMemory(pi) {
       const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
       if (prompt.length < 3) return undefined;
       const limit = topK();
-      const data = await client.call("memory_search", { query: prompt.slice(0, MAX_QUERY_CHARS), top_k: limit }, { seconds: callSeconds() });
+      const data = await client.call(server.tools.search, { query: prompt.slice(0, MAX_QUERY_CHARS), top_k: limit }, { seconds: callSeconds() });
       const content = formatContext(data, limit);
       if (!content) return undefined;
       return { message: { customType: "rh-memory-recall", content, display: false } };
@@ -246,16 +273,17 @@ export default function rhMemory(pi) {
     if (!captureEnabled()) return;
     try {
       const text = buildCaptureText(event?.messages);
-      if (!text) return;
-      await client.call("memory_add", { text }, { seconds: envSeconds("RH_MEMORY_CAPTURE_TIMEOUT", 15) });
+      if (!text || !server.tools.add) return;
+      await client.call(server.tools.add, { text }, { seconds: envSeconds("RH_MEMORY_CAPTURE_TIMEOUT", 15) });
     } catch (error) {
       warn("capture skipped: " + errorName(error));
     }
   });
 
+  const upstream = { memory_search: server.tools.search, memory_add: server.tools.add, memory_delete: server.tools.delete };
   const guarded = (name, build) => async (_id, params, signal) => {
     try {
-      const data = await client.call(name, build(params ?? {}), { signal, seconds: envSeconds("RH_MEMORY_TOOL_TIMEOUT", 20) });
+      const data = await client.call(upstream[name], build(params ?? {}), { signal, seconds: envSeconds("RH_MEMORY_TOOL_TIMEOUT", 20) });
       return { content: [{ type: "text", text: toolText(data) }], details: {} };
     } catch (error) {
       warn(name + " failed: " + errorName(error));
@@ -270,7 +298,7 @@ export default function rhMemory(pi) {
     parameters: { type: "object", properties: { query: { type: "string", description: "Natural-language search query." }, top_k: { type: "integer", description: "Maximum number of results to return." } }, required: ["query"] },
     execute: guarded("memory_search", (p) => ({ query: String(p.query ?? ""), top_k: Number.isInteger(p.top_k) ? Math.min(Math.max(p.top_k, 1), MAX_TOP_K) : topK() })),
   });
-  pi.registerTool({
+  if (upstream.memory_add) pi.registerTool({
     name: "memory_add",
     label: "Memory add",
     description: "Save one durable fact, decision or lesson to your own memory. Never store secrets or credentials.",
@@ -278,7 +306,7 @@ export default function rhMemory(pi) {
     parameters: { type: "object", properties: { text: { type: "string", description: "The fact or note to remember." } }, required: ["text"] },
     execute: guarded("memory_add", (p) => ({ text: String(p.text ?? "") })),
   });
-  pi.registerTool({
+  if (upstream.memory_delete) pi.registerTool({
     name: "memory_delete",
     label: "Memory delete",
     description: "Delete one of your own memories by id (from memory_search).",
