@@ -494,6 +494,13 @@ describe("Pi memory extension: recall query comes from the task", () => {
     expect(searchQueries()).toEqual(["Fix refresh race Token refresh races when two requests refresh at once; serialise the refresh."]);
   });
 
+  it("keeps technical tokens and prose notes, and stops at blank lines after metadata lists", async () => {
+    const description = ["Builder: python-services", "Allowed paths:", "- services/a/b.py", "", "Fix UTF-8 decoding in the SHA-256 hasher.", "", "Note: keep the public API unchanged.", "", "Acceptance criteria:", "Run the hasher tests and ruff."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "Hasher bug", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    expect(searchQueries()).toEqual(["Hasher bug Fix UTF-8 decoding in the SHA-256 hasher."]);
+  });
+
   it("falls back to the title alone when the description is only metadata", async () => {
     const description = ["Linear: https://linear.app/acme/issue/TECH-9125/x", "Builder: data-pipelines", "Allowed paths: redesign-health-data/projects/x/y.py", "Estimated changed lines: 40", "Allowed paths are a ceiling."].join("\n");
     const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "TECH-9125 Backfill the foo table", description } }) });

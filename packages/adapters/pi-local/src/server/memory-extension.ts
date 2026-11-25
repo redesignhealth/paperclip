@@ -37,7 +37,7 @@ export function findPiMemoryRelayServer(servers: readonly PiMcpRelayServer[]): P
   return servers.find(({ server }) => resolvePiMemoryToolName(server.allowedTools, "memory_search") !== null) ?? null;
 }
 
-// The source is plain ESM with no imports of Pi packages. It avoids backticks, "${" and "\\" sequences so it can
+// The source is plain ESM with no imports of Pi packages. It avoids backticks and "${" so it can
 // live in a String.raw template. Tests load it from a data: URL against a fake `pi` and a local HTTP server.
 export function piMemoryExtensionSource(options: { taskQuery?: string } = {}): string {
   const taskQuery = typeof options.taskQuery === "string" ? options.taskQuery : "";
@@ -274,14 +274,14 @@ function flatRecallText(text) {
     .replace(/\s+/g, " ")
     .trim();
 }
-const TICKET_KEY = /\b[A-Z][A-Z0-9]{1,9}-\d+\b[:,]?/g;
+const TICKET_KEY = /\b(?!(?:UTF|SHA|ISO|HTTP|AES|RFC|TLS|SSL|MD|CRC|IPV|RSA|HS|ES|GPT|PEP|CVE)-)[A-Z][A-Z0-9]{1,9}-\d+\b[:,]?/g;
 function shortRecallText(text) {
   return flatRecallText(cleanForCapture(text).replace(TICKET_KEY, " "));
 }
 function recallTitle(title) {
   return shortRecallText(String(title ?? "").replace(/^(?:\s*\[[^\]]*\][\s:-]*)+/, "")).replace(/^[\s:-]+/, "");
 }
-const META_KEY = "linear|linear (?:issue|ticket|link)|ticket|builder|allowed paths?|allowed|base branch|base ref|base|branch|estimated(?: changed)?(?: lines| size)?|estimate|size|area|repo|repository|project|parent|assignee|labels?|acceptance(?: checks?| criteria)?|checks?|tests? to run|replay rules?|replay|rules?|constraints?|notes?";
+const META_KEY = "linear|linear (?:issue|ticket|link)|builder|allowed paths?|allowed|base branch|base ref|estimated(?: changed)?(?: lines| size)?|estimate|repo|repository|assignee|labels?|acceptance(?: checks?| criteria)?|tests? to run|replay rules?|replay";
 const META_LINE = new RegExp("^[\\s>*#_-]*(?:" + META_KEY + ")[\\s*_]*(?::|$)", "i");
 const BOILERPLATE_LINE = /^[\s>*_-]*(?:allowed paths are a ceiling|paths? (?:listed|named) (?:here )?(?:are|is) a ceiling)\b/i;
 const HEADING = /^\s*(?:#{1,6}\s+(.+?)|[*][*]([^*]+?)[*][*]:?|__([^_]+?)__:?|([A-Za-z][A-Za-z /&-]{2,40}):)\s*$/;
@@ -294,19 +294,25 @@ function headingOf(line) {
 }
 // The task text of a description: the Problem/Change section, else the first plain paragraph, with metadata dropped.
 export function recallDescription(description) {
-  const lines = cleanForCapture(description).split("\n");
+  // Blank lines are kept (they end a list and separate paragraphs); cleanForCapture runs per line for its secret filter.
+  const lines = String(description ?? "").split(/\r?\n/).map((line) => (line.trim() ? cleanForCapture(line) : ""));
   const sections = [];
   let current = { heading: "", lines: [] };
   let skipList = false;
   for (const raw of lines) {
     const line = raw.replace(TICKET_KEY, " ").trim();
-    if (!line) { current.lines.push(""); skipList = false; continue; }
+    if (!line) {
+      skipList = false;
+      // A colon-style metadata header ("Allowed paths:") ends at the blank line; a marked heading ends at the next heading.
+      if (current.colon) { sections.push(current); current = { heading: "", lines: [] }; } else current.lines.push("");
+      continue;
+    }
     const heading = headingOf(line);
     if (META_LINE.test(line) && (heading === null || META_LINE.test(heading + ":"))) {
       // A metadata line (or section) and any bullets under it: dropped.
       const value = line.replace(META_LINE, "").trim();
       skipList = value === "";
-      if (heading !== null && /^[#*_]/.test(line)) { sections.push(current); current = { heading: "meta", lines: [] }; }
+      if (heading !== null || value === "") { sections.push(current); current = { heading: "meta", lines: [], colon: !/^[#*_]/.test(line) }; }
       continue;
     }
     if (heading !== null && !LIST_ITEM.test(line)) {
