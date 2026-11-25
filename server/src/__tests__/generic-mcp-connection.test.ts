@@ -4972,7 +4972,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect(byName.get(name)!.status).toBe("active");
         expect(byName.get(name)!.reviewedAt).not.toBeNull();
       }
-      // Every non-ceiling tool — erase, write, even a read-only search — stays quarantined.
+      // Every non-ceiling tool — erase, write, even a read-only Ashby fetch — stays quarantined.
       for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_get_person_ashby"]) {
         expect(byName.get(name)!.status).toBe("quarantined");
         expect(byName.get(name)!.reviewedAt).toBeNull();
