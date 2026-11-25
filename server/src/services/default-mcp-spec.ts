@@ -675,6 +675,10 @@ export const DEFAULT_MCP_SPEC: readonly DefaultMcpEntrySpec[] = [
       "zoom__list_my_meetings",
       // Humanizer scan of a draft in the owner's own voice (`voice:read`); the only voice tool in this ceiling.
       "voice_apply",
+      // MDM golden-record reads (TECH-10780): the same `mdm:read` list the shared-org service token offers, so private
+      // orgs' agents can enrich against MDM as their owner. rh-mcp still applies its own per-person checks. Ashby
+      // (`mdm:ashby:read`), merge and write tools stay out.
+      ...RH_MCP_SERVICE_TOOLS_BY_SCOPE["mdm:read"],
     ],
     toolTimeoutMs: { voice_apply: VOICE_APPLY_TOOL_TIMEOUT_MS },
     oauthSeed: {

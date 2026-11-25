@@ -872,6 +872,25 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     "zoom__get_meeting",
     "zoom__list_my_meetings",
     "voice_apply",
+    // MDM golden-record reads (TECH-10780).
+    "mdm_get_person",
+    "mdm_get_persons",
+    "mdm_search_persons",
+    "mdm_get_org",
+    "mdm_get_orgs",
+    "mdm_search_orgs",
+    "mdm_get_concept",
+    "mdm_get_concepts",
+    "mdm_search_concepts",
+    "mdm_get_opportunity",
+    "mdm_search_opportunities",
+    "mdm_get_opportunity_lists",
+    "mdm_get_person_interactions",
+    "mdm_get_org_interactions",
+    "mdm_get_founder_engagement",
+    "mdm_get_duplicate_candidate",
+    "mdm_get_org_duplicate_candidate",
+    "mdm_get_unmerge_request",
   ];
   const valid = {
     name: "rh-mcp-personal",
@@ -881,7 +900,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     config: { url: "https://mcp.example.test/mcp", identityModel: "personal_only", paperclipDefaultMcpEntry: "rh-mcp" },
   };
 
-  it("is one OFF, hook-less oauth entry with exactly the fourteen raw tools (read tools, the three Argus review verbs and voice_apply) as its ceiling", () => {
+  it("is one OFF, hook-less oauth entry with exactly the thirty-two raw tools (read tools, the three Argus review verbs, voice_apply and the MDM reads) as its ceiling", () => {
     expect(entry).toMatchObject({
       displayName: "RH MCP",
       connectionName: "rh-mcp-personal",
@@ -893,7 +912,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     expect([...entry.readCeiling!].sort()).toEqual([...CEILING].sort());
     // No writer, disconnect, visibility, reassign, erase, annotation, meeting-mutating zoom, or voice action is ever reachable by an agent, except the read-scoped voice_apply.
     for (const name of entry.readCeiling!) {
-      expect(name).toMatch(/^(mdm_(granola_status|list_my_granola_notes|list_shared_granola_notes|get_granola_note|get_granola_transcript)|argus_(get_proxy_token|start_review|get_review|cancel_review)|voice_apply|zoom__(get_transcript|get_meeting_transcript|get_meeting|list_my_meetings))$/);
+      expect(name).toMatch(/^(mdm_(granola_status|list_my_granola_notes|list_shared_granola_notes|get_granola_note|get_granola_transcript)|argus_(get_proxy_token|start_review|get_review|cancel_review)|voice_apply|zoom__(get_transcript|get_meeting_transcript|get_meeting|list_my_meetings)|mdm_(get|search)_[a-z_]+)$/);
       expect(name).not.toMatch(/disconnect|visibility|reassign|erase|annotation|write|set_|request_/);
       if (name.startsWith("voice")) expect(name).toBe("voice_apply");
       // Positive allowlist for zoom__, not just a negative ban on known mutators: a future
@@ -939,7 +958,7 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
     }
   });
 
-  it("caps a valid tagged template to the fourteen raw names and nothing else; the name alone never caps", () => {
+  it("caps a valid tagged template to the thirty-two raw names and nothing else; the name alone never caps", () => {
     expect([...agentReadCeilingForConnection(valid)!].sort()).toEqual([...CEILING].sort());
     for (const name of CEILING) expect(agentMayUseConnectionTool(valid, name)).toBe(true);
     for (const name of [
@@ -952,6 +971,14 @@ describe("rh-mcp personal default entry and agent read ceiling (TECH-7276)", () 
       "zoom__create_meeting",
       "zoom__delete_meeting",
       "voice_save_style_guide",
+      // TECH-10780: only the mdm:read verbs joined; Ashby, merge/unmerge, user annotations and supabase stay out.
+      "mdm_get_person_ashby",
+      "mdm_get_persons_ashby",
+      "mdm_request_person_merge",
+      "mdm_request_org_unmerge",
+      "mdm_operator_confirm_duplicate_candidate",
+      "mdm_get_user_annotations",
+      "supabase_execute_sql",
       "mdm.rh-mcp-personal-abcd1234:mdm_get_granola_note",
       "",
       null,
@@ -1108,7 +1135,7 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
 
   it("isPersonalDefaultMcpTemplate includes a strict personal instance, and the read ceiling applies to it", () => {
     expect(isPersonalDefaultMcpTemplate(personalInstance)).toBe(true);
-    // The rh-mcp ceiling is exactly the fourteen Granola/Argus/Zoom/voice_apply tools for a personal instance too.
+    // The rh-mcp ceiling is exactly the thirty-two Granola/Argus/Zoom/voice_apply/MDM-read tools for a personal instance too.
     const ceiling = agentReadCeilingForConnection(personalInstance);
     expect(ceiling).not.toBeNull();
     expect([...ceiling!].sort()).toEqual([
@@ -1116,11 +1143,29 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
       "argus_get_proxy_token",
       "argus_get_review",
       "argus_start_review",
+      "mdm_get_concept",
+      "mdm_get_concepts",
+      "mdm_get_duplicate_candidate",
+      "mdm_get_founder_engagement",
       "mdm_get_granola_note",
       "mdm_get_granola_transcript",
+      "mdm_get_opportunity",
+      "mdm_get_opportunity_lists",
+      "mdm_get_org",
+      "mdm_get_org_duplicate_candidate",
+      "mdm_get_org_interactions",
+      "mdm_get_orgs",
+      "mdm_get_person",
+      "mdm_get_person_interactions",
+      "mdm_get_persons",
+      "mdm_get_unmerge_request",
       "mdm_granola_status",
       "mdm_list_my_granola_notes",
       "mdm_list_shared_granola_notes",
+      "mdm_search_concepts",
+      "mdm_search_opportunities",
+      "mdm_search_orgs",
+      "mdm_search_persons",
       "voice_apply",
       "zoom__get_meeting",
       "zoom__get_meeting_transcript",
@@ -1225,7 +1270,7 @@ describe("discovery-only seeds and strict personal instances (TECH-7340)", () =>
     expect(managedConnectionRole(metadata, CO, nestedForge)).toBeNull();
     // The strict predicate still admits the full-fact instance (no relax in the other direction).
     expect(isPersonalDefaultMcpInstance(personalInstance)).toBe(true);
-    expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(14);
+    expect(agentReadCeilingForConnection(personalInstance)?.size).toBe(32);
   });
 });
 

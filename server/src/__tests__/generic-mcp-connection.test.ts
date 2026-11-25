@@ -4383,7 +4383,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       ...RH_CEILING_TOOLS.map((name) => ({ name, description: name, annotations: { readOnlyHint: true } })),
       { name: "mdm_erase_granola_note", description: "Erase a note", annotations: { readOnlyHint: false } },
       { name: "mdm_write_annotation", description: "Write an annotation", annotations: { readOnlyHint: false } },
-      { name: "mdm_search_concepts", description: "Search concepts", annotations: { readOnlyHint: true } },
+      { name: "mdm_get_person_ashby", description: "Ashby record", annotations: { readOnlyHint: true } },
     ];
 
     /**
@@ -4960,7 +4960,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect(responseByName.get(name)!.status).toBe("active");
         expect(responseByName.get(name)!.reviewedAt).not.toBeNull();
       }
-      for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_search_concepts"]) {
+      for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_get_person_ashby"]) {
         expect(responseByName.get(name)!.status).toBe("quarantined");
         expect(responseByName.get(name)!.reviewedAt).toBeNull();
       }
@@ -4972,15 +4972,15 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
         expect(byName.get(name)!.status).toBe("active");
         expect(byName.get(name)!.reviewedAt).not.toBeNull();
       }
-      // Every non-ceiling tool — erase, write, even a read-only search — stays quarantined.
-      for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_search_concepts"]) {
+      // Every non-ceiling tool — erase, write, even a read-only Ashby fetch — stays quarantined.
+      for (const name of ["mdm_erase_granola_note", "mdm_write_annotation", "mdm_get_person_ashby"]) {
         expect(byName.get(name)!.status).toBe("quarantined");
         expect(byName.get(name)!.reviewedAt).toBeNull();
       }
       // The rh-mcp spec entry's read ceiling is broader than this fixture's simulated upstream
-      // (which only discovers the five Granola tools); the ceiling itself is a fixed 10 raw names.
+      // (which only discovers the five Granola tools); the ceiling itself is a fixed 32 raw names.
       const instanceRow = (await db.select().from(toolConnections).where(eq(toolConnections.id, instanceId)))[0]!;
-      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(14);
+      expect(agentReadCeilingForConnection(instanceRow)?.size).toBe(32);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_erase_granola_note")).toBe(false);
       expect(agentMayUseConnectionTool(instanceRow, "mdm_get_granola_note")).toBe(true);
       // S5+S6: the brand-new profile is initialized (once, under the finish transaction) with
