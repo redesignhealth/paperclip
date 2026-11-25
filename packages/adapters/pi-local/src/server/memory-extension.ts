@@ -47,8 +47,8 @@ import path from "node:path";
 
 const DEFAULT_TOP_K = 5;
 const MAX_TOP_K = 20;
-const MAX_QUERY_CHARS = 6000;
-const MAX_TASK_QUERY_CHARS = 1500;
+const MAX_TASK_QUERY_CHARS = 300;
+const MAX_DESCRIPTION_QUERY_CHARS = 250;
 const MAX_CONTEXT_CHARS = 4000;
 const MAX_TASK_CHARS = 600;
 const MAX_OUTCOME_CHARS = 3000;
@@ -258,17 +258,32 @@ export function cleanForCapture(text) {
 // lesson, so a whole-prompt query searches boilerplate. Order: the task the adapter staged (issue title and description),
 // then the issue line and description found in the prompt, then the prompt with the known receipt note removed.
 const RECEIPT_NOTE = /Paperclip may post a short platform-generated fast-response receipt[\s\S]*?generic acknowledgement[.]?/g;
+// The server matches short extracted facts, so a whole ticket (URLs, links, code, boilerplate) scores below its cutoff.
+// Recall searches the title plus the first part of the description, with URLs, markdown links and code fences removed.
+function shortRecallText(text) {
+  return cleanForCapture(text)
+    .replace(/[\x60]{3}[\s\S]*?(?:[\x60]{3}|$)/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/https?:[/][/]\S+/g, " ")
+    .replace(/[\x60]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function joinRecallParts(title, description) {
+  return (shortRecallText(title) + " " + shortRecallText(description).slice(0, MAX_DESCRIPTION_QUERY_CHARS)).trim().slice(0, MAX_TASK_QUERY_CHARS);
+}
 export function buildRecallQuery(prompt) {
   const staged = String(TASK_QUERY).replace(RECEIPT_NOTE, " ").trim();
-  if (staged.length >= 3) return staged.slice(0, MAX_TASK_QUERY_CHARS);
+  if (staged.length >= 3) {
+    const lines = staged.split(/\r?\n/);
+    const query = joinRecallParts(lines[0], lines.slice(1).join("\n"));
+    if (query.length >= 3) return query;
+  }
   const text = String(prompt ?? "").replace(RECEIPT_NOTE, " ");
-  const parts = [];
   const issue = /^- issue:[ \t]*(.+)$/m.exec(text);
-  if (issue) parts.push(issue[1].trim());
   const description = /^Issue description:\r?\n[\x60]{3}[a-z]*\r?\n([\s\S]*?)\r?\n[\x60]{3}/m.exec(text);
-  if (description && description[1].trim()) parts.push(description[1].trim());
-  const task = parts.join("\n").trim();
-  return task.length >= 3 ? task.slice(0, MAX_TASK_QUERY_CHARS) : text.trim().slice(0, MAX_QUERY_CHARS);
+  const task = joinRecallParts(issue ? issue[1] : "", description ? description[1] : "");
+  return task.length >= 3 ? task : shortRecallText(text).slice(0, MAX_TASK_QUERY_CHARS);
 }
 
 function textOf(content) {
@@ -374,13 +389,19 @@ export default function rhMemory(pi) {
 `;
 }
 
-/** The recall query for a run: the issue title and description from the wake payload (empty when it has none). */
+/** The recall query for a run: the issue title plus the start of its description from the wake payload, cleaned and short (empty when it has none). */
 export function buildPiMemoryTaskQuery(wake: unknown): string {
   const issue = wake && typeof wake === "object" ? (wake as { issue?: unknown }).issue : null;
   if (!issue || typeof issue !== "object") return "";
   const { title, description } = issue as { title?: unknown; description?: unknown };
-  const parts = [typeof title === "string" ? title.trim() : "", typeof description === "string" ? description.trim() : ""];
-  return parts.filter(Boolean).join("\n").slice(0, 1500);
+  const clean = (text: unknown) => (typeof text === "string" ? text : "")
+    .replace(/`{3}[\s\S]*?(?:`{3}|$)/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/`/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${clean(title)} ${clean(description).slice(0, 250)}`.trim().slice(0, 300);
 }
 
 export async function preparePiMemoryExtension(options: { taskQuery?: string } = {}) {
