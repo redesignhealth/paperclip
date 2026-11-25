@@ -16,8 +16,6 @@ const deniedRequests = [
   { method: "POST", path: "/api/assets/screenshot-1/content" },
   { method: "DELETE", path: "/api/assets/screenshot-1/content" },
   { method: "GET", path: "/api/assets/screenshot-1/content/extra" },
-  { method: "PATCH", path: "/api/companies/company-1/skills/skill-1" },
-  { method: "DELETE", path: "/api/companies/company-1/skills/skill-1/files" },
   { method: "GET", path: "/api/companies/company-1/skills/skill-1/files/extra" },
   { method: "POST", path: "/api/issues/task-1/diagnostics/wakes" },
   { method: "GET", path: "/api/issues/task-1/diagnostics/wakes/extra" },

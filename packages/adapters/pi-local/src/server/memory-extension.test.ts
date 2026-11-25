@@ -396,14 +396,14 @@ describe("Pi memory extension: recall query comes from the task", () => {
   it("searches the staged issue title and description, not the platform note at the head of the prompt", async () => {
     const { handlers } = await load({ taskQuery: "Add a boundary test for hash_user\nEmpty and very long inputs." });
     await handlers.get("before_agent_start")!({ prompt: RECEIPT_NOTE + "\n\nSome wake text" });
-    expect(searchQueries()).toEqual(["Add a boundary test for hash_user\nEmpty and very long inputs."]);
+    expect(searchQueries()).toEqual(["Add a boundary test for hash_user Empty and very long inputs."]);
   });
 
   it("falls back to the issue line and description in the prompt when nothing was staged", async () => {
     const { handlers } = await load();
     const prompt = [RECEIPT_NOTE, "", "- issue: DAN-3253 Add retry test", "- status: todo", "", "Issue description:", "```md", "Cover the retry backoff path.", "```", "", "More boilerplate."].join("\n");
     await handlers.get("before_agent_start")!({ prompt });
-    expect(searchQueries()).toEqual(["DAN-3253 Add retry test\nCover the retry backoff path."]);
+    expect(searchQueries()).toEqual(["DAN-3253 Add retry test Cover the retry backoff path."]);
   });
 
   it("drops the known platform note from an otherwise unstructured prompt", async () => {
@@ -424,13 +424,37 @@ describe("Pi memory extension: recall query comes from the task", () => {
   it("bounds the staged query", async () => {
     const { handlers } = await load({ taskQuery: "a".repeat(5000) });
     await handlers.get("before_agent_start")!({ prompt: "anything at all" });
-    expect(searchQueries()[0]).toHaveLength(1500);
+    expect(searchQueries()[0]).toHaveLength(300);
+  });
+
+  it("shortens a long ticket to the title plus the start of the description, without URLs, links, code or extra whitespace", async () => {
+    const description = [
+      "See [the design doc](https://docs.example.com/d/abc) and https://github.com/acme/repo/pull/42 for context.",
+      "```ts",
+      "const noisy = codeThatShouldNotBeSearched();",
+      "```",
+      "The retry backoff   never   resets after a success.",
+      "x".repeat(2000),
+    ].join("\n");
+    const { handlers } = await load({ taskQuery: "Fix retry backoff\n" + description });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    const query = searchQueries()[0]!;
+    expect(query.startsWith("Fix retry backoff See the design doc and for context. The retry backoff never resets after a success.")).toBe(true);
+    expect(query).not.toMatch(/https?:|\]\(|noisy|codeThatShouldNotBeSearched|\n|\s{2}/);
+    expect(query.length).toBeLessThanOrEqual(300);
+  });
+
+  it("cleans the staged issue title and description before searching", () => {
+    const query = buildPiMemoryTaskQuery({ issue: { title: "Fix [retry](https://x.test/a) bug", description: "Details at https://x.test/long/path?q=1 here.\n\n```\ncode\n```\n" + "y".repeat(1000) } });
+    expect(query).toMatch(/^Fix retry bug Details at here\. y+$/);
+    expect(query.length).toBeLessThanOrEqual(300);
+    expect(query.length - "Fix retry bug ".length).toBeLessThanOrEqual(250);
   });
 
   it("builds the adapter-side task query from the wake issue", () => {
-    expect(buildPiMemoryTaskQuery({ issue: { title: " Fix retry ", description: "Backoff is wrong.\n" } })).toBe("Fix retry\nBackoff is wrong.");
+    expect(buildPiMemoryTaskQuery({ issue: { title: " Fix retry ", description: "Backoff is wrong.\n" } })).toBe("Fix retry Backoff is wrong.");
     expect(buildPiMemoryTaskQuery({ issue: { title: "Only title", description: null } })).toBe("Only title");
-    expect(buildPiMemoryTaskQuery({ issue: { title: "t".repeat(3000) } })).toHaveLength(1500);
+    expect(buildPiMemoryTaskQuery({ issue: { title: "t".repeat(3000) } })).toHaveLength(300);
     expect(buildPiMemoryTaskQuery(undefined)).toBe("");
     expect(buildPiMemoryTaskQuery({})).toBe("");
   });
