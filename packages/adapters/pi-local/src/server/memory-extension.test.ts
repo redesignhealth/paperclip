@@ -346,12 +346,26 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     respond = () => ({ result: { isError: true, content: [{ type: "text", text: "boom" }] } });
     const { handlers } = await load();
     await handlers.get("before_agent_start")!({ prompt: "needs memory" });
-    expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error query="needs memory"\n');
+    expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error: boom query="needs memory"\n');
     respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify({ results: [{ id: "n1", memory: "saved", event: "ADD" }] }) }] } });
     await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
     expect(lines(stderr).at(-1)).toMatch(/^\[rh-memory\] capture stored chars=\d+\n$/);
     await handlers.get("agent_end")!({ messages: [] });
     expect(lines(stderr).at(-1)).toBe("[rh-memory] capture skipped: nothing worth storing\n");
+  });
+
+  it("logs the tool error message text on a failed capture, bounded and without the memory content", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    respond = () => ({ result: { isError: true, content: [{ type: "text", text: "text exceeds 2000 characters\n" + "z".repeat(400) }] } });
+    const { handlers } = await load();
+    await handlers.get("agent_end")!({ messages: [{ role: "user", content: "secret task words" }, assistant("A sufficiently long outcome that would normally be stored.")] });
+    const line = lines(stderr).at(-1)!;
+    expect(line).toMatch(/^\[rh-memory\] capture failed: Error: tool error: text exceeds 2000 characters z+\.\.\.\n$/);
+    expect(line.length).toBeLessThan(300);
+    expect(line).not.toMatch(/secret task words|sufficiently long outcome/);
+    respond = () => ({ result: { isError: true, content: [] } });
+    await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
+    expect(lines(stderr).at(-1)).toBe("[rh-memory] capture failed: Error: tool error\n");
   });
 
   it("keeps secrets and non-client error text out of the lines", async () => {
@@ -363,7 +377,7 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     expect(line).toBe('[rh-memory] recall query="Fix the retry bug" results=0 injected=0 ids= scores=\n');
     respond = () => ({ result: { content: [{ type: "text", text: "x" }], isError: true } });
     await handlers.get("before_agent_start")!({ prompt: "Fix the retry bug" });
-    expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error query="Fix the retry bug"\n');
+    expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error: x query="Fix the retry bug"\n');
     // a SyntaxError-style message is not echoed
     const stderr2 = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     stderr2.mockClear();
