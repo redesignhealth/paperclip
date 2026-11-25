@@ -268,6 +268,83 @@ describe("readPiGuardProfile", () => {
   });
 });
 
+describe("guard: git commands from a subdirectory and paths that contain mcp", () => {
+  let mainRepo: string;
+  let linkedRepo: string;
+  beforeAll(async () => {
+    await fs.mkdir(path.join(repo, "services", "rh-mcp", "tests"), { recursive: true });
+    mainRepo = path.join(workDir, "main-repo");
+    await fs.mkdir(path.join(mainRepo, ".git"), { recursive: true });
+    await fs.mkdir(path.join(mainRepo, "services", "rh-mcp"), { recursive: true });
+    await fs.writeFile(path.join(mainRepo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    // A linked worktree: .git is a file pointing at the real git dir.
+    linkedRepo = path.join(workDir, "linked-repo");
+    const realGitDir = path.join(workDir, "real-git-dir");
+    await fs.mkdir(realGitDir, { recursive: true });
+    await fs.writeFile(path.join(realGitDir, "HEAD"), "ref: refs/heads/feature/linked\n");
+    await fs.mkdir(path.join(linkedRepo, "services", "rh-mcp"), { recursive: true });
+    await fs.writeFile(path.join(linkedRepo, ".git"), "gitdir: " + realGitDir + "\n");
+  });
+
+  it.each([
+    "cd services/rh-mcp",
+    "cd services/rh-mcp && pytest tests",
+    "pytest services/rh-mcp/tests",
+    "git add services/rh-mcp/src/server.py",
+    'gh pr create --title "fix(rh-mcp): handle empty tool list" --body "touches rh-memory-mcp too"',
+    "cd services/rh-mcp && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "cd services/rh-mcp && git push", // paperclip:allow-git-push: guard test fixture, never executed
+    "cd services/rh-mcp/tests && git push -u origin HEAD && gh pr create --title t --body b", // paperclip:allow-git-push: guard test fixture, never executed
+    "git -C services/rh-mcp push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "git push -u origin feature/x && gh pr create --title 'rh-mcp' --body b", // paperclip:allow-git-push: guard test fixture, never executed
+    "ls services/rh-mcp rh-memory-mcp",
+    "echo mcp",
+  ])("allows %s", (command) => {
+    expect(bash(command)).toBeNull();
+  });
+
+  it("finds the branch through a linked worktree .git file from a subdirectory", () => {
+    expect(guard.evaluateToolCall("bash", { command: "cd services/rh-mcp && git push origin HEAD" }, linkedRepo)).toBeNull(); // paperclip:allow-git-push: guard test fixture, never executed
+  });
+
+  it("still blocks a push from a subdirectory of a repo that is on a default branch", () => {
+    const verdict = guard.evaluateToolCall("bash", { command: "cd services/rh-mcp && git push origin HEAD" }, mainRepo); // paperclip:allow-git-push: guard test fixture, never executed
+    expect(verdict?.kind).toBe("deny");
+    expect((verdict as { why: string }).why).toContain("default branch main");
+    const bare = guard.evaluateToolCall("bash", { command: "git push" }, path.join(mainRepo, "services", "rh-mcp")); // paperclip:allow-git-push: guard test fixture, never executed
+    expect((bare as { why: string } | null)?.why).toContain("default branch main");
+  });
+
+  it.each([
+    "git clone https://github.com/o/r.git services/new && cd services/new && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "git init services/new && cd services/new && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "git worktree add services/wt && cd services/wt && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "gh repo clone o/r services/new && cd services/new && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+  ])("does not borrow the enclosing repo's branch for a repo created earlier in the command: %s", (command) => {
+    const verdict = guard.evaluateToolCall("bash", { command }, repo);
+    expect((verdict as { why: string } | null)?.why).toContain("cannot be verified");
+  });
+
+  it("fails closed after a cd to a computed directory", () => {
+    const verdict = guard.evaluateToolCall("bash", { command: "cd $SOME_DIR && git push origin HEAD" }, repo); // paperclip:allow-git-push: guard test fixture, never executed
+    expect((verdict as { why: string } | null)?.why).toContain("cannot be verified");
+  });
+
+  it("still fails closed when no repository can be found", () => {
+    const verdict = guard.evaluateToolCall("bash", { command: "git push origin HEAD" }, workDir); // paperclip:allow-git-push: guard test fixture, never executed
+    expect((verdict as { why: string } | null)?.why).toContain("cannot be verified");
+  });
+
+  it.each([
+    'git push origin main', // paperclip:allow-git-push: guard test fixture, never executed
+    "cd services/rh-mcp && git push --force origin feature/x", // paperclip:allow-git-push: guard test fixture, never executed
+    "cat ~/.ssh/id_rsa services/rh-mcp/x",
+    "gh pr merge 12 --squash",
+  ])("still blocks %s", (command) => {
+    expect(bash(command)?.kind).toBe("deny");
+  });
+});
+
 describe("guard: builders may not dismiss Argus findings", () => {
   const dismissed = (command: string, mod?: GuardModule) => {
     const verdict = bash(command, mod);
