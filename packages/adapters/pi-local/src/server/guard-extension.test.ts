@@ -315,6 +315,21 @@ describe("guard: git commands from a subdirectory and paths that contain mcp", (
     expect((bare as { why: string } | null)?.why).toContain("default branch main");
   });
 
+  it.each([
+    "git clone https://github.com/o/r.git services/new && cd services/new && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "git init services/new && cd services/new && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "git worktree add services/wt && cd services/wt && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+    "gh repo clone o/r services/new && cd services/new && git push origin HEAD", // paperclip:allow-git-push: guard test fixture, never executed
+  ])("does not borrow the enclosing repo's branch for a repo created earlier in the command: %s", (command) => {
+    const verdict = guard.evaluateToolCall("bash", { command }, repo);
+    expect((verdict as { why: string } | null)?.why).toContain("cannot be verified");
+  });
+
+  it("fails closed after a cd to a computed directory", () => {
+    const verdict = guard.evaluateToolCall("bash", { command: "cd $SOME_DIR && git push origin HEAD" }, repo); // paperclip:allow-git-push: guard test fixture, never executed
+    expect((verdict as { why: string } | null)?.why).toContain("cannot be verified");
+  });
+
   it("still fails closed when no repository can be found", () => {
     const verdict = guard.evaluateToolCall("bash", { command: "git push origin HEAD" }, workDir); // paperclip:allow-git-push: guard test fixture, never executed
     expect((verdict as { why: string } | null)?.why).toContain("cannot be verified");

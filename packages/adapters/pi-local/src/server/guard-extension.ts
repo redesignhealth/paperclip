@@ -160,12 +160,18 @@ export function parseShell(src) {
   return { commands, nested };
 }
 
-// Git finds the repository from any subdirectory, so look for .git in the directory and each parent.
-function findGitEntry(cwd) {
+// Git finds the repository from any subdirectory, so look for .git in the directory and each parent. Only "not there" keeps
+// the walk going; any other error (unreadable) fails closed. exactOnly checks the directory itself: used when an earlier
+// part of the command may have created a repository that does not exist yet (clone, init, worktree add).
+function findGitEntry(cwd, exactOnly) {
   let dir = path.resolve(cwd);
+  if (dir === path.join(path.sep, "paperclip-unknown-directory") || dir.startsWith(path.join(path.sep, "paperclip-unknown-directory") + path.sep)) return null;
   for (let depth = 0; depth < 64; depth++) {
     const candidate = path.join(dir, ".git");
-    try { return { dir, gitPath: candidate, stat: fs.statSync(candidate) }; } catch { /* keep walking up */ }
+    try { return { dir, gitPath: candidate, stat: fs.statSync(candidate) }; } catch (error) {
+      if (!error || (error.code !== "ENOENT" && error.code !== "ENOTDIR")) return null;
+    }
+    if (exactOnly) return null;
     const parent = path.dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -173,9 +179,9 @@ function findGitEntry(cwd) {
   return null;
 }
 
-function readCurrentBranch(cwd) {
+function readCurrentBranch(cwd, exactOnly) {
   try {
-    const found = findGitEntry(cwd);
+    const found = findGitEntry(cwd, exactOnly);
     if (!found) return null;
     let gitDir = found.gitPath;
     if (found.stat.isFile()) {
@@ -201,7 +207,7 @@ function checkGitPush(args, cwd, state) {
     if (arg.startsWith("-")) continue;
     if (remote === null) remote = arg; else refspecs.push(arg);
   }
-  const current = readCurrentBranch(cwd);
+  const current = readCurrentBranch(cwd, state.mayCreateRepo === true);
   const targets = [];
   if (refspecs.length === 0) targets.push(current === null ? "?" : current);
   for (const spec of refspecs) {
@@ -240,6 +246,7 @@ function checkGit(words, cwd, state) {
   if (!sub) return null;
   const args = words.slice(i + 1);
   if (!ALLOWED_GIT.has(sub)) return unlisted("git " + sub);
+  if (sub === "clone" || sub === "init" || sub === "worktree" || sub === "submodule") state.mayCreateRepo = true;
   if (sub === "push") return checkGitPush(args, dir, state);
   if (sub === "checkout" || sub === "switch") {
     for (const a of args) if (DEFAULT_BRANCHES.has(a)) state.onDefaultBranch = true;
@@ -254,6 +261,7 @@ function checkGh(words) {
   const action = words.slice(idx + 1).find((w) => !w.startsWith("-"));
   if (group === "pr" && action === "merge") return deny("merging a pull request");
   if (group === "auth" || group === "secret" || group === "variable" || group === "ssh-key" || group === "gpg-key") return deny("gh " + group + " (credentials)");
+  if (group === "repo" && action === "clone") state.mayCreateRepo = true;
   if (group === "repo" && (action === "delete" || action === "edit" || action === "archive")) return deny("changing or deleting a repository");
   if (group === "release" || group === "workflow") return unlisted("gh " + group);
   if (group === "api") {
