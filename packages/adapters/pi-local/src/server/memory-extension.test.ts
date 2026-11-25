@@ -161,6 +161,22 @@ describe("Pi memory extension: capture", () => {
     expect(text).not.toMatch(/sk-abc|woken|PAPERCLIP_|Run id|Token:/);
   });
 
+  it("never sends memory_add text longer than the memory server accepts (2000 characters)", async () => {
+    const longTask = "Investigate the failing deployment pipeline and report back. ".repeat(60);
+    const longOutcome = "Traced the failure to a stale cache entry and cleared it before the rerun. ".repeat(120);
+    const { handlers } = await load();
+    await handlers.get("agent_end")!({ messages: [
+      { role: "user", content: [{ type: "text", text: longTask }] },
+      assistant(longOutcome),
+    ] });
+    expect(calls).toHaveLength(1);
+    const text = calls[0]!.arguments.text as string;
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(text.length).toBeLessThanOrEqual(1900);
+    expect(text).toMatch(/^Task: /);
+    expect(text).toContain("Outcome: ");
+  });
+
   it("is on by default and off for RH_MEMORY_CAPTURE=off", async () => {
     process.env.RH_MEMORY_CAPTURE = "off";
     const { handlers } = await load();
