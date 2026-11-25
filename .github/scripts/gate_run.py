@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -147,6 +148,47 @@ def submit_review(read: Any, app: Any, pr_number: int, sha: str) -> str:
         return f"REVIEW_UNAVAILABLE_{exc.code}"
 
 
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_REVIEW_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_REQUESTED_BY_RE = re.compile(r"[A-Za-z0-9_.:@+-]{1,200}")
+
+
+def supplied_diff_marker(sha: str) -> str:
+    return f"{gate_lib.SUPPLIED_DIFF_MARKER_PREFIX} {sha} -->"
+
+
+def supplied_diff_comment(sha: str, supplied: argus_verdict.SuppliedDiff) -> str:
+    """The disclosure comment. The digest must be well formed (fail closed); the free-text fields are sanitised."""
+    if not _DIGEST_RE.fullmatch(supplied.digest or ""):
+        raise GateError("SUPPLIED_DIFF_DIGEST_INVALID")
+    review_id = supplied.review_id if _REVIEW_ID_RE.fullmatch(supplied.review_id or "") else "(unrecognized)"
+    requested_by = supplied.requested_by if _REQUESTED_BY_RE.fullmatch(supplied.requested_by or "") else "(unrecognized)"
+    return (
+        f"{supplied_diff_marker(sha)}\n"
+        f"**Approved on a supplied resolution diff, not the full compare diff.**\n\n"
+        f"- Head: `{sha}`\n"
+        f"- Diff digest: `{supplied.digest}`\n"
+        f"- Review id: `{review_id}`\n"
+        f"- Requested by: `{requested_by}`\n\n"
+        "Upstream code outside the resolution diff was not reviewed by Argus."
+    )
+
+
+def post_supplied_diff_comment(app: Any, pr_number: int, sha: str, supplied: argus_verdict.SuppliedDiff) -> str:
+    """Post the supplied-diff disclosure once per head SHA. Raises GateError if it cannot be posted or verified."""
+    body = supplied_diff_comment(sha, supplied)
+    marker = supplied_diff_marker(sha)
+    for comment in app.paginate(f"/repos/{gate_lib.REPO}/issues/{pr_number}/comments"):
+        if (
+            isinstance(comment, dict)
+            and (comment.get("user") or {}).get("login") == gate_lib.APP_BOT_LOGIN
+            and marker in (comment.get("body") or "")
+        ):
+            return "ALREADY_POSTED"
+    app.post(f"/repos/{gate_lib.REPO}/issues/{pr_number}/comments", {"body": body})
+    return "POSTED"
+
+
 def recompute_required(base_required: list[str], labels: list[str]) -> list[str]:
     """Recompute required workflows taking into account label-dependent workflows."""
     req = set(base_required)
@@ -230,6 +272,12 @@ def run(
             return 1 if argus.state == "error" else 0
         # Fresh read of head + Argus + CI immediately before concluding success.
         argus, ci = evaluate(key)
+        if argus.passed and ci.state == "SUCCESS" and argus.supplied_diff is not None:
+            # Approved on an APPROVE-DIFF: say so on the PR BEFORE concluding success, and do not conclude if the
+            # comment cannot be posted (the fact must be visible). Never reached for an ordinary APPROVE.
+            # NOTE: argus_verdict.evaluate does not yet accept APPROVE-DIFF or set `supplied_diff`; once it does
+            # (and binds the round's digest to the PR's resolution diff), this is where the disclosure fires.
+            post_supplied_diff_comment(app, pr_number, sha, argus.supplied_diff)
         publish_pair(argus_outcome(argus), ci_outcome(ci))
     except Superseded as exc:
         cancelled = Outcome("cancelled", "Superseded", f"The head changed or the PR is no longer eligible ({exc.code}).")

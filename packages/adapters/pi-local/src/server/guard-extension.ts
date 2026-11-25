@@ -38,7 +38,7 @@ const SHIFT_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", 
 const INTERPRETERS = new Set(["python", "python3", "node", "tsx", "ruby", "perl", "bash", "sh", "zsh", "bun"]);
 const ENV_READ = /\benviron\b|process\.env|\bgetenv\b|\bprintenv\b|\bENV\b/;
 
-function deny(why) { return { kind: "deny", why }; }
+function deny(why, hint) { return { kind: "deny", why, hint }; }
 function unlisted(what) { return { kind: "unlisted", what }; }
 
 function isSecretVar(name) {
@@ -254,12 +254,93 @@ function checkGit(words, cwd, state) {
   return null;
 }
 
-function checkGh(words) {
+// Builders may not dismiss their own Argus findings: a /dismiss in PR or issue comment text or a review body is refused.
+// Only the dismissal command is matched; every other comment is allowed.
+const DISMISS_RE = /\/dismiss/i;
+const DISMISS_HINT = "BLOCKED by the Paperclip guard: builders may not dismiss Argus findings, so a comment or review containing /dismiss is never allowed in this run. Fix the finding in the code, or ask on your Paperclip issue. Do not retry it or look for a workaround.";
+function denyDismiss() { return deny("posting a /dismiss comment (builders may not dismiss Argus findings)", DISMISS_HINT); }
+function denyUnreadableBody(flag) {
+  return deny("a comment body read from a file the guard cannot read (" + flag + ")", "BLOCKED by the Paperclip guard: the guard cannot read the file given to " + flag + ", and builders may not dismiss Argus findings, so it cannot confirm the comment has no /dismiss. Post the comment with --body and the text inline instead. Do not retry it or look for a workaround.");
+}
+
+function readBodyFile(file, state) {
+  if (!file || file === "-") return null;
+  try {
+    // Only a regular file: a FIFO, /dev/stdin or /dev/zero could block or exhaust memory inside the guard.
+    const target = path.resolve(state.cwd, file);
+    if (!fs.statSync(target).isFile()) return null;
+    return fs.readFileSync(target, "utf8");
+  } catch { return null; }
+}
+
+// Literal text is matched directly. Text built by the shell ($VAR, $(...)) cannot be read, so the whole command text is matched instead.
+function checkBodyText(text, state) {
+  if (DISMISS_RE.test(text)) return denyDismiss();
+  if ((text.includes("$") || text.includes(BT)) && DISMISS_RE.test(state.raw)) return denyDismiss();
+  return null;
+}
+
+function checkBodyFile(file, flag, state) {
+  const text = readBodyFile(file, state);
+  if (text === null) return denyUnreadableBody(flag);
+  if (DISMISS_RE.test(text) || DISMISS_RE.test(state.raw)) return denyDismiss();
+  return null;
+}
+
+function checkCommentBody(words, from, state) {
+  for (let i = from; i < words.length; i++) {
+    const w = words[i];
+    let m;
+    if (w === "--body" || w === "-b") { const r = checkBodyText(words[++i] || "", state); if (r) return r; continue; }
+    if ((m = /^--body=([\s\S]*)$/.exec(w)) || (m = /^-b([\s\S]+)$/.exec(w))) { const r = checkBodyText(m[1], state); if (r) return r; continue; }
+    if (w === "--body-file" || w === "-F") { const r = checkBodyFile(words[++i], w, state); if (r) return r; continue; }
+    if ((m = /^--body-file=([\s\S]*)$/.exec(w)) || (m = /^-F([\s\S]+)$/.exec(w))) { const r = checkBodyFile(m[1], "--body-file", state); if (r) return r; continue; }
+  }
+  return null;
+}
+
+function checkApiComment(words, from, state) {
+  const targets = words.slice(from).filter((w) => !w.startsWith("-"));
+  const graphql = targets.some((w) => /(^|\/)graphql$/.test(w));
+  const commentEndpoint = targets.some((w) => /(^|\/)(comments|reviews|replies)(\/|\?|$)/.test(w));
+  if (!graphql && !commentEndpoint) return null;
+  for (let i = from; i < words.length; i++) {
+    const w = words[i];
+    let m;
+    let field = null;
+    let fileFlag = false;
+    if (w === "-f" || w === "--raw-field") field = words[++i] || "";
+    else if (w === "-F" || w === "--field") { field = words[++i] || ""; fileFlag = true; }
+    else if ((m = /^--(raw-field|field)=([\s\S]*)$/.exec(w))) { field = m[2]; fileFlag = m[1] === "field"; }
+    else if ((m = /^-([fF])([\s\S]+)$/.exec(w))) { field = m[2]; fileFlag = m[1] === "F"; }
+    else if (w === "--input") { const r = checkBodyFile(words[++i], "--input", state); if (r) return r; continue; }
+    else if ((m = /^--input=([\s\S]*)$/.exec(w))) { const r = checkBodyFile(m[1], "--input", state); if (r) return r; continue; }
+    if (field === null) continue;
+    const eq = field.indexOf("=");
+    const key = eq === -1 ? field : field.slice(0, eq);
+    const value = eq === -1 ? "" : field.slice(eq + 1);
+    if (!graphql && key !== "body") continue;
+    if (fileFlag && value.startsWith("@")) { const r = checkBodyFile(value.slice(1), "-F " + key, state); if (r) return r; continue; }
+    const r = checkBodyText(value, state);
+    if (r) return r;
+  }
+  return null;
+}
+
+function checkGh(words, state) {
   const group = words.slice(1).find((w) => !w.startsWith("-"));
   const idx = group ? words.indexOf(group) : -1;
   if (!group) return null;
   const action = words.slice(idx + 1).find((w) => !w.startsWith("-"));
   if (group === "pr" && action === "merge") return deny("merging a pull request");
+  if ((group === "pr" && (action === "comment" || action === "review")) || (group === "issue" && action === "comment")) {
+    const dismissed = checkCommentBody(words, idx + 1, state);
+    if (dismissed) return dismissed;
+  }
+  if (group === "api") {
+    const dismissed = checkApiComment(words, idx + 1, state);
+    if (dismissed) return dismissed;
+  }
   if (group === "auth" || group === "secret" || group === "variable" || group === "ssh-key" || group === "gpg-key") return deny("gh " + group + " (credentials)");
   if (group === "repo" && action === "clone") state.mayCreateRepo = true;
   if (group === "repo" && (action === "delete" || action === "edit" || action === "archive")) return deny("changing or deleting a repository");
@@ -367,7 +448,7 @@ function checkSimple(input, _cwd, state) {
   if ((base === "bash" || base === "sh" || base === "zsh") && words[1] && relativeScript(words[1])) return null;
   if (base === "rm") { const r = checkRm(words); if (r) return r; }
   if (base === "git") { const r = checkGit(words, cwd, state); if (r) return r; return null; }
-  if (base === "gh") { const r = checkGh(words); if (r) return r; return null; }
+  if (base === "gh") { const r = checkGh(words, state); if (r) return r; return null; }
   if (base === "terraform" || base === "tofu") { if (!ALLOWED.has(base)) return unlisted(base); return checkTerraform(words); }
   if (base === "chmod" && words.slice(1).some((w) => /^[0-7]*7[0-7]7$|^a\+rwx$/.test(w))) return deny("making files world-writable");
   if (ALLOWED.has(base)) return null;
@@ -399,7 +480,7 @@ export function evaluateBash(command, cwd) {
   if (secretVar) return deny("reading the secret environment variable " + secretVar);
   if (secretPathIn(command)) return deny("touching a secret path or credential file");
   for (const entry of DENY_RAW) if (entry.re.test(command)) return deny(entry.why);
-  return evaluateBashSource(command, cwd, { onDefaultBranch: false, cwd }, 0);
+  return evaluateBashSource(command, cwd, { onDefaultBranch: false, cwd, raw: command }, 0);
 }
 
 function insideAllowedWriteRoot(target, cwd) {
@@ -437,6 +518,7 @@ export function evaluateToolCall(toolName, input, cwd) {
 }
 
 export function blockMessage(result) {
+  if (result.kind === "deny" && result.hint) return result.hint;
   if (result.kind === "deny") {
     return "BLOCKED by the Paperclip guard: " + result.why + " is never allowed in this run and will not be approved. Do not retry it or look for a workaround. If this is needed, post a comment on your Paperclip issue saying what and why, set the issue to blocked, and end your turn.";
   }
