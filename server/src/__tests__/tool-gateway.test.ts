@@ -10008,10 +10008,11 @@ rl.on("line", (line) => {
       body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "ok" }] } },
     }));
     try {
-      // The VALID tagged personal template, with a non-Granola catalog tool (mdm_get_org) next to the
+      // The VALID tagged personal template, with a non-Granola catalog tool (mdm_get_person_ashby) next to the
       // five allowed Granola reads and the Granola writers.
       const seeded = await seedRhMcpPersonal(db, company.id, { url: fake.url, userId });
-      const nonGranolaTool = "mdm_get_org";
+      // Outside the ceiling even after TECH-10780 added the mdm:read verbs (Ashby is `mdm:ashby:read`).
+      const nonGranolaTool = "mdm_get_person_ashby";
       const [nonGranolaEntry] = await db.insert(toolCatalogEntries).values({
         companyId: company.id,
         applicationId: seeded.application.id,
