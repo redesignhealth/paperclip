@@ -7,7 +7,7 @@ import { preparePiGuardExtension, readPiGuardProfile, PI_GUARD_MAX_BLOCKS } from
 import { PI_MEMORY_TOOL_NAMES } from "./memory-extension.js";
 import { BUILDER_GUARD_POLICY, resolvePiGuardPolicy } from "./guard-policy.js";
 
-type Verdict = { kind: "deny"; why: string } | { kind: "unlisted"; what: string } | null;
+type Verdict = { kind: "deny"; why: string; hint?: string } | { kind: "unlisted"; what: string } | null;
 interface GuardModule {
   evaluateToolCall(tool: string, input: unknown, cwd: string): Verdict;
   default(pi: { on(event: string, handler: (event: unknown, ctx: unknown) => unknown): void }): void;
@@ -265,5 +265,133 @@ describe("readPiGuardProfile", () => {
     expect(readPiGuardProfile({ PAPERCLIP_PI_GUARD_PROFILE: "builder" })).toBe("builder");
     expect(readPiGuardProfile({ PAPERCLIP_PI_GUARD_PROFILE: { type: "plain", value: "infrastructure" } })).toBe("infrastructure");
     expect(resolvePiGuardPolicy(readPiGuardProfile({ PAPERCLIP_PI_GUARD_PROFILE: { type: "secret_ref", secretId: "x" } })).profile).toBe("infrastructure");
+  });
+});
+
+describe("guard: builders may not dismiss Argus findings", () => {
+  const dismissed = (command: string, mod?: GuardModule) => {
+    const verdict = bash(command, mod);
+    return verdict?.kind === "deny" ? verdict : null;
+  };
+
+  it.each([
+    'gh pr comment 12 --body "/dismiss"',
+    'gh pr comment 12 -b "/dismiss finding 3: false positive"',
+    'gh pr comment 12 --body "Looks fine. /DISMISS all"',
+    "gh pr comment 12 --body=/dismiss",
+    "gh pr comment 12 -b/dismiss",
+    'gh pr comment --body "/Dismiss" 12',
+    'gh pr review 12 --comment --body "/dismiss"',
+    'gh pr review 12 --approve -b "ok\n/dismiss"',
+    'gh issue comment 7 --body "/dismiss"',
+    'gh api repos/o/r/issues/12/comments -f body="/dismiss"',
+    'gh api repos/o/r/issues/12/comments --raw-field body=/dismiss',
+    'gh api repos/o/r/issues/12/comments -F body="/dismiss"',
+    'gh api repos/o/r/pulls/12/comments -f body="x /dismiss" -f path=a.ts',
+    'gh api repos/o/r/pulls/12/reviews -f body="/dismiss" -f event=COMMENT',
+    'gh api repos/o/r/pulls/comments/55/replies -f body="/dismiss"',
+    'gh api graphql -f query=\'mutation { addComment(input:{subjectId:"x", body:"/dismiss"}) { clientMutationId } }\'',
+    'echo hi && gh pr comment 12 --body "/dismiss"',
+    'gh pr comment 12 --body "`echo /dismiss`"',
+    'bash -c \'gh pr comment 12 --body "/dismiss"\'',
+    'gh pr comment 12 --body "$(cat <<\'EOF\'\n/dismiss\nEOF\n)"',
+  ])("blocks %s", (command) => {
+    const verdict = dismissed(command);
+    expect(verdict).not.toBeNull();
+    expect(verdict?.why).toContain("dismiss Argus findings");
+  });
+
+  it("tells the builder to fix the finding or ask on the issue", () => {
+    const sink: Array<{ block?: boolean; reason?: string } | undefined> = [];
+    guard.default({
+      on: (_event, handler) => {
+        sink.push(handler({ toolName: "bash", input: { command: 'gh pr comment 1 --body "/dismiss"' } }, { cwd: repo, abort: () => undefined }) as never);
+      },
+    });
+    return Promise.resolve(sink[0]).then((result) => {
+      expect(result?.block).toBe(true);
+      expect(result?.reason).toContain("builders may not dismiss Argus findings");
+      expect(result?.reason).toContain("Fix the finding");
+      expect(result?.reason).toContain("ask on your Paperclip issue");
+    });
+  });
+
+  it("applies to the infrastructure profile too", () => {
+    expect(dismissed('gh pr comment 12 --body "/dismiss"', infra)?.why).toContain("dismiss Argus findings");
+  });
+
+  describe("body files", () => {
+    let bodies: string;
+    beforeAll(async () => {
+      bodies = path.join(workDir, "bodies");
+      await fs.mkdir(bodies, { recursive: true });
+      await fs.writeFile(path.join(bodies, "bad.md"), "finding is wrong\n/dismiss\n");
+      await fs.writeFile(path.join(bodies, "good.md"), "Fixed in the latest commit.\n");
+      await fs.writeFile(path.join(bodies, "bad.json"), JSON.stringify({ body: "/dismiss" }));
+    });
+
+    it.each([
+      (d: string) => `gh pr comment 12 --body-file ${d}/bad.md`,
+      (d: string) => `gh pr comment 12 -F ${d}/bad.md`,
+      (d: string) => `gh pr comment 12 --body-file=${d}/bad.md`,
+      (d: string) => `gh pr review 12 --comment -F ${d}/bad.md`,
+      (d: string) => `gh issue comment 7 --body-file ${d}/bad.md`,
+      (d: string) => `gh api repos/o/r/issues/12/comments -F body=@${d}/bad.md`,
+      (d: string) => `gh api repos/o/r/issues/12/comments --input ${d}/bad.json`,
+    ])("blocks a body file that contains /dismiss (%#)", (make) => {
+      expect(dismissed(make(bodies))?.why).toContain("dismiss Argus findings");
+    });
+
+    it("blocks a body file the guard cannot read, and tells the builder to use --body", () => {
+      for (const command of [
+        "gh pr comment 12 --body-file /nonexistent/body.md",
+        "gh pr comment 12 -F -",
+        "gh pr comment 12 --body-file /dev/stdin",
+        "gh pr review 12 --comment --body-file /nonexistent/body.md",
+        "gh issue comment 7 -F /nonexistent/body.md",
+        "gh api repos/o/r/issues/12/comments --input -",
+      ]) {
+        const verdict = dismissed(command);
+        expect(verdict, command).not.toBeNull();
+        expect(verdict?.hint).toContain("--body");
+      }
+    });
+
+    it("blocks a body file that the same command rewrites to contain /dismiss", () => {
+      expect(dismissed(`echo '/dismiss' > ${bodies}/good.md && gh pr comment 12 --body-file ${bodies}/good.md`)).not.toBeNull();
+    });
+
+    it("allows a readable body file without /dismiss", () => {
+      expect(bash(`gh pr comment 12 --body-file ${bodies}/good.md`)).toBeNull();
+      expect(bash(`gh issue comment 7 -F ${bodies}/good.md`)).toBeNull();
+    });
+  });
+
+  it.each([
+    'gh pr comment 12 --body "@claude review all"',
+    'gh pr comment 12 -b "Fixed the null check in parse(); pushed a8f3c1."',
+    'gh pr comment 12 --body "Please dismiss nothing, I fixed it"',
+    'gh pr review 12 --comment --body "Looks good"',
+    'gh issue comment 7 --body "Blocked: need the staging URL"',
+    'gh issue comment 7 --body "$(cat <<\'EOF\'\nSummary of the change\nEOF\n)"',
+    "gh api repos/o/r/issues/12/comments",
+    "gh api repos/o/r/pulls/12/comments",
+    "gh api repos/o/r/pulls/12/reviews",
+    'echo "/dismiss" > /tmp/note.txt',
+    'git commit -m "docs: explain /dismiss for reviewers"',
+    "gh pr view 12 --comments",
+  ])("does not hard-deny %s", (command) => {
+    // gh pr review is simply not on the builder's pre-approved list ("unlisted"); the point here is no /dismiss denial.
+    expect(bash(command)?.kind).not.toBe("deny");
+  });
+
+  it("allows a plain pr comment and a plain issue comment (no verdict at all)", () => {
+    expect(bash('gh pr comment 12 --body "Fixed the null check"')).toBeNull();
+    expect(bash('gh issue comment 7 --body "Started"')).toBeNull();
+  });
+
+  it("still allows ordinary builder comments end to end", () => {
+    expect(bash('gh pr comment 12 --body "@claude review all"')).toBeNull();
+    expect(bash('gh issue comment 7 --body "Started on this"')).toBeNull();
   });
 });
