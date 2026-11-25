@@ -262,9 +262,11 @@ export function cleanForCapture(text) {
 // then the issue line and description found in the prompt, then the prompt with the known receipt note removed.
 const RECEIPT_NOTE = /Paperclip may post a short platform-generated fast-response receipt[\s\S]*?generic acknowledgement[.]?/g;
 // The server matches short extracted facts, so a whole ticket (URLs, links, code, boilerplate) scores below its cutoff.
-// Recall searches the title plus the first part of the description, with URLs, markdown links and code fences removed.
-function shortRecallText(text) {
-  return cleanForCapture(text)
+// Recall searches the task substance: the title without its [tag] prefix or ticket key, plus the Problem/Change text of
+// the description (or its first plain paragraph). The planner's child issues open with metadata (Linear link, Builder,
+// Allowed paths, Base branch, Estimated, acceptance checks, replay rules) that matches no lesson and swamps the task.
+function flatRecallText(text) {
+  return String(text ?? "")
     .replace(/[\x60]{3}[\s\S]*?(?:[\x60]{3}|$)/g, " ")
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/https?:[/][/]\S+/g, " ")
@@ -272,8 +274,67 @@ function shortRecallText(text) {
     .replace(/\s+/g, " ")
     .trim();
 }
+const TICKET_KEY = /\b[A-Z][A-Z0-9]{1,9}-\d+\b[:,]?/g;
+function shortRecallText(text) {
+  return flatRecallText(cleanForCapture(text).replace(TICKET_KEY, " "));
+}
+function recallTitle(title) {
+  return shortRecallText(String(title ?? "").replace(/^(?:\s*\[[^\]]*\][\s:-]*)+/, "")).replace(/^[\s:-]+/, "");
+}
+const META_KEY = "linear|linear (?:issue|ticket|link)|ticket|builder|allowed paths?|allowed|base branch|base ref|base|branch|estimated(?: changed)?(?: lines| size)?|estimate|size|area|repo|repository|project|parent|assignee|labels?|acceptance(?: checks?| criteria)?|checks?|tests? to run|replay rules?|replay|rules?|constraints?|notes?";
+const META_LINE = new RegExp("^[\\s>*#_-]*(?:" + META_KEY + ")[\\s*_]*(?::|$)", "i");
+const BOILERPLATE_LINE = /^[\s>*_-]*(?:allowed paths are a ceiling|paths? (?:listed|named) (?:here )?(?:are|is) a ceiling)\b/i;
+const HEADING = /^\s*(?:#{1,6}\s+(.+?)|[*][*]([^*]+?)[*][*]:?|__([^_]+?)__:?|([A-Za-z][A-Za-z /&-]{2,40}):)\s*$/;
+const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
+const PATHISH = /^\s*(?:[-*+]\s*)?[\x60]?[\w@.-]+(?:[/][\w@.*-]+)+[/]?[\x60]?\s*$/;
+const SUBSTANCE_HEADING = /^(?:problem|change|changes|what|task|goal|summary|context|description|background|fix|bug|issue|request|work)\b/i;
+function headingOf(line) {
+  const match = HEADING.exec(line);
+  return match ? (match[1] || match[2] || match[3] || match[4] || "").trim() : null;
+}
+// The task text of a description: the Problem/Change section, else the first plain paragraph, with metadata dropped.
+export function recallDescription(description) {
+  const lines = cleanForCapture(description).split("\n");
+  const sections = [];
+  let current = { heading: "", lines: [] };
+  let skipList = false;
+  for (const raw of lines) {
+    const line = raw.replace(TICKET_KEY, " ").trim();
+    if (!line) { current.lines.push(""); skipList = false; continue; }
+    const heading = headingOf(line);
+    if (META_LINE.test(line) && (heading === null || META_LINE.test(heading + ":"))) {
+      // A metadata line (or section) and any bullets under it: dropped.
+      const value = line.replace(META_LINE, "").trim();
+      skipList = value === "";
+      if (heading !== null && /^[#*_]/.test(line)) { sections.push(current); current = { heading: "meta", lines: [] }; }
+      continue;
+    }
+    if (heading !== null && !LIST_ITEM.test(line)) {
+      sections.push(current);
+      current = { heading, lines: [] };
+      skipList = false;
+      continue;
+    }
+    if (BOILERPLATE_LINE.test(line) || PATHISH.test(line)) continue;
+    if (skipList && LIST_ITEM.test(line)) continue;
+    skipList = false;
+    current.lines.push(line);
+  }
+  sections.push(current);
+  const text = (section) => flatRecallText(section.lines.join("\n"));
+  const wanted = sections.find((section) => SUBSTANCE_HEADING.test(section.heading) && text(section).length >= 3);
+  if (wanted) return text(wanted);
+  for (const section of sections) {
+    if (section.heading === "meta" || META_LINE.test(section.heading + ":")) continue;
+    for (const paragraph of section.lines.join("\n").split(/\n\s*\n/)) {
+      const flat = flatRecallText(paragraph);
+      if (flat.length >= 3) return flat;
+    }
+  }
+  return "";
+}
 function joinRecallParts(title, description) {
-  return (shortRecallText(title) + " " + shortRecallText(description).slice(0, MAX_DESCRIPTION_QUERY_CHARS)).trim().slice(0, MAX_TASK_QUERY_CHARS);
+  return (recallTitle(title) + " " + recallDescription(description).slice(0, MAX_DESCRIPTION_QUERY_CHARS)).trim().slice(0, MAX_TASK_QUERY_CHARS);
 }
 export function buildRecallQuery(prompt) {
   const staged = String(TASK_QUERY).replace(RECEIPT_NOTE, " ").trim();
@@ -392,19 +453,18 @@ export default function rhMemory(pi) {
 `;
 }
 
-/** The recall query for a run: the issue title plus the start of its description from the wake payload, cleaned and short (empty when it has none). */
+/**
+ * The task text staged for the extension: the issue title, a newline, then the raw description (bounded). The extension
+ * reduces it to the task substance (title without tag or ticket key, Problem/Change text, no planner metadata), so the
+ * one copy of that logic lives in the extension source. Empty when the wake has no issue.
+ */
 export function buildPiMemoryTaskQuery(wake: unknown): string {
   const issue = wake && typeof wake === "object" ? (wake as { issue?: unknown }).issue : null;
   if (!issue || typeof issue !== "object") return "";
   const { title, description } = issue as { title?: unknown; description?: unknown };
-  const clean = (text: unknown) => (typeof text === "string" ? text : "")
-    .replace(/`{3}[\s\S]*?(?:`{3}|$)/g, " ")
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/https?:\/\/\S+/g, " ")
-    .replace(/`/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  return `${clean(title)} ${clean(description).slice(0, 250)}`.trim().slice(0, 300);
+  const oneLine = (text: unknown) => (typeof text === "string" ? text : "").replace(/\s+/g, " ").trim().slice(0, 300);
+  const body = (typeof description === "string" ? description : "").replace(/\r\n?/g, "\n").trim().slice(0, 6000);
+  return `${oneLine(title)}\n${body}`.replace(/\s+$/, "");
 }
 
 export async function preparePiMemoryExtension(options: { taskQuery?: string } = {}) {

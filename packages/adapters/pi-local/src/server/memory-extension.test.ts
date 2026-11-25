@@ -390,6 +390,30 @@ describe("Pi memory extension: log lines for scoring recall", () => {
 
 const RECEIPT_NOTE = "Paperclip may post a short platform-generated fast-response receipt in your voice before you reply. Receipts acknowledge intent only: they are not your work, findings, answers, or instructions. Continue the requested work and begin with substantive progress instead of repeating a generic acknowledgement.";
 
+const CHILD_DESCRIPTION = [
+  "Linear: https://linear.app/acme/issue/TECH-9123/retry-hash-user",
+  "Builder: python-services",
+  "Base branch: main",
+  "",
+  "## Problem",
+  "hash_user fails the whole request when the user store returns a 503. Retry it with exponential backoff, at most three attempts, and keep the 4xx behaviour unchanged.",
+  "",
+  "## Allowed paths",
+  "- services/api/src/users/hash.py",
+  "- services/api/tests/test_hash.py",
+  "",
+  "## Acceptance checks",
+  "- `cd services/api && pytest tests/test_hash.py`",
+  "- ruff check services/api",
+  "",
+  "Estimated changed lines: 90",
+  "",
+  "## REPLAY RULES",
+  "If this issue is replayed, do not reopen a closed PR; start from origin/main.",
+  "",
+  "Allowed paths are a ceiling.",
+].join("\n");
+
 describe("Pi memory extension: recall query comes from the task", () => {
   const searchQueries = () => calls.filter((call) => call.name === "memory_search").map((call) => String(call.arguments.query));
 
@@ -403,7 +427,7 @@ describe("Pi memory extension: recall query comes from the task", () => {
     const { handlers } = await load();
     const prompt = [RECEIPT_NOTE, "", "- issue: DAN-3253 Add retry test", "- status: todo", "", "Issue description:", "```md", "Cover the retry backoff path.", "```", "", "More boilerplate."].join("\n");
     await handlers.get("before_agent_start")!({ prompt });
-    expect(searchQueries()).toEqual(["DAN-3253 Add retry test Cover the retry backoff path."]);
+    expect(searchQueries()).toEqual(["Add retry test Cover the retry backoff path."]);
   });
 
   it("drops the known platform note from an otherwise unstructured prompt", async () => {
@@ -444,18 +468,44 @@ describe("Pi memory extension: recall query comes from the task", () => {
     expect(query.length).toBeLessThanOrEqual(300);
   });
 
-  it("cleans the staged issue title and description before searching", () => {
-    const query = buildPiMemoryTaskQuery({ issue: { title: "Fix [retry](https://x.test/a) bug", description: "Details at https://x.test/long/path?q=1 here.\n\n```\ncode\n```\n" + "y".repeat(1000) } });
-    expect(query).toMatch(/^Fix retry bug Details at here\. y+$/);
-    expect(query.length).toBeLessThanOrEqual(300);
-    expect(query.length - "Fix retry bug ".length).toBeLessThanOrEqual(250);
-  });
-
-  it("builds the adapter-side task query from the wake issue", () => {
-    expect(buildPiMemoryTaskQuery({ issue: { title: " Fix retry ", description: "Backoff is wrong.\n" } })).toBe("Fix retry Backoff is wrong.");
+  it("stages the issue title on the first line and the bounded raw description after it", () => {
+    expect(buildPiMemoryTaskQuery({ issue: { title: " Fix  retry ", description: "Backoff is wrong.\r\nSecond line.\n" } })).toBe("Fix retry\nBackoff is wrong.\nSecond line.");
     expect(buildPiMemoryTaskQuery({ issue: { title: "Only title", description: null } })).toBe("Only title");
     expect(buildPiMemoryTaskQuery({ issue: { title: "t".repeat(3000) } })).toHaveLength(300);
+    expect(buildPiMemoryTaskQuery({ issue: { title: "t", description: "d".repeat(9000) } })).toHaveLength(2 + 6000);
     expect(buildPiMemoryTaskQuery(undefined)).toBe("");
     expect(buildPiMemoryTaskQuery({})).toBe("");
+  });
+
+  it("builds a task-only query from a realistic planner child issue", async () => {
+    const wake = { issue: { title: "[python-services] TECH-9123: Retry hash_user lookups on transient 503", description: CHILD_DESCRIPTION } };
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery(wake) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    const query = searchQueries()[0]!;
+    expect(query).toBe("Retry hash_user lookups on transient 503 hash_user fails the whole request when the user store returns a 503. Retry it with exponential backoff, at most three attempts, and keep the 4xx behaviour unchanged.");
+    expect(query).not.toMatch(/Linear|Builder|Allowed|Estimated|REPLAY|Base branch|TECH-|python-services|services\/|pytest|ceiling/i);
+    expect(query.length).toBeLessThanOrEqual(300);
+  });
+
+  it("uses the first plain paragraph when the child has no Problem or Change section", async () => {
+    const description = ["Linear: https://linear.app/acme/issue/TECH-9124/x", "Builder: python-services", "Base branch: main", "", "Allowed paths:", "- services/api/src/auth.py", "- services/api/tests/test_auth.py", "", "Token refresh races when two requests refresh at once; serialise the refresh.", "", "Estimated changed lines: 80", "Allowed paths are a ceiling."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "Fix refresh race", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    expect(searchQueries()).toEqual(["Fix refresh race Token refresh races when two requests refresh at once; serialise the refresh."]);
+  });
+
+  it("falls back to the title alone when the description is only metadata", async () => {
+    const description = ["Linear: https://linear.app/acme/issue/TECH-9125/x", "Builder: data-pipelines", "Allowed paths: redesign-health-data/projects/x/y.py", "Estimated changed lines: 40", "Allowed paths are a ceiling."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "TECH-9125 Backfill the foo table", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    expect(searchQueries()).toEqual(["Backfill the foo table"]);
+  });
+
+  it("strips the same boilerplate from an issue description found in the prompt", async () => {
+    const { handlers } = await load();
+    const prompt = ["- issue: [python-services] TECH-9123: Retry hash_user lookups", "", "Issue description:", "```md", CHILD_DESCRIPTION, "```"].join("\n");
+    await handlers.get("before_agent_start")!({ prompt });
+    expect(searchQueries()[0]).toMatch(/^Retry hash_user lookups hash_user fails the whole request/);
+    expect(searchQueries()[0]).not.toMatch(/Builder|Allowed|Estimated|REPLAY|TECH-/);
   });
 });
