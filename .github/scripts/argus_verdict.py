@@ -36,10 +36,22 @@ SSM_REGION = "us-east-1"
 
 
 @dataclass(frozen=True)
+class SuppliedDiff:
+    """What an `APPROVE-DIFF` (supplied-diff) approval rests on, for the PR comment that discloses it."""
+
+    digest: str  # sha256:<hex> of the exact document Argus reviewed
+    review_id: str
+    requested_by: str
+
+
+@dataclass(frozen=True)
 class ArgusResult:
     state: str  # approve | blocking | pending | error
     code: str
     summary: str
+    # Set only when the approval is an APPROVE-DIFF on a caller-supplied diff. An ordinary APPROVE leaves it None.
+    # evaluate() does not set it yet: it still rejects APPROVE-DIFF as INVALID_VERDICT (see gate_run.run).
+    supplied_diff: SuppliedDiff | None = None
 
     @property
     def passed(self) -> bool:
