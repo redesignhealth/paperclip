@@ -45,7 +45,7 @@ describe("agent guidance for comms board wakes (TECH-9889)", () => {
 
   it("covers every point the dev end-to-end runs showed was needed, and stays short", () => {
     const guide = read(REFERENCE);
-    expect(guide.split(/\s+/).length).toBeLessThan(800);
+    expect(guide.split(/\s+/).length).toBeLessThan(850);
     for (const needle of [
       "comms_board_conversation",
       "Read the whole conversation",
@@ -112,7 +112,7 @@ describe("buildCommsWakeComment", () => {
   it("names the board identity to act as, and the connection to use, in both comments", () => {
     for (const kind of ["message", "invite"] as const) {
       const text = buildCommsWakeComment(event(kind), AGENT_ID);
-      expect(text).toContain(`This wake is for your own board identity \`paperclip-agent-${AGENT_ID}\``);
+      expect(text).toContain(`This wake is for your own board identity, whose name starts with \`paperclip-agent-${AGENT_ID}\``);
       expect(text).toContain("(board agent id `22222222-2222-4222-8222-222222222222`)");
       expect(text).toContain("Use the comms board connection where `comms_whoami` returns that identity as active");
       expect(text).toContain("ignore any other board connection for this conversation");
@@ -132,7 +132,8 @@ describe("buildCommsWakeComment", () => {
   it("explains in the reference which connection to use when there is more than one", () => {
     const guide = read(REFERENCE);
     expect(guide).toContain("If you have more than one comms board connection");
-    expect(guide).toContain("`comms_whoami` returns your own identity");
+    expect(guide).toContain("`comms_whoami` returns your own identity as active");
+    expect(guide).toContain("`-r<N>` suffix");
     expect(guide).toContain("A wake is addressed to your own Paperclip board identity");
     expect(guide).toContain("Another connection is a different identity");
   });

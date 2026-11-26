@@ -79,7 +79,7 @@ export function buildCommsWakeComment(event: CommsWakeEvent, agentId: string) {
   const { kind, conversationId, seq, messageType, senderAgentId, recipientAgentId } = event.data;
   // recipientAgentId is checked against the registration's board agent id before the event is processed.
   const identity =
-    `This wake is for your own board identity \`paperclip-agent-${agentId}\` (board agent id \`${recipientAgentId}\`). ` +
+    `This wake is for your own board identity, whose name starts with \`paperclip-agent-${agentId}\` (board agent id \`${recipientAgentId}\`). ` +
     "Use the comms board connection where `comms_whoami` returns that identity as active; ignore any other board connection for this conversation.";
   const closing =
     "Then mark this issue done, even if there was nothing to do; it reopens when the next message arrives.";
