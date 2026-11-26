@@ -2745,6 +2745,13 @@
       "when": 1795706669057,
       "tag": "0393_company_default_environment",
       "breakpoints": true
+    },
+    {
+      "idx": 394,
+      "version": "7",
+      "when": 1795707600864,
+      "tag": "0394_instance_new_agent_default_environment",
+      "breakpoints": true
     }
   ]
 }

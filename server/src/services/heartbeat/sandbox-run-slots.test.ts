@@ -38,6 +38,12 @@ describe("company default environment fallback (TECH-10878)", () => {
     expect(cappedSandboxProviderForAgent(base, { defaultEnvironmentId: id })).toBe("kubernetes");
   });
 
+  it("falls back to the instance new-agent default after the company default", () => {
+    const withInstance = placement({ environments: new Map([["k8s-env", k8s]]), newAgentDefaultEnvironmentId: "k8s-env" });
+    expect(fallbackEnvironmentIdForAgent(withInstance, { companyId: "c1", adapterType: "hermes_local" }, null)).toBe("k8s-env");
+    expect(fallbackEnvironmentIdForAgent(withInstance, { companyId: "c1", adapterType: "claude_local" }, null)).toBeNull();
+  });
+
   it("stays local for an adapter the sandbox does not list, an inactive default, or another company's default", () => {
     expect(fallbackEnvironmentIdForAgent(base, { companyId: "c1", adapterType: "claude_local" }, "k8s-env")).toBeNull();
     expect(fallbackEnvironmentIdForAgent(base, { companyId: "c1", adapterType: "hermes_local" }, "gone-env")).toBeNull();

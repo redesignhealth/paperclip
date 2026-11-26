@@ -126,6 +126,7 @@ export const instanceExperimentalSettingsWithManagedSchema = instanceExperimenta
 
 export const patchInstanceSettingsSchema = z.object({
   defaultEnvironmentId: z.string().guid().nullable().optional(),
+  newAgentDefaultEnvironmentId: z.string().guid().nullable().optional(),
 }).strict();
 
 // The longest time a task drain can run before it expires on its own. A
@@ -188,6 +189,7 @@ export type PatchInstanceSsoSettings = z.infer<typeof patchInstanceSsoSettingsSc
 export const instanceSettingsSchema = z.object({
   id: z.string().guid(),
   defaultEnvironmentId: z.string().guid().nullable(),
+  newAgentDefaultEnvironmentId: z.string().guid().nullable(),
   general: instanceGeneralSettingsSchema,
   experimental: instanceExperimentalSettingsWithManagedSchema,
   sso: instanceSsoSettingsSchema,

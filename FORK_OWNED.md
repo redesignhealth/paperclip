@@ -217,3 +217,8 @@ any new fork patch; remove one when the patch is upstreamed.
 - `packages/adapters/pi-local/src/server/execute.ts` and `runtime-config.ts`: sandbox runs route the Router provider through the model relay (TECH-10174)
 - `packages/adapters/hermes/src/server/execute-sandbox.ts` Hermes sandbox launch wires Ashby relay env and scrubs stale credentials
 - `packages/adapters/hermes/src/server/execute.sandbox.test.ts`
+
+## Default environment for new agents (TECH-10878)
+
+- `server/src/services/agent-default-environment.ts` company and instance default environment for new agents, and its run-time fallback
+- `server/src/__tests__/agent-default-environment-inheritance.test.ts`
