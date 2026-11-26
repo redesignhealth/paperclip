@@ -416,6 +416,14 @@ describeEmbeddedPostgres("comms-board wake operator tools for existing agents (T
       expect(report.outcomes).toEqual([{ agentId: proc.id, result: "enrolled" }]);
     });
 
+    it("set-up of a new process agent does not register it (the setting is on), a new pi_local agent is offered the entry", async () => {
+      const { companyId, ownerId } = await seedCompany(true);
+      const proc = await existingAgent(companyId, ownerId, { adapterType: "process" });
+      const pi = await existingAgent(companyId, ownerId, { adapterType: "pi_local" });
+      expect((await stateOf(proc.id))["comms-wake"]).toBeUndefined();
+      expect((await stateOf(pi.id))["comms-wake"]!.setup.state).toBe("pending");
+    });
+
     it("a deliberately unsubscribed agent stays unsubscribed", async () => {
       const { companyId, agent } = await orgWithExistingAgent();
       const fetchImpl = boardFetch();
@@ -444,13 +452,12 @@ describeEmbeddedPostgres("comms-board wake operator tools for existing agents (T
 
     it("does not back-fill an agent outside the rollout scope", async () => {
       const { companyId, agent } = await orgWithExistingAgent();
-      const fetchImpl = boardFetch();
       expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "none" } })).toBe(0);
       expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [] } })).toBe(0);
       expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [randomUUID()] } })).toBe(0);
       expect((await stateOf(agent.id))["comms-wake"]).toBeUndefined();
       expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [companyId] } })).toBe(1);
-      expect(fetchImpl.sets()).toHaveLength(0);
+      expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("pending");
     });
 
     it("does nothing while the org setting is off", async () => {

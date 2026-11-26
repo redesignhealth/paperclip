@@ -219,7 +219,7 @@ describeEmbeddedPostgres("comms-board wake registration at agent creation (TECH-
   async function createAgent(companyId: string, ownerUserId: string) {
     const created = await agentService(db).create(
       companyId,
-      { name: `Agent ${randomUUID().slice(0, 6)}`, role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
+      { name: `Agent ${randomUUID().slice(0, 6)}`, role: "engineer", status: "idle", adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
       { claudeLogin: { storedSessionId: null, ownerUserId } },
     );
     await waitForScheduledDefaultMcpSetups();
