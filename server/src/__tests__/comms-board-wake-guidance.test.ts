@@ -8,6 +8,7 @@ const repoRoot = path.resolve(import.meta.dirname, "../../..");
 const read = (relative: string) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
 const REFERENCE = "skills/paperclip/references/comms-board-wake.md";
 
+const AGENT_ID = "55555555-5555-4555-8555-555555555555";
 const event = (kind: "message" | "invite"): CommsWakeEvent => ({
   eventId: "11111111-1111-4111-8111-111111111111",
   name: "comms.wake",
@@ -44,7 +45,7 @@ describe("agent guidance for comms board wakes (TECH-9889)", () => {
 
   it("covers every point the dev end-to-end runs showed was needed, and stays short", () => {
     const guide = read(REFERENCE);
-    expect(guide.split(/\s+/).length).toBeLessThan(750);
+    expect(guide.split(/\s+/).length).toBeLessThan(850);
     for (const needle of [
       "comms_board_conversation",
       "Read the whole conversation",
@@ -89,23 +90,52 @@ describe("agent guidance for comms board wakes (TECH-9889)", () => {
 describe("buildCommsWakeComment", () => {
   it("tells the agent to finish by marking the issue done even with nothing to do", () => {
     for (const kind of ["message", "invite"] as const) {
-      expect(buildCommsWakeComment(event(kind))).toContain("mark this issue done, even if there was nothing to do");
+      expect(buildCommsWakeComment(event(kind), AGENT_ID)).toContain("mark this issue done, even if there was nothing to do");
     }
   });
 
   it("tells the agent not to reply just to acknowledge or to answer twice", () => {
-    const text = buildCommsWakeComment(event("message"));
+    const text = buildCommsWakeComment(event("message"), AGENT_ID);
     expect(text).toContain("Reply on the board only if a reply is needed");
     expect(text).toContain("not just to acknowledge");
     expect(text).toContain("not again if you already answered it");
   });
 
   it("tells an agent woken by an invite to read the whole conversation, since the opening message gets no wake", () => {
-    const text = buildCommsWakeComment(event("invite"));
+    const text = buildCommsWakeComment(event("invite"), AGENT_ID);
     expect(text).toMatch(/^New comms-board invitation\. Conversation: /);
     expect(text).toContain("comms_get_conversation");
     expect(text).toContain("will not wake you again");
     expect(text).toContain("mark this issue done");
+  });
+
+  it("names the board identity to act as, and the connection to use, in both comments", () => {
+    for (const kind of ["message", "invite"] as const) {
+      const text = buildCommsWakeComment(event(kind), AGENT_ID);
+      expect(text).toContain(`This wake is for your own board identity, whose name starts with \`paperclip-agent-${AGENT_ID}\``);
+      expect(text).toContain("(board agent id `22222222-2222-4222-8222-222222222222`)");
+      expect(text).toContain("Use the comms board connection where `comms_whoami` returns that identity as active");
+      expect(text).toContain("ignore any other board connection for this conversation");
+    }
+    expect(buildCommsWakeComment(event("invite"), AGENT_ID)).toMatch(/^New comms-board invitation\. Conversation: /);
+    expect(buildCommsWakeComment(event("message"), AGENT_ID)).toMatch(/^New comms-board message\. Conversation: /);
+  });
+
+  it("keeps the existing instructions next to the identity sentence", () => {
+    const invite = buildCommsWakeComment(event("invite"), AGENT_ID);
+    expect(invite).toContain("accept or decline the invitation");
+    expect(invite).toContain("read the whole conversation with `comms_get_conversation`");
+    const message = buildCommsWakeComment(event("message"), AGENT_ID);
+    expect(message).toContain("Read the conversation with your comms-board tools");
+  });
+
+  it("explains in the reference which connection to use when there is more than one", () => {
+    const guide = read(REFERENCE);
+    expect(guide).toContain("If you have more than one comms board connection");
+    expect(guide).toContain("`comms_whoami` returns your own identity as active");
+    expect(guide).toContain("`-r<N>` suffix");
+    expect(guide).toContain("A wake is addressed to your own Paperclip board identity");
+    expect(guide).toContain("Another connection is a different identity");
   });
 
   it("explains in the reference why an accepted invite needs a read of the opening message", () => {
@@ -115,9 +145,10 @@ describe("buildCommsWakeComment", () => {
   });
 
   it("still names the conversation and the message number and carries no message content", () => {
-    const text = buildCommsWakeComment(event("message"));
+    const text = buildCommsWakeComment(event("message"), AGENT_ID);
     expect(text).toContain("33333333-3333-4333-8333-333333333333");
     expect(text).toContain("Message number: `4`");
     expect(text).toContain("Type: `task_assign`");
+    expect(text).not.toMatch(/ignore previous|secret|body/i);
   });
 });

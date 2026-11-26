@@ -200,6 +200,8 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
     expect(comments[0]!.body).toContain("`4`");
     expect(comments[0]!.body).toContain("`task_assign`");
     expect(comments[0]!.body).toContain(body.data.senderAgentId);
+    expect(comments[0]!.body).toContain(`paperclip-agent-${a.agentId}`);
+    expect(comments[0]!.body).toContain(`(board agent id \`${a.boardAgentId}\`)`);
 
     expect(wakes).toHaveLength(1);
     expect(wakes[0]!.agentId).toBe(a.agentId);
@@ -293,6 +295,8 @@ describeEmbeddedPostgres("comms board wake: issue, comment and wake", () => {
     expect(comment!.body).toContain("invited");
     expect(comment!.body).toContain(sender);
     expect(comment!.body).toContain("accept or decline");
+    expect(comment!.body).toContain(`paperclip-agent-${a.agentId}`);
+    expect(comment!.body).toContain(`(board agent id \`${a.boardAgentId}\`)`);
     expect(comment!.body).not.toContain("Message number");
   });
 
