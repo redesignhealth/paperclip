@@ -209,7 +209,8 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
   // after the replayed histories, so a retained company row gains
   // `visibility: null` and `deletion_started_at: null` and must otherwise be unchanged.
   // Migration 0391_company_comms_board_wake adds companies.comms_board_wake_enabled
-  // (not null, default false), so the retained row also gains `comms_board_wake_enabled: false`.
+  // (not null, default false); migration 0392 only flips the column default to true and leaves existing rows alone, so the
+  // retained row still gains `comms_board_wake_enabled: false`.
   function withoutForkAddedCompanyColumns<T extends { company: Record<string, unknown> } | undefined>(rows: T): T {
     if (!rows) return rows;
     const { visibility, deletion_started_at, comms_board_wake_enabled, ...company } = rows.company;

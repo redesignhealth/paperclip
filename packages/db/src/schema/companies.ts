@@ -30,10 +30,12 @@ export const companies = pgTable(
       .notNull()
       .default(false),
     /**
-     * Rollout setting (TECH-9912), not a feature flag: when true, NEW agents of this company are subscribed to comms-board
-     * wake events at creation. Changed only by an instance admin. Off for every company until switched on.
+     * Per-org off switch (TECH-9912, TECH-10684), not a feature flag: on by default, so agents of this company are subscribed
+     * to comms-board wake events. Turning it off stops the org's wakes (they are answered "retry later" and held by the board);
+     * agents already subscribed stay registered. Changed only by an instance admin. The default only applies to new companies;
+     * migration 0392 does not touch existing rows.
      */
-    commsBoardWakeEnabled: boolean("comms_board_wake_enabled").notNull().default(false),
+    commsBoardWakeEnabled: boolean("comms_board_wake_enabled").notNull().default(true),
     interactionResolverGovernance: jsonb("interaction_resolver_governance")
       .$type<InteractionResolverGovernance>()
       .notNull()
