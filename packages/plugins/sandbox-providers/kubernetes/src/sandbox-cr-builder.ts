@@ -1,3 +1,5 @@
+import type { KubernetesToleration } from "./types.js";
+
 /**
  * Builds a kubernetes-sigs/agent-sandbox Sandbox CR manifest.
  *
@@ -50,6 +52,8 @@ export interface BuildSandboxCrManifestInput {
     limits?: { cpu?: string; memory?: string };
   };
   runtimeClassName?: string;
+  nodeSelector?: Record<string, string>;
+  tolerations?: KubernetesToleration[];
   imagePullSecrets?: string[];
 }
 
@@ -86,6 +90,12 @@ export function buildSandboxCrManifest(
           restartPolicy: "Always",
           ...(input.runtimeClassName
             ? { runtimeClassName: input.runtimeClassName }
+            : {}),
+          ...(input.nodeSelector && Object.keys(input.nodeSelector).length > 0
+            ? { nodeSelector: input.nodeSelector }
+            : {}),
+          ...(input.tolerations && input.tolerations.length > 0
+            ? { tolerations: input.tolerations }
             : {}),
           ...(input.imagePullSecrets && input.imagePullSecrets.length > 0
             ? {

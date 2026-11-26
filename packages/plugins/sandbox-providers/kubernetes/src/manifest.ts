@@ -98,6 +98,40 @@ const manifest: PaperclipPluginManifestV1 = {
             description:
               "Optional RuntimeClass for pod isolation (e.g. `kata-fc` for Firecracker-backed microVMs). Cluster must have the RuntimeClass installed.",
           },
+          nodeSelector: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description:
+              "Optional pod nodeSelector (node label key to value) applied to sandbox pods, e.g. to schedule onto dedicated nodes.",
+          },
+          tolerations: {
+            type: "array",
+            description:
+              "Optional pod tolerations applied to sandbox pods, e.g. to tolerate the taint on dedicated nodes. Same shape as the Kubernetes Toleration.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                key: { type: "string", description: "Taint key. May be empty only with operator `Exists`." },
+                operator: {
+                  type: "string",
+                  enum: ["Equal", "Exists"],
+                  description: "`Equal` (default) matches key and value; `Exists` matches any value and must not set `value`.",
+                },
+                value: { type: "string", description: "Taint value. Must be unset with operator `Exists`." },
+                effect: {
+                  type: "string",
+                  enum: ["NoSchedule", "PreferNoSchedule", "NoExecute"],
+                  description: "Taint effect to match. Empty matches all effects.",
+                },
+                tolerationSeconds: {
+                  type: "integer",
+                  minimum: 0,
+                  description: "For `NoExecute`, how long the pod stays bound after the taint is added.",
+                },
+              },
+            },
+          },
           serviceAccountAnnotations: {
             type: "object",
             additionalProperties: { type: "string" },

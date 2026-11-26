@@ -71,6 +71,20 @@ describe("buildJobManifest", () => {
     expect(job.spec.template.spec.runtimeClassName).toBe("kata-fc");
   });
 
+  it("applies nodeSelector and tolerations when set", () => {
+    const job = buildJobManifest({ ...baseInput, nodeSelector: { workload: "code-factory" }, tolerations: [{ key: "dedicated", operator: "Equal" as const, value: "code-factory", effect: "NoSchedule" as const }] });
+    expect(job.spec.template.spec.nodeSelector).toEqual({ workload: "code-factory" });
+    expect(job.spec.template.spec.tolerations).toEqual([{ key: "dedicated", operator: "Equal" as const, value: "code-factory", effect: "NoSchedule" as const }]);
+  });
+
+  it("omits nodeSelector and tolerations when unset or empty", () => {
+    for (const input of [baseInput, { ...baseInput, nodeSelector: {}, tolerations: [] }]) {
+      const spec = buildJobManifest(input).spec.template.spec;
+      expect("nodeSelector" in spec).toBe(false);
+      expect("tolerations" in spec).toBe(false);
+    }
+  });
+
   it("does not set runtimeClassName when unset", () => {
     const job = buildJobManifest(baseInput);
     expect(job.spec.template.spec.runtimeClassName).toBeUndefined();
