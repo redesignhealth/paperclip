@@ -32,6 +32,7 @@ const ALLOWED_GIT = new Set(POLICY.allowedGit);
 const ALLOWED_TF = new Set(POLICY.allowedTerraform);
 const DEFAULT_BRANCHES = new Set(POLICY.defaultBranches);
 const MCP_DENY = POLICY.denyMcpToolPatterns;
+const MCP_SHELL_HINT = "BLOCKED by the Paperclip guard: mcp is a Pi tool, not a shell command, so it cannot be run from bash. Nothing in this command ran. If an mcp tool is listed among your tools, call it directly instead (for example the mcp tool with search set to argus, then call the tool it finds) and re-run the rest of the command without the mcp part. If no mcp tool is available in this run, say so on your issue. Either way this is not an approval problem: do not ask for approval for the shell command.";
 const WRAPPERS = new Set(["command", "builtin", "exec", "nohup", "time", "nice", "timeout", "xargs", "env", "stdbuf"]);
 const SKIP_COMMANDS = new Set(["done", "fi", "esac", "for", "select", "case", "function", "in"]);
 const SHIFT_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "!"]);
@@ -411,6 +412,10 @@ function checkSimple(input, _cwd, state) {
     state.cwd = target && !/[$~]|\$\(/.test(target) ? path.resolve(state.cwd, target) : path.join(path.sep, "paperclip-unknown-directory");
     return null;
   }
+  // mcp is a Pi tool, not a shell command. Run in bash it is not a binary in the pod, and the generic "unlisted" reply would
+  // tell the builder to stop and ask for approval, so it gets its own reply that points at the tool. Only the command word
+  // matches: paths, filenames, arguments and grep patterns that contain "mcp" are untouched.
+  if (base === "mcp") return deny("running mcp as a shell command", MCP_SHELL_HINT);
   if (base === "sudo" || base === "su" || base === "doas") return deny("privilege escalation");
   if (WRAPPERS.has(base)) {
     let rest = words.slice(1);
