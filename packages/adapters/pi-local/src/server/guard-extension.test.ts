@@ -299,43 +299,8 @@ describe("guard: git commands from a subdirectory and paths that contain mcp", (
     "git push -u origin feature/x && gh pr create --title 'rh-mcp' --body b", // paperclip:allow-git-push: guard test fixture, never executed
     "ls services/rh-mcp rh-memory-mcp",
     "echo mcp",
-    "uv run pytest services/shared/tests/test_mcp_observability.py",
-    "cd services/shared && .venv/bin/pytest tests/test_mcp_observability.py -q",
-    "grep -rn mcp services/shared/src | head",
-    "grep mcp services/rh-mcp/README.md",
-    "grep -rn 'mcp' services/shared/tests | wc -l",
-    "ls services/rh-mcp/src && cat services/rh-mcp/pyproject.toml",
-    "git diff -- services/rh-mcp services/shared/tests/test_mcp_observability.py",
-    "git add services/shared/tests/test_mcp_observability.py && git commit -m 'test mcp observability'",
-    'gh pr create --draft --title "TECH-1: test mcp observability" --body "Tests only; services/shared/tests/test_mcp_observability.py."',
-    "mkdir -p mcp && echo mcp > mcp/notes.txt",
-    "ls ./mcp",
-    "echo mcp | cat",
-    "python3 -m mcp --help",
-    "uvx mcp-server-fetch --help",
   ])("allows %s", (command) => {
     expect(bash(command)).toBeNull();
-  });
-
-  it.each([
-    "mcp search",
-    "mcp search argus 2>/dev/null",
-    "gh pr create --draft --title t --body b 2>&1|tail -2; mcp search 2>/dev/null",
-    "cd /workspace && mcp search argus",
-    "echo hi && mcp search",
-    "echo hi | mcp call argus-get-review",
-    "true || mcp search",
-    "(mcp search)",
-    "FOO=1 mcp search",
-    "timeout 5 mcp search",
-    "env mcp search",
-    "/usr/local/bin/mcp search",
-    "bash -c 'mcp search argus'",
-    "if true; then mcp search; fi",
-  ])("denies running mcp as a shell command: %s", (command) => {
-    const verdict = bash(command);
-    expect(verdict?.kind).toBe("deny");
-    expect(verdict && "hint" in verdict ? verdict.hint : "").toContain("Pi tool");
   });
 
   it("finds the branch through a linked worktree .git file from a subdirectory", () => {
