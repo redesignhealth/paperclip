@@ -109,4 +109,45 @@ describe("kubernetesProviderConfigSchema", () => {
       parseKubernetesProviderConfig({ inCluster: true, reuseLease: true, reuseLeaseScope: "conversations" }),
     ).toMatchObject({ reuseLease: true, reuseLeaseScope: "conversations" });
   });
+
+  describe("nodeSelector and tolerations", () => {
+    const parse = (extra: Record<string, unknown>) => parseKubernetesProviderConfig({ inCluster: true, ...extra });
+
+    it("round-trips nodeSelector and tolerations (not dropped on save)", () => {
+      const cfg = {
+        nodeSelector: { workload: "code-factory" },
+        tolerations: [
+          { key: "dedicated", operator: "Equal", value: "code-factory", effect: "NoSchedule" },
+          { operator: "Exists" },
+          { key: "spot", operator: "Exists", effect: "NoExecute", tolerationSeconds: 60 },
+        ],
+      };
+      expect(parse(cfg)).toMatchObject(cfg);
+      expect(parse({}).nodeSelector).toBeUndefined();
+      expect(parse({}).tolerations).toBeUndefined();
+    });
+
+    it("accepts Equal with no explicit operator when a key is set", () => {
+      expect(parse({ tolerations: [{ key: "dedicated", value: "x" }] }).tolerations).toHaveLength(1);
+    });
+
+    it("rejects Exists with a value", () => {
+      expect(() => parse({ tolerations: [{ key: "k", operator: "Exists", value: "v" }] })).toThrow();
+    });
+
+    it("rejects an empty key unless operator is Exists", () => {
+      expect(() => parse({ tolerations: [{ operator: "Equal", value: "v" }] })).toThrow();
+      expect(() => parse({ tolerations: [{ value: "v" }] })).toThrow();
+    });
+
+    it("rejects a bad effect, negative tolerationSeconds and unknown keys", () => {
+      expect(() => parse({ tolerations: [{ key: "k", effect: "Nope" }] })).toThrow();
+      expect(() => parse({ tolerations: [{ key: "k", tolerationSeconds: -1 }] })).toThrow();
+      expect(() => parse({ tolerations: [{ key: "k", operater: "Equal" }] })).toThrow();
+    });
+
+    it("rejects non-string nodeSelector values", () => {
+      expect(() => parse({ nodeSelector: { a: 1 } })).toThrow();
+    });
+  });
 });

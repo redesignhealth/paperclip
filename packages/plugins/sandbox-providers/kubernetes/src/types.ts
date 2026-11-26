@@ -20,6 +20,38 @@ const quantity = z.string().regex(quantityRegex, "Invalid Kubernetes quantity");
 export const DEFAULT_QUOTA_PODS = 20;
 export const DEFAULT_RESOURCE_QUOTA = defaultQuotaForPods(DEFAULT_QUOTA_PODS);
 
+/**
+ * Pod toleration (Kubernetes core/v1 Toleration). Strict so typos fail
+ * validation instead of silently producing a pod that never schedules.
+ */
+export const kubernetesTolerationSchema = z
+  .object({
+    key: z.string().optional(),
+    operator: z.enum(["Equal", "Exists"]).optional(),
+    value: z.string().optional(),
+    effect: z.enum(["NoSchedule", "PreferNoSchedule", "NoExecute"]).optional(),
+    tolerationSeconds: z.number().int().nonnegative().optional(),
+  })
+  .strict()
+  .superRefine((t, ctx) => {
+    if (t.operator === "Exists" && t.value !== undefined && t.value !== "") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["value"],
+        message: "value must be empty when operator is Exists",
+      });
+    }
+    if (t.operator !== "Exists" && !t.key) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["key"],
+        message: "key is required unless operator is Exists (an empty key is only valid with Exists)",
+      });
+    }
+  });
+
+export type KubernetesToleration = z.infer<typeof kubernetesTolerationSchema>;
+
 /** Default budget for a sandbox pod to become Ready before failing the run. */
 export const DEFAULT_POD_READY_TIMEOUT_SEC = 90;
 
@@ -103,6 +135,10 @@ export const kubernetesProviderConfigSchema = z
       .optional(),
 
     runtimeClassName: z.string().optional(),
+    /** Pod `nodeSelector` (label key -> value), e.g. to pin sandbox pods to dedicated nodes. */
+    nodeSelector: z.record(z.string()).optional(),
+    /** Pod `tolerations`, e.g. to tolerate the taint on dedicated sandbox nodes. */
+    tolerations: z.array(kubernetesTolerationSchema).optional(),
     serviceAccountAnnotations: z.record(z.string()).default({}),
 
     jobTtlSecondsAfterFinished: z.number().int().nonnegative().default(900),

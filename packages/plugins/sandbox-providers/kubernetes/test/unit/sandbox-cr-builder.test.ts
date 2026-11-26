@@ -124,6 +124,20 @@ describe("buildSandboxCrManifest", () => {
     expect(cr.spec.podTemplate.spec.runtimeClassName).toBe("kata-fc");
   });
 
+  it("applies nodeSelector and tolerations when set", () => {
+    const cr = buildSandboxCrManifest({ ...baseInput, nodeSelector: { workload: "code-factory" }, tolerations: [{ key: "dedicated", operator: "Equal" as const, value: "code-factory", effect: "NoSchedule" as const }] });
+    expect(cr.spec.podTemplate.spec.nodeSelector).toEqual({ workload: "code-factory" });
+    expect(cr.spec.podTemplate.spec.tolerations).toEqual([{ key: "dedicated", operator: "Equal" as const, value: "code-factory", effect: "NoSchedule" as const }]);
+  });
+
+  it("omits nodeSelector and tolerations when unset or empty", () => {
+    for (const input of [baseInput, { ...baseInput, nodeSelector: {}, tolerations: [] }]) {
+      const spec = buildSandboxCrManifest(input).spec.podTemplate.spec;
+      expect("nodeSelector" in spec).toBe(false);
+      expect("tolerations" in spec).toBe(false);
+    }
+  });
+
   it("does not set runtimeClassName when unset", () => {
     const cr = buildSandboxCrManifest(baseInput);
     expect(cr.spec.podTemplate.spec.runtimeClassName).toBeUndefined();

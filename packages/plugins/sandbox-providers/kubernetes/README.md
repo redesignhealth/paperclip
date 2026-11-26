@@ -81,6 +81,8 @@ Common optional fields:
 | `egressAllowCidrs` | `[]` | Additional CIDRs to allow egress to. |
 | `egressMode` | `"standard"` | `standard` (NetworkPolicy + CIDRs) or `cilium` (CiliumNetworkPolicy + FQDN allow-list). |
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
+| `nodeSelector` | (none) | Node label key/value map applied to sandbox pods, e.g. `{ "workload": "code-factory" }`, to schedule onto dedicated nodes. |
+| `tolerations` | (none) | List of pod tolerations (`key`, `operator` `Equal`/`Exists`, `value`, `effect`, `tolerationSeconds`) so sandbox pods can run on tainted dedicated nodes. `Exists` must not set `value`; an empty `key` is only valid with `Exists`. Unknown fields are rejected. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
 | `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
