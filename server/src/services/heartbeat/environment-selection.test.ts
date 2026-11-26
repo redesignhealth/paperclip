@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agents, builtInManagedResources, companies, createDb, environments, heartbeatRuns, issues, projects, projectWorkspaces, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { environmentService } from "../environments.js";
@@ -192,6 +192,42 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
       await db.insert(builtInManagedResources).values({ companyId: other!.id, bundleKey: "test", resourceKind: "environment", resourceKey: "b", resourceId: ssh.id, stockVersion: "1", stockHash: "x" });
       const { input } = await withCompanyDefault(ssh.id);
       expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.driver).toBe("local");
+    });
+
+    describe("instance new-agent default", () => {
+      afterEach(async () => { await instanceSettingsService(db).update({ newAgentDefaultEnvironmentId: null }); });
+
+      it("runs an agent with no environment on the instance new-agent default when the company has none", async () => {
+        const ssh = await db.insert(environments).values({ name: `Instance ssh ${randomUUID()}`, driver: "ssh", status: "active", config: {} }).returning().then((rows) => rows[0]!);
+        await instanceSettingsService(db).update({ newAgentDefaultEnvironmentId: ssh.id });
+        const { input } = await withCompanyDefault(null);
+        expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(ssh.id);
+      });
+
+      it("prefers the company default, keeps explicit Local local, and falls through an unusable instance default", async () => {
+        const company = await db.insert(environments).values({ name: `Company ssh ${randomUUID()}`, driver: "ssh", status: "active", config: {} }).returning().then((rows) => rows[0]!);
+        const instance = await db.insert(environments).values({ name: `Instance ssh ${randomUUID()}`, driver: "ssh", status: "active", config: {} }).returning().then((rows) => rows[0]!);
+        await instanceSettingsService(db).update({ newAgentDefaultEnvironmentId: instance.id });
+        const { input } = await withCompanyDefault(company.id);
+        expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(company.id);
+        const local = await environmentService(db).ensureLocalEnvironment(input.agent.companyId);
+        input.agent.defaultEnvironmentId = local.id;
+        expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(local.id);
+        input.agent.defaultEnvironmentId = null;
+        await db.update(environments).set({ status: "archived" }).where(eq(environments.id, company.id));
+        await db.update(environments).set({ status: "archived" }).where(eq(environments.id, instance.id));
+        expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.driver).toBe("local");
+      });
+
+      it("keeps a claude_local agent Local when the instance default is a sandbox that does not list claude_local", async () => {
+        const sandbox = await db.insert(environments).values({ name: `Instance k8s ${randomUUID()}`, driver: "sandbox", status: "active", config: { provider: "kubernetes", adapters: [{ adapterType: "hermes_local", enabled: true }] } }).returning().then((rows) => rows[0]!);
+        await instanceSettingsService(db).update({ newAgentDefaultEnvironmentId: sandbox.id });
+        const { input } = await withCompanyDefault(null);
+        input.agent.adapterType = "claude_local";
+        expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.driver).toBe("local");
+        input.agent.adapterType = "hermes_local";
+        expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(sandbox.id);
+      });
     });
 
     it("skips a sandbox default whose adapter registry does not list the agent's adapter", async () => {

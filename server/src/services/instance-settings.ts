@@ -613,6 +613,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     return {
       id: row.id,
       defaultEnvironmentId: row.defaultEnvironmentId ?? null,
+      newAgentDefaultEnvironmentId: row.newAgentDefaultEnvironmentId ?? null,
       general: toGeneralView(row.general),
       experimental: toExperimentalView(row.experimental),
       createdAt: row.createdAt,
@@ -691,6 +692,9 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         .set({
           ...(Object.prototype.hasOwnProperty.call(patch, "defaultEnvironmentId")
             ? { defaultEnvironmentId: patch.defaultEnvironmentId ?? null }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(patch, "newAgentDefaultEnvironmentId")
+            ? { newAgentDefaultEnvironmentId: patch.newAgentDefaultEnvironmentId ?? null }
             : {}),
           updatedAt: now,
         })

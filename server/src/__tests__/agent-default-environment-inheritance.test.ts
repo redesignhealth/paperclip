@@ -5,12 +5,15 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, builtInManagedResources, companies, createDb, environments } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { companyRoutes } from "../routes/companies.js";
+import { instanceSettingsRoutes } from "../routes/instance-settings.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { resolveAgentFallbackEnvironmentId } from "../services/agent-default-environment.js";
 import { environmentService } from "../services/environments.js";
 
 /**
@@ -74,6 +77,7 @@ describeEmbeddedPostgres("company default environment inheritance", () => {
       req.actor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
       next();
     });
+    server.use("/api", instanceSettingsRoutes(db));
     server.use("/api/companies", companyRoutes(db));
     server.use("/api", agentRoutes(db));
     server.use(errorHandler);
@@ -164,6 +168,85 @@ describeEmbeddedPostgres("company default environment inheritance", () => {
     const patched = await request(app()).patch(`/api/companies/${companyId}`).send({ defaultEnvironmentId: await localEnvironmentId() });
     expect(patched.status, JSON.stringify(patched.body)).toBe(200);
     expect(await storedEnvironmentId(agentId)).toBeNull();
+  });
+
+  describe("instance newAgentDefaultEnvironmentId (TECH-10878)", () => {
+    async function setInstance(environmentId: string | null) {
+      return instanceSettingsService(db).update({ newAgentDefaultEnvironmentId: environmentId });
+    }
+
+    afterEach(async () => {
+      await setInstance(null);
+    });
+
+    it("resolves explicit > company > instance > none, skipping unusable candidates", async () => {
+      const a = await sshEnvironment();
+      const b = await sshEnvironment();
+      const company = await seedCompany(a.id);
+      await setInstance(b.id);
+      expect(await resolveAgentFallbackEnvironmentId(db, company, "codex_local")).toBe(a.id);
+      await db.update(companies).set({ defaultEnvironmentId: null }).where(eq(companies.id, company));
+      expect(await resolveAgentFallbackEnvironmentId(db, company, "codex_local")).toBe(b.id);
+      await db.update(companies).set({ defaultEnvironmentId: a.id }).where(eq(companies.id, company));
+      await db.update(environments).set({ status: "archived" }).where(eq(environments.id, a.id));
+      expect(await resolveAgentFallbackEnvironmentId(db, company, "codex_local")).toBe(b.id);
+      await db.update(environments).set({ status: "archived" }).where(eq(environments.id, b.id));
+      expect(await resolveAgentFallbackEnvironmentId(db, company, "codex_local")).toBeNull();
+      await setInstance(null);
+      expect(await resolveAgentFallbackEnvironmentId(await db, await seedCompany(), "codex_local")).toBeNull();
+    });
+
+    it("skips an instance default bound to another company or not allowed for the adapter", async () => {
+      const ssh = await sshEnvironment();
+      await setInstance(ssh.id);
+      const company = await seedCompany();
+      expect(await resolveAgentFallbackEnvironmentId(db, company, "process")).toBeNull();
+      const other = await seedCompany();
+      await db.insert(builtInManagedResources).values({
+        companyId: other, bundleKey: "test", resourceKind: "environment", resourceKey: "bound",
+        resourceId: ssh.id, stockVersion: "1", stockHash: "x",
+      });
+      expect(await resolveAgentFallbackEnvironmentId(db, company, "codex_local")).toBeNull();
+      expect(await resolveAgentFallbackEnvironmentId(db, other, "codex_local")).toBe(ssh.id);
+    });
+
+    for (const route of ["agents", "agent-hires"] as const) {
+      it(`${route}: a new agent stores the instance default when the company has none; explicit values win`, async () => {
+        const localId = await localEnvironmentId();
+        await setInstance(localId);
+        const companyId = await seedCompany();
+        const inherited = await request(app()).post(`/api/companies/${companyId}/${route}`).send(body());
+        expect(inherited.status, JSON.stringify(inherited.body)).toBe(201);
+        expect(await storedEnvironmentId((inherited.body.agent ?? inherited.body).id)).toBe(localId);
+        const none = await request(app()).post(`/api/companies/${companyId}/${route}`).send(body({ defaultEnvironmentId: null }));
+        expect(await storedEnvironmentId((none.body.agent ?? none.body).id)).toBeNull();
+      });
+    }
+
+    it("leaves an existing agent untouched when the instance setting changes", async () => {
+      const companyId = await seedCompany();
+      const created = await request(app()).post(`/api/companies/${companyId}/agents`).send(body());
+      const agentId = (created.body.agent ?? created.body).id;
+      await setInstance(await localEnvironmentId());
+      expect(await storedEnvironmentId(agentId)).toBeNull();
+    });
+
+    it("PATCH /instance/settings validates and returns the setting, and leaves defaultEnvironmentId alone", async () => {
+      const ssh = await sshEnvironment();
+      const before = (await request(app()).get("/api/instance/settings")).body.defaultEnvironmentId;
+      const set = await request(app()).patch("/api/instance/settings").send({ newAgentDefaultEnvironmentId: ssh.id });
+      expect(set.status, JSON.stringify(set.body)).toBe(200);
+      expect(set.body.newAgentDefaultEnvironmentId).toBe(ssh.id);
+      expect(set.body.defaultEnvironmentId).toBe(before);
+      expect((await request(app()).get("/api/instance/settings")).body.newAgentDefaultEnvironmentId).toBe(ssh.id);
+      const missing = await request(app()).patch("/api/instance/settings").send({ newAgentDefaultEnvironmentId: randomUUID() });
+      expect(missing.status).toBe(422);
+      const archived = await sshEnvironment({ status: "archived" });
+      expect((await request(app()).patch("/api/instance/settings").send({ newAgentDefaultEnvironmentId: archived.id })).status).toBe(422);
+      expect((await request(app()).patch("/api/instance/settings").send({ newAgentDefaultEnvironmentId: "local" })).status).toBe(400);
+      const cleared = await request(app()).patch("/api/instance/settings").send({ newAgentDefaultEnvironmentId: null });
+      expect(cleared.body.newAgentDefaultEnvironmentId).toBeNull();
+    });
   });
 
   describe("PATCH /companies/:id defaultEnvironmentId", () => {

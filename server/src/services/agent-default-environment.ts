@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companies } from "@paperclipai/db";
+import { companies, instanceSettings } from "@paperclipai/db";
 import { supportedEnvironmentDriversForAdapter } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -62,7 +62,7 @@ export function fallbackEnvironmentRejection(
 
 /**
  * The company/instance fallback environment for an agent of `adapterType` that has no environment of its own
- * (TECH-10878): the company default, else (later) the instance new-agent default. Returns the first candidate that can
+ * (TECH-10878): the company default, else the instance new-agent default. Returns the first candidate that can
  * run this adapter, or null (Local). A candidate that cannot is skipped, never an error. Used at agent creation, which
  * stores the result on the agent row, and at run time for agents whose environment is still null.
  */
@@ -76,8 +76,15 @@ export async function resolveAgentFallbackEnvironmentId(
     .from(companies)
     .where(eq(companies.id, companyId))
     .then((rows) => rows[0] ?? null);
+  const instanceRow = await db
+    .select({ newAgentDefaultEnvironmentId: instanceSettings.newAgentDefaultEnvironmentId })
+    .from(instanceSettings)
+    .where(eq(instanceSettings.singletonKey, "default"))
+    .then((rows) => rows[0] ?? null);
+  // Company default first, then the instance new-agent default.
   const candidates: Array<{ source: string; environmentId: string | null | undefined }> = [
     { source: "company", environmentId: row?.defaultEnvironmentId },
+    { source: "instance", environmentId: instanceRow?.newAgentDefaultEnvironmentId },
   ];
   const environmentsSvc = environmentService(db);
   for (const { source, environmentId } of candidates) {

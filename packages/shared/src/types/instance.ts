@@ -220,6 +220,8 @@ export interface InstanceSsoSettings {
 export interface InstanceSettings {
   id: string;
   defaultEnvironmentId: string | null;
+  /** Environment new agents inherit when neither the request nor the company names one. */
+  newAgentDefaultEnvironmentId: string | null;
   general: InstanceGeneralSettings;
   experimental: InstanceExperimentalSettingsWithManaged;
   sso: InstanceSsoSettings;

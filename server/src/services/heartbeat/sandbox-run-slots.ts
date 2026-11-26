@@ -62,26 +62,31 @@ export interface SandboxPlacement {
   managedSandboxOnly: boolean;
   managedSandboxProvider: string | null;
   instanceDefaultEnvironmentId: string | null;
+  /** Instance new-agent default (TECH-10878); a fallback after the company default. */
+  newAgentDefaultEnvironmentId?: string | null;
   environments: Map<string, { driver: string; provider: string | null; config?: Record<string, unknown>; boundCompanyIds?: string[] }>;
 }
 
 /**
- * The environment a run of an agent with none of its own falls back to: the company default when this adapter can run
- * there (TECH-10878). Placement-only, so it never awaits inside the slot decision.
+ * The environment a run of an agent with none of its own falls back to: the company default, then the instance
+ * new-agent default, the first one this adapter can run on (TECH-10878). Placement-only, so it never awaits inside the slot decision.
  */
 export function fallbackEnvironmentIdForAgent(
   placement: SandboxPlacement,
   agent: { companyId: string; adapterType?: string | null },
   companyDefaultEnvironmentId: string | null | undefined,
 ): string | null {
-  if (!companyDefaultEnvironmentId) return null;
-  const environment = placement.environments.get(companyDefaultEnvironmentId);
-  if (!environment) return null;
-  const reason = fallbackEnvironmentRejection(
-    { driver: environment.driver, status: "active", config: environment.config ?? (environment.provider ? { provider: environment.provider } : {}) },
-    { companyId: agent.companyId, adapterType: agent.adapterType, boundCompanyIds: environment.boundCompanyIds ?? [] },
-  );
-  return reason ? null : companyDefaultEnvironmentId;
+  for (const candidate of [companyDefaultEnvironmentId, placement.newAgentDefaultEnvironmentId]) {
+    if (!candidate) continue;
+    const environment = placement.environments.get(candidate);
+    if (!environment) continue;
+    const reason = fallbackEnvironmentRejection(
+      { driver: environment.driver, status: "active", config: environment.config ?? (environment.provider ? { provider: environment.provider } : {}) },
+      { companyId: agent.companyId, adapterType: agent.adapterType, boundCompanyIds: environment.boundCompanyIds ?? [] },
+    );
+    if (!reason) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -199,6 +204,7 @@ async function loadSandboxPlacement(db: Db): Promise<SandboxPlacement> {
     managedSandboxOnly,
     managedSandboxProvider,
     instanceDefaultEnvironmentId: settings.defaultEnvironmentId ?? null,
+    newAgentDefaultEnvironmentId: settings.newAgentDefaultEnvironmentId ?? null,
     environments: environmentById,
   };
 }

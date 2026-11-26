@@ -162,6 +162,13 @@ export function instanceSettingsRoutes(
           typeof req.body.defaultEnvironmentId === "string" ? req.body.defaultEnvironmentId : null,
         );
       }
+      if (Object.prototype.hasOwnProperty.call(req.body, "newAgentDefaultEnvironmentId")) {
+        await assertEnvironmentSelectionForCompany(
+          environments,
+          "instance",
+          typeof req.body.newAgentDefaultEnvironmentId === "string" ? req.body.newAgentDefaultEnvironmentId : null,
+        );
+      }
       // An explicit tenant write of the instance default reclassifies its
       // attribution: whatever the default becomes — including a deliberate
       // re-selection of the managed sandbox row — it is tenant-chosen, so
@@ -198,6 +205,7 @@ export function instanceSettingsRoutes(
             entityId: updated.id,
             details: {
               defaultEnvironmentId: updated.defaultEnvironmentId,
+              newAgentDefaultEnvironmentId: updated.newAgentDefaultEnvironmentId,
               changedKeys: Object.keys(req.body).sort(),
             },
           }),
