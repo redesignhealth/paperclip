@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agents, companies, createDb, environments, heartbeatRuns, issues, projects, projectWorkspaces, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
+import { agents, builtInManagedResources, companies, createDb, environments, heartbeatRuns, issues, projects, projectWorkspaces, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -156,6 +156,50 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
       expect(input.services.findSharedWorkspaceHolder).not.toHaveBeenCalled();
       expect(input.task.issueRef!.executionWorkspaceId).toBe(source.id);
     } finally { read.mockRestore(); select.mockRestore(); }
+  });
+
+  describe("company default environment fallback (TECH-10878)", () => {
+    async function withCompanyDefault(environmentId: string | null) {
+      const f = await fixture();
+      await db.update(companies).set({ defaultEnvironmentId: environmentId }).where(eq(companies.id, f.input.agent.companyId));
+      f.input.agent.adapterType = "codex_local";
+      return f;
+    }
+
+    it("runs an agent with no environment on the company default", async () => {
+      const ssh = await db.insert(environments).values({ name: `Company ssh ${randomUUID()}`, driver: "ssh", status: "active", config: {} }).returning().then((rows) => rows[0]!);
+      const { input } = await withCompanyDefault(ssh.id);
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(ssh.id);
+    });
+
+    it("keeps an agent with an explicit Local environment on Local", async () => {
+      const ssh = await db.insert(environments).values({ name: `Company ssh ${randomUUID()}`, driver: "ssh", status: "active", config: {} }).returning().then((rows) => rows[0]!);
+      const { input } = await withCompanyDefault(ssh.id);
+      const local = await environmentService(db).ensureLocalEnvironment(input.agent.companyId);
+      input.agent.defaultEnvironmentId = local.id;
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.id).toBe(local.id);
+    });
+
+    it("falls through to Local when the company default is archived", async () => {
+      const archived = await db.insert(environments).values({ name: `Archived ssh ${randomUUID()}`, driver: "ssh", status: "archived", config: {} }).returning().then((rows) => rows[0]!);
+      const { input } = await withCompanyDefault(archived.id);
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.driver).toBe("local");
+    });
+
+    it("falls through to Local when the company default is bound to another company", async () => {
+      const ssh = await db.insert(environments).values({ name: `Foreign ssh ${randomUUID()}`, driver: "ssh", status: "active", config: {} }).returning().then((rows) => rows[0]!);
+      const [other] = await db.insert(companies).values({ name: "Other", issuePrefix: "OTH" }).returning();
+      await db.insert(builtInManagedResources).values({ companyId: other!.id, bundleKey: "test", resourceKind: "environment", resourceKey: "b", resourceId: ssh.id, stockVersion: "1", stockHash: "x" });
+      const { input } = await withCompanyDefault(ssh.id);
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.driver).toBe("local");
+    });
+
+    it("skips a sandbox default whose adapter registry does not list the agent's adapter", async () => {
+      const sandbox = await db.insert(environments).values({ name: `Curated sandbox ${randomUUID()}`, driver: "sandbox", status: "active", config: { provider: "kubernetes", adapters: [{ adapterType: "pi_local", enabled: true }] } }).returning().then((rows) => rows[0]!);
+      const { input } = await withCompanyDefault(sandbox.id);
+      input.agent.adapterType = "claude_local";
+      expect((await selectHeartbeatEnvironment(db, input)).selectedEnvironmentForConfig?.driver).toBe("local");
+    });
   });
 
   it("uses the low-trust task sandbox even when workspace feature gates hide issue settings", async () => {

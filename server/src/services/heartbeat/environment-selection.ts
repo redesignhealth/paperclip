@@ -5,6 +5,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { isExecutionForcedToKubernetes } from "../execution-allowlist.js";
+import { resolveAgentFallbackEnvironmentId } from "../agent-default-environment.js";
 import { parseExecutionPolicyBootstrapEnv } from "../execution-policy-bootstrap.js";
 import {
   parseIssueExecutionWorkspaceSettings,
@@ -162,8 +163,10 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     lowTrustIssueEnvironmentId: trustPreset.kind === "low_trust_review"
       ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, {includeEnvironmentId: true})?.environmentId : null,
     agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+    // Company default (then the instance default) for an agent with no environment of its own (TECH-10878).
     instanceDefaultEnvironmentId:
-      resolvedInstanceSettings.defaultEnvironmentId ?? null,
+      (agent.defaultEnvironmentId ? null : await resolveAgentFallbackEnvironmentId(db, agent.companyId, agent.adapterType))
+      ?? resolvedInstanceSettings.defaultEnvironmentId ?? null,
     localDefaultEnvironmentId: localEnvironment.id,
     managedSandboxOnly,
     managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,

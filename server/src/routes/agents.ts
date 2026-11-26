@@ -1,6 +1,7 @@
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
 import { agentHarnessType, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
+import { resolveInheritedAgentEnvironmentId } from "../services/agent-default-environment.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 
@@ -3241,7 +3242,7 @@ export function agentRoutes(
     // packaged runtime before creation/adoption even when a token is saved.
     // This metadata-only path sends no model prompt.
     if (test || binding.provider === "github") {
-      const testEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId, binding.provider === "github");
+      const testEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId, binding.provider === "github", adapterType);
       if (testEnvironmentId) await assertAdapterTestEnvironmentForCompany(companyId, testEnvironmentId, adapterType);
       // A setup draft row has no prepared computer yet; explicit tests preserve saved identity for adoption.
       const savedAgent = newAgent && isUuidLike(agentId) ? await svc.getById(agentId) : null;
@@ -3307,6 +3308,7 @@ export function agentRoutes(
           ? savedAgent?.defaultEnvironmentId
           : asNonEmptyString(req.body.environmentId),
         aiBinding?.provider === "github",
+        type,
       );
       // Fail closed on a foreign environment before any secret resolution, env
       // merge, target resolution, sandbox lease, or adapter test runs.
@@ -5130,6 +5132,10 @@ export function agentRoutes(
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
+    // No environment in the request: inherit the company default (TECH-10878). An explicit value, including null, wins.
+    if (hireInput.defaultEnvironmentId === undefined) {
+      hireInput.defaultEnvironmentId = await resolveInheritedAgentEnvironmentId(db, companyId, hireInput.adapterType);
+    }
     Object.assign(hireInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...hireInput, runner: hireRunner }));
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType, hireInput.adapterConfig);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
@@ -5470,6 +5476,10 @@ export function agentRoutes(
     assertNoAgentLocalAdapterHostCommandMutation(req, createInput.adapterType ?? "process", requestedCreateConfig, await callerUsesAiConnectionPool(req, companyId));
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
+    // No environment in the request: inherit the company default (TECH-10878). An explicit value, including null, wins.
+    if (createInput.defaultEnvironmentId === undefined) {
+      createInput.defaultEnvironmentId = await resolveInheritedAgentEnvironmentId(db, companyId, createInput.adapterType);
+    }
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner }));
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType, createInput.adapterConfig);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;

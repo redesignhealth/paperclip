@@ -1,6 +1,7 @@
 import type { CompanyVisibility, InteractionResolverGovernance } from "@paperclipai/shared";
 import { numeric, pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex, check } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+import { environments } from "./environments.js";
 
 export const companies = pgTable(
   "companies",
@@ -36,6 +37,11 @@ export const companies = pgTable(
      * migration 0392 does not touch existing rows.
      */
     commsBoardWakeEnabled: boolean("comms_board_wake_enabled").notNull().default(true),
+    /**
+     * Environment NEW agents of this company inherit when the create/hire request names none (TECH-10878). Stored on
+     * the agent at creation; agents with no environment of their own also run here. Null = no company default.
+     */
+    defaultEnvironmentId: uuid("default_environment_id").references(() => environments.id, { onDelete: "set null" }),
     interactionResolverGovernance: jsonb("interaction_resolver_governance")
       .$type<InteractionResolverGovernance>()
       .notNull()

@@ -1,8 +1,9 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, environments, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, builtInManagedResources, companies, environments, heartbeatRuns, type Db } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { isExecutionForcedToKubernetes } from "../execution-allowlist.js";
 import { instanceSettingsService } from "../instance-settings.js";
+import { fallbackEnvironmentRejection } from "../agent-default-environment.js";
 
 /**
  * Server-wide limit on concurrently running sandbox-backed runs (TECH-9015).
@@ -61,7 +62,26 @@ export interface SandboxPlacement {
   managedSandboxOnly: boolean;
   managedSandboxProvider: string | null;
   instanceDefaultEnvironmentId: string | null;
-  environments: Map<string, { driver: string; provider: string | null }>;
+  environments: Map<string, { driver: string; provider: string | null; config?: Record<string, unknown>; boundCompanyIds?: string[] }>;
+}
+
+/**
+ * The environment a run of an agent with none of its own falls back to: the company default when this adapter can run
+ * there (TECH-10878). Placement-only, so it never awaits inside the slot decision.
+ */
+export function fallbackEnvironmentIdForAgent(
+  placement: SandboxPlacement,
+  agent: { companyId: string; adapterType?: string | null },
+  companyDefaultEnvironmentId: string | null | undefined,
+): string | null {
+  if (!companyDefaultEnvironmentId) return null;
+  const environment = placement.environments.get(companyDefaultEnvironmentId);
+  if (!environment) return null;
+  const reason = fallbackEnvironmentRejection(
+    { driver: environment.driver, status: "active", config: environment.config ?? (environment.provider ? { provider: environment.provider } : {}) },
+    { companyId: agent.companyId, adapterType: agent.adapterType, boundCompanyIds: environment.boundCompanyIds ?? [] },
+  );
+  return reason ? null : companyDefaultEnvironmentId;
 }
 
 /**
@@ -151,20 +171,27 @@ export interface SandboxRunSlotGateOptions {
 
 async function loadSandboxPlacement(db: Db): Promise<SandboxPlacement> {
   const settingsSvc = instanceSettingsService(db);
-  const [settings, experimental, rows] = await Promise.all([
+  const [settings, experimental, rows, bindings] = await Promise.all([
     settingsSvc.get(),
     settingsSvc.getExperimental(),
     db
       .select({ id: environments.id, driver: environments.driver, config: environments.config, metadata: environments.metadata })
       .from(environments)
       .where(eq(environments.status, "active")),
+    db
+      .select({ companyId: builtInManagedResources.companyId, resourceId: builtInManagedResources.resourceId })
+      .from(builtInManagedResources)
+      .where(eq(builtInManagedResources.resourceKind, "environment")),
   ]);
   const managedSandboxOnly = experimental.enableManagedSandboxOnly === true;
-  const environmentById = new Map<string, { driver: string; provider: string | null }>();
+  const environmentById: SandboxPlacement["environments"] = new Map();
   let managedSandboxProvider: string | null = null;
   for (const row of rows) {
     const provider = typeof row.config?.provider === "string" ? row.config.provider : null;
-    environmentById.set(row.id, { driver: row.driver, provider });
+    environmentById.set(row.id, {
+      driver: row.driver, provider, config: row.config ?? {},
+      boundCompanyIds: bindings.filter((binding) => binding.resourceId === row.id).map((binding) => binding.companyId),
+    });
     if (row.driver === "sandbox" && row.metadata?.managedByPaperclip === true) managedSandboxProvider = provider;
   }
   return {
@@ -211,20 +238,26 @@ export function createSandboxRunSlotGate(options: SandboxRunSlotGateOptions = {}
   }
 
   /** The capped provider for runs of this agent, or null when they are not counted (or the limit is off). */
-  async function providerForAgent(db: Db, agent: { defaultEnvironmentId: string | null }) {
+  async function providerForAgent(db: Db, agent: { defaultEnvironmentId: string | null; companyId?: string; adapterType?: string | null }) {
     if (limit() <= 0) return null;
-    return cappedSandboxProviderForAgent(await placementFor(db), agent);
+    const placement = await placementFor(db);
+    if (agent.defaultEnvironmentId || !agent.companyId) return cappedSandboxProviderForAgent(placement, agent);
+    const companyDefault = await db.select({ id: companies.defaultEnvironmentId }).from(companies).where(eq(companies.id, agent.companyId)).then((rows) => rows[0]?.id ?? null);
+    return cappedSandboxProviderForAgent(placement, { defaultEnvironmentId: fallbackEnvironmentIdForAgent(placement, { companyId: agent.companyId, adapterType: agent.adapterType }, companyDefault) });
   }
 
   /** Running runs that hold a slot, plus in-flight claims. */
   async function occupancy(db: Db) {
     const placement = await placementFor(db);
     const rows = await db
-      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, defaultEnvironmentId: agents.defaultEnvironmentId })
+      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, adapterType: agents.adapterType, defaultEnvironmentId: agents.defaultEnvironmentId, companyDefaultEnvironmentId: companies.defaultEnvironmentId })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(eq(heartbeatRuns.status, "running"));
-    const running = rows.filter((row) => cappedSandboxProviderForAgent(placement, row) !== null);
+    const running = rows.filter((row) => cappedSandboxProviderForAgent(placement, {
+      defaultEnvironmentId: row.defaultEnvironmentId ?? fallbackEnvironmentIdForAgent(placement, row, row.companyDefaultEnvironmentId),
+    }) !== null);
     const runningIds = new Set(running.map((row) => row.id));
     const at = now();
     for (const [runId, reservation] of reservations) {

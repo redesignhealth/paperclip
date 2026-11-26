@@ -1,4 +1,5 @@
 import { logger } from "../middleware/logger.js";
+import { resolveInheritedAgentEnvironmentId } from "./agent-default-environment.js";
 import type { Db } from "@paperclipai/db";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
@@ -64,6 +65,13 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
   return {
     ...base,
     async requestHire(...args: Parameters<typeof base.requestHire>) {
+      // Every hire path (built-ins, onboarding, plugins, imports) stores the company default when the caller names no
+      // environment (TECH-10878). The agent routes resolve it earlier; an explicit value, including null, is kept.
+      const [companyId, data, ...rest] = args;
+      if (data.defaultEnvironmentId === undefined) {
+        const inherited = await resolveInheritedAgentEnvironmentId(db, companyId, data.adapterType);
+        if (inherited !== null) args = [companyId, { ...data, defaultEnvironmentId: inherited }, ...rest] as typeof args;
+      }
       const agent = await base.requestHire(...args);
       afterHireCommitted(db, agent);
       return agent;

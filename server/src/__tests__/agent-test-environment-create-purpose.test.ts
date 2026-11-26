@@ -55,6 +55,12 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   }> => ({ enableManagedSandboxOnly: false })),
 }));
 
+// These tests mock the services with a stub db; the company default environment fallback (TECH-10878) needs a real one.
+vi.mock("../services/agent-default-environment.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/agent-default-environment.js")>()),
+  resolveAgentFallbackEnvironmentId: vi.fn(async () => null),
+  resolveInheritedAgentEnvironmentId: vi.fn(async () => null),
+}));
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
   agentInstructionsService: () => ({}),

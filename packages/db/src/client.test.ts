@@ -213,10 +213,12 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
   // retained row still gains `comms_board_wake_enabled: false`.
   function withoutForkAddedCompanyColumns<T extends { company: Record<string, unknown> } | undefined>(rows: T): T {
     if (!rows) return rows;
-    const { visibility, deletion_started_at, comms_board_wake_enabled, ...company } = rows.company;
+    const { visibility, deletion_started_at, comms_board_wake_enabled, default_environment_id, ...company } = rows.company;
     expect(visibility ?? null).toBeNull();
     expect(deletion_started_at ?? null).toBeNull();
     expect(comms_board_wake_enabled ?? false).toBe(false);
+    // Migration 0393_company_default_environment adds nullable companies.default_environment_id.
+    expect(default_environment_id ?? null).toBeNull();
     return { ...rows, company } as T;
   }
 

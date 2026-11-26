@@ -5,6 +5,7 @@ vi.mock("../adapters/registry.js", () => ({ findActiveServerAdapter: (type: stri
 vi.mock("./adapter-plugin-store.js", () => ({ getDisabledAdapterTypes: () => state.disabled }));
 vi.mock("./instance-settings.js", () => ({ instanceSettingsService: () => ({ get: async () => state.settings }) }));
 vi.mock("./environments.js", () => ({ environmentService: () => ({ getById: state.getEnvironment, listBoundCompanyIds: state.bindings, findManagedSandboxEnvironment: state.managedEnvironment, findKubernetesEnvironment: state.kubernetesEnvironment, ensureKubernetesEnvironment: state.ensureKubernetesEnvironment }) }));
+vi.mock("./agent-default-environment.js", () => ({ resolveInheritedAgentEnvironmentId: async () => null }));
 vi.mock("./environment-probe.js", () => ({ readSandboxPlatformQualification: state.sandboxQualification }));
 vi.mock("./environment-config.js", () => ({ resolveEnvironmentDriverConfigForRuntime: state.resolveEnvironment }));
 vi.mock("@paperclipai/adapter-utils/ssh", () => ({ runSshCommand: state.ssh }));

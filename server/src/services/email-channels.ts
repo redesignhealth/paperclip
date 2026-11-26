@@ -43,6 +43,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { environmentService } from "./environments.js";
+import { resolveAgentFallbackEnvironmentId } from "./agent-default-environment.js";
 import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
 import { emailConnectionService } from "./email-connections.js";
 import { secretService } from "./secrets.js";
@@ -654,7 +655,8 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       const selected = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
-          (await settings.get()).defaultEnvironmentId ?? null,
+          (agent.defaultEnvironmentId ? null : await resolveAgentFallbackEnvironmentId(db, companyId, agent.adapterType))
+          ?? (await settings.get()).defaultEnvironmentId ?? null,
         localDefaultEnvironmentId: local.id,
         managedSandboxOnly: experimental.enableManagedSandboxOnly,
         managedSandboxEnvironmentId: managed?.id,
