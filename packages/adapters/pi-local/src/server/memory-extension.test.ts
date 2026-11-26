@@ -536,6 +536,15 @@ describe("Pi memory extension: recall query comes from the task", () => {
     expect(searchQueries()).toEqual(["Backfill foo Backfill the foo table for November."]);
   });
 
+  it("drops the Routing rule and Routing decision variants but keeps task text that merely mentions routing", async () => {
+    const description = ["Routing rule: 2 because the change is under services/*", "Routing decision: python-services", "", "Update the gateway routing table so dispatch honours the new region header."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "Region header", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    const query = searchQueries()[0]!;
+    expect(query).toContain("Update the gateway routing table so dispatch honours the new region header.");
+    expect(query).not.toMatch(/because|python-services|Routing rule|Routing decision/);
+  });
+
   it("falls back to the title alone when the description is only metadata", async () => {
     const description = ["Linear: https://linear.app/acme/issue/TECH-9125/x", "Builder: data-pipelines", "Allowed paths: redesign-health-data/projects/x/y.py", "Estimated changed lines: 40", "Allowed paths are a ceiling."].join("\n");
     const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "TECH-9125 Backfill the foo table", description } }) });
