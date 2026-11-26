@@ -123,6 +123,25 @@ describe("Pi memory extension: recall", () => {
     expect(result.message.content.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(2);
   });
 
+  it("reads results from the tool gateway envelope (structuredContent nested under structuredContent)", async () => {
+    // The gateway relays a provider result as { content, structuredContent: <provider body>, isError, transport, ... }.
+    const envelope = { content: [{ type: "text", text: JSON.stringify(SEARCH_RESULTS) }], structuredContent: SEARCH_RESULTS, isError: false, transport: "mcp_http", spawnedLocalProcess: false };
+    respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify(SEARCH_RESULTS) }], structuredContent: envelope, isError: false } });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const { handlers } = await load();
+    const result = (await handlers.get("before_agent_start")!({ prompt: "Fix the auth bug in the api" })) as { message: { content: string } };
+    expect(result.message.content.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(5);
+    expect(stderr.mock.calls.map(([l]) => String(l)).filter((l) => l.startsWith("[rh-memory]")).at(-1)).toMatch(/results=7 injected=5 ids=m1,/);
+  });
+
+  it("reads results from a gateway envelope delivered only as text", async () => {
+    const envelope = { content: [], structuredContent: SEARCH_RESULTS, isError: false, transport: "mcp_http" };
+    respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify(envelope) }] } });
+    const { handlers } = await load();
+    const result = (await handlers.get("before_agent_start")!({ prompt: "Fix the auth bug in the api" })) as { message: { content: string } };
+    expect(result.message.content.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(5);
+  });
+
   it("does nothing for an empty prompt or when nothing is recalled", async () => {
     const { handlers } = await load();
     expect(await handlers.get("before_agent_start")!({ prompt: "  " })).toBeUndefined();
@@ -349,7 +368,7 @@ describe("Pi memory extension: log lines for scoring recall", () => {
     expect(lines(stderr).at(-1)).toBe('[rh-memory] recall failed: Error: tool error query="needs memory"\n');
     respond = () => ({ result: { content: [{ type: "text", text: JSON.stringify({ results: [{ id: "n1", memory: "saved", event: "ADD" }] }) }] } });
     await handlers.get("agent_end")!({ messages: [{ role: "user", content: "task" }, assistant("A sufficiently long outcome that would normally be stored.")] });
-    expect(lines(stderr).at(-1)).toMatch(/^\[rh-memory\] capture stored chars=\d+\n$/);
+    expect(stderr.mock.calls.map(([l]) => String(l)).filter((l) => l.startsWith("[rh-memory]")).at(-1)).toMatch(/^\[rh-memory\] capture stored chars=\d+\n$/);
     await handlers.get("agent_end")!({ messages: [] });
     expect(lines(stderr).at(-1)).toBe("[rh-memory] capture skipped: nothing worth storing\n");
   });

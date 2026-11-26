@@ -190,8 +190,16 @@ function createClient(server) {
   function unwrap(result) {
     const text = (Array.isArray(result?.content) ? result.content : []).filter((part) => part && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n");
     if (result?.isError) throw new Error("tool error");
-    if (result && result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
-    try { return JSON.parse(text); } catch { return { text }; }
+    if (result && result.structuredContent && typeof result.structuredContent === "object") return peel(result.structuredContent);
+    try { return peel(JSON.parse(text)); } catch { return { text }; }
+  }
+  // The Paperclip tool gateway relays a provider result as structuredContent = { content, structuredContent: <provider body>,
+  // isError, transport, ... }. Reading "results" off that envelope finds nothing, so recall logged results=0 for every run
+  // while the explicit memory_search (which hands the whole envelope to the model) worked. Descend to the provider body.
+  function peel(value) {
+    let body = value;
+    for (let depth = 0; depth < 3 && body && typeof body === "object" && !Array.isArray(body) && !("results" in body) && body.structuredContent && typeof body.structuredContent === "object"; depth++) body = body.structuredContent;
+    return body;
   }
   return {
     async call(name, args, { signal, seconds }) {
