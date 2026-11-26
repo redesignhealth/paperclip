@@ -245,7 +245,7 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   }
   if (isDefaultMcpSpecEnabled()) {
     // Comms-board wake (TECH-9912): offered only while the company's rollout setting is on.
-    const commsWakeExcluded = await commsWakeExcludedSetupKeys(txDb, companyId);
+    const commsWakeExcluded = await commsWakeExcludedSetupKeys(txDb, companyId, created.adapterType);
     // Durable per-agent default (OFF unless the spec says otherwise), committed with the agent row.
     await snapshotDefaultMcpForNewAgent(txDb, {
       companyId,

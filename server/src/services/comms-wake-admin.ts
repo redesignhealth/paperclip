@@ -327,8 +327,9 @@ export async function enrolCommsWakeAgents(
 }
 
 /**
- * Writes the agent's `comms-wake` entry as `pending`, only while the entry is absent (a concurrent writer is never
- * overwritten, and a deliberately unsubscribed `not_required` entry is never touched). The setup hook does the rest.
+ * Writes the agent's `comms-wake` entry (`pending` by default, `not_required` for an unsubscribe), only while the entry is
+ * absent: a concurrent writer is never overwritten and an existing entry, including a deliberately unsubscribed
+ * `not_required` one, is never touched. Returns whether this call wrote it. For `pending` the setup hook does the rest.
  */
 async function insertPendingCommsWakeEntry(
   db: Db,
