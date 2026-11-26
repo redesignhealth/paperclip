@@ -520,6 +520,31 @@ describe("Pi memory extension: recall query comes from the task", () => {
     expect(searchQueries()).toEqual(["Hasher bug Fix UTF-8 decoding in the SHA-256 hasher."]);
   });
 
+  it("drops the planner's Routing line from the recall query", async () => {
+    const description = ["Routing: python-services because the change is in rh-data-platform under services/* (target:rh-data-platform, Routing rule 2); it is a test-only change.", "Builder: python-services", "", "Add one parametrized test pinning try_resolve_email on non-string and falsy claim values."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "pin try_resolve_email for non-string and falsy claim values (test only)", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    const query = searchQueries()[0]!;
+    expect(query).toBe("pin try_resolve_email for non-string and falsy claim values (test only) Add one parametrized test pinning try_resolve_email on non-string and falsy claim values.");
+    expect(query).not.toMatch(/Routing|because|python-services/);
+  });
+
+  it("drops a bold Routing line and keeps the plain paragraph under it", async () => {
+    const description = ["**Routing:** data-pipeline because the change is under redesign-health-data/projects.", "Backfill the foo table for November."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "Backfill foo", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    expect(searchQueries()).toEqual(["Backfill foo Backfill the foo table for November."]);
+  });
+
+  it("drops the Routing rule and Routing decision variants but keeps task text that merely mentions routing", async () => {
+    const description = ["Routing rule: 2 because the change is under services/*", "Routing decision: python-services", "", "Update the gateway routing table so dispatch honours the new region header."].join("\n");
+    const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "Region header", description } }) });
+    await handlers.get("before_agent_start")!({ prompt: "anything at all" });
+    const query = searchQueries()[0]!;
+    expect(query).toContain("Update the gateway routing table so dispatch honours the new region header.");
+    expect(query).not.toMatch(/because|python-services|Routing rule|Routing decision/);
+  });
+
   it("falls back to the title alone when the description is only metadata", async () => {
     const description = ["Linear: https://linear.app/acme/issue/TECH-9125/x", "Builder: data-pipelines", "Allowed paths: redesign-health-data/projects/x/y.py", "Estimated changed lines: 40", "Allowed paths are a ceiling."].join("\n");
     const { handlers } = await load({ taskQuery: buildPiMemoryTaskQuery({ issue: { title: "TECH-9125 Backfill the foo table", description } }) });
