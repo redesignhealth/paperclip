@@ -330,7 +330,14 @@ export async function enrolCommsWakeAgents(
  * Writes the agent's `comms-wake` entry as `pending`, only while the entry is absent (a concurrent writer is never
  * overwritten, and a deliberately unsubscribed `not_required` entry is never touched). The setup hook does the rest.
  */
-async function insertPendingCommsWakeEntry(db: Db, companyId: string, agentId: string, ownerUserId: string | null, nowIso: string): Promise<void> {
+async function insertPendingCommsWakeEntry(
+  db: Db,
+  companyId: string,
+  agentId: string,
+  ownerUserId: string | null,
+  nowIso: string,
+  state: "pending" | "not_required" = "pending",
+): Promise<boolean> {
   const spec = DEFAULT_MCP_SPEC.find((candidate) => candidate.key === COMMS_WAKE_ENTRY_KEY);
   if (!spec) throw new Error("comms-wake spec missing");
   const entry: DefaultMcpEntryState = {
@@ -342,8 +349,8 @@ async function insertPendingCommsWakeEntry(db: Db, companyId: string, agentId: s
     connectionId: null,
     ownerUserId,
     setup: {
-      state: "pending",
-      reason: null,
+      state,
+      reason: state === "not_required" ? "operator_excluded" : null,
       attemptCount: 0,
       nextAttemptAt: null,
       leaseUntil: null,
@@ -354,10 +361,12 @@ async function insertPendingCommsWakeEntry(db: Db, companyId: string, agentId: s
     },
     binding: null,
   };
-  await db
+  const rows = await db
     .update(agents)
     .set({ metadata: sql`jsonb_set(${agents.metadata}, ${entryPath()}, ${JSON.stringify(entry)}::jsonb, true)` })
-    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId), sql`${agents.metadata} #> ${entryPath()} is null`));
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId), sql`${agents.metadata} #> ${entryPath()} is null`))
+    .returning({ id: agents.id });
+  return rows.length === 1;
 }
 
 export const COMMS_WAKE_BACKFILL_BATCH = 10;
@@ -402,8 +411,7 @@ export async function backfillCommsWakeEntries(
   let written = 0;
   for (const row of rows) {
     try {
-      await insertPendingCommsWakeEntry(db, row.company_id, row.id, row.owner_user_id ?? null, nowIso);
-      written += 1;
+      if (await insertPendingCommsWakeEntry(db, row.company_id, row.id, row.owner_user_id ?? null, nowIso)) written += 1;
     } catch (err) {
       logger.warn({ agentId: row.id, errorClass: errorClass(err) }, "comms wake back-fill item failed");
     }
@@ -514,6 +522,11 @@ export async function unsubscribeCommsWakeAgent(
     }
 
     await patchWakeSetup(db, companyId, agentId, { state: "not_required", reason: "operator_excluded", nextAttemptAt: null, leaseUntil: null, claimId: null, updatedAt: new Date().toISOString() }, ["pending", "in_progress", "error", "ready"]);
+    // An agent that never had a comms-wake entry gets an excluded one, so the sweep back-fill does not subscribe it later.
+    const unsubscribedState = readDefaultMcpState((await loadAgentInCompany(db, companyId, agentId)).metadata)?.entries ?? {};
+    if (!unsubscribedState[COMMS_WAKE_ENTRY_KEY]) {
+      await insertPendingCommsWakeEntry(db, companyId, agentId, unsubscribedState["comms-board"]?.ownerUserId ?? null, new Date().toISOString(), "not_required");
+    }
     await logActivity(db, {
       companyId,
       actorType: input.actorUserId ? "user" : "system",

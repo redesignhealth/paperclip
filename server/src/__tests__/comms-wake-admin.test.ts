@@ -431,6 +431,28 @@ describeEmbeddedPostgres("comms-board wake operator tools for existing agents (T
       expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("not_required");
     });
 
+    it("unsubscribing an agent that never had a wake entry keeps the back-fill away from it", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      const report = await unsubscribeCommsWakeAgent(db, { companyId, agentId: agent.id, actorUserId: null }, { env, fetchImpl });
+      expect(report.result).toBe("not_registered");
+      expect((await stateOf(agent.id))["comms-wake"]!.setup).toMatchObject({ state: "not_required", reason: "operator_excluded" });
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(0);
+      expect(await registrationOf(agent.id)).toBeNull();
+    });
+
+    it("does not back-fill an agent outside the rollout scope", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "none" } })).toBe(0);
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [] } })).toBe(0);
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [randomUUID()] } })).toBe(0);
+      expect((await stateOf(agent.id))["comms-wake"]).toBeUndefined();
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [companyId] } })).toBe(1);
+      expect(fetchImpl.sets()).toHaveLength(0);
+    });
+
     it("does nothing while the org setting is off", async () => {
       const { companyId, agent } = await orgWithExistingAgent();
       await db.update(companies).set({ commsBoardWakeEnabled: false }).where(eq(companies.id, companyId));
