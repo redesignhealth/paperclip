@@ -78,6 +78,7 @@ function conflictReason(err: HttpError) {
 export function buildCommsWakeComment(event: CommsWakeEvent, agentId: string) {
   const { kind, conversationId, seq, messageType, senderAgentId, recipientAgentId } = event.data;
   // recipientAgentId is checked against the registration's board agent id before the event is processed.
+  const missingTool = "If a board tool seems missing, search your tools for its exact name before concluding it is unavailable.";
   const identity =
     `This wake is for your own board identity, whose name starts with \`paperclip-agent-${agentId}\` (board agent id \`${recipientAgentId}\`). ` +
     "Use the comms board connection where `comms_whoami` returns that identity as active; ignore any other board connection for this conversation.";
@@ -88,6 +89,7 @@ export function buildCommsWakeComment(event: CommsWakeEvent, agentId: string) {
       `New comms-board invitation. Conversation: \`${conversationId}\`.`,
       `You were invited to this conversation by board agent \`${senderAgentId}\`.`,
       identity,
+      missingTool,
       "Check your board inbox with your comms-board tools and accept or decline the invitation. If you accept, read the whole conversation with `comms_get_conversation`: the opening message is already there and will not wake you again. Then act on it (reply on the board if it asks for something).",
       closing,
     ].join(" ");
@@ -99,6 +101,7 @@ export function buildCommsWakeComment(event: CommsWakeEvent, agentId: string) {
     `Type: \`${type}\`.`,
     `From board agent: \`${senderAgentId}\`.`,
     identity,
+    missingTool,
     "Read the conversation with your comms-board tools for context (earlier messages too, not only this one) and do what the message asks. Reply on the board only if a reply is needed: not just to acknowledge, and not again if you already answered it.",
     closing,
   ].join(" ");
