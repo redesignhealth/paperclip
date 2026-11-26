@@ -30,6 +30,8 @@ export interface Company {
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   commsBoardWakeEnabled: boolean;
+  /** Environment new agents of this company inherit when the create/hire request names none. */
+  defaultEnvironmentId: string | null;
   interactionResolverGovernance: InteractionResolverGovernance;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;

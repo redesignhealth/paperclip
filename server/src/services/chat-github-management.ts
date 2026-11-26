@@ -26,6 +26,7 @@ import { logActivity } from "./activity-log.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { environmentService } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { resolveAgentFallbackEnvironmentId } from "./agent-default-environment.js";
 import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
 
 export function githubChatManagementService(db: Db, fetchImpl = fetch) {
@@ -519,7 +520,8 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
         const selected = resolveExecutionWorkspaceEnvironmentId({
           agentDefaultEnvironmentId: agent.defaultEnvironmentId,
           instanceDefaultEnvironmentId:
-            (await settings.get()).defaultEnvironmentId ?? null,
+            (agent.defaultEnvironmentId ? null : await resolveAgentFallbackEnvironmentId(db, bot.companyId, agent.adapterType))
+            ?? (await settings.get()).defaultEnvironmentId ?? null,
           localDefaultEnvironmentId: local.id,
           managedSandboxOnly: experimental.enableManagedSandboxOnly,
           managedSandboxEnvironmentId: managed?.id,

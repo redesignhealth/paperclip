@@ -66,6 +66,8 @@ import {
   workTimelineService,
 } from "../services/index.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { environmentService } from "../services/environments.js";
+import { assertCompanyDefaultEnvironmentSelection } from "../services/agent-default-environment.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -1272,6 +1274,12 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     // Rollout scope for comms-board wake subscriptions (TECH-9912): an instance admin decides which orgs are on, never
     // an org's own board member or its CEO agent (agents cannot reach this field: they use the branding schema).
     if (body.commsBoardWakeEnabled !== undefined) assertInstanceAdmin(req);
+
+    // Company default environment for NEW agents (TECH-10878): it must exist, not be archived, and be unbound or bound
+    // to this company. Only board users reach this schema; it never moves existing agents.
+    if (body.defaultEnvironmentId !== undefined) {
+      await assertCompanyDefaultEnvironmentSelection(environmentService(db), companyId, body.defaultEnvironmentId as string | null);
+    }
 
     if (req.actor.type !== "agent") {
       if (body.feedbackDataSharingEnabled === true && !existingCompany.feedbackDataSharingEnabled) {

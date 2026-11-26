@@ -7,6 +7,7 @@ import { createHeartbeatQueueTestDependencies as callbacks } from "../../__tests
 import { createHeartbeatQueue } from "./queue.js";
 import {
   cappedSandboxProviderForAgent,
+  fallbackEnvironmentIdForAgent,
   createSandboxRunSlotGate,
   DEFAULT_MAX_CONCURRENT_SANDBOX_RUNS,
   parseMaxConcurrentSandboxRuns,
@@ -25,6 +26,26 @@ function placement(overrides: Partial<SandboxPlacement> = {}): SandboxPlacement 
     ...overrides,
   };
 }
+
+describe("company default environment fallback (TECH-10878)", () => {
+  const k8s = { driver: "sandbox", provider: "kubernetes", config: { provider: "kubernetes", adapters: [{ adapterType: "hermes_local", enabled: true }] } };
+  const base = placement({ environments: new Map([["k8s-env", k8s]]) });
+
+  it("places an agent with no environment on the company default when the adapter is listed", () => {
+    const agent = { companyId: "c1", adapterType: "hermes_local" };
+    const id = fallbackEnvironmentIdForAgent(base, agent, "k8s-env");
+    expect(id).toBe("k8s-env");
+    expect(cappedSandboxProviderForAgent(base, { defaultEnvironmentId: id })).toBe("kubernetes");
+  });
+
+  it("stays local for an adapter the sandbox does not list, an inactive default, or another company's default", () => {
+    expect(fallbackEnvironmentIdForAgent(base, { companyId: "c1", adapterType: "claude_local" }, "k8s-env")).toBeNull();
+    expect(fallbackEnvironmentIdForAgent(base, { companyId: "c1", adapterType: "hermes_local" }, "gone-env")).toBeNull();
+    expect(fallbackEnvironmentIdForAgent(base, { companyId: "c1", adapterType: "hermes_local" }, null)).toBeNull();
+    const bound = placement({ environments: new Map([["k8s-env", { ...k8s, boundCompanyIds: ["other"] }]]) });
+    expect(fallbackEnvironmentIdForAgent(bound, { companyId: "c1", adapterType: "hermes_local" }, "k8s-env")).toBeNull();
+  });
+});
 
 describe("sandbox run limit configuration", () => {
   it.each([

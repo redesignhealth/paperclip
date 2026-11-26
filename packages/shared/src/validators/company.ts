@@ -44,6 +44,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       spentMonthlyCents: z.number().int().nonnegative().optional(),
       requireBoardApprovalForNewAgents: z.boolean().optional(),
       commsBoardWakeEnabled: z.boolean().optional(),
+      defaultEnvironmentId: z.string().uuid().nullable().optional(),
       interactionResolverGovernance: interactionResolverGovernanceSchema.optional(),
       feedbackDataSharingEnabled: z.boolean().optional(),
       feedbackDataSharingConsentAt: z.coerce.date().nullable().optional(),

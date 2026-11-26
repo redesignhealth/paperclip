@@ -19,6 +19,7 @@ import { validateAiApiKey } from "./ai-api-key-test.js";
 import { probeCopilotExecutionTarget } from "./copilot-connection-probe.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { resolveAgentFallbackEnvironmentId } from "./agent-default-environment.js";
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: PluginWorkerManager) {
   const instanceSettings = instanceSettingsService(db);
@@ -27,13 +28,16 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
   // A null agent override inherits the instance default, just like dispatch.
   // Resolve this before secrets or probes so a default remote environment can
   // never accidentally validate the account on the control-plane host.
-  async function resolveAdapterTestEnvironmentId(companyId: string, environmentId: string | null | undefined, copilot = false) {
+  async function resolveAdapterTestEnvironmentId(companyId: string, environmentId: string | null | undefined, copilot = false, adapterType?: string | null) {
     if (copilot && (await instanceSettings.getGeneral()).executionMode === "kubernetes") {
       const kubernetes = await environmentsSvc.findKubernetesEnvironment(companyId);
       if (!kubernetes) throw unprocessable("The Kubernetes execution environment is unavailable.", { code: "copilot_environment_unavailable" });
       return kubernetes.id;
     }
     if (environmentId) return environmentId;
+    // Company default (then the instance default) for an agent with no environment of its own (TECH-10878).
+    const fallbackEnvironmentId = await resolveAgentFallbackEnvironmentId(db, companyId, adapterType);
+    if (fallbackEnvironmentId) return fallbackEnvironmentId;
     const settings = await instanceSettings.get();
     if (settings.defaultEnvironmentId) return settings.defaultEnvironmentId;
     if ((await instanceSettings.getExperimental()).enableManagedSandboxOnly === true) {

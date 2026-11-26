@@ -122,6 +122,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}, co
     defaultResponsibleUserId: companies.defaultResponsibleUserId,
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     commsBoardWakeEnabled: companies.commsBoardWakeEnabled,
+    defaultEnvironmentId: companies.defaultEnvironmentId,
     interactionResolverGovernance: companies.interactionResolverGovernance,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
     feedbackDataSharingConsentAt: companies.feedbackDataSharingConsentAt,

@@ -176,7 +176,11 @@ export function resolveNewAgentRunner(input: AgentRunnerSelection): { adapterTyp
 export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string, input: AgentRunnerSelection & { defaultEnvironmentId?: string | null }) {
   if (!["codex_local", "claude_local"].includes(agentHarnessType(input.adapterType ?? "process", input.adapterConfig))
     || input.runner === "legacy" || (input.adapterType === "paperclip_runner" && (input.runner === undefined || input.runner === "paperclip"))) return resolveNewAgentRunner(input);
-  const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId);
+  // Same inheritance the create/hire routes store on the agent (TECH-10878), so the runner target matches the stored env.
+  const defaultEnvironmentId = input.defaultEnvironmentId === undefined
+    ? await (await import("./agent-default-environment.js")).resolveInheritedAgentEnvironmentId(db, companyId, input.adapterType)
+    : input.defaultEnvironmentId;
+  const target = await resolveAgentRunnerTargetForCompany(db, companyId, defaultEnvironmentId);
   return resolveNewAgentRunner({ ...input, target });
 }
 
