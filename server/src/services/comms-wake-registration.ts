@@ -47,6 +47,12 @@ export function generateCommsWakeSecret(): string {
   return `whsec_${randomBytes(32).toString("base64")}`;
 }
 
+/**
+ * Adapter types the AUTOMATIC paths never subscribe: a `process` agent gets no board tools and no guidance, so a wake would
+ * only create an empty run. The operator enrol command is not restricted by this.
+ */
+export const COMMS_WAKE_AUTOMATIC_EXCLUDED_ADAPTER_TYPES: readonly string[] = ["process"];
+
 /** New-agent creation: `comms-wake` is left out of the agent's setup state when the company's setting is off (it is on by default). */
 export async function commsWakeExcludedSetupKeys(db: Pick<Db, "select">, companyId: string): Promise<Set<string>> {
   const [company] = await db
