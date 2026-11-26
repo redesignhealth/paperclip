@@ -289,7 +289,7 @@ function shortRecallText(text) {
 function recallTitle(title) {
   return shortRecallText(String(title ?? "").replace(/^(?:\s*\[[^\]]*\][\s:-]*)+/, "")).replace(/^[\s:-]+/, "");
 }
-const META_KEY = "linear|linear (?:issue|ticket|link)|builder|allowed paths?|allowed|base branch|base ref|estimated(?: changed)?(?: lines| size)?|estimate|repo|repository|assignee|labels?|acceptance(?: checks?| criteria)?|tests? to run|replay rules?|replay|routing(?: rule| decision)?";
+const META_KEY = "linear|linear (?:issue|ticket|link)|builder|allowed paths?|allowed|base branch|base ref|estimated(?: changed)?(?: lines| size)?|estimate|repo|repository|assignee|labels?|acceptance(?: checks?| criteria)?|tests? to run|replay rules?|replay";
 const META_LINE = new RegExp("^[\\s>*#_-]*(?:" + META_KEY + ")[\\s*_]*(?::|$)", "i");
 const BOILERPLATE_LINE = /^[\s>*_-]*(?:allowed paths are a ceiling|paths? (?:listed|named) (?:here )?(?:are|is) a ceiling)\b/i;
 const HEADING = /^\s*(?:#{1,6}\s+(.+?)|[*][*]([^*]+?)[*][*]:?|__([^_]+?)__:?|([A-Za-z][A-Za-z /&-]{2,40}):)\s*$/;
