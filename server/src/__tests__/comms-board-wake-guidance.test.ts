@@ -45,7 +45,7 @@ describe("agent guidance for comms board wakes (TECH-9889)", () => {
 
   it("covers every point the dev end-to-end runs showed was needed, and stays short", () => {
     const guide = read(REFERENCE);
-    expect(guide.split(/\s+/).length).toBeLessThan(850);
+    expect(guide.split(/\s+/).length).toBeLessThan(930);
     for (const needle of [
       "comms_board_conversation",
       "Read the whole conversation",
@@ -119,6 +119,22 @@ describe("buildCommsWakeComment", () => {
     }
     expect(buildCommsWakeComment(event("invite"), AGENT_ID)).toMatch(/^New comms-board invitation\. Conversation: /);
     expect(buildCommsWakeComment(event("message"), AGENT_ID)).toMatch(/^New comms-board message\. Conversation: /);
+  });
+
+  it("tells the agent to search for a missing board tool by exact name, in both comments and the reference", () => {
+    for (const kind of ["message", "invite"] as const) {
+      expect(buildCommsWakeComment(event(kind), AGENT_ID)).toContain(
+        "If a board tool seems missing, search your tools for its exact name before concluding it is unavailable.",
+      );
+    }
+    const guide = read(REFERENCE);
+    expect(guide).toContain("## If a board tool seems missing");
+    expect(guide).toContain("search your tools for its exact name");
+    for (const tool of ["comms_whoami", "comms_inbox", "comms_accept", "comms_decline_invite", "comms_get_conversation", "comms_post_message"]) {
+      expect(guide, tool).toContain(`\`${tool}\``);
+    }
+    expect(guide).toContain("use the copy on the connection for your own identity");
+    expect(guide).toContain("names the missing tool, then mark the issue done as usual");
   });
 
   it("keeps the existing instructions next to the identity sentence", () => {
