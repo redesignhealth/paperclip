@@ -22,6 +22,7 @@ import { setCommsWakePublicBaseUrl } from "../services/comms-wake-registration.j
 import {
   COMMS_WAKE_ENROL_CONFIRMATION,
   CommsWakeConfirmationError,
+  backfillCommsWakeEntries,
   enrolCommsWakeAgents,
   listCommsWakeStatus,
   rotateCommsWakeSecret,
@@ -185,10 +186,10 @@ describeEmbeddedPostgres("comms-board wake operator tools for existing agents (T
   }
 
   /** An agent that exists before the org turned the setting on: it has a ready board identity and no comms-wake entry. */
-  async function existingAgent(companyId: string, ownerUserId: string, opts: { boardReady?: boolean } = {}) {
+  async function existingAgent(companyId: string, ownerUserId: string, opts: { boardReady?: boolean; adapterType?: string } = {}) {
     const created = await agentService(db).create(
       companyId,
-      { name: `Agent ${randomUUID().slice(0, 6)}`, role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
+      { name: `Agent ${randomUUID().slice(0, 6)}`, role: "engineer", status: "idle", adapterType: opts.adapterType ?? "claude_local", adapterConfig: {}, runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null },
       { claudeLogin: { storedSessionId: null, ownerUserId } },
     );
     await waitForScheduledDefaultMcpSetups();
@@ -364,6 +365,155 @@ describeEmbeddedPostgres("comms-board wake operator tools for existing agents (T
       expect(fetchImpl.calls).toHaveLength(0);
       expect(await registrationOf(agentB.id)).toBeNull();
       expect((await stateOf(agentB.id))["comms-wake"]!.setup.state).toBe("pending"); // as created, untouched
+    });
+  });
+
+  describe("automatic back-fill of existing agents (TECH-10684)", () => {
+    /** Org that had the setting off when its agents were created (no comms-wake entry), then got it on. */
+    async function orgWithExistingAgent(opts: { boardReady?: boolean } = {}) {
+      const { companyId, ownerId } = await seedCompany(false);
+      const agent = await existingAgent(companyId, ownerId, opts);
+      expect((await stateOf(agent.id))["comms-wake"]).toBeUndefined();
+      await db.update(companies).set({ commsBoardWakeEnabled: true }).where(eq(companies.id, companyId));
+      return { companyId, ownerId, agent };
+    }
+    const tick = async (fetchImpl: ReturnType<typeof boardFetch>, now: () => Date = LATER) => {
+      const written = await backfillCommsWakeEntries(db, {});
+      await sweepDefaultMcpSetups({ db, env, fetchImpl, now });
+      return written;
+    };
+
+    it("an existing agent with a ready board entry and no wake entry is registered by the sweep; a second run changes nothing", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      expect(await tick(fetchImpl)).toBe(1);
+      expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("ready");
+      const registration = await registrationOf(agent.id);
+      expect(registration).not.toBeNull();
+      expect(fetchImpl.sets()).toHaveLength(1);
+      expect(await wakeSecrets(companyId)).toHaveLength(1);
+
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(1);
+      expect(await wakeSecrets(companyId)).toHaveLength(1);
+      expect(await registrationOf(agent.id)).toEqual(registration);
+    });
+
+    it("a process agent with a ready board entry is not back-filled, while the operator enrol still subscribes it", async () => {
+      const { companyId, ownerId } = await seedCompany(false);
+      const proc = await existingAgent(companyId, ownerId, { adapterType: "process" });
+      const other = await existingAgent(companyId, ownerId, { adapterType: "pi_local" });
+      await db.update(companies).set({ commsBoardWakeEnabled: true }).where(eq(companies.id, companyId));
+      const fetchImpl = boardFetch();
+      expect(await tick(fetchImpl)).toBe(1);
+      expect((await stateOf(other.id))["comms-wake"]!.setup.state).toBe("ready");
+      expect((await stateOf(proc.id))["comms-wake"]).toBeUndefined();
+      expect(await registrationOf(proc.id)).toBeNull();
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(1);
+
+      const report = await enrol(db, fetchImpl, { companyId, agentId: proc.id, ...real });
+      expect(report.outcomes).toEqual([{ agentId: proc.id, result: "enrolled" }]);
+    });
+
+    it("a deliberately unsubscribed agent stays unsubscribed", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      await enrol(db, fetchImpl, { companyId, agentId: agent.id, ...real });
+      await unsubscribeCommsWakeAgent(db, { companyId, agentId: agent.id, actorUserId: null }, { env, fetchImpl });
+      expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("not_required");
+      fetchImpl.calls.length = 0;
+
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(0);
+      expect(await registrationOf(agent.id)).toBeNull();
+      expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("not_required");
+    });
+
+    it("unsubscribing an agent that never had a wake entry keeps the back-fill away from it", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      const report = await unsubscribeCommsWakeAgent(db, { companyId, agentId: agent.id, actorUserId: null }, { env, fetchImpl });
+      expect(report.result).toBe("not_registered");
+      expect((await stateOf(agent.id))["comms-wake"]!.setup).toMatchObject({ state: "not_required", reason: "operator_excluded" });
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(0);
+      expect(await registrationOf(agent.id)).toBeNull();
+    });
+
+    it("does not back-fill an agent outside the rollout scope", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "none" } })).toBe(0);
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [] } })).toBe(0);
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [randomUUID()] } })).toBe(0);
+      expect((await stateOf(agent.id))["comms-wake"]).toBeUndefined();
+      expect(await backfillCommsWakeEntries(db, { templateScope: { mode: "allowlist", companyIds: [companyId] } })).toBe(1);
+      expect(fetchImpl.sets()).toHaveLength(0);
+    });
+
+    it("does nothing while the org setting is off", async () => {
+      const { companyId, agent } = await orgWithExistingAgent();
+      await db.update(companies).set({ commsBoardWakeEnabled: false }).where(eq(companies.id, companyId));
+      const fetchImpl = boardFetch();
+      expect(await tick(fetchImpl)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(0);
+      expect((await stateOf(agent.id))["comms-wake"]).toBeUndefined();
+      expect(await registrationOf(agent.id)).toBeNull();
+    });
+
+    it("skips terminated and pending-approval agents, archived orgs and agents whose board entry is not ready", async () => {
+      const { companyId, ownerId } = await seedCompany(false);
+      const terminated = await existingAgent(companyId, ownerId);
+      const pendingApproval = await existingAgent(companyId, ownerId);
+      const notReady = await existingAgent(companyId, ownerId, { boardReady: false });
+      const live = await existingAgent(companyId, ownerId);
+      await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(eq(agents.id, terminated.id));
+      await db.update(agents).set({ status: "pending_approval", lifecycleState: "pending_approval" }).where(eq(agents.id, pendingApproval.id));
+      await db.update(companies).set({ commsBoardWakeEnabled: true }).where(eq(companies.id, companyId));
+      const fetchImpl = boardFetch();
+      expect(await tick(fetchImpl)).toBe(1);
+      expect((await stateOf(live.id))["comms-wake"]!.setup.state).toBe("ready");
+      for (const skipped of [terminated, pendingApproval, notReady]) {
+        expect((await stateOf(skipped.id))["comms-wake"]).toBeUndefined();
+        expect(await registrationOf(skipped.id)).toBeNull();
+      }
+      expect(fetchImpl.sets()).toHaveLength(1);
+
+      const other = await seedCompany(false);
+      const inArchived = await existingAgent(other.companyId, other.ownerId);
+      await db.update(companies).set({ commsBoardWakeEnabled: true, status: "archived" }).where(eq(companies.id, other.companyId));
+      await tick(fetchImpl); // the sweep may also finish the not-ready agent's board entry, which is then back-filled: that is fine
+      expect((await stateOf(inArchived.id))["comms-wake"]).toBeUndefined();
+      expect(await registrationOf(inArchived.id)).toBeNull();
+    });
+
+    it("takes a bounded batch per tick and finishes the rest on later ticks", async () => {
+      const { companyId, ownerId } = await seedCompany(false);
+      for (let i = 0; i < 3; i += 1) await existingAgent(companyId, ownerId);
+      await db.update(companies).set({ commsBoardWakeEnabled: true }).where(eq(companies.id, companyId));
+      expect(await backfillCommsWakeEntries(db, { limit: 2 })).toBe(2);
+      expect(await backfillCommsWakeEntries(db, { limit: 2 })).toBe(1);
+      expect(await backfillCommsWakeEntries(db, { limit: 2 })).toBe(0);
+    });
+
+    it("a board that is down leaves the entry pending behind the existing backoff, with no further calls until it is due", async () => {
+      const { agent } = await orgWithExistingAgent();
+      const fetchImpl = boardFetch();
+      fetchImpl.control.failNext = 100;
+      const fixed = new Date(LATER());
+      expect(await tick(fetchImpl, () => fixed)).toBe(1);
+      const entry = (await stateOf(agent.id))["comms-wake"]!;
+      expect(entry.setup.state).toBe("pending");
+      expect(Date.parse(entry.setup.nextAttemptAt!)).toBeGreaterThan(fixed.getTime());
+      const calls = fetchImpl.sets().length;
+      expect(await tick(fetchImpl, () => fixed)).toBe(0);
+      expect(fetchImpl.sets()).toHaveLength(calls);
+
+      fetchImpl.control.failNext = 0;
+      await sweepDefaultMcpSetups({ db, env, fetchImpl, now: LATER });
+      expect((await stateOf(agent.id))["comms-wake"]!.setup.state).toBe("ready");
     });
   });
 
