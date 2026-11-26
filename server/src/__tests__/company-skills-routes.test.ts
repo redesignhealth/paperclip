@@ -5,7 +5,19 @@ import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockCaptureRunIdentity = vi.hoisted(() => vi.fn());
 
-const mockSkillSourceService = vi.hoisted(() => ({ sourceForSkill: vi.fn(), importFromUrl: vi.fn(), discover: vi.fn(), branches: vi.fn() }));
+const mockSkillSourceService = vi.hoisted(() => ({
+  sourceForSkill: vi.fn(),
+  importFromUrl: vi.fn(),
+  discover: vi.fn(),
+  branches: vi.fn(),
+  create: vi.fn(),
+  settings: vi.fn(),
+  refresh: vi.fn(),
+  disconnect: vi.fn(),
+  preview: vi.fn(),
+  list: vi.fn(),
+  detail: vi.fn(),
+}));
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -324,6 +336,35 @@ describe("company skill mutation permissions", () => {
     mockCaptureRunIdentity.mockResolvedValue({ run: { responsibleUserId: "validated-owner" } });
     mockSkillSourceService.sourceForSkill.mockResolvedValue(null);
     mockSkillSourceService.importFromUrl.mockImplementation((companyId, source) => mockCompanySkillService.importFromSource(companyId, source));
+    mockSkillSourceService.create.mockImplementation(async (_companyId, _input, context) => {
+      await context?.authorize?.("skills.import");
+      return { id: "source-1" };
+    });
+    mockSkillSourceService.settings.mockImplementation(async (_companyId, _sourceId, _input, context) => {
+      await context?.authorize?.("skills.edit");
+      return { id: "source-1" };
+    });
+    mockSkillSourceService.refresh.mockImplementation(async (_companyId, _sourceId, context) => {
+      await context?.authorize?.("skills.edit");
+      return { id: "source-1" };
+    });
+    mockSkillSourceService.disconnect.mockImplementation(async (_companyId, _sourceId, context) => {
+      await context?.authorize?.("skills.remove");
+      return { id: "source-1" };
+    });
+    mockSkillSourceService.preview.mockImplementation(async (_input, context) => {
+      await context?.authorize?.("skills.import");
+      return { preview: true };
+    });
+    mockSkillSourceService.list.mockResolvedValue([]);
+    mockSkillSourceService.detail.mockResolvedValue({ id: "source-1" });
+    mockSkillSourceService.branches.mockImplementation(async () => {
+      return { defaultBranch: "main", branches: [] };
+    });
+    mockSkillSourceService.discover.mockImplementation(async (_input, context) => {
+      await context?.authorize?.("skills.import");
+      return { candidates: [], commitSha: "a".repeat(40) };
+    });
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockCompanySkillService.importFromSource.mockResolvedValue({
       imported: [],
@@ -2854,6 +2895,125 @@ describe("company skill mutation permissions", () => {
         expect(res.body).toMatchObject({
           code: "skill_company_boundary_denied",
         });
+      });
+    });
+  });
+
+  describe("skill import, skill-source mutation, and source read permissions for agents (TECH-10594 D3)", () => {
+    const mutatingRoutes = [
+      // Import
+      { name: "post import", method: "post", path: "/api/companies/:cid/skills/import", body: { source: "https://github.com/acme/skills" }, successStatus: 201 },
+      // Skill-source mutations
+      { name: "create skill source", method: "post", path: "/api/companies/:cid/skill-sources", body: { repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), selectedPaths: [] }, successStatus: 201 },
+      { name: "discover skill source", method: "post", path: "/api/companies/:cid/skill-sources/discover", body: { repositoryUrl: "https://github.com/acme/skills" }, successStatus: 200 },
+      { name: "preview skill source", method: "post", path: "/api/companies/:cid/skill-sources/preview", body: { repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), skillPath: "SKILL.md", filePath: "SKILL.md" }, successStatus: 200 },
+      { name: "update skill source settings", method: "patch", path: "/api/companies/:cid/skill-sources/source-1/settings", body: { revision: 0, trackingRef: "main" }, successStatus: 200 },
+      { name: "select skill source paths", method: "patch", path: "/api/companies/:cid/skill-sources/source-1", body: { revision: 0, selectedPaths: [], excludedFolders: [] }, successStatus: 200 },
+      { name: "disconnect skill source", method: "delete", path: "/api/companies/:cid/skill-sources/source-1", body: { revision: 0, skills: "delete" }, successStatus: 200 },
+    ] as const;
+
+    const readRoutes = [
+      { name: "list skill sources", method: "get", path: "/api/companies/:cid/skill-sources", body: undefined, successStatus: 200 },
+      { name: "detail skill source", method: "get", path: "/api/companies/:cid/skill-sources/source-1", body: undefined, successStatus: 200 },
+      { name: "branch list skill source", method: "get", path: "/api/companies/:cid/skill-sources/source-1/branches", body: undefined, successStatus: 200 },
+    ] as const;
+
+    describe.each(mutatingRoutes)("$name", ({ method, path, body, successStatus }) => {
+      it("allows standard agents without skills grants", async () => {
+        mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+          return denySkillChangeDecision();
+        });
+
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("allows board users unchanged", async () => {
+        const app = await createApp(boardActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("denies low-trust agents with 403 skill_actor_restricted", async () => {
+        mockAccessService.decide.mockResolvedValue(denySkillChangeDecision(
+          "deny_low_trust_boundary",
+          "Low-trust agents cannot use company-wide skill APIs.",
+        ));
+
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body).toMatchObject({
+          code: "skill_actor_restricted",
+          details: { reason: "platform_invariant" },
+        });
+      });
+
+      it("denies cross-company agents with 403", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-2");
+        const req = body !== undefined
+          ? (request(app)[method as "post" | "patch" | "delete"](targetPath) as any).send(body)
+          : request(app)[method as "post" | "patch" | "delete"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        if (path.includes("/skills/import")) {
+          expect(res.body).toMatchObject({
+            code: "skill_company_boundary_denied",
+          });
+        }
+      });
+    });
+
+    describe.each(readRoutes)("$name", ({ method, path, body, successStatus }) => {
+      it("allows standard agents", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "get"](targetPath) as any).send(body)
+          : request(app)[method as "get"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("allows board users unchanged", async () => {
+        const app = await createApp(boardActor());
+        const targetPath = path.replace(":cid", "company-1");
+        const req = body !== undefined
+          ? (request(app)[method as "get"](targetPath) as any).send(body)
+          : request(app)[method as "get"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(successStatus);
+      });
+
+      it("denies cross-company agents with 403", async () => {
+        const app = await createApp(assignedAgentActor());
+        const targetPath = path.replace(":cid", "company-2");
+        const req = body !== undefined
+          ? (request(app)[method as "get"](targetPath) as any).send(body)
+          : request(app)[method as "get"](targetPath);
+
+        const res = await req;
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
       });
     });
   });

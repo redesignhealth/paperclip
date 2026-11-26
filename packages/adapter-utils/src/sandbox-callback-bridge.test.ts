@@ -4237,7 +4237,6 @@ describe("company skill authoring routes in the bridge allowlist (TECH-10534)", 
   });
 
   const denied: Array<[string, string]> = [
-    ["POST", "/api/companies/c1/skills/import"],
     ["PUT", "/api/companies/c1/skills/s1/files"],
     ["POST", "/api/companies/c1/skills/"],
     ["POST", "/api/companies/c1/skills/extra/deep"],
@@ -4301,15 +4300,6 @@ describe("low-risk company skill routes in the bridge allowlist (TECH-10594)", (
 
   const denied: Array<[string, string]> = [
     // Still blocked routes
-    ["POST", "/api/companies/c1/skills/import"],
-    ["POST", "/api/companies/c1/skill-sources"],
-    ["PATCH", "/api/companies/c1/skill-sources/src-1"],
-    ["DELETE", "/api/companies/c1/skill-sources/src-1"],
-    ["POST", "/api/companies/c1/skill-sources/adopt-project"],
-    ["POST", "/api/companies/c1/skill-sources/discover"],
-    ["POST", "/api/companies/c1/skill-sources/preview"],
-    ["POST", "/api/companies/c1/skill-sources/src-1/refresh"],
-    ["PATCH", "/api/companies/c1/skill-sources/src-1/settings"],
     ["PUT", "/api/companies/c1/skill-policy"],
     ["DELETE", "/api/companies/c1/skill-policy"],
     ["POST", "/api/companies/c1/skill-policy/evaluate"],
@@ -4479,10 +4469,6 @@ describe("guarded company skill routes in the bridge allowlist (TECH-10594 PR-3)
 
   const denied: Array<[string, string]> = [
     // Still blocked administrative and external mutations
-    ["POST", "/api/companies/c1/skills/import"],
-    ["POST", "/api/companies/c1/skill-sources"],
-    ["PATCH", "/api/companies/c1/skill-sources/src-1"],
-    ["DELETE", "/api/companies/c1/skill-sources/src-1"],
     ["PUT", "/api/companies/c1/skill-policy"],
     ["POST", "/api/routine-triggers/public/p1/fire"],
 
@@ -4514,6 +4500,106 @@ describe("guarded company skill routes in the bridge allowlist (TECH-10594 PR-3)
     ["PUT", "/api/companies/c1/skills/s1/test-runs"],
     ["PUT", "/api/companies/c1/skills/browse-project"],
     ["PUT", "/api/companies/c1/skills/scan-projects"],
+  ];
+
+  it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))
+        .toBe(`Route not allowed: ${method} ${requestPath}`);
+    }
+  });
+});
+
+describe("skill import, skill-source management, and catalog routes in the bridge allowlist (TECH-10594 D3)", () => {
+  const allowed: Array<[string, string]> = [
+    // Skill import
+    ["POST", "/api/companies/c1/skills/import"],
+
+    // Skill-source mutations
+    ["POST", "/api/companies/c1/skill-sources/adopt-project"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1/settings"],
+    ["POST", "/api/companies/c1/skill-sources/discover"],
+    ["POST", "/api/companies/c1/skill-sources/preview"],
+    ["POST", "/api/companies/c1/skill-sources"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1"],
+    ["POST", "/api/companies/c1/skill-sources/src-1/refresh"],
+    ["DELETE", "/api/companies/c1/skill-sources/src-1"],
+
+    // Skill-source reads
+    ["GET", "/api/companies/c1/skill-sources/project-repositories"],
+    ["GET", "/api/companies/c1/skill-sources/src-1/branches"],
+    ["GET", "/api/companies/c1/skill-sources/repositories"],
+
+    // Catalog reads
+    ["GET", "/api/skills/catalog"],
+    ["GET", "/api/skills/catalog/review"],
+    ["GET", "/api/skills/catalog/review/files"],
+  ];
+
+  it.each(allowed)("admits %s %s on both transports", (method, requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes)).toBeNull();
+    }
+  });
+
+  const denied: Array<[string, string]> = [
+    // Trailing slashes
+    ["POST", "/api/companies/c1/skills/import/"],
+    ["POST", "/api/companies/c1/skill-sources/adopt-project/"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1/settings/"],
+    ["POST", "/api/companies/c1/skill-sources/discover/"],
+    ["POST", "/api/companies/c1/skill-sources/preview/"],
+    ["POST", "/api/companies/c1/skill-sources/"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1/"],
+    ["POST", "/api/companies/c1/skill-sources/src-1/refresh/"],
+    ["DELETE", "/api/companies/c1/skill-sources/src-1/"],
+    ["GET", "/api/companies/c1/skill-sources/project-repositories/"],
+    ["GET", "/api/companies/c1/skill-sources/src-1/branches/"],
+    ["GET", "/api/companies/c1/skill-sources/repositories/"],
+    ["GET", "/api/skills/catalog/"],
+    ["GET", "/api/skills/catalog/review/"],
+    ["GET", "/api/skills/catalog/review/files/"],
+
+    // Extra path segments
+    ["POST", "/api/companies/c1/skills/import/extra"],
+    ["POST", "/api/companies/c1/skill-sources/adopt-project/extra"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1/settings/extra"],
+    ["POST", "/api/companies/c1/skill-sources/discover/extra"],
+    ["POST", "/api/companies/c1/skill-sources/preview/extra"],
+    ["POST", "/api/companies/c1/skill-sources/extra"],
+    ["PATCH", "/api/companies/c1/skill-sources/src-1/extra"],
+    ["POST", "/api/companies/c1/skill-sources/src-1/refresh/extra"],
+    ["DELETE", "/api/companies/c1/skill-sources/src-1/extra"],
+    ["GET", "/api/companies/c1/skill-sources/project-repositories/extra"],
+    ["GET", "/api/companies/c1/skill-sources/src-1/branches/extra"],
+    ["GET", "/api/companies/c1/skill-sources/repositories/extra"],
+    ["GET", "/api/skills/catalog/review/files/extra"],
+
+    // Wrong HTTP verbs
+    ["PUT", "/api/companies/c1/skills/import"],
+    ["PUT", "/api/companies/c1/skill-sources/adopt-project"],
+    ["PUT", "/api/companies/c1/skill-sources/src-1/settings"],
+    ["PUT", "/api/companies/c1/skill-sources/discover"],
+    ["PUT", "/api/companies/c1/skill-sources/preview"],
+    ["PUT", "/api/companies/c1/skill-sources"],
+    ["PUT", "/api/companies/c1/skill-sources/src-1"],
+    ["PUT", "/api/companies/c1/skill-sources/src-1/refresh"],
+    ["POST", "/api/companies/c1/skill-sources/project-repositories"],
+    ["POST", "/api/companies/c1/skill-sources/src-1/branches"],
+    ["POST", "/api/companies/c1/skill-sources/repositories"],
+    ["POST", "/api/skills/catalog"],
+    ["POST", "/api/skills/catalog/review"],
+    ["POST", "/api/skills/catalog/review/files"],
+    ["DELETE", "/api/skills/catalog"],
+    ["DELETE", "/api/skills/catalog/review"],
+    ["DELETE", "/api/skills/catalog/review/files"],
+
+    // Kept blocked: skill-policy writes and public webhook fire
+    ["PUT", "/api/companies/c1/skill-policy"],
+    ["POST", "/api/companies/c1/skill-policy"],
+    ["DELETE", "/api/companies/c1/skill-policy"],
+    ["POST", "/api/companies/c1/skill-policy/evaluate"],
+    ["POST", "/api/routine-triggers/public/p1/fire"],
   ];
 
   it.each(denied)("denies %s %s on both transports", (method, requestPath) => {
