@@ -1762,6 +1762,7 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
     const startedAt = Date.now();
     let result: Awaited<ReturnType<typeof runner.execute>>;
     let failures = 0;
+    let fastFailures = 0;
     for (;;) {
       result = await runner.execute({
         command: "sh", args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed"],
@@ -1771,6 +1772,7 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
       });
       if (!result.timedOut && result.exitCode === 0) break;
       failures += 1;
+      if (!result.timedOut) fastFailures += 1;
       // The first exec on a fresh sandbox lease also waits for the pod to become
       // Ready inside this attempt's timeout. A Pending pod (node scale-up, image
       // pull) outlasts one attempt, so keep trying within a bounded window.
@@ -1778,10 +1780,13 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
       const elapsed = Date.now() - startedAt;
       const exhausted = result.timedOut
         ? elapsed >= retry.totalBudgetMs
-        : failures >= retry.maxFastFailures;
+        : fastFailures >= retry.maxFastFailures;
       if (exhausted) {
-        const detail = result.timedOut ? `timed out after ${Math.round(elapsed / 1000)}s` : `exit code ${result.exitCode}`;
-        throw new Error(`Could not read execution-target Git context (${detail}, ${failures} attempts)`);
+        const detail = result.timedOut
+          ? `timed out after ${Math.round(elapsed / 1000)}s`
+          : result.exitCode === null ? `signal ${result.signal ?? "unknown"}` : `exit code ${result.exitCode}`;
+        const provider = result.stderr.trim().slice(-300);
+        throw new Error(`Could not read execution-target Git context (${detail}, ${failures} attempts)${provider ? `: ${provider}` : ""}`);
       }
       if (!result.timedOut) await retry.sleep(retry.fastFailureDelayMs);
     }

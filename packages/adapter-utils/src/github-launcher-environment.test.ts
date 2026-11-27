@@ -316,7 +316,7 @@ describe("managed GitHub launcher environment", () => {
 
   describe("remote Git context read retry", () => {
     const retry = { attemptTimeoutMs: 15_000, totalBudgetMs: 3_600_000, fastFailureDelayMs: 0, sleep: async () => {} };
-    const timedOut = { exitCode: null as number | null, signal: null, timedOut: true, stdout: "", stderr: "", pid: null, startedAt: "" };
+    const timedOut = { exitCode: null as number | null, signal: null, timedOut: true, stdout: "", stderr: "pod Pending: Insufficient cpu", pid: null, startedAt: "" };
 
     async function flaky(failures: number, failure: Partial<typeof timedOut>) {
       const fixture = await sandbox("usr/bin");
@@ -343,7 +343,7 @@ describe("managed GitHub launcher environment", () => {
       await expect(prepareGitHubExecutionEnvironment({
         target: fixture.target, cwd: "/absent", env: {}, hostCredentials: false, networkAccess: true,
         gitContextRetry: { ...retry, totalBudgetMs: 0 },
-      })).rejects.toThrow("Could not read execution-target Git context (timed out");
+      })).rejects.toThrow(/Could not read execution-target Git context \(timed out.*pod Pending: Insufficient cpu/);
       expect(calls()).toBe(1);
     });
 
