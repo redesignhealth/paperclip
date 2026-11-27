@@ -1702,22 +1702,34 @@ export function agentRoutes(
     return session;
   }
 
-  async function assertCanReadConfigurations(req: Request, companyId: string) {
+  async function assertCanReadConfigurations(req: Request, companyId: string, targetAgentId?: string) {
     // Reading agent configurations, skills, and config revisions is a
     // read-only operation available to any board (human) member of the
     // company. Responses go through `redactAgentConfiguration` so secrets
     // are never exposed. Mutations and environment probes still gate on
     // agents:create or agents:configure via the mutating route helpers.
     //
-    // For AGENT actors we keep a stricter gate: an agent must have either
-    // agents:configure or agents:suggest-changes before it can inspect peer
-    // agent configuration for a proposed diff.
+    // For AGENT actors reading their OWN configuration, skills, or config
+    // revisions, the platform's allow_self rule applies when targetAgentId
+    // matches the actor's agentId within the same company.
+    // For inspecting PEER agents or company-wide configurations, we keep a
+    // stricter gate: an agent must have either agents:configure or
+    // agents:suggest-changes before it can inspect peer agent configuration.
     assertCompanyAccess(req, companyId);
     if (req.actor.type === "agent") {
+      const isSelf = Boolean(
+        targetAgentId &&
+        req.actor.agentId &&
+        targetAgentId === req.actor.agentId &&
+        req.actor.companyId === companyId,
+      );
+      const resource = isSelf
+        ? { type: "agent" as const, companyId, agentId: targetAgentId }
+        : { type: "company" as const, companyId };
       const decision = await access.decide({
         actor: req.actor,
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource,
       });
       if (!decision.allowed) {
         throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -3874,7 +3886,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
 
     const adapter = findActiveServerAdapter(agent.adapterType);
     if (!adapter?.listSkills) {
@@ -4849,7 +4861,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     res.json(redactAgentConfiguration(agent));
   });
 
@@ -4860,7 +4872,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     const revisions = await svc.listConfigRevisions(id);
     res.json(revisions.map((revision) => redactConfigRevision(revision)));
   });
@@ -4873,7 +4885,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     const revision = await svc.getConfigRevision(id, revisionId);
     if (!revision) {
       res.status(404).json({ error: "Revision not found" });

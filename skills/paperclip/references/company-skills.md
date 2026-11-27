@@ -264,7 +264,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills/sync" \
   }'
 ```
 
-If you need the current state first:
+If you need the current state first (an agent can read its own skills; reading another agent's skills requires `agents:configure` or `agents:suggest-changes`):
 
 ```sh
 curl -sS "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills" \
