@@ -1658,6 +1658,23 @@ async function githubOperationLauncherBasePath(
   return remotePath;
 }
 
+interface GitContextReadRetry {
+  attemptTimeoutMs: number;
+  /** Total window for timed-out attempts; covers a pod Pending through a node scale-up. */
+  totalBudgetMs: number;
+  maxFastFailures: number;
+  fastFailureDelayMs: number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+const GIT_CONTEXT_READ_RETRY: GitContextReadRetry = {
+  attemptTimeoutMs: 15_000,
+  totalBudgetMs: 300_000,
+  maxFastFailures: 3,
+  fastFailureDelayMs: 2_000,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
 /** Read only execution-target Git context; never import the controller's credentials into SSH. */
 export async function prepareGitHubExecutionEnvironment(input: {
   target: AdapterExecutionTarget | null | undefined;
@@ -1665,6 +1682,8 @@ export async function prepareGitHubExecutionEnvironment(input: {
   env: Record<string, string>;
   hostCredentials: boolean;
   networkAccess: boolean;
+  /** Overrides for the remote Git-context read retry; tests use it. */
+  gitContextRetry?: Partial<GitContextReadRetry>;
 }): Promise<Record<string, string>> {
   const script = String.raw`
 const fs = require('node:fs');
@@ -1738,13 +1757,34 @@ if [ -n "$top" ] && [ "$(cd "$top" && pwd -P)" = "$cwd" ]; then
 fi
 printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
 `;
-    const result = await adapterExecutionTargetCommandRunner(remote).execute({
-      command: "sh", args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed"],
-      // The caller's cwd belongs to the controller. Copied sandbox/SSH
-      // workspaces can live at a different path on the execution target.
-      cwd: remote.remoteCwd, timeoutMs: 15_000,
-    });
-    if (result.exitCode !== 0) throw new Error("Could not read execution-target Git context");
+    const runner = adapterExecutionTargetCommandRunner(remote);
+    const retry = { ...GIT_CONTEXT_READ_RETRY, ...input.gitContextRetry };
+    const startedAt = Date.now();
+    let result: Awaited<ReturnType<typeof runner.execute>>;
+    let failures = 0;
+    for (;;) {
+      result = await runner.execute({
+        command: "sh", args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed"],
+        // The caller's cwd belongs to the controller. Copied sandbox/SSH
+        // workspaces can live at a different path on the execution target.
+        cwd: remote.remoteCwd, timeoutMs: retry.attemptTimeoutMs,
+      });
+      if (!result.timedOut && result.exitCode === 0) break;
+      failures += 1;
+      // The first exec on a fresh sandbox lease also waits for the pod to become
+      // Ready inside this attempt's timeout. A Pending pod (node scale-up, image
+      // pull) outlasts one attempt, so keep trying within a bounded window.
+      // Fast non-timeout failures get only a few attempts.
+      const elapsed = Date.now() - startedAt;
+      const exhausted = result.timedOut
+        ? elapsed >= retry.totalBudgetMs
+        : failures >= retry.maxFastFailures;
+      if (exhausted) {
+        const detail = result.timedOut ? `timed out after ${Math.round(elapsed / 1000)}s` : `exit code ${result.exitCode}`;
+        throw new Error(`Could not read execution-target Git context (${detail}, ${failures} attempts)`);
+      }
+      if (!result.timedOut) await retry.sleep(retry.fastFailureDelayMs);
+    }
     const payload = result.stdout.split("\0PAPERCLIP_GIT_CONTEXT_V1\0")[1]?.split("\0PAPERCLIP_GIT_CONTEXT_END\0")[0];
     if (payload === undefined) throw new Error("Could not read execution-target Git context");
     discovered = {};

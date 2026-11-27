@@ -314,6 +314,48 @@ describe("managed GitHub launcher environment", () => {
     }
   });
 
+  describe("remote Git context read retry", () => {
+    const retry = { attemptTimeoutMs: 15_000, totalBudgetMs: 3_600_000, fastFailureDelayMs: 0, sleep: async () => {} };
+    const timedOut = { exitCode: null as number | null, signal: null, timedOut: true, stdout: "", stderr: "", pid: null, startedAt: "" };
+
+    async function flaky(failures: number, failure: Partial<typeof timedOut>) {
+      const fixture = await sandbox("usr/bin");
+      const real = fixture.runner.execute.getMockImplementation()!;
+      let calls = 0;
+      fixture.runner.execute.mockImplementation(async (input) => {
+        calls += 1;
+        return calls <= failures ? { ...timedOut, timedOut: false, ...failure } : real(input);
+      });
+      return { fixture, calls: () => calls };
+    }
+
+    it("retries a probe that timed out while the pod was still Pending", async () => {
+      const { fixture, calls } = await flaky(3, timedOut);
+      const env = await prepareGitHubExecutionEnvironment({
+        target: fixture.target, cwd: "/absent", env: {}, hostCredentials: false, networkAccess: true, gitContextRetry: retry,
+      });
+      expect(calls()).toBe(4);
+      expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("managed");
+    });
+
+    it("gives up after the total budget when the pod never becomes ready", async () => {
+      const { fixture, calls } = await flaky(1000, timedOut);
+      await expect(prepareGitHubExecutionEnvironment({
+        target: fixture.target, cwd: "/absent", env: {}, hostCredentials: false, networkAccess: true,
+        gitContextRetry: { ...retry, totalBudgetMs: 0 },
+      })).rejects.toThrow("Could not read execution-target Git context (timed out");
+      expect(calls()).toBe(1);
+    });
+
+    it("bounds retries of fast non-timeout failures", async () => {
+      const { fixture, calls } = await flaky(1000, { exitCode: 1, timedOut: false });
+      await expect(prepareGitHubExecutionEnvironment({
+        target: fixture.target, cwd: "/absent", env: {}, hostCredentials: false, networkAccess: true, gitContextRetry: retry,
+      })).rejects.toThrow("Could not read execution-target Git context (exit code 1, 3 attempts)");
+      expect(calls()).toBe(3);
+    });
+  });
+
   it("keeps task-only startup free of command probes and host credentials", async () => {
     const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "plugin", remoteCwd: "/project", runnerTask: async () => ({}) };
     await expect(prepareGitHubExecutionEnvironment({ target, cwd: "/absent-controller-path", env: {}, hostCredentials: false, networkAccess: true }))
