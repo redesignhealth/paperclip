@@ -48,7 +48,7 @@ Under the direct-to-master model, upstream sync PRs land directly into `master`:
    A heuristic `security`/`breaking` verdict is never downgraded by the model: the category is
    kept and `classified_by = 'heuristic(kept)+llm:<model>'` records that the model only
    supplied the summary.
-3. **alert** per `feature | breaking | security` row, then **ops alerts**, then flush.
+3. **alert** per `feature | breaking | security` row, plus any classified row with `touches_migrations` (headline `[upstream-sync MIGRATIONS]` for other categories), then **ops alerts**, then flush.
 
 The whole locked section has a run budget (`UPSTREAM_SYNC_RUN_BUDGET_MS`, default 10 min).
 Classify and alert/flush stop starting new work once it is exhausted; unclassified rows and
