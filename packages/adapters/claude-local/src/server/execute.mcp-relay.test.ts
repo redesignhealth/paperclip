@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import os from "node:os";
 import path from "node:path";
@@ -88,10 +88,12 @@ function sandboxTarget(): AdapterExecutionTarget {
 describe("claude runtime MCP servers", () => {
   const cleanupDirs: string[] = [];
   const stagedMcpJson: string[] = [];
+  const stagedInstructions: string[] = [];
 
   function reset() {
     vi.clearAllMocks();
     stagedMcpJson.length = 0;
+    stagedInstructions.length = 0;
     runnerInputs.length = 0;
     resetClaudeCliCapabilitiesCacheForTests();
     runChildProcess.mockReset().mockImplementation(async (_runId: unknown, _command: unknown, args: unknown) => ({
@@ -102,6 +104,11 @@ describe("claude runtime MCP servers", () => {
     startAdapterExecutionTargetPaperclipBridge.mockReset().mockImplementation(async () => ({ env: { ...BRIDGE_ENV }, stop: async () => {} }));
     prepareAdapterExecutionTargetRuntime.mockReset().mockImplementation((async (input: { target: AdapterExecutionTarget; assets?: Array<{ key: string; localDir: string }> }) => {
       for (const asset of input.assets ?? []) {
+        if (asset.key === "skills") {
+          for (const name of await readdir(asset.localDir)) {
+            if (name.endsWith(".md")) stagedInstructions.push(await readFile(path.join(asset.localDir, name), "utf8"));
+          }
+        }
         if (asset.key !== "mcp-config") continue;
         stagedMcpJson.push(await readFile(path.join(asset.localDir, "mcp-config.json"), "utf8"));
       }
@@ -215,5 +222,58 @@ describe("claude runtime MCP servers", () => {
     });
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
     expect(env.MCP_TOOL_TIMEOUT).toBeUndefined();
+  });
+
+  describe("memory", () => {
+    const memoryMcp = {
+      getServers: () => [
+        {
+          name: "Agent Memory",
+          url: "https://paperclip.example/api/mcp/memory",
+          token: MCP_TOKEN,
+          connectionId: "conn-3",
+          allowedTools: ["mcp.rh-agent-memory-tools-2d639e79:memory-search", "mcp.rh-agent-memory-tools-2d639e79:memory-add"],
+        },
+      ],
+    };
+    const hookEnv = { RH_MEMORY_TOKEN: "memory-secret-do-not-leak", RH_MEMORY_URL: "https://memory.internal.example", RH_MEMORY_PROXY: "http://127.0.0.1:1055", RH_MEMORY_TOP_K: "3" };
+
+    it("in a sandbox pod keeps the hook env out, relays the memory server and tells the agent to use it", async () => {
+      const { env, logs } = await run({
+        executionTarget: sandboxTarget(),
+        runtimeMcp: memoryMcp,
+        config: { engine: "cli", command: "claude", env: hookEnv },
+      });
+      expect(env.RH_MEMORY_TOKEN).toBeUndefined();
+      expect(env.RH_MEMORY_URL).toBeUndefined();
+      expect(env.RH_MEMORY_PROXY).toBeUndefined();
+      expect(env.RH_MEMORY_TOP_K).toBe("3");
+      expect(JSON.stringify(env)).not.toContain("memory-secret-do-not-leak");
+      expect(JSON.parse(stagedMcpJson[0]!).mcpServers).toHaveProperty("agent_memory");
+      expect(stagedInstructions.join("\n")).toContain("## Memory in this sandbox");
+      expect(stagedInstructions.join("\n")).toContain("`agent_memory`");
+      expect(logs.join("")).toContain("Memory hooks are off in a sandbox pod");
+    });
+
+    it("warns, and adds no memory note, when the agent has hook env but no memory server", async () => {
+      const { env, logs } = await run({
+        executionTarget: sandboxTarget(),
+        config: { engine: "cli", command: "claude", env: hookEnv },
+      });
+      expect(env.RH_MEMORY_TOKEN).toBeUndefined();
+      expect(stagedInstructions.join("\n")).not.toContain("Memory in this sandbox");
+      expect(logs.join("")).toContain("memory MCP server is not available");
+    });
+
+    it("leaves the hook env and the instructions alone for a local run", async () => {
+      const { env } = await run({
+        runtimeMcp: memoryMcp,
+        config: { engine: "cli", command: "claude", env: hookEnv },
+      });
+      expect(env.RH_MEMORY_TOKEN).toBe("memory-secret-do-not-leak");
+      expect(env.RH_MEMORY_URL).toBe("https://memory.internal.example");
+      expect(env.RH_MEMORY_PROXY).toBe("http://127.0.0.1:1055");
+      expect(stagedInstructions).toEqual([]);
+    });
   });
 });
