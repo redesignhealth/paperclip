@@ -95,6 +95,12 @@ import {
   minimumClaudeCliVersionForModel,
   readClaudeCommandVersion,
 } from "./cli-capabilities.js";
+import {
+  buildClaudeMcpRelayConfig,
+  buildClaudeMcpRelayRoutes,
+  claudeMcpToolTimeoutMs,
+  selectClaudeMcpRelayServers,
+} from "./mcp-relay.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
@@ -570,6 +576,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeMcpIdentity = JSON.stringify(
     runtimeMcpServers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
   );
+  // TECH-11041: a sandbox pod with the bridge cannot reach the Paperclip server, so its runtime MCP servers go through the
+  // bridge relay (same as pi_local). Every other target keeps the direct config.
+  const mcpRelayAvailable = executionTargetIsSandbox && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
+  const { relayServers: mcpRelayServers, skipped: mcpRelaySkipped } = mcpRelayAvailable
+    ? selectClaudeMcpRelayServers(runtimeMcpServers)
+    : { relayServers: [], skipped: [] };
+  const effectiveMcpServerCount = mcpRelayAvailable ? mcpRelayServers.length : runtimeMcpServers.length;
+  if (mcpRelaySkipped.length > 0) {
+    await onLog(
+      "stdout",
+      `[paperclip] Warning: ${mcpRelaySkipped.length} runtime MCP server(s) have no allowed tools and are not wired into this sandbox run: ${mcpRelaySkipped.join(", ")}.\n`,
+    );
+  }
+  if (mcpRelayAvailable && mcpRelayServers.length > 0 && !hasNonEmptyEnvValue(env, "MCP_TOOL_TIMEOUT")) {
+    env.MCP_TOOL_TIMEOUT = String(claudeMcpToolTimeoutMs(mcpRelayServers));
+  }
   const claudeRuntimeStateDir = resolveManagedClaudeRuntimeStateDir(
     process.env,
     agent.companyId,
@@ -579,6 +601,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     stateDir: claudeRuntimeStateDir,
     runId,
     servers: runtimeMcpServers,
+    ...(mcpRelayAvailable ? { relayConfig: buildClaudeMcpRelayConfig(mcpRelayServers) } : {}),
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
   const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
@@ -744,7 +767,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timeoutSec,
       hostApiToken: env.PAPERCLIP_API_KEY,
       onLog,
+      ...(mcpRelayServers.length > 0 ? { relayRoutes: buildClaudeMcpRelayRoutes(mcpRelayServers) } : {}),
     });
+    if (mcpRelayServers.length > 0 && !paperclipBridge) {
+      throw new Error("The MCP relay needs the Paperclip bridge, which did not start; refusing to run without a way to reach the MCP servers.");
+    }
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
       const runtimeEnv = ensurePathInEnv({ ...buildAgentChildBaseEnv(process.env), ...env });
@@ -885,7 +912,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (attemptInstructionsFilePath && !resumeSessionId) {
       args.push("--append-system-prompt-file", attemptInstructionsFilePath);
     }
-    if (runtimeMcpServers.length > 0) {
+    if (effectiveMcpServerCount > 0) {
       args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     }
     args.push("--add-dir", effectivePromptBundleAddDir);
@@ -957,9 +984,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (with current file location in the run prompt)`,
       );
     }
-    if (runtimeMcpServers.length > 0) {
+    if (effectiveMcpServerCount > 0) {
       commandNotes.push(
-        `Using ${runtimeMcpServers.length} Paperclip-managed MCP server(s) from strict config ${effectiveMcpConfigPath}.`,
+        `Using ${effectiveMcpServerCount} Paperclip-managed MCP server(s)${mcpRelayAvailable ? " through the bridge relay" : ""} from strict config ${effectiveMcpConfigPath}.`,
       );
     }
     if (onMeta) {
