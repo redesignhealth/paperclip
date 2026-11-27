@@ -51,6 +51,8 @@ describe("guard: pre-approved builder flow", () => {
     "pnpm install --frozen-lockfile",
     "uv sync && uv run pytest -q tests/",
     "npx vitest run src/server",
+    "bun install --frozen-lockfile",
+    "bunx biome check .", // bunx is bun x, the same class as npx
     "set -euo pipefail; cd packages/x && npm test 2>&1 | tail -20",
     "git add -A && git commit -m \"fix: thing\"",
     "git commit -m \"$(cat <<'EOF'\nfix: heredoc body with rm -rf / and sudo inside\n\nCo-Authored-By: x\nEOF\n)\"",

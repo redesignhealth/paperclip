@@ -94,7 +94,7 @@ const BASE_COMMANDS = [
 
 const DEV_COMMANDS = [
   "npm", "pnpm", "yarn", "npx", "node", "tsx", "python", "python3", "pip", "pip3", "uv", "uvx", "pytest", "ruff",
-  "mypy", "tsc", "vitest", "eslint", "prettier", "make", "cargo", "rustc", "go", "bun", "corepack",
+  "mypy", "tsc", "vitest", "eslint", "prettier", "make", "cargo", "rustc", "go", "bun", "bunx", "corepack",
 ];
 
 const IR_TERRAFORM = ["fmt", "validate", "plan", "init", "version", "show", "output", "providers", "graph"];
