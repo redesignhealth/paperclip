@@ -23,6 +23,8 @@ import { cn, relativeTime } from "../lib/utils";
 import { FoldCurtain } from "./FoldCurtain";
 import { DocumentAnnotationsCountChip, IssueDocumentAnnotations } from "./IssueDocumentAnnotations";
 import type { DocumentAnnotationTarget } from "@/api/document-annotations";
+import { HtmlDocumentBody } from "./HtmlDocumentBody";
+import { isHtmlDocumentBody } from "@/lib/html-preview";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "./MarkdownBody";
 import { MarkdownEditor, type MentionOption } from "./MarkdownEditor";
 import { OutputFeedbackButtons } from "./OutputFeedbackButtons";
@@ -108,7 +110,11 @@ function renderFoldableBody(
   body: string,
   className?: string,
   externalReferences?: MarkdownExternalReferenceMap,
+  documentKey?: string,
 ) {
+  if (isHtmlDocumentBody(body)) {
+    return <HtmlDocumentBody html={body} title={documentKey ?? "document"} />;
+  }
   return (
     <FoldCurtain>
       <MarkdownBody className={className} softBreaks={false} externalReferences={externalReferences}>
@@ -1276,7 +1282,7 @@ export function IssueDocumentsSection({
                   >
                     {(() => {
                       const renderedDocumentBody = isHistoricalPreview ? (
-                        renderFoldableBody(displayedBody, documentBodyContentClassName, externalReferences)
+                        renderFoldableBody(displayedBody, documentBodyContentClassName, externalReferences, doc.key)
                       ) : activeDraft ? (
                         <MarkdownEditor
                           value={displayedBody}
@@ -1298,7 +1304,7 @@ export function IssueDocumentsSection({
                           onSubmit={() => void commitDraft(activeDraft ?? draft, { clearAfterSave: false, trackAutosave: true })}
                         />
                       ) : (
-                        renderFoldableBody(displayedBody, documentBodyContentClassName, externalReferences)
+                        renderFoldableBody(displayedBody, documentBodyContentClassName, externalReferences, doc.key)
                       );
 
                       return documentSubject.annotations ? (
