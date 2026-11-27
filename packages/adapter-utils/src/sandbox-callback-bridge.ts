@@ -357,8 +357,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // The server enforces sharingScope restrictions, managed-local deletion bounds,
   // task-bound-run requirements, project:read authorization, and agent_config:update
   // authorization on affected agents.
-  // Deliberately NOT allowed from the sandbox: import, skill-sources mutations,
-  // skill-policy writes, and public fire.
+  // Deliberately NOT allowed from the sandbox: skill-policy writes (PUT/POST/DELETE
+  // under /skill-policy) and public routine fire (POST /api/routine-triggers/public/:publicId/fire).
   { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/files$/ },
@@ -367,6 +367,34 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/[^/]+\/test-runs$/ },
   { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/browse-project$/ },
   { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/scan-projects$/ },
+
+  // Skill import, skill-source management, and catalog discovery (TECH-10594 D3):
+  // forward routes through the sandbox bridge so pod agents match ECS agents.
+  // The server remains the gate: company boundary, skills.import/skills.edit/
+  // skills.update/skills.remove policy actions, low-trust denial, and task-bound
+  // run requirements.
+  // Note: import of external code by agents is an accepted risk; pods now have
+  // open internet access, so a prompt-injected agent could import an attacker's
+  // repository. No additional server guard is added by decision.
+  // Skill import
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skills\/import$/ },
+  // Skill-source mutations
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skill-sources\/adopt-project$/ },
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skill-sources\/[^/]+\/settings$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skill-sources\/discover$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skill-sources\/preview$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skill-sources$/ },
+  { method: "PATCH", path: /^\/api\/companies\/[^/]+\/skill-sources\/[^/]+$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/skill-sources\/[^/]+\/refresh$/ },
+  { method: "DELETE", path: /^\/api\/companies\/[^/]+\/skill-sources\/[^/]+$/ },
+  // Skill-source reads
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-sources\/project-repositories$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-sources\/[^/]+\/branches$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/skill-sources\/repositories$/ },
+  // Catalog reads (read-only, no company data, authenticated actors only)
+  { method: "GET", path: /^\/api\/skills\/catalog$/ },
+  { method: "GET", path: /^\/api\/skills\/catalog\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/skills\/catalog\/[^/]+\/files$/ },
   { method: "GET", path: /^\/api\/projects\/[^/]+$/ },
   { method: "GET", path: /^\/api\/goals\/[^/]+$/ },
 

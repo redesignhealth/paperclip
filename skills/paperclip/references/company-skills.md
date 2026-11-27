@@ -28,24 +28,24 @@ set.
 
 ## Authoring Your Own Skill (Agents)
 
-When authoring or modifying skills from a sandboxed agent (e.g. Hermes or Kubernetes), use the callback bridge to create and maintain managed local company skills. Agents can create, edit, audit, version, test, comment/star, rename, delete (managed-local only), fork (only reassigning agents they may configure), install from the catalog, update and reset skills; only import and skill-source changes remain unavailable from a sandbox. Sharing scope is always `company` for agents. Files written to Hermes or provider-home paths (`~/.hermes/skills` and `$HERMES_HOME`) are ephemeral and deleted when the run ends; task workspace files and managed local company skills are durable.
+When authoring or modifying skills from a sandboxed agent (e.g. Hermes or Kubernetes), use the callback bridge to create and maintain managed local company skills. Agents can create, edit, audit, version, test, comment/star, rename, delete (managed-local only), fork (only reassigning agents they may configure), install from the catalog, update, reset, import from external sources, and manage skill sources; only skill-policy changes (board-only) remain unavailable from a sandbox. Sharing scope is always `company` for agents. Files written to Hermes or provider-home paths (`~/.hermes/skills` and `$HERMES_HOME`) are ephemeral and deleted when the run ends; task workspace files and managed local company skills are durable.
 
 **Available Bridge Endpoints**:
 - `POST /api/companies/{companyId}/skills` — create a managed local skill.
 - `PATCH /api/companies/{companyId}/skills/{skillId}` — update skill details (sharing scope restricted to `company`).
 - `PATCH /api/companies/{companyId}/skills/{skillId}/files` — update files (e.g. `SKILL.md` or supporting files).
-- `DELETE /api/companies/{companyId}/skills/{skillId}/files` — delete skill files (managed-local skills only).
+- `DELETE /api/companies/{companyId}/skills/{skillId}/files` — delete skill files (managed-local skills only; requires `{path, target: "file"|"folder"}`).
 - `DELETE /api/companies/{companyId}/skills/{skillId}` — delete a skill (managed-local skills only, must be unused by agents).
 - `POST /api/companies/{companyId}/skills/{skillId}/fork` — fork a skill (only reassigning agents the caller is authorized to configure).
 - `POST /api/companies/{companyId}/skills/{skillId}/rename` — rename a managed-local skill (repointing only agents the caller is authorized to configure).
 - `POST /api/companies/{companyId}/skills/{skillId}/test-runs` — create and orchestrate test runs against skills.
 - `POST /api/companies/{companyId}/skills/browse-project` and `POST .../skills/scan-projects` — workspace enumeration (requires `project:read` on each project).
 - `POST /api/companies/{companyId}/skills/{skillId}/audit` — run security scans on the skill.
-- Reads and discovery (`GET .../skills`, `GET .../skills/{skillId}`, `GET .../files`, `fork-precheck`, `versions`, `update-status`, `skill-sources`, `skill-policy`).
-- Catalog installation, update, reset, test inputs/templates, test run inspection/cancellation/deletion, stars, and comments.
+- `POST /api/companies/{companyId}/skills/import` (external import) and skill-source management (`POST/PATCH/DELETE .../skill-sources*`, discover, preview, adopt-project, settings, refresh, branches, repositories).
+- Reads and discovery (`GET .../skills*`, `GET .../skill-sources*`, `GET .../skill-policy`, `GET /api/skills/catalog*`), catalog install/update/reset, test inputs/templates, test runs, stars, and comments. Note: bridge DELETE requests require a JSON body `{}` (send `{}` for bodyless DELETEs); deleting files with `DELETE .../files` requires `{path, target: "file"|"folder"}`.
 
 **Endpoints Not Available in Sandboxes**:
-The sandbox bridge deliberately blocks external source imports and skill policy administrative operations: `import` (`POST /api/companies/{companyId}/skills/import`), `skill-sources` mutations (POST/PATCH/DELETE under `/api/companies/{companyId}/skill-sources`), and skill-policy mutations (`PUT/DELETE/POST .../skill-policy*`). If any of these are needed, ask a board user.
+The sandbox bridge deliberately blocks skill policy administrative operations: skill-policy mutations (`PUT/DELETE/POST .../skill-policy*`). If these are needed, ask a board user.
 
 **Rules and Workflow**:
 - **Task-bound runs and company scope**: Create, file edits, file deletion, skill deletion, audit, and test runs require an active, task-bound run in standard or skill_test mode. Agent-created skills and updates are always company-scoped (`sharingScope: "company"`, rejecting others with 403 `skill_agent_field_restricted`).
@@ -53,7 +53,7 @@ The sandbox bridge deliberately blocks external source imports and skill policy 
 - **Peer agent reassignment guard**: Forking with reassignment or renaming a skill repoints affected agents. For agent actors, each affected agent must be configurable by the caller (`agents:configure` grant for peers, `allow_self` for own agent) else 403 `skill_agent_reassign_restricted` before any mutations occur.
 - **Workspace enumeration access**: Project browsing and scanning verify `project:read` authorization on each target project, failing closed with 403 `skill_agent_project_read_restricted` if unreadable. Note that scan-projects defaults to mode `import` (creates project-scan skills), so it is available to pods only with project:read.
 - **Low-trust denial**: Low-trust agents are denied outright from mutating skill APIs (`403 skill_actor_restricted`).
-- **Verbatim execution**: Agent-written executable files and skill content are loaded verbatim by agents the skill is attached to. Only attach skills to other agents deliberately.
+- **Verbatim execution**: Agent-written executable files and skill content are loaded verbatim by agents the skill is attached to. Imported skills are loaded verbatim by every agent they are attached to, so import only from sources you trust and attach deliberately. Only attach skills to other agents deliberately.
 - **Metadata from frontmatter**: In managed local skills, `SKILL.md` frontmatter drives name and description. No separate metadata call is needed.
 - **Audit before attaching**: After authoring or editing files, call `POST /api/companies/{companyId}/skills/{skillId}/audit` and fix any hard-stop findings before attaching the skill to any agent.
 - **Assignment**: Self-attach works via `POST /api/agents/{agentId}/skills/sync` with `mode: "add"`. Attaching the skill to another agent requires the `agents:configure` grant.
