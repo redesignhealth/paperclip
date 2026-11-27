@@ -84,6 +84,8 @@ export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
+  // Claim a routine: board users may set this to themselves so connectors run as them.
+  responsibleUserId: z.string().min(1).optional(),
 });
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 

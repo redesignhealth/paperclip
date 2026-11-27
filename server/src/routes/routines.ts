@@ -372,6 +372,13 @@ export function routineRoutes(
     if (assigneeWillChange) {
       await assertBoardCanAssignTasks(req, routine.companyId);
     }
+    if (req.body.responsibleUserId !== undefined && req.body.responsibleUserId !== routine.responsibleUserId) {
+      // Routines run connectors as their responsible user, so only a board user
+      // may take ownership, and only for themselves.
+      if (req.actor.type !== "board" || !req.actor.userId || req.body.responsibleUserId !== req.actor.userId) {
+        throw forbidden("Only a board user can set themselves as a routine's responsible user");
+      }
+    }
     const statusWillActivate =
       req.body.status !== undefined &&
       req.body.status === "active" &&
