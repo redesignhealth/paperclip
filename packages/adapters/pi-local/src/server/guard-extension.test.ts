@@ -51,6 +51,8 @@ describe("guard: pre-approved builder flow", () => {
     "pnpm install --frozen-lockfile",
     "uv sync && uv run pytest -q tests/",
     "npx vitest run src/server",
+    "bun install --frozen-lockfile",
+    "bunx biome check .", // bunx is bun x, the same class as npx
     "set -euo pipefail; cd packages/x && npm test 2>&1 | tail -20",
     "git add -A && git commit -m \"fix: thing\"",
     "git commit -m \"$(cat <<'EOF'\nfix: heredoc body with rm -rf / and sudo inside\n\nCo-Authored-By: x\nEOF\n)\"",
@@ -143,6 +145,8 @@ describe("guard: deny list", () => {
     ["echo $MY_SERVICE_API_KEY > /tmp/k", "MY_SERVICE_API_KEY"],
     ["python3 -c 'import os; print(os.environ)'", "environment"],
     ["node -e 'console.log(process.env)'", "environment"],
+    ["bunx node -e 'console.log(process.env)'", "environment"],
+    ["bun x node -e 'console.log(process.env)'", "environment"],
     ["bash -c 'printenv'", "environment"],
     ["echo $(printenv)", "environment"],
     ["cat ~/.ssh/id_rsa", "secret"],
@@ -203,6 +207,8 @@ describe("guard: everything else fails fast", () => {
     expect(bash("terraform plan", infra)).toBeNull();
     expect(bash("pnpm install", infra)?.kind).toBe("unlisted");
     expect(bash("curl https://example.com", infra)?.kind).toBe("unlisted");
+    expect(bash("bun install", infra)?.kind).toBe("unlisted");
+    expect(bash("bunx biome check .", infra)?.kind).toBe("unlisted");
     expect(bash("gh pr merge 1", infra)?.kind).toBe("deny");
     expect(resolvePiGuardPolicy("anything-else").profile).toBe("infrastructure");
     expect(resolvePiGuardPolicy("").profile).toBe("builder");

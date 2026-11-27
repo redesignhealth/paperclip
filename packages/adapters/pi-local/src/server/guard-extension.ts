@@ -36,7 +36,7 @@ const MCP_SHELL_HINT = "BLOCKED by the Paperclip guard: mcp is a Pi tool, not a 
 const WRAPPERS = new Set(["command", "builtin", "exec", "nohup", "time", "nice", "timeout", "xargs", "env", "stdbuf"]);
 const SKIP_COMMANDS = new Set(["done", "fi", "esac", "for", "select", "case", "function", "in"]);
 const SHIFT_KEYWORDS = new Set(["if", "then", "else", "elif", "while", "until", "do", "!"]);
-const INTERPRETERS = new Set(["python", "python3", "node", "tsx", "ruby", "perl", "bash", "sh", "zsh", "bun"]);
+const INTERPRETERS = new Set(["python", "python3", "node", "tsx", "ruby", "perl", "bash", "sh", "zsh", "bun", "bunx"]);
 const ENV_READ = /\benviron\b|process\.env|\bgetenv\b|\bprintenv\b|\bENV\b/;
 
 function deny(why, hint) { return { kind: "deny", why, hint }; }
