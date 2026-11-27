@@ -10,13 +10,14 @@ name: Factory Auto-Merge
 # Squash. Rules live in .github/scripts/factory-merge-eligibility.mjs (unit-tested in .github/scripts/tests/).
 #
 # Never merged here: any other PR; upstream-sync PRs (they need merge commits); PRs touching .github/, migrations,
-# auth or secrets code, release and image files, the lockfile (a person is told with a comment).
+# auth or secrets code, release and image files, lockfiles, env files, CODEOWNERS (a person is told with a comment).
 #
 # MERGE IDENTITY: this workflow's own GITHUB_TOKEN. It is not a ruleset bypass actor, so the ruleset ("master: human
 # review (bootstrap)": argus-gate and ci-aggregate required) stays fully in force and refuses any merge it would refuse
 # a person. The workflow re-checks the same facts and never relies on the ruleset to refuse. Limit: a merge made with
-# GITHUB_TOKEN does not start push-triggered workflows on master (GitHub suppresses them); docker.yml,
-# agent-runtime-images.yml, release.yml and similar run on the next push by a person or on their schedule.
+# GITHUB_TOKEN does not start push-triggered workflows on master (GitHub suppresses them): no refresh-lockfile,
+# release canary (verify_canary, publish_canary), docker or agent-runtime-images run for that merge. They run for the next
+# push by a person; a factory merge gets no canary or image of its own and must be dispatched by hand if one is needed.
 #
 # OFF SWITCH: set repository variable FACTORY_AUTO_MERGE_DISABLED to `true` to stop all factory merges at once.
 # DRY RUN: dispatch with dry_run=true (optionally pr_number) to log decisions without merging.
@@ -60,10 +61,10 @@ jobs:
       checks: read
       issues: write
     steps:
-      - name: Checkout eligibility script from master
+      - name: Checkout eligibility script (default-branch SHA of this run, never PR code)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: refs/heads/master
+          ref: ${{ github.sha }}
           sparse-checkout: .github/scripts
           persist-credentials: false
 
@@ -85,6 +86,7 @@ jobs:
             const disabled = process.env.DISABLED === 'true';
             const dryRun = process.env.DRY_RUN === 'true';
             const only = process.env.ONLY_PR ? parseInt(process.env.ONLY_PR, 10) : null;
+            if (process.env.ONLY_PR && !(only > 0)) { core.setFailed(`pr_number must be a positive integer, got: ${process.env.ONLY_PR}`); return; }
 
             let candidates;
             if (only) {
@@ -122,7 +124,7 @@ jobs:
                   const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: c.number, per_page: 100 });
                   if (!comments.some(x => x.body?.includes(marker))) {
                     await github.rest.issues.createComment({ owner, repo, issue_number: c.number, body:
-                      `${marker}\nFactory auto-merge is not merging this PR: it touches hold-list paths (anything under .github/, migrations, auth or secrets code, release and image files, the lockfile). A person must merge it.\n\n` +
+                      `${marker}\nFactory auto-merge is not merging this PR: it touches hold-list paths (anything under .github/, migrations and schema, auth or secrets code, release and image files, lockfiles, env files, CODEOWNERS, fork bookkeeping). A person must merge it.\n\n` +
                       result.paths.map(p => `- \`${p}\``).join('\n') });
                   }
                   continue;

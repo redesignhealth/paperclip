@@ -76,12 +76,12 @@ test('a newer revoking gate run beats an older success', () => {
 });
 
 test('hold-list paths are held for a person', () => {
-  for (const f of ['.github/workflows/x.yml', 'packages/db/src/migrations/0400_x.sql', 'server/src/auth/x.ts', 'server/src/secrets/x.ts', 'docker/x', 'Dockerfile', 'pnpm-lock.yaml', 'docs/merge-policy.md']) {
+  for (const f of ['.github/workflows/x.yml', 'packages/db/src/migrations/0400_x.sql', 'server/src/auth/x.ts', 'server/src/secrets/x.ts', 'docker/x', 'Dockerfile', 'pnpm-lock.yaml', 'packages/plugins/x/pnpm-lock.yaml', 'docker/.env.example', 'CODEOWNERS', 'docs/CODEOWNERS', 'FORK_OWNED.md', 'docs/merge-policy.md']) {
     const r = evaluateFactoryPr(base({ files: ['ui/src/a.ts', f] }));
     assert.equal(r.action, 'hold', f);
     assert.deepEqual(r.paths, [f]);
   }
-  assert.deepEqual(holdPaths(['ui/src/a.ts', 'packages/shared/src/b.ts']), []);
+  assert.deepEqual(holdPaths(['ui/src/a.ts', 'packages/shared/src/b.ts', 'server/src/author.ts']), []);
 });
 
 test('an upstream-sync branch is skipped (needs a merge commit)', () => {
@@ -102,6 +102,16 @@ test('merge state unknown retries; conflicts, behind and blocked skip', () => {
   assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable: false, mergeable_state: 'dirty' }) })).action, 'skip');
   assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'behind' }) })).action, 'skip');
   assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'blocked' }) })).action, 'skip');
+  assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'unstable' }) })).action, 'skip');
+});
+
+test('a rename away from a held path is held through previous_filename', () => {
+  // the workflow passes both names of a rename
+  assert.equal(evaluateFactoryPr(base({ files: ['ui/new.ts', '.github/workflows/old.yml'] })).action, 'hold');
+});
+
+test('a PR with no user is not owned', () => {
+  assert.equal(isFactoryOwned(pr({ user: null }), REPO), false);
 });
 
 test('the off switch stops everything', () => {

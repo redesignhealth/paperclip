@@ -38,7 +38,7 @@ export const HOLD_PATH_PATTERNS = [
   /(^|\/)(migrations?|drizzle)\//i,
   /^packages\/db\/src\/(migrations|schema)\//,
   /(^|\/)(auth|secrets?)([-_][^/]*)?\//i,
-  /(^|\/)(auth|authn|authz|oauth|okta|secrets?)[^/]*\.(py|ts|tsx|js|mjs|cjs|json|ya?ml|sql)$/i,
+  /(^|\/)(auth|authn|authz|oauth|okta|secrets?)([-_.][^/]*)?\.(py|ts|tsx|js|mjs|cjs|json|ya?ml|sql)$/i,
   /(^|\/)Dockerfile[^/]*$/,
   /^docker\//,
   /^releases?\//,
@@ -46,8 +46,15 @@ export const HOLD_PATH_PATTERNS = [
   /^scripts\/release[^/]*$/,
   /^patches\//,
   /^tools\/upstream-sync\//,
-  /^pnpm-lock\.yaml$/,
+  // Lockfiles at any depth (pnpm, npm, Cargo) and workspace config.
+  /(^|\/)(pnpm-lock\.yaml|package-lock\.json|Cargo\.lock)$/,
   /^pnpm-workspace\.yaml$/,
+  // Env files and CODEOWNERS anywhere.
+  /(^|\/)\.env(\.[^/]*)?$/,
+  /(^|\/)CODEOWNERS$/,
+  // Schema and protocol definitions outside packages/db.
+  /^packages\/paperclip-runner\/protocol\/schemas\//,
+  /^tools\/upstream-sync\/schema\.sql$/,
   /^FORK_OWNED\.md$/,
   /^docs\/merge-policy\.md$/,
 ];
@@ -116,7 +123,9 @@ export function evaluateFactoryPr({ pr, repo, files, checkRuns, disabled }) {
   if (pr.mergeable === false || pr.mergeable_state === "dirty") {
     return { action: "skip", reason: "merge conflicts" };
   }
-  if (pr.mergeable_state === "behind" || pr.mergeable_state === "blocked") {
+  // Fail closed: only a clean (or hook-only) merge state merges. unstable, behind, blocked and any
+  // state GitHub adds later are left alone.
+  if (pr.mergeable_state !== "clean" && pr.mergeable_state !== "has_hooks") {
     return { action: "skip", reason: `merge state ${pr.mergeable_state}` };
   }
   return { action: "merge", reason: "all conditions hold", paths: [] };
