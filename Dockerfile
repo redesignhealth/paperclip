@@ -212,6 +212,14 @@ RUN cd /opt/pi-mcp-adapter \
 # turns, so nothing can be installed or downloaded at runtime).
 # uv: official multi-arch image, pinned by tag and index digest; keep >= the services' required-version.
 COPY --from=ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d /uv /uvx /usr/local/bin/
+# bun: official multi-arch image, pinned by tag and index digest; arcadia's web checks (`bun install --frozen-lockfile`,
+# typecheck, lint, test) need exactly this version. The debian variant is glibc, matching this image. bunx is a symlink
+# to bun in the source image.
+COPY --from=oven/bun:1.4.2-debian@sha256:4f6e31d1a54d6a3dd312daef655fc998101b5043d52e12592ac293ef04b9bc73 /usr/local/bin/bun /usr/local/bin/bunx /usr/local/bin/
+# terraform: official multi-arch image, pinned by tag and index digest; matches rh-paperclip's .terraform-version. Lets
+# builders run `terraform fmt -check` (offline). init/validate need the provider registry, which pods cannot reach, so
+# those stay in CI.
+COPY --from=hashicorp/terraform:1.15.8@sha256:7ae513256f7ce67879e218ae8593d6fbe216ec9e123abe6c94e4e10704857963 /bin/terraform /usr/local/bin/terraform
 # pnpm: corepack is enabled in the base stage; pre-activate the version this repo pins (packageManager) into a
 # root-owned, world-readable COREPACK_HOME so user 1000 resolves it offline.
 # UV_LINK_MODE=copy: uv's default hardlink/clone fails across the cache and project volumes in a pod.
@@ -225,6 +233,11 @@ RUN PNPM_VERSION="$(node -p "require('/tmp/pm/package.json').packageManager.repl
   && rm -rf /tmp/pm \
   && uv --version | grep -q '^uv 0\.13\.9' \
   && gosu node uv --version \
+  && bun --version | grep -qx '1\.4\.2' \
+  && gosu node env HOME=/nonexistent bun --version | grep -qx '1\.4\.2' \
+  && gosu node env HOME=/nonexistent bunx --version | grep -qx '1\.4\.2' \
+  && terraform version | head -1 | grep -qx 'Terraform v1\.15\.8' \
+  && gosu node env HOME=/nonexistent terraform version >/dev/null \
   && (cd / && gosu node env HOME=/nonexistent pnpm --version | grep -qx "${PNPM_VERSION}")
 
 COPY docker/hermes/ /tmp/hermes/
