@@ -158,9 +158,19 @@ export async function writePaperclipClaudeMcpConfig(input: {
   stateDir: string;
   runId: string;
   servers: AdapterRuntimeMcpServer[];
+  /**
+   * TECH-11041: a prebuilt config body (relay placeholders only) written instead of the per-server URL and bearer
+   * token. Used for sandbox pods; omitted for every other target, which keeps the output unchanged.
+   */
+  relayConfig?: Record<string, unknown>;
 }): Promise<string> {
   const configDir = path.join(input.stateDir, "runs", input.runId, "mcp");
   const configPath = path.join(configDir, "mcp-config.json");
+  if (input.relayConfig) {
+    await fs.mkdir(configDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(input.relayConfig), { mode: 0o600 });
+    return configPath;
+  }
   const usedNames = new Set<string>();
   const mcpServers: Record<string, unknown> = {};
   for (const server of input.servers) {
