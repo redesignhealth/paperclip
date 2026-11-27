@@ -264,7 +264,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills/sync" \
   }'
 ```
 
-If you need the current state first (an agent can read its own skills; reading another agent's skills requires `agents:configure` or `agents:suggest-changes`):
+If you need the current state first (an agent can read its own skills when it is a standard, unscoped agent; low-trust, skill-test-scoped and task-bridge actors remain denied; reading another agent's skills needs agents:configure or agents:suggest-changes):
 
 ```sh
 curl -sS "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills" \

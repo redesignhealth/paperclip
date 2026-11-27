@@ -28,6 +28,10 @@ import {
   type AuthorizationActor,
 } from "../services/authorization.js";
 import { logger } from "../middleware/logger.js";
+import express from "express";
+import request from "supertest";
+import { agentRoutes } from "../routes/agents.js";
+import { errorHandler } from "../middleware/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3040,5 +3044,211 @@ describeEmbeddedPostgres("authorization service", () => {
       await expect(authz.decide({ actor, action: "secrets:propose", resource }))
         .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
     }
+  });
+
+  describe("agent configuration read permissions (self, peer, cross-company, and low-trust)", () => {
+    function createRouteApp(actor: AuthorizationActor) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = actor;
+        next();
+      });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+      return app;
+    }
+
+    it("(a) allows a standard agent with no grants to read its own configuration and skills via allow_self", async () => {
+      const company = await createCompany(db, "SelfConfigRead");
+      const actorAgent = await createAgent(db, company.id);
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: actorAgent.id,
+        status: "active",
+        membershipRole: "member",
+      });
+      const authz = authorizationService(db);
+
+      // Decision level:
+      const decision = await authz.decide({
+        actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+        action: "agent_config:read",
+        resource: { type: "agent", companyId: company.id, agentId: actorAgent.id },
+      });
+      expect(decision).toMatchObject({
+        allowed: true,
+        reason: "allow_self",
+        explanation: "Allowed because the actor is reading its own agent configuration.",
+      });
+
+      // Route level:
+      const app = createRouteApp({
+        type: "agent",
+        agentId: actorAgent.id,
+        companyId: company.id,
+        source: "agent_key",
+      });
+      const skillsRes = await request(app).get(`/api/agents/${actorAgent.id}/skills`);
+      expect(skillsRes.status).toBe(200);
+
+      const configRes = await request(app).get(`/api/agents/${actorAgent.id}/configuration`);
+      expect(configRes.status).toBe(200);
+    });
+
+    it("(b) denies an ungranted agent reading peer agent and company configuration", async () => {
+      const company = await createCompany(db, "PeerConfigReadDenied");
+      const actorAgent = await createAgent(db, company.id);
+      const peerAgent = await createAgent(db, company.id);
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: actorAgent.id,
+        status: "active",
+        membershipRole: "member",
+      });
+      const authz = authorizationService(db);
+
+      // Decision level - peer agent resource:
+      const peerDecision = await authz.decide({
+        actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+        action: "agent_config:read",
+        resource: { type: "agent", companyId: company.id, agentId: peerAgent.id },
+      });
+      expect(peerDecision.allowed).toBe(false);
+      expect(["deny_no_grant", "deny_missing_grant"]).toContain(peerDecision.reason);
+
+      // Decision level - company resource:
+      const companyDecision = await authz.decide({
+        actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+        action: "agent_config:read",
+        resource: { type: "company", companyId: company.id },
+      });
+      expect(companyDecision.allowed).toBe(false);
+      expect(["deny_no_grant", "deny_missing_grant"]).toContain(companyDecision.reason);
+
+      // Route level:
+      const app = createRouteApp({
+        type: "agent",
+        agentId: actorAgent.id,
+        companyId: company.id,
+        source: "agent_key",
+      });
+      const skillsRes = await request(app).get(`/api/agents/${peerAgent.id}/skills`);
+      expect(skillsRes.status).toBe(403);
+      expect(skillsRes.body.error).toContain("Missing permission: agents:suggest-changes");
+
+      const configRes = await request(app).get(`/api/agents/${peerAgent.id}/configuration`);
+      expect(configRes.status).toBe(403);
+      expect(configRes.body.error).toContain("Missing permission: agents:suggest-changes");
+    });
+
+    it("(c) allows an agent with agents:suggest-changes grant to read peer configuration and skills", async () => {
+      const company = await createCompany(db, "PeerSuggestGrant");
+      const actorAgent = await createAgent(db, company.id);
+      const peerAgent = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actorAgent.id, "agents:suggest-changes");
+      const authz = authorizationService(db);
+
+      // Decision level:
+      const decision = await authz.decide({
+        actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+        action: "agent_config:read",
+        resource: { type: "agent", companyId: company.id, agentId: peerAgent.id },
+      });
+      expect(decision).toMatchObject({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        grant: expect.objectContaining({ permissionKey: "agents:suggest-changes" }),
+      });
+
+      // Route level:
+      const app = createRouteApp({
+        type: "agent",
+        agentId: actorAgent.id,
+        companyId: company.id,
+        source: "agent_key",
+      });
+      const skillsRes = await request(app).get(`/api/agents/${peerAgent.id}/skills`);
+      expect(skillsRes.status).toBe(200);
+
+      const configRes = await request(app).get(`/api/agents/${peerAgent.id}/configuration`);
+      expect(configRes.status).toBe(200);
+    });
+
+    it("(d) denies a cross-company agent reading configuration or skills", async () => {
+      const companyA = await createCompany(db, "CompanyA");
+      const companyB = await createCompany(db, "CompanyB");
+      const targetAgent = await createAgent(db, companyA.id);
+      const foreignAgent = await createAgent(db, companyB.id);
+      const authz = authorizationService(db);
+
+      // Decision level:
+      const decision = await authz.decide({
+        actor: { type: "agent", agentId: foreignAgent.id, companyId: companyB.id, source: "agent_key" },
+        action: "agent_config:read",
+        resource: { type: "agent", companyId: companyA.id, agentId: targetAgent.id },
+      });
+      expect(decision).toMatchObject({
+        allowed: false,
+        reason: "deny_company_boundary",
+        explanation: "Agent key cannot access another company.",
+      });
+
+      // Route level:
+      const app = createRouteApp({
+        type: "agent",
+        agentId: foreignAgent.id,
+        companyId: companyB.id,
+        source: "agent_key",
+      });
+      const skillsRes = await request(app).get(`/api/agents/${targetAgent.id}/skills`);
+      expect(skillsRes.status).toBe(403);
+      expect(skillsRes.body.error).toBe("Agent key cannot access another company");
+    });
+
+    it("(e) denies a low_trust_review agent reading its own configuration or skills under deny_low_trust_boundary", async () => {
+      const company = await createCompany(db, "LowTrustSelfRead");
+      const project = await createProject(db, company.id, "LowTrustProject");
+      const lowTrustAgent = await createAgent(db, company.id, {
+        role: "engineer",
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+              allowedAgentIds: [],
+            },
+          },
+        },
+      });
+      const authz = authorizationService(db);
+
+      // Decision level:
+      const decision = await authz.decide({
+        actor: { type: "agent", agentId: lowTrustAgent.id, companyId: company.id, source: "agent_key" },
+        action: "agent_config:read",
+        resource: { type: "agent", companyId: company.id, agentId: lowTrustAgent.id },
+      });
+      expect(decision).toMatchObject({
+        allowed: false,
+        reason: "deny_low_trust_boundary",
+        explanation: `${LOW_TRUST_REVIEW_PRESET} agents cannot use company-wide or privileged agent_config:read APIs by default.`,
+      });
+
+      // Route level:
+      const app = createRouteApp({
+        type: "agent",
+        agentId: lowTrustAgent.id,
+        companyId: company.id,
+        source: "agent_key",
+      });
+      const skillsRes = await request(app).get(`/api/agents/${lowTrustAgent.id}/skills`);
+      expect(skillsRes.status).toBe(403);
+      expect(skillsRes.body.error).toContain("low_trust_review agents cannot use company-wide or privileged agent_config:read APIs by default.");
+    });
   });
 });
