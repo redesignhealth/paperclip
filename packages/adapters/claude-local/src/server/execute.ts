@@ -101,6 +101,11 @@ import {
   claudeMcpToolTimeoutMs,
   selectClaudeMcpRelayServers,
 } from "./mcp-relay.js";
+import {
+  buildClaudeSandboxMemoryNote,
+  findClaudeMemoryRelayServer,
+  stripSandboxMemoryHookEnv,
+} from "./memory-relay.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
@@ -566,12 +571,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Warning: skill "${entry.key}" is enabled for this agent but its files are unavailable and it was not mounted${entry.missingDetail ? `: ${entry.missingDetail}` : "."}\n`,
     );
   }
-  const promptBundle = await prepareClaudePromptBundle({
-    companyId: agent.companyId,
-    skills: mountableSkillEntries,
-    instructionsContents: combinedInstructionsContents,
-    onLog,
-  });
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
   const runtimeMcpIdentity = JSON.stringify(
     runtimeMcpServers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
@@ -592,6 +591,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (mcpRelayAvailable && mcpRelayServers.length > 0 && !hasNonEmptyEnvValue(env, "MCP_TOOL_TIMEOUT")) {
     env.MCP_TOOL_TIMEOUT = String(claudeMcpToolTimeoutMs(mcpRelayServers));
   }
+  // TECH-11041: a pod cannot reach the memory service, so the recall/capture hooks are off there (no hook env in the pod)
+  // and memory works through the relayed memory MCP tools, which the agent is told about.
+  if (mcpRelayAvailable) {
+    const removedHookEnv = stripSandboxMemoryHookEnv(env);
+    if (removedHookEnv.length > 0) {
+      await onLog(
+        "stdout",
+        "[paperclip] Memory hooks are off in a sandbox pod (the memory service is not reachable from it); the memory MCP tools are used instead.\n",
+      );
+    }
+    const memoryServer = findClaudeMemoryRelayServer(mcpRelayServers);
+    if (memoryServer) {
+      const memoryNote = buildClaudeSandboxMemoryNote(memoryServer);
+      combinedInstructionsContents = combinedInstructionsContents
+        ? `${combinedInstructionsContents}\n\n${memoryNote}`
+        : memoryNote;
+    } else if (removedHookEnv.length > 0) {
+      await onLog(
+        "stderr",
+        "[paperclip] Warning: memory is enabled for this agent but its memory MCP server is not available in this sandbox run; continuing without memory.\n",
+      );
+    }
+  }
+  const promptBundle = await prepareClaudePromptBundle({
+    companyId: agent.companyId,
+    skills: mountableSkillEntries,
+    instructionsContents: combinedInstructionsContents,
+    onLog,
+  });
   const claudeRuntimeStateDir = resolveManagedClaudeRuntimeStateDir(
     process.env,
     agent.companyId,
@@ -704,6 +732,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // The refresh above re-applies the agent's configured env, which holds the memory hook env.
+  if (mcpRelayAvailable) stripSandboxMemoryHookEnv(env);
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))
     : null;
