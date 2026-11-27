@@ -30,6 +30,27 @@ wrong-App, outage, revocation, and fork-SHA cases. Keep the current human requir
 while those checks are being validated. A temporary human-approved bootstrap is not evidence that
 the machine gate is live.
 
+## Factory auto-merge exception (TECH-11016)
+
+The code factory's own pull requests merge without a person. This is the one exception to "do not
+enable an automatic merge". It is not the GitHub auto-merge setting (that stays off) and not a merge
+queue: the `Factory Auto-Merge` workflow (`.github/workflows/factory-auto-merge.yml`) merges a pull
+request with its own `GITHUB_TOKEN` only when all of these hold, and the ruleset stays fully in force
+as the backstop (the workflow is not a bypass actor):
+
+- the head branch is `factory/...` in this repository, the author is `rh-code-factory[bot]`, and the
+  base is `master`;
+- `argus-gate` and `ci-aggregate` are both green at the exact head SHA and were published by the
+  RH PR Approval Gate App (`5166579`); a same-named check from another app does not count;
+- the pull request is not a draft, merges cleanly, and touches none of the hold-list paths (anything
+  under `.github/`, migrations and schema, auth and secrets code, release and image files, the
+  lockfile). A person merges those.
+
+Upstream-sync pull requests (`factory/sync...`) are never merged by it: they need merge commits, and
+the workflow always squashes. Set the repository variable `FACTORY_AUTO_MERGE_DISABLED` to `true` to
+stop all factory merges at once. Everything in this document about people's pull requests, the human
+fallback, and rollback is unchanged.
+
 ## Rollback and boundary
 
 If the machine gate is unavailable or disputed, restore the human-review requirement first, then
