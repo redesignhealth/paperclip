@@ -220,6 +220,19 @@ COPY --from=oven/bun:1.4.2-debian@sha256:4f6e31d1a54d6a3dd312daef655fc998101b504
 # builders run `terraform fmt -check` (offline). init/validate need the provider registry, which pods cannot reach, so
 # those stay in CI.
 COPY --from=hashicorp/terraform:1.15.8@sha256:7ae513256f7ce67879e218ae8593d6fbe216ec9e123abe6c94e4e10704857963 /bin/terraform /usr/local/bin/terraform
+# python 3.12: arcadia's API pins requires-python "==3.12.*" and the Debian python3 here is 3.13, so `uv pip install -e .` and
+# mypy there fail without it. Baked at build time from uv's python-build-standalone (uv verifies the archive hash it ships for
+# this exact version), into a root-owned, world-readable dir that user 1000 reads offline; UV_PYTHON_DOWNLOADS=never stops pods
+# trying to fetch another interpreter (the release-asset host is not on the egress allowlist). python3.12 is linked into
+# /usr/local/bin; `python3` stays Debian's 3.13. Keep the pin within what the installed uv's python list offers.
+ENV UV_PYTHON_INSTALL_DIR=/usr/local/share/uv-python \
+  UV_PYTHON_BIN_DIR=/usr/local/bin
+RUN UV_PYTHON_DOWNLOADS=automatic uv python install 3.12.16 \
+  && chmod -R a+rX "$UV_PYTHON_INSTALL_DIR" \
+  && python3.12 --version | grep -qx 'Python 3\.12\.16' \
+  && gosu node env HOME=/nonexistent UV_CACHE_DIR=/tmp/uv-python-check UV_PYTHON_DOWNLOADS=never uv python find 3.12 >/dev/null \
+  && rm -rf /tmp/uv-python-check
+ENV UV_PYTHON_DOWNLOADS=never
 # pnpm: corepack is enabled in the base stage; pre-activate the version this repo pins (packageManager) into a
 # root-owned, world-readable COREPACK_HOME so user 1000 resolves it offline.
 # UV_LINK_MODE=copy: uv's default hardlink/clone fails across the cache and project volumes in a pod.
