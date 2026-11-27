@@ -94,6 +94,9 @@ test-results/
 /packages/paperclip-runner/provider-assets/
 /server/provider-assets/
 
+# Upstream-sync downloaded RDS CA bundle (baked into Docker image, not committed)
+tools/upstream-sync/global-bundle.pem
+
 # Local native Runner test/session state
 .paperclip-runner-prp/
 
