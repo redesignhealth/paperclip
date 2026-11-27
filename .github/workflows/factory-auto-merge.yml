@@ -9,8 +9,8 @@ name: Factory Auto-Merge
 # ignored. The merge call is pinned to the evaluated head SHA, so a push after the check makes GitHub refuse it.
 # Squash. Rules live in .github/scripts/factory-merge-eligibility.mjs (unit-tested in .github/scripts/tests/).
 #
-# Never merged here: any other PR; upstream-sync PRs (they need merge commits); PRs touching .github/, migrations,
-# auth or secrets code, release and image files, lockfiles, env files, CODEOWNERS (a person is told with a comment).
+# Never merged here: any other PR; upstream-sync PRs (they need merge commits); PRs touching the hold list in
+# factory-merge-eligibility.mjs (HOLD_PATH_PATTERNS, summarised in docs/merge-policy.md): a person is told with a comment.
 #
 # MERGE IDENTITY: this workflow's own GITHUB_TOKEN. It is not a ruleset bypass actor, so the ruleset ("master: human
 # review (bootstrap)": argus-gate and ci-aggregate required) stays fully in force and refuses any merge it would refuse
@@ -85,8 +85,8 @@ jobs:
             const repoFull = `${owner}/${repo}`;
             const disabled = process.env.DISABLED === 'true';
             const dryRun = process.env.DRY_RUN === 'true';
-            const only = process.env.ONLY_PR ? parseInt(process.env.ONLY_PR, 10) : null;
-            if (process.env.ONLY_PR && !(only > 0)) { core.setFailed(`pr_number must be a positive integer, got: ${process.env.ONLY_PR}`); return; }
+            const only = process.env.ONLY_PR ? Number(process.env.ONLY_PR) : null;
+            if (process.env.ONLY_PR && !(Number.isInteger(only) && only > 0)) { core.setFailed(`pr_number must be a positive integer, got: ${process.env.ONLY_PR}`); return; }
 
             let candidates;
             if (only) {
@@ -124,7 +124,7 @@ jobs:
                   const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: c.number, per_page: 100 });
                   if (!comments.some(x => x.body?.includes(marker))) {
                     await github.rest.issues.createComment({ owner, repo, issue_number: c.number, body:
-                      `${marker}\nFactory auto-merge is not merging this PR: it touches hold-list paths (anything under .github/, migrations and schema, auth or secrets code, release and image files, lockfiles, env files, CODEOWNERS, fork bookkeeping). A person must merge it.\n\n` +
+                      `${marker}\nFactory auto-merge is not merging this PR: it touches hold-list paths (see HOLD_PATH_PATTERNS in factory-merge-eligibility.mjs and docs/merge-policy.md: .github/, migrations and schema, auth and secrets code, release and image files, lockfiles, env files, CODEOWNERS, fork bookkeeping). A person must merge it.\n\n` +
                       result.paths.map(p => `- \`${p}\``).join('\n') });
                   }
                   continue;

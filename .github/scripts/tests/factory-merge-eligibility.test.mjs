@@ -76,12 +76,12 @@ test('a newer revoking gate run beats an older success', () => {
 });
 
 test('hold-list paths are held for a person', () => {
-  for (const f of ['.github/workflows/x.yml', 'packages/db/src/migrations/0400_x.sql', 'server/src/auth/x.ts', 'server/src/secrets/x.ts', 'docker/x', 'Dockerfile', 'pnpm-lock.yaml', 'packages/plugins/x/pnpm-lock.yaml', 'docker/.env.example', 'CODEOWNERS', 'docs/CODEOWNERS', 'FORK_OWNED.md', 'docs/merge-policy.md']) {
+  for (const f of ['.github/workflows/x.yml', 'packages/db/src/migrations/0400_x.sql', 'server/src/auth/x.ts', 'server/src/secrets/x.ts', 'docker/x', 'Dockerfile', 'pnpm-lock.yaml', 'packages/plugins/x/pnpm-lock.yaml', 'docker/.env.example', 'CODEOWNERS', 'docs/CODEOWNERS', 'FORK_OWNED.md', 'docs/merge-policy.md', 'server/src/services/authorization.ts', 'ui/src/lib/authorizationUrl.ts', 'server/src/secretary-x.ts', 'package-lock.json', 'docker/x/package-lock.json', 'Cargo.lock', '.env', '.envrc', 'pnpm-workspace.yaml', 'packages/paperclip-runner/protocol/schemas/a.json', 'packages/paperclip-runner/protocol/provider-schemas/a.json', 'patches/x.patch', 'tools/upstream-sync/x.mjs']) {
     const r = evaluateFactoryPr(base({ files: ['ui/src/a.ts', f] }));
     assert.equal(r.action, 'hold', f);
     assert.deepEqual(r.paths, [f]);
   }
-  assert.deepEqual(holdPaths(['ui/src/a.ts', 'packages/shared/src/b.ts', 'server/src/author.ts']), []);
+  assert.deepEqual(holdPaths(['ui/src/a.ts', 'packages/shared/src/b.ts']), []);
 });
 
 test('an upstream-sync branch is skipped (needs a merge commit)', () => {
@@ -103,6 +103,7 @@ test('merge state unknown retries; conflicts, behind and blocked skip', () => {
   assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'behind' }) })).action, 'skip');
   assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'blocked' }) })).action, 'skip');
   assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'unstable' }) })).action, 'skip');
+  assert.equal(evaluateFactoryPr(base({ pr: pr({ mergeable_state: 'has_hooks' }) })).action, 'merge');
 });
 
 test('a rename away from a held path is held through previous_filename', () => {

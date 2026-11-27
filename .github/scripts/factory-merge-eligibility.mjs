@@ -38,7 +38,7 @@ export const HOLD_PATH_PATTERNS = [
   /(^|\/)(migrations?|drizzle)\//i,
   /^packages\/db\/src\/(migrations|schema)\//,
   /(^|\/)(auth|secrets?)([-_][^/]*)?\//i,
-  /(^|\/)(auth|authn|authz|oauth|okta|secrets?)([-_.][^/]*)?\.(py|ts|tsx|js|mjs|cjs|json|ya?ml|sql)$/i,
+  /(^|\/)(auth|authn|authz|oauth|okta|secrets?)[^/]*\.(py|ts|tsx|js|mjs|cjs|json|ya?ml|sql)$/i,
   /(^|\/)Dockerfile[^/]*$/,
   /^docker\//,
   /^releases?\//,
@@ -50,11 +50,10 @@ export const HOLD_PATH_PATTERNS = [
   /(^|\/)(pnpm-lock\.yaml|package-lock\.json|Cargo\.lock)$/,
   /^pnpm-workspace\.yaml$/,
   // Env files and CODEOWNERS anywhere.
-  /(^|\/)\.env(\.[^/]*)?$/,
+  /(^|\/)\.env(rc|\.[^/]*)?$/,
   /(^|\/)CODEOWNERS$/,
   // Schema and protocol definitions outside packages/db.
-  /^packages\/paperclip-runner\/protocol\/schemas\//,
-  /^tools\/upstream-sync\/schema\.sql$/,
+  /^packages\/paperclip-runner\/protocol\/[^/]*schemas?\//,
   /^FORK_OWNED\.md$/,
   /^docs\/merge-policy\.md$/,
 ];

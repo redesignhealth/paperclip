@@ -42,7 +42,7 @@ force as the backstop (the workflow is not a bypass actor):
   base is `master`;
 - `argus-gate` and `ci-aggregate` are both green at the exact head SHA and were published by the
   RH PR Approval Gate App (`5166579`); a same-named check from another app does not count;
-- the pull request is not a draft, its merge state is clean, and it touches none of the hold-list
+- the pull request is not a draft, its merge state is `clean` (or `has_hooks`; `unstable`, `behind` and `blocked` are left for a person), and it touches none of the hold-list
   paths: anything under `.github/`, migrations and schema, auth and secrets code, release and image
   files (`docker/`, Dockerfiles, `releases/`, `skills-releases/`, `scripts/release*`), lockfiles,
   `pnpm-workspace.yaml`, env files, CODEOWNERS, `patches/`, `tools/upstream-sync/`, `FORK_OWNED.md`
