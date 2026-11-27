@@ -602,3 +602,78 @@ test("report cells escape backslash, pipe, CR and newline", () => {
   assert.ok(!escapeMarkdownCell("[@D](user://u1)").includes("user://"));
   assert.equal(escapeMarkdownCell(null), "");
 });
+
+// ---- RED-1631: exactly-one alert across timed-out / lost deliveries -----------
+
+function commentSinkCfg() {
+  return {
+    httpTimeoutMs: 1000,
+    alert: { sink: "paperclip-comment", channel: "#eng", paperclipApiUrl: "http://x/api", paperclipApiKey: "k", issueId: "i1", paperclipRunId: "r1" },
+  };
+}
+
+// In-memory Paperclip comments API: GET lists newest first, POST appends.
+function fakeCommentsApi({ failPostsAfterStore = 0 } = {}) {
+  const comments = [];
+  const state = { gets: 0, posts: 0 };
+  const fetchImpl = async (url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") {
+      state.gets++;
+      assert.match(url, /\/api\/issues\/i1\/comments\?order=desc&limit=500$/);
+      return { ok: true, status: 200, json: async () => [...comments].reverse() };
+    }
+    state.posts++;
+    const id = `c${state.posts}`;
+    comments.push({ id, body: JSON.parse(init.body).body });
+    // The server stored the comment but the client never saw the response.
+    if (state.posts <= failPostsAfterStore) throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    return { ok: true, status: 201, json: async () => ({ id }) };
+  };
+  return { fetchImpl, comments, state };
+}
+
+test("a comment posted before a timed-out delivery is not posted again next run", async () => {
+  const { flushAlerts } = await import("../lib/alerts.mjs");
+  const alert = { id: 9, dedup_key: "row:" + "e".repeat(40), channel: "#eng", payload: { text: "hello" } };
+  const api = fakeCommentsApi({ failPostsAfterStore: 1 });
+  const cfg = commentSinkCfg();
+  const quiet = () => {};
+
+  const run1 = await flushAlerts(fakeDb([alert]), cfg, { fetchImpl: api.fetchImpl, log: quiet });
+  assert.deepEqual(run1, { delivered: 0, failed: 1, deferred: 0 });
+  assert.equal(api.comments.length, 1, "the comment did land");
+
+  const db2 = fakeDb([alert]);
+  const run2 = await flushAlerts(db2, cfg, { fetchImpl: api.fetchImpl, log: quiet });
+  assert.deepEqual(run2, { delivered: 1, failed: 0, deferred: 0 });
+  assert.equal(api.comments.length, 1, "no duplicate comment");
+  assert.equal(api.state.posts, 1);
+  const marked = db2.calls.find((c) => /SET delivered_at=now\(\)/.test(c.sql));
+  assert.match(marked.params[1], /^paperclip-comment:c1:existing$/);
+});
+
+test("comment sink posts each alert once, lists comments once per flush, and hides the marker", async () => {
+  const { flushAlerts } = await import("../lib/alerts.mjs");
+  const alerts = [1, 2, 3].map((id) => ({ id, dedup_key: `row:${id}`, channel: "#eng", payload: { text: `a${id}` } }));
+  const api = fakeCommentsApi();
+  const r = await flushAlerts(fakeDb(alerts), commentSinkCfg(), { fetchImpl: api.fetchImpl, log: () => {} });
+  assert.deepEqual(r, { delivered: 3, failed: 0, deferred: 0 });
+  assert.equal(api.state.gets, 1);
+  assert.equal(api.state.posts, 3);
+  assert.match(api.comments[0].body, /\n\n<!-- upstream-sync-alert:row:1 -->$/);
+  // A second flush over the same rows (crash after send, before mark) posts nothing.
+  await flushAlerts(fakeDb(alerts), commentSinkCfg(), { fetchImpl: api.fetchImpl, log: () => {} });
+  assert.equal(api.state.posts, 3);
+});
+
+test("if existing comments cannot be listed, nothing is posted and the alerts stay undelivered", async () => {
+  const { flushAlerts } = await import("../lib/alerts.mjs");
+  const alerts = [1, 2].map((id) => ({ id, dedup_key: `row:${id}`, channel: "#eng", payload: { text: `a${id}` } }));
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return { ok: false, status: 503, json: async () => ({}) }; };
+  const db = fakeDb(alerts);
+  const r = await flushAlerts(db, commentSinkCfg(), { fetchImpl, log: () => {} });
+  assert.deepEqual(r, { delivered: 0, failed: 2, deferred: 0 });
+  assert.equal(calls, 1, "lookup failure is cached for the rest of the flush");
+  assert.equal(db.calls.filter((c) => /SET delivered_at=now\(\)/.test(c.sql)).length, 0);
+});
