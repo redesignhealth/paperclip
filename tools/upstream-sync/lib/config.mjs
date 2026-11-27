@@ -102,6 +102,8 @@ export function loadConfig(env = process.env, warn = console.warn) {
     ops: {
       queueDepthMax: count("UPSTREAM_SYNC_QUEUE_DEPTH_MAX", 40),
       oldestPendingHoursMax: count("UPSTREAM_SYNC_OLDEST_PENDING_HOURS_MAX", 48),
+      // Re-fire a still-active ops alert this often; 0 disables reminders.
+      reminderHours: count("UPSTREAM_SYNC_OPS_REMINDER_HOURS", 24),
     },
   };
 }

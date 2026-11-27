@@ -209,7 +209,10 @@ In P1 the alert moves from classification time to merge time.
 
 Ops alerts are edge-triggered (one alert when a condition starts, re-armed when it clears):
 queue depth `> UPSTREAM_SYNC_QUEUE_DEPTH_MAX` (default 40) and oldest `pending` older than
-`UPSTREAM_SYNC_OLDEST_PENDING_HOURS_MAX` (default 48).
+`UPSTREAM_SYNC_OLDEST_PENDING_HOURS_MAX` (default 48). While a condition stays active the
+alert is re-enqueued every `UPSTREAM_SYNC_OPS_REMINDER_HOURS` (default 24, `0` = off) with an
+hour-bucket dedup key (`ops:<name>:h<hour>`). The manual `alert` and `flush` commands take the
+same run lock as `run`, so they cannot send a pending alert at the same time as the hourly job.
 
 ## Configuration (environment)
 

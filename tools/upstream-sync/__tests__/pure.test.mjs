@@ -602,3 +602,88 @@ test("report cells escape backslash, pipe, CR and newline", () => {
   assert.ok(!escapeMarkdownCell("[@D](user://u1)").includes("user://"));
   assert.equal(escapeMarkdownCell(null), "");
 });
+
+// ---- RED-1577: alert dedup + ops reminders -------------------------------------
+// Stateful fake for the alert/state tables: enforces UNIQUE(dedup_key) like Postgres.
+function alertsFakeDb({ pending = 0, oldestH = 0, logRows = [] } = {}) {
+  const alerts = [];
+  const state = new Map();
+  return {
+    alerts, state,
+    async query(sql, params) {
+      if (/INSERT INTO upstream_sync_alerts/.test(sql)) {
+        if (alerts.some((a) => a.dedup_key === params[0])) return { rows: [], rowCount: 0 };
+        alerts.push({ dedup_key: params[0], kind: params[1], upstream_sha: params[2], payload: params[5] });
+        return { rows: [{ id: alerts.length }], rowCount: 1 };
+      }
+      if (/FROM upstream_sync_log\s+WHERE status = 'pending'/.test(sql)) return { rows: [{ depth: pending, oldest_h: oldestH }], rowCount: 1 };
+      if (/FROM upstream_sync_log\s+WHERE category = ANY/.test(sql)) return { rows: logRows, rowCount: logRows.length };
+      if (/SELECT value FROM upstream_sync_state/.test(sql)) return state.has(params[0]) ? { rows: [{ value: state.get(params[0]) }], rowCount: 1 } : { rows: [], rowCount: 0 };
+      if (/INSERT INTO upstream_sync_state/.test(sql)) { state.set(params[0], params[1]); return { rows: [], rowCount: 1 }; }
+      if (/DELETE FROM upstream_sync_state/.test(sql)) { state.delete(params[0]); return { rows: [], rowCount: 1 }; }
+      return { rows: [], rowCount: 1 };
+    },
+  };
+}
+
+test("one upstream sha yields one alert row even if alert_state is reset and the row is re-selected", async () => {
+  const { alertForClassifiedRows } = await import("../lib/alerts.mjs");
+  const row = { upstream_sha: "77ddf260bf".padEnd(40, "0"), upstream_pr: 21860, category: "security", summary: "s", title: "t", status: "pending", fork_owned_hits: [] };
+  const db = alertsFakeDb({ logRows: [row] });
+  const cfg = { ...loadConfig({}), alert: { sink: "outbox", channel: "#eng", maxPerRun: 10 } };
+  const first = await alertForClassifiedRows(db, cfg);
+  // Re-classification / a second run selects the same row again (alert_state NULL).
+  const second = await alertForClassifiedRows(db, cfg);
+  assert.equal(first.queued, 1);
+  assert.equal(second.queued, 0);
+  assert.equal(db.alerts.filter((a) => a.upstream_sha === row.upstream_sha && a.kind === "security").length, 1);
+});
+
+test("ops alert: fires once, stays quiet inside the reminder window, re-fires after N hours", async () => {
+  const { opsAlerts } = await import("../lib/alerts.mjs");
+  const db = alertsFakeDb({ pending: 100, oldestH: 10 });
+  const cfg = { ...loadConfig({}), alert: { sink: "outbox", channel: "#eng" }, ops: { queueDepthMax: 40, oldestPendingHoursMax: 48, reminderHours: 24 } };
+  const t0 = Date.UTC(2026, 10, 16, 0, 5);
+  const H = 3600 * 1000;
+  assert.deepEqual((await opsAlerts(db, cfg, { now: t0 })).fired, ["queue_depth"]);
+  assert.deepEqual((await opsAlerts(db, cfg, { now: t0 + 23 * H })).fired, [], "inside the window");
+  const r = await opsAlerts(db, cfg, { now: t0 + 24 * H });
+  assert.deepEqual(r.fired, ["queue_depth"], "reminder after 24h");
+  assert.match(db.alerts.at(-1).payload.text, /reminder/);
+  assert.match(db.alerts.at(-1).dedup_key, /^ops:queue_depth:h\d+$/);
+  assert.deepEqual((await opsAlerts(db, cfg, { now: t0 + 25 * H })).fired, [], "window restarts at the reminder");
+  assert.deepEqual((await opsAlerts(db, cfg, { now: t0 + 48 * H })).fired, ["queue_depth"], "and again 24h later");
+  assert.equal(db.alerts.length, 3);
+});
+
+test("ops reminder is deduped per hour bucket and can be disabled", async () => {
+  const { opsAlerts } = await import("../lib/alerts.mjs");
+  const base = { ...loadConfig({}), alert: { sink: "outbox", channel: "#eng" } };
+  const t0 = Date.UTC(2026, 10, 16, 0, 5);
+  // Overlapping evaluation in the same hour: flag write lost, key still collides.
+  const db = alertsFakeDb({ pending: 100 });
+  const cfg = { ...base, ops: { queueDepthMax: 40, oldestPendingHoursMax: 48, reminderHours: 24 } };
+  db.state.set("ops_active_queue_depth", String(t0));
+  const due = t0 + 24 * 3600 * 1000;
+  await opsAlerts(db, cfg, { now: due });
+  db.state.set("ops_active_queue_depth", String(t0)); // second racer saw the old flag
+  const r = await opsAlerts(db, cfg, { now: due + 60 * 1000 });
+  assert.deepEqual(r.fired, [], "same hour bucket must not enqueue twice");
+  assert.equal(db.alerts.length, 1);
+  // reminderHours=0 restores pure edge-trigger behaviour.
+  const off = alertsFakeDb({ pending: 100 });
+  const offCfg = { ...base, ops: { queueDepthMax: 40, oldestPendingHoursMax: 48, reminderHours: 0 } };
+  await opsAlerts(off, offCfg, { now: t0 });
+  assert.deepEqual((await opsAlerts(off, offCfg, { now: t0 + 1000 * 3600 * 1000 })).fired, []);
+  // Recovery clears the flag so the next episode alerts immediately.
+  const rec = alertsFakeDb({ pending: 100 });
+  await opsAlerts(rec, cfg, { now: t0 });
+  rec.query = ((q) => async (s, p) => /FROM upstream_sync_log\s+WHERE status = 'pending'/.test(s) ? { rows: [{ depth: 0, oldest_h: null }], rowCount: 1 } : q(s, p))(rec.query);
+  await opsAlerts(rec, cfg, { now: t0 + 1000 });
+  assert.equal(rec.state.has("ops_active_queue_depth"), false);
+});
+
+test("config: ops reminder defaults to 24h and is overridable", () => {
+  assert.equal(loadConfig({}).ops.reminderHours, 24);
+  assert.equal(loadConfig({ UPSTREAM_SYNC_OPS_REMINDER_HOURS: "0" }).ops.reminderHours, 0);
+});
