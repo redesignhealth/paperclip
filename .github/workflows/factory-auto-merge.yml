@@ -1,0 +1,150 @@
+name: Factory Auto-Merge
+
+# TECH-11016 (rolled out from rh-data-platform's TECH-9802). Merges PRs the code factory owns, and only those.
+#
+# A PR is the factory's only if ALL hold: head branch starts with `factory/` in this repository, it was opened by the
+# rh-code-factory GitHub App (rh-code-factory[bot]), and it targets master. It merges only when both required gate
+# checks, `argus-gate` (a service-run Argus APPROVE at the exact head SHA) and `ci-aggregate` (trusted CI at that SHA),
+# are green and were published by the RH PR Approval Gate App (5166579). A same-named check from any other app is
+# ignored. The merge call is pinned to the evaluated head SHA, so a push after the check makes GitHub refuse it.
+# Squash. Rules live in .github/scripts/factory-merge-eligibility.mjs (unit-tested in .github/scripts/tests/).
+#
+# Never merged here: any other PR; upstream-sync PRs (they need merge commits); PRs touching the hold list in
+# factory-merge-eligibility.mjs (HOLD_PATH_PATTERNS, summarised in docs/merge-policy.md): a person is told with a comment.
+#
+# MERGE IDENTITY: this workflow's own GITHUB_TOKEN. It is not a ruleset bypass actor, so the ruleset ("master: human
+# review (bootstrap)": argus-gate and ci-aggregate required) stays fully in force and refuses any merge it would refuse
+# a person. The workflow re-checks the same facts and never relies on the ruleset to refuse. Limit: a merge made with
+# GITHUB_TOKEN does not start push-triggered workflows on master (GitHub suppresses them): no refresh-lockfile,
+# release canary (verify_canary, publish_canary), docker or agent-runtime-images run for that merge. They run for the next
+# push by a person; a factory merge gets no canary or image of its own and must be dispatched by hand if one is needed.
+#
+# OFF SWITCH: set repository variable FACTORY_AUTO_MERGE_DISABLED to `true` to stop all factory merges at once.
+# DRY RUN: dispatch with dry_run=true (optionally pr_number) to log decisions without merging.
+
+on:
+  workflow_run:
+    workflows: ["Auto Approve"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Only consider this PR number (default: all open factory PRs). A non-factory PR is reported and skipped."
+        required: false
+        type: number
+      dry_run:
+        description: "Log what would happen and merge nothing"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: factory-auto-merge
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  merge:
+    if: |
+      github.ref == 'refs/heads/master' &&
+      github.repository_id == '1326789272' &&
+      vars.FACTORY_AUTO_MERGE_DISABLED != 'true' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      issues: write
+    steps:
+      - name: Checkout eligibility script (default-branch SHA of this run, never PR code)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Evaluate and merge eligible factory PRs
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          ONLY_PR: ${{ github.event.inputs.pr_number }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DISABLED: ${{ vars.FACTORY_AUTO_MERGE_DISABLED }}
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const path = require('path');
+            const { evaluateFactoryPr, FACTORY_BRANCH_PREFIX, FACTORY_BOT_LOGIN, BASE_BRANCH } = await import(
+              pathToFileURL(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/factory-merge-eligibility.mjs')).href
+            );
+            const { owner, repo } = context.repo;
+            const repoFull = `${owner}/${repo}`;
+            const disabled = process.env.DISABLED === 'true';
+            const dryRun = process.env.DRY_RUN === 'true';
+            const only = process.env.ONLY_PR ? Number(process.env.ONLY_PR) : null;
+            if (process.env.ONLY_PR && !(Number.isInteger(only) && only > 0)) { core.setFailed(`pr_number must be a positive integer, got: ${process.env.ONLY_PR}`); return; }
+
+            let candidates;
+            if (only) {
+              // A named PR is always evaluated, factory or not; evaluateFactoryPr skips a non-factory one.
+              candidates = [(await github.rest.pulls.get({ owner, repo, pull_number: only })).data];
+            } else {
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: BASE_BRANCH, per_page: 100 });
+              // Cheap pre-filter on the same ownership facts; evaluateFactoryPr re-checks them.
+              candidates = open.filter(p =>
+                p.head?.ref?.startsWith(FACTORY_BRANCH_PREFIX) &&
+                p.user?.login === FACTORY_BOT_LOGIN);
+            }
+            core.info(`${candidates.length} candidate PR(s)${dryRun ? ' (dry run: nothing will be merged)' : ''}`);
+
+            let failures = 0;
+            for (const c of candidates) {
+              try {
+                let pr = (await github.rest.pulls.get({ owner, repo, pull_number: c.number })).data;
+                // mergeable is computed lazily: poll a few times before calling it unknown.
+                for (let i = 0; i < 5 && (pr.mergeable === null || pr.mergeable_state === 'unknown'); i++) {
+                  await new Promise(r => setTimeout(r, 4000));
+                  pr = (await github.rest.pulls.get({ owner, repo, pull_number: c.number })).data;
+                }
+                const sha = pr.head.sha;
+                if (pr.changed_files >= 3000) { core.warning(`PR #${c.number}: ${pr.changed_files} files, file list may be truncated; leaving for a person`); continue; }
+                const files = (await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: c.number, per_page: 100 })).flatMap(f => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
+                const checkRuns = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, per_page: 100 });
+
+                const result = evaluateFactoryPr({ pr, repo: repoFull, files, checkRuns, disabled });
+                core.info(`PR #${c.number} @ ${sha.slice(0, 7)}: ${result.action} (${result.reason})`);
+
+                if (result.action === 'hold') {
+                  if (dryRun) continue;
+                  const marker = `<!-- factory-auto-merge-hold ${require('crypto').createHash('sha1').update([...new Set(result.paths)].sort().join('\n')).digest('hex')} -->`;
+                  const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: c.number, per_page: 100 });
+                  if (!comments.some(x => x.body?.includes(marker))) {
+                    await github.rest.issues.createComment({ owner, repo, issue_number: c.number, body:
+                      `${marker}\nFactory auto-merge is not merging this PR: it touches hold-list paths (see HOLD_PATH_PATTERNS in factory-merge-eligibility.mjs and docs/merge-policy.md: .github/, migrations and schema, auth and secrets code, release and image files, lockfiles, env files, CODEOWNERS, fork bookkeeping). A person must merge it.\n\n` +
+                      result.paths.map(p => `- \`${p}\``).join('\n') });
+                  }
+                  continue;
+                }
+                if (result.action !== 'merge') continue;
+                if (dryRun) { core.info(`PR #${c.number}: dry run, would squash-merge at ${sha}`); continue; }
+
+                // Pinned to the evaluated head SHA: GitHub returns 409 if the head moved.
+                try {
+                  await github.rest.pulls.merge({ owner, repo, pull_number: c.number, sha, merge_method: 'squash' });
+                  core.info(`PR #${c.number} merged at ${sha}`);
+                } catch (e) {
+                  // 409: head moved. 405: the ruleset refuses right now. The schedule retries either way.
+                  if (e.status === 409 || e.status === 405) { core.warning(`PR #${c.number}: head moved or the ruleset refuses (${e.status}): ${e.message}; retrying next run`); continue; }
+                  throw e;
+                }
+              } catch (e) {
+                // One PR failing must not stop the others; the schedule retries.
+                failures++;
+                core.error(`PR #${c.number}: ${e.message}`);
+              }
+            }
+            if (failures > 0) core.setFailed(`${failures} factory PR(s) failed to evaluate or merge; the schedule retries`);
