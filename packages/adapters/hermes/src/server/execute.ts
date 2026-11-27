@@ -60,6 +60,7 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   VALID_PROVIDERS,
+  HERMES_TOOL_REPAIR_NOTICE_RE,
 } from "../shared/constants.js";
 
 import {
@@ -1372,6 +1373,15 @@ export function isHermesCliAdvisoryLine(line: string): boolean {
   return HERMES_CLI_ADVISORY_RES.some((re) => re.test(t));
 }
 
+/**
+ * Hermes's mid-run tool-name auto-repair notice (TECH-8974). Separate from
+ * `isHermesCliAdvisoryLine`: that one matches start-anchored CLI startup banners, this one
+ * matches a notice that may carry a configurable `log_prefix`. Matched after ANSI stripping.
+ */
+export function isHermesToolRepairNotice(line: string): boolean {
+  return HERMES_TOOL_REPAIR_NOTICE_RE.test(line.replace(ANSI_ESCAPE_RE, "").trim());
+}
+
 /** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
 function cleanResponse(raw: string): string {
   return raw
@@ -1381,6 +1391,7 @@ function cleanResponse(raw: string): string {
       const t = line.trim();
       if (!t) return true; // keep blank lines for paragraph separation
       if (isHermesCliAdvisoryLine(t)) return false;
+      if (isHermesToolRepairNotice(t)) return false;
       if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
       if (t.startsWith("session_id:")) return false;
       if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;

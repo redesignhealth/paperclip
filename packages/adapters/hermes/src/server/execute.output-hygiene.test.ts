@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { execute, isHermesCliAdvisoryLine } from "./execute.js";
+import { execute, isHermesCliAdvisoryLine, isHermesToolRepairNotice } from "./execute.js";
 
 /**
  * Output hygiene for chat-connected runs: Paperclip publishes a run's summary /
@@ -29,6 +29,8 @@ const TIRITH_BANNER =
 // Verbatim banner observed on the pilot (cli_model_switch_mixin); the model names are part of the
 // fixture, not a model choice.
 const MODEL_BANNER = "⚠️  Normalized model 'claude-haiku-4.5' to 'claude-haiku-4-5' for anthropic.";
+// Verbatim from hermes-agent 0.21.3 agent/turn_tool_validation.py:95 (TECH-8974).
+const REPAIR_NOTICE = "\u{1F527} Auto-repaired tool name: 'mcp__mem0_search' -> 'mem0_search'";
 const REPLY = "<!subteam^S0ABC> this looks like a **tech/provisioning_deploy** request.";
 
 function makeContext(logs: Array<{ stream: string; chunk: string }>): AdapterExecutionContext {
@@ -36,7 +38,15 @@ function makeContext(logs: Array<{ stream: string; chunk: string }>): AdapterExe
     runId: "run-output-hygiene-1",
     agent: { id: "agent-1", companyId: "company-1", name: "Hermes", adapterType: "hermes_local", adapterConfig: {} },
     runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-    config: { command: "/usr/bin/hermes", timeoutSec: 30, graceSec: 2, env: { ANTHROPIC_API_KEY: "FAKE-KEY-FOR-TESTS-not-a-real-credential" } },
+    config: {
+      command: "/usr/bin/hermes",
+      timeoutSec: 30,
+      graceSec: 2,
+      env: {
+        ANTHROPIC_API_KEY: "FAKE-KEY-FOR-TESTS-not-a-real-credential",
+        HERMES_HOME: "/dev/null",
+      },
+    },
     context: { issueId: "issue-1", wakeReason: "manual" },
     authToken: "paperclip-run-token",
     onLog: async (stream: "stdout" | "stderr", chunk: string) => {
@@ -61,6 +71,28 @@ describe("isHermesCliAdvisoryLine", () => {
   });
 });
 
+describe("isHermesToolRepairNotice", () => {
+  it("matches the auto-repair notice with or without ANSI dimming or log_prefix", () => {
+    expect(isHermesToolRepairNotice(REPAIR_NOTICE)).toBe(true);
+    expect(isHermesToolRepairNotice(`  \u001b[2m${REPAIR_NOTICE}\u001b[0m`)).toBe(true);
+    expect(isHermesToolRepairNotice(`TALENT ${REPAIR_NOTICE}`)).toBe(true);
+    expect(
+      isHermesToolRepairNotice("\u{1F527} Auto-repaired tool name: 'mcp__mem0_add' -> 'mem0_add'"),
+    ).toBe(true);
+  });
+
+  it("leaves ordinary reply lines alone, including prose mentioning auto-repair", () => {
+    expect(isHermesToolRepairNotice(REPLY)).toBe(false);
+    expect(isHermesToolRepairNotice("I auto-repaired the tool name for you.")).toBe(false);
+    expect(
+      isHermesToolRepairNotice("Hermes reported: 🔧 Auto-repaired tool name: 'a' -> 'b'"),
+    ).toBe(false);
+    expect(
+      isHermesToolRepairNotice("🔧 Auto-repaired tool name: 'a' -> 'b' and then I did something else"),
+    ).toBe(false);
+  });
+});
+
 describe("execute: Hermes CLI advisories never reach the summary", () => {
   beforeEach(() => {
     child = { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
@@ -74,6 +106,14 @@ describe("execute: Hermes CLI advisories never reach the summary", () => {
     expect((result.resultJson as { result: string }).result).toBe(REPLY);
     expect(result.summary).not.toContain("tirith");
     expect(result.summary).not.toContain("Normalized model");
+  });
+
+  it("strips the tool-name auto-repair notice, including a duplicated one", async () => {
+    child.stdout = `${REPAIR_NOTICE}\n${REPAIR_NOTICE}\n${REPLY}\n\nsession_id: sess-4`;
+    const result = await execute(makeContext([]));
+    expect(result.summary).toBe(REPLY);
+    expect((result.resultJson as { result: string }).result).toBe(REPLY);
+    expect(result.summary).not.toContain("Auto-repaired");
   });
 });
 
